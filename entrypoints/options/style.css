@@ -1,0 +1,16 @@
+.options {
+  max-width: 480px;
+  margin: 0 auto;
+  padding: var(--space-4);
+}
+
+.options__title {
+  margin: 0 0 var(--space-2);
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.options__lead {
+  color: var(--muted);
+  margin: 0;
+}

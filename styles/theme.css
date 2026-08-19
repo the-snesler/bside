@@ -1,0 +1,107 @@
+/**
+ * Shared design tokens for every extension surface (sidebar + options).
+ * Restrained, system-adaptive baseline: system UI sans by default,
+ * monospace reserved for tool-call/code content only.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  /* Light tokens */
+  --bg: oklch(1 0 0);
+  --surface: oklch(0.965 0 0);
+  --ink: oklch(0.18 0.01 28.3);
+  --muted: oklch(0.45 0.02 28.3);
+  --primary: oklch(0.49 0.19 28.3);
+  --on-primary: oklch(1 0 0);
+  --accent: oklch(0.55 0.13 250);
+  --error: oklch(0.5 0.2 25);
+  --success: oklch(0.55 0.14 145);
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+
+  --radius-control: 8px;
+  --radius-panel: 12px;
+
+  --focus-ring-width: 2px;
+  --transition-fast: 160ms;
+
+  --font-sans:
+    system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: oklch(0.12 0 0);
+    --surface: oklch(0.18 0.01 28.3);
+    --ink: oklch(0.95 0 0);
+    --muted: oklch(0.72 0.02 28.3);
+    --primary: oklch(0.68 0.16 28.3);
+    --on-primary: oklch(0.12 0 0);
+    --accent: oklch(0.73 0.11 250);
+    --error: oklch(0.7 0.18 25);
+    --success: oklch(0.75 0.14 145);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --transition-fast: 0ms;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+code,
+pre,
+.tool-call {
+  font-family: var(--font-mono);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: var(--focus-ring-width) solid var(--accent);
+  outline-offset: 2px;
+}
+
+button {
+  border-radius: var(--radius-control);
+  transition:
+    background-color var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.panel {
+  border-radius: var(--radius-panel);
+  background: var(--surface);
+}
