@@ -2,7 +2,7 @@ export function App() {
   return (
     <div class="sidebar">
       <header class="sidebar__header">
-        <h1 class="sidebar__title">Agent</h1>
+        <h1 class="sidebar__title">bside</h1>
         <button
           type="button"
           class="sidebar__settings"
