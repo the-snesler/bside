@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Agent Fixture</title>
+  </head>
+  <body>
+    <article>
+      <p>Orchid launch moved to Friday.</p>
+    </article>
+
+    <form id="agent-form">
+      <div>
+        <label for="email">Email</label>
+        <input id="email" name="email" type="email" />
+      </div>
+      <div>
+        <label for="priority">Priority</label>
+        <select id="priority" name="priority">
+          <option value="low">Low</option>
+          <option value="high">High</option>
+        </select>
+      </div>
+      <div>
+        <label for="notify">
+          <input id="notify" name="notify" type="checkbox" />
+          Notify me
+        </label>
+      </div>
+      <button type="submit">Submit</button>
+    </form>
+
+    <div id="output" aria-live="polite"></div>
+
+    <p><a href="/next-page.html">Next page</a></p>
+
+    <script>
+      var form = document.getElementById("agent-form");
+      var output = document.getElementById("output");
+      form.addEventListener("submit", function (event) {
+        event.preventDefault();
+        var email = document.getElementById("email").value;
+        var priority = document.getElementById("priority").value;
+        var notify = document.getElementById("notify").checked;
+        output.textContent =
+          "Submitted: " + email + " \u00b7 " + priority + " \u00b7 " + (notify ? "notify" : "silent");
+      });
+    </script>
+  </body>
+</html>
