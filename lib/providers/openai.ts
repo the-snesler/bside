@@ -149,9 +149,16 @@ function buildInput(request: ProviderTurnRequest): ResponseInputItem[] {
 
   // Tool results accumulate across rounds in `transcript`; every one not yet
   // acknowledged by a prior round must be resent since nothing is stored
-  // server-side (`store:false`).
+  // server-side (`store:false`). Every `function_call_output` requires a
+  // matching `function_call` earlier in the same request — one that only
+  // exists in the replay state of the run that produced it — so a
+  // tool-result with no matching call in this request is dropped rather
+  // than sent and rejected by the API.
+  const knownCallIds = new Set(
+    replay?.outputItems.filter(isFunctionCallItem).map((item) => item.call_id) ?? [],
+  );
   for (const item of request.transcript) {
-    if (item.kind === "tool-result") {
+    if (item.kind === "tool-result" && knownCallIds.has(item.callId)) {
       items.push({ type: "function_call_output", call_id: item.callId, output: JSON.stringify(item.result) });
     }
   }
@@ -209,6 +216,10 @@ function mapStreamEvent(event: ResponseStreamEvent, previousReplayState: JsonVal
 
 interface ReplayState {
   outputItems: ResponseInputItem[];
+}
+
+function isFunctionCallItem(item: ResponseInputItem): item is Extract<ResponseInputItem, { type: "function_call" }> {
+  return "type" in item && item.type === "function_call";
 }
 
 function readReplayState(value: JsonValue | null): ReplayState | null {

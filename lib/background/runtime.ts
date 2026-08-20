@@ -235,7 +235,12 @@ export class BackgroundRuntime {
     this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt, page: userItem.kind === "message" ? userItem.context : null });
     await this.#writeCheckpoint(runId, "running", "");
 
-    await this.#runAgentLoop(runId, conversation.items, artifact, credential.apiKey);
+    // Tool-call/tool-result items only pair validly with the replay state
+    // from the run that produced them (the matching `function_call` item);
+    // that replay state is discarded when a run ends, so a new run must
+    // start from message history only, never from a prior run's tool items.
+    const transcript = conversation.items.filter((item) => item.kind === "message");
+    await this.#runAgentLoop(runId, transcript, artifact, credential.apiKey);
   }
 
   async #runAgentLoop(runId: string, transcript: ConversationItem[], artifact: ContextArtifact | null, apiKey: string): Promise<void> {

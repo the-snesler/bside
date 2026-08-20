@@ -336,6 +336,34 @@ describe("OpenAIProvider.streamTurn: request shape", () => {
     const completed = events[0] as { type: "turn.completed"; replayState: { outputItems: unknown[] } };
     expect(completed.replayState.outputItems).toEqual([priorItem, newItem]);
   });
+
+  it("drops a tool-result with no matching function_call in this request (regression: prevents 'No tool call found for function call output')", async () => {
+    responsesCreateMock.mockResolvedValue(
+      fixtureStream([{ type: "response.completed", sequence_number: 1, response: fixtureResponse() }] as ResponseStreamEvent[]),
+    );
+
+    const provider = new OpenAIProvider();
+    await collect(
+      provider.streamTurn(
+        baseRequest({
+          // No replayState: this call_id's function_call only ever existed
+          // in a prior, now-completed run's (discarded) replay state.
+          replayState: null,
+          transcript: [
+            { id: "u1", kind: "message", role: "user", text: "Show the guestbook.", context: null, at: 1 },
+            { id: "tc1", kind: "tool-call", call: { id: "call_orphan", name: "page_snapshot", arguments: { mode: "readable" } }, at: 2 },
+            { id: "tr1", kind: "tool-result", callId: "call_orphan", result: { ok: true, summary: "Captured." }, at: 3 },
+            { id: "u2", kind: "message", role: "user", text: "Try again.", context: null, at: 4 },
+          ],
+        }),
+        AUTH,
+        new AbortController().signal,
+      ),
+    );
+
+    const [body] = responsesCreateMock.mock.calls[0] as [{ input: Array<{ type?: string }> }];
+    expect(body.input.some((item) => item.type === "function_call_output")).toBe(false);
+  });
 });
 
 describe("OpenAIProvider: safe error normalization", () => {

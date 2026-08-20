@@ -27,10 +27,12 @@ function unsupportedPageTabControllerFactory(): TabController {
 class FakeProvider implements ProviderAdapter {
   readonly definition = { id: "openai" as const, name: "OpenAI", authMethods: [], models: [] };
   script: ProviderEvent[] | ((signal: AbortSignal) => AsyncIterable<ProviderEvent>) = [];
+  requests: ProviderTurnRequest[] = [];
 
   async validateAuth(_auth: ProviderAuth, _signal: AbortSignal): Promise<void> {}
 
-  async *streamTurn(_request: ProviderTurnRequest, _auth: ProviderAuth, signal: AbortSignal): AsyncIterable<ProviderEvent> {
+  async *streamTurn(request: ProviderTurnRequest, _auth: ProviderAuth, signal: AbortSignal): AsyncIterable<ProviderEvent> {
+    this.requests.push(request);
     const events = typeof this.script === "function" ? this.script(signal) : this.script;
     yield* events;
   }
@@ -204,5 +206,48 @@ describe("BackgroundRuntime: missing credential", () => {
     if (broadcast?.type === "state.snapshot") {
       expect(broadcast.payload.notice).toContain("API key");
     }
+  });
+});
+
+describe("BackgroundRuntime: cross-run transcript (regression)", () => {
+  it("does not carry a prior run's tool-call/tool-result items into a new run's transcript", async () => {
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    // FakeProvider.streamTurn is called once per AgentLoop round; wire
+    // distinct rounds via a counter. Run 1 emits a tool call (TabController
+    // is unattached, so it resolves as a failed but still-persisted tool
+    // result) then a final message; run 2 is plain text.
+    let round = 0;
+    const rounds: ProviderEvent[][] = [
+      [
+        { type: "tool.call", call: { id: "call_1", name: "page_snapshot", arguments: { mode: "readable" } } },
+        { type: "turn.completed", replayState: null },
+      ],
+      [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }],
+      [{ type: "text.delta", delta: "Second reply." }, { type: "turn.completed", replayState: null }],
+    ];
+    provider.script = () => {
+      const events = rounds[round] ?? [{ type: "turn.completed", replayState: null }];
+      round += 1;
+      return { [Symbol.asyncIterator]: async function* () { yield* events; } };
+    };
+
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Show the guestbook" });
+    const firstRunConversation = (await runtime.getSnapshot()).conversation;
+    expect(firstRunConversation.items.some((item) => item.kind === "tool-call")).toBe(true);
+    expect(firstRunConversation.items.some((item) => item.kind === "tool-result")).toBe(true);
+
+    await runtime.handleCommand({ v: 1, id: "2", type: "run.start", prompt: "Try again" });
+
+    const secondRunRequest = provider.requests[2];
+    expect(secondRunRequest).toBeDefined();
+    expect(secondRunRequest?.transcript.every((item) => item.kind === "message")).toBe(true);
+    expect(secondRunRequest?.replayState).toBeNull();
   });
 });
