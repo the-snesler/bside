@@ -4,8 +4,13 @@
  * writes conversation/checkpoint storage. Sidebar and options pages never
  * own an inference request, tool loop, transcript authority, or credential
  * read — they only ever see what this file publishes through SidebarHub.
+ *
+ * Per-round provider/tool orchestration is delegated to `AgentLoop`; this
+ * file owns run lifecycle (single-run enforcement, checkpointing,
+ * persistence) and everything outside an active run (credentials, settings).
  */
 
+import { AgentLoop } from "@/lib/background/agent-loop";
 import type { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController } from "@/lib/background/tab-controller";
 import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
@@ -24,11 +29,13 @@ import {
   saveRunCheckpoint,
   deleteOpenAICredential as deleteStoredCredential,
 } from "@/lib/storage";
+import type { RunStatus } from "@/lib/storage";
 import { validatePromptText } from "@/lib/validation";
 import type { ContextArtifact } from "@/lib/domain/tools";
 import type { ConversationItem } from "@/lib/domain/conversation";
 import type { AppSettingsV1, ProviderAdapter, ProviderAuth } from "@/lib/domain/provider";
 import type {
+  ApprovalRequest,
   CredentialRequest,
   CredentialResponse,
   NormalizedError,
@@ -42,11 +49,15 @@ const CHECKPOINT_MIN_INTERVAL_MS = 1_000;
 const DELTA_COALESCE_MS = 16;
 const DELTA_COALESCE_BYTES = 1024;
 
+type RunLifecycleStatus = "running" | "awaiting-approval" | "cancelling";
+
 interface ActiveRun {
   runId: string;
   controller: AbortController;
-  status: "running" | "cancelling";
+  agentLoop: AgentLoop;
+  status: RunLifecycleStatus;
   partialAssistantText: string;
+  pendingApproval: ApprovalRequest | null;
   lastCheckpointAt: number;
 }
 
@@ -85,7 +96,12 @@ export class BackgroundRuntime {
       settings,
       page: this.#sidebarHub.currentAttachment(),
       activeRun: this.#activeRun
-        ? { runId: this.#activeRun.runId, status: this.#activeRun.status, partialAssistantText: this.#activeRun.partialAssistantText }
+        ? {
+            runId: this.#activeRun.runId,
+            status: this.#activeRun.status,
+            partialAssistantText: this.#activeRun.partialAssistantText,
+            pendingApproval: this.#activeRun.pendingApproval,
+          }
         : null,
       lastSeq: this.#sidebarHub.lastSeq(),
       notice,
@@ -99,6 +115,14 @@ export class BackgroundRuntime {
     }
     if (command.type === "run.cancel") {
       this.#cancelRun(command.runId);
+      return;
+    }
+    if (command.type === "action.approve") {
+      this.#resolveApproval(command.runId, command.callId, true);
+      return;
+    }
+    if (command.type === "action.deny") {
+      this.#resolveApproval(command.runId, command.callId, false);
     }
   }
 
@@ -171,7 +195,17 @@ export class BackgroundRuntime {
     // active run and is dropped rather than racing into a second run.
     const runId = crypto.randomUUID();
     const controller = new AbortController();
-    this.#activeRun = { runId, controller, status: "running", partialAssistantText: "", lastCheckpointAt: 0 };
+    const tabController = this.#tabControllerFactory();
+    const agentLoop = new AgentLoop(this.#provider, tabController, this.#sidebarHub);
+    this.#activeRun = {
+      runId,
+      controller,
+      agentLoop,
+      status: "running",
+      partialAssistantText: "",
+      pendingApproval: null,
+      lastCheckpointAt: 0,
+    };
 
     const credential = await getOpenAICredential();
     if (!credential) {
@@ -183,7 +217,6 @@ export class BackgroundRuntime {
 
     this.#sidebarHub.startRun();
 
-    const tabController = this.#tabControllerFactory();
     const captureOutcome = await tabController.captureActivePage();
     const artifact: ContextArtifact | null = captureOutcome.ok
       ? { ...captureOutcome.value.artifact, target: { kind: "tab", tabId: captureOutcome.value.snapshot.tabId }, snapshot: captureOutcome.value.snapshot }
@@ -200,12 +233,12 @@ export class BackgroundRuntime {
     const conversation = await appendConversationItem(userItem);
 
     this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt, page: userItem.kind === "message" ? userItem.context : null });
-    await saveRunCheckpoint({ version: 1, runId, status: "running", partialAssistantText: "", lastSeq: this.#sidebarHub.lastSeq(), updatedAt: Date.now() });
+    await this.#writeCheckpoint(runId, "running", "");
 
-    await this.#runProvider(runId, conversation.items, artifact, credential.apiKey);
+    await this.#runAgentLoop(runId, conversation.items, artifact, credential.apiKey);
   }
 
-  async #runProvider(runId: string, transcript: ConversationItem[], artifact: ContextArtifact | null, apiKey: string): Promise<void> {
+  async #runAgentLoop(runId: string, transcript: ConversationItem[], artifact: ContextArtifact | null, apiKey: string): Promise<void> {
     const run = this.#activeRun;
     if (!run || run.runId !== runId) return;
 
@@ -221,68 +254,80 @@ export class BackgroundRuntime {
       lastFlush = Date.now();
     };
 
-    try {
-      const stream = this.#provider.streamTurn(
-        {
-          modelId: settings.modelId,
-          reasoningEffort: settings.reasoningEffort,
-          transcript,
-          contextArtifacts: artifact ? [artifact] : [],
-          replayState: null,
-          tools: [],
-        },
-        auth,
-        run.controller.signal,
-      );
+    const result = await run.agentLoop.run({
+      runId,
+      modelId: settings.modelId,
+      reasoningEffort: settings.reasoningEffort,
+      transcript,
+      contextArtifact: artifact,
+      auth,
+      signal: run.controller.signal,
+      onDelta: (delta) => {
+        if (this.#activeRun?.runId !== runId) return;
+        run.partialAssistantText += delta;
+        coalesced += delta;
+        if (coalesced.length >= DELTA_COALESCE_BYTES || Date.now() - lastFlush >= DELTA_COALESCE_MS) flushDelta();
+        void this.#maybeCheckpoint(runId, run);
+      },
+      onItem: async (item) => {
+        await appendConversationItem(item);
+        if (item.kind === "message" && item.role === "assistant") run.partialAssistantText = "";
+        await this.#writeCheckpoint(runId, run.status, run.partialAssistantText);
+      },
+      onApprovalPending: (request) => {
+        if (this.#activeRun?.runId !== runId) return;
+        flushDelta();
+        run.pendingApproval = request;
+        run.status = request ? "awaiting-approval" : "running";
+        void this.#sidebarHub.broadcastSnapshot();
+      },
+    });
 
-      for await (const event of stream) {
-        if (this.#activeRun?.runId !== runId) return; // superseded/terminal already handled
-        if (event.type === "text.delta") {
-          run.partialAssistantText += event.delta;
-          coalesced += event.delta;
-          if (coalesced.length >= DELTA_COALESCE_BYTES || Date.now() - lastFlush >= DELTA_COALESCE_MS) {
-            flushDelta();
-          }
-          await this.#maybeCheckpoint(runId, run);
-        }
-        // tool.call is ignored in this slice: no tools are advertised, so the
-        // model should never emit one; Slice 4 adds the tool loop.
-      }
-      flushDelta();
+    if (this.#activeRun?.runId !== runId) return;
+    flushDelta();
 
-      if (this.#activeRun?.runId !== runId) return;
-      await this.#completeRun(runId, run.partialAssistantText);
-    } catch (error) {
-      if (this.#activeRun?.runId !== runId) return;
-      flushDelta();
-      if (run.status === "cancelling") {
-        await this.#finishCancelled(runId, run.partialAssistantText);
-      } else {
-        await this.#failRun(runId, toNormalizedError(error, "provider"));
-      }
+    if (result.status === "completed") {
+      const messageId = result.finalMessageId ?? (await this.#persistEmptyFinalMessage());
+      this.#sidebarHub.publishRunEvent(runId, "run.completed", { messageId });
+      await clearRunCheckpoint();
+      this.#activeRun = null;
+      return;
     }
+    if (result.status === "cancelled") {
+      this.#sidebarHub.publishRunEvent(runId, "run.cancelled", { partialText: result.partialText });
+      await clearRunCheckpoint();
+      this.#activeRun = null;
+      return;
+    }
+    this.#sidebarHub.publishRunEvent(runId, "run.failed", result.error);
+    await clearRunCheckpoint();
+    this.#activeRun = null;
   }
 
+
+  /** Rare: the model produced neither text nor a tool call. Persist an empty final message so `run.completed` always has a real id. */
+  async #persistEmptyFinalMessage(): Promise<string> {
+    const id = crypto.randomUUID();
+    await appendConversationItem({ id, kind: "message", role: "assistant", text: "", at: Date.now() });
+    return id;
+  }
   async #maybeCheckpoint(runId: string, run: ActiveRun): Promise<void> {
     const now = Date.now();
     if (now - run.lastCheckpointAt < CHECKPOINT_MIN_INTERVAL_MS) return;
     run.lastCheckpointAt = now;
+    await this.#writeCheckpoint(runId, run.status, run.partialAssistantText);
+  }
+
+  async #writeCheckpoint(runId: string, status: RunLifecycleStatus, partialAssistantText: string): Promise<void> {
+    const checkpointStatus: RunStatus = status === "cancelling" ? "cancelled" : status;
     await saveRunCheckpoint({
       version: 1,
       runId,
-      status: run.status === "cancelling" ? "cancelled" : "running",
-      partialAssistantText: run.partialAssistantText,
+      status: checkpointStatus,
+      partialAssistantText,
       lastSeq: this.#sidebarHub.lastSeq(),
-      updatedAt: now,
+      updatedAt: Date.now(),
     });
-  }
-
-  async #completeRun(runId: string, text: string): Promise<void> {
-    const messageId = crypto.randomUUID();
-    await appendConversationItem({ id: messageId, kind: "message", role: "assistant", text, at: Date.now() });
-    this.#sidebarHub.publishRunEvent(runId, "run.completed", { messageId });
-    await clearRunCheckpoint();
-    this.#activeRun = null;
   }
 
   #cancelRun(runId: string): void {
@@ -291,16 +336,11 @@ export class BackgroundRuntime {
     this.#activeRun.controller.abort();
   }
 
-  async #finishCancelled(runId: string, partialText: string): Promise<void> {
-    this.#sidebarHub.publishRunEvent(runId, "run.cancelled", { partialText });
-    await clearRunCheckpoint();
-    this.#activeRun = null;
-  }
-
-  async #failRun(runId: string, error: NormalizedError): Promise<void> {
-    this.#sidebarHub.publishRunEvent(runId, "run.failed", error);
-    await clearRunCheckpoint();
-    this.#activeRun = null;
+  #resolveApproval(runId: string, callId: string, approved: boolean): void {
+    if (!this.#activeRun || this.#activeRun.runId !== runId) return;
+    if (this.#activeRun.pendingApproval?.call.id !== callId) return;
+    if (approved) this.#activeRun.agentLoop.approve(callId);
+    else this.#activeRun.agentLoop.deny(callId);
   }
 }
 

@@ -19,6 +19,8 @@ export interface BackgroundState extends RuntimeSnapshot {
 export interface BackgroundActions {
   sendPrompt(prompt: string): void;
   cancelRun(): void;
+  approveAction(callId: string): void;
+  denyAction(callId: string): void;
 }
 
 const INITIAL_STATE: BackgroundState = {
@@ -70,7 +72,37 @@ export function useBackground(): BackgroundState & BackgroundActions {
     portRef.current?.postMessage(command);
   }, []);
 
-  return { ...state, sendPrompt, cancelRun };
+  const approveAction = useCallback((callId: string) => {
+    const runId = activeRunIdRef.current;
+    if (!runId) return;
+    const command: SidebarCommand = { v: 1, id: crypto.randomUUID(), type: "action.approve", runId, callId };
+    portRef.current?.postMessage(command);
+  }, []);
+
+  const denyAction = useCallback((callId: string) => {
+    const runId = activeRunIdRef.current;
+    if (!runId) return;
+    const command: SidebarCommand = { v: 1, id: crypto.randomUUID(), type: "action.deny", runId, callId };
+    portRef.current?.postMessage(command);
+  }, []);
+
+  return { ...state, sendPrompt, cancelRun, approveAction, denyAction };
+}
+
+function commitPendingText(prev: BackgroundState): BackgroundState {
+  if (!prev.activeRun || !prev.activeRun.partialAssistantText) return prev;
+  const message: ConversationItem = {
+    id: `${prev.activeRun.runId}-msg-${prev.conversation.items.length}`,
+    kind: "message",
+    role: "assistant",
+    text: prev.activeRun.partialAssistantText,
+    at: Date.now(),
+  };
+  return {
+    ...prev,
+    activeRun: { ...prev.activeRun, partialAssistantText: "" },
+    conversation: { ...prev.conversation, items: [...prev.conversation.items, message] },
+  };
 }
 
 function applyEvent(
@@ -100,7 +132,7 @@ function applyEvent(
       };
       return {
         ...prev,
-        activeRun: { runId: event.runId as string, status: "running", partialAssistantText: "" },
+        activeRun: { runId: event.runId as string, status: "running", partialAssistantText: "", pendingApproval: null },
         conversation: { ...prev.conversation, items: [...prev.conversation.items, userItem], updatedAt: event.at },
       };
     });
@@ -114,10 +146,56 @@ function applyEvent(
     );
     return;
   }
+  if (event.type === "tool.requested") {
+    setState((prev) => {
+      const committed = commitPendingText(prev);
+      if (!committed.activeRun) return committed;
+      const callItem: ConversationItem = { id: `${event.payload.call.id}-call`, kind: "tool-call", call: event.payload.call, at: event.at };
+      return { ...committed, conversation: { ...committed.conversation, items: [...committed.conversation.items, callItem] } };
+    });
+    return;
+  }
+  if (event.type === "action.approval-required") {
+    setState((prev) => {
+      const committed = commitPendingText(prev);
+      if (!committed.activeRun) return committed;
+      const callItem: ConversationItem = { id: `${event.payload.call.id}-call`, kind: "tool-call", call: event.payload.call, at: event.at };
+      return {
+        ...committed,
+        activeRun: { ...committed.activeRun, status: "awaiting-approval", pendingApproval: event.payload },
+        conversation: { ...committed.conversation, items: [...committed.conversation.items, callItem] },
+      };
+    });
+    return;
+  }
+  if (event.type === "tool.result") {
+    setState((prev) => {
+      if (!prev.activeRun) return prev;
+      const resultItem: ConversationItem = {
+        id: `${event.payload.callId}-result`,
+        kind: "tool-result",
+        callId: event.payload.callId,
+        result: event.payload.result,
+        at: event.at,
+      };
+      const stillPending = prev.activeRun.pendingApproval?.call.id === event.payload.callId ? null : prev.activeRun.pendingApproval;
+      return {
+        ...prev,
+        activeRun: {
+          ...prev.activeRun,
+          status: stillPending ? "awaiting-approval" : "running",
+          pendingApproval: stillPending,
+        },
+        conversation: { ...prev.conversation, items: [...prev.conversation.items, resultItem] },
+      };
+    });
+    return;
+  }
   if (event.type === "run.completed") {
     activeRunIdRef.current = null;
     setState((prev) => {
       if (!prev.activeRun) return prev;
+      if (!prev.activeRun.partialAssistantText) return { ...prev, activeRun: null };
       const assistantItem: ConversationItem = {
         id: event.payload.messageId,
         kind: "message",

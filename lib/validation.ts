@@ -14,7 +14,7 @@ const MAX_URL_LEN = 2048;
 const MAX_SELECT_VALUES = 20;
 const MAX_SELECT_VALUE_LEN = 256;
 
-function isRecord(value: JsonValue): value is { [key: string]: JsonValue } {
+export function isRecord(value: JsonValue): value is { [key: string]: JsonValue } {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 

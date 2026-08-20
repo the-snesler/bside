@@ -15,6 +15,7 @@ import type {
   PageErrorCode,
   PageSnapshotV1,
   PageToolName,
+  ToolCall,
   ToolResult,
 } from "@/lib/domain/tools";
 import type { ConversationRecordV1 } from "@/lib/domain/conversation";
@@ -163,14 +164,28 @@ export const SIDEBAR_PORT_NAME = "agent-sidebar:v1";
 export type SidebarCommand =
   | { v: 1; id: string; type: "state.subscribe"; lastSeq: number | null }
   | { v: 1; id: string; type: "run.start"; prompt: string }
-  | { v: 1; id: string; type: "run.cancel"; runId: string };
+  | { v: 1; id: string; type: "run.cancel"; runId: string }
+  | { v: 1; id: string; type: "action.approve"; runId: string; callId: string }
+  | { v: 1; id: string; type: "action.deny"; runId: string; callId: string };
+
+export interface ApprovalRequest {
+  call: ToolCall;
+  origin: string;
+  display: string;
+  target: { ref?: string; role?: string; name?: string };
+}
 
 export interface RuntimeSnapshot {
   conversation: ConversationRecordV1;
   credential: { configured: boolean; maskedSuffix: string | null };
   settings: AppSettingsV1;
   page: PageArtifactSummary | null;
-  activeRun: { runId: string; status: "running" | "cancelling"; partialAssistantText: string } | null;
+  activeRun: {
+    runId: string;
+    status: "running" | "awaiting-approval" | "cancelling";
+    partialAssistantText: string;
+    pendingApproval: ApprovalRequest | null;
+  } | null;
   lastSeq: number;
   notice: string | null;
 }
@@ -190,6 +205,9 @@ export type SidebarEvent =
   | EventBase<"page.attached", PageArtifactSummary | null>
   | EventBase<"run.started", { prompt: string; page: PageArtifactSummary | null }>
   | EventBase<"assistant.delta", { delta: string }>
+  | EventBase<"tool.requested", { call: ToolCall; display: string }>
+  | EventBase<"action.approval-required", ApprovalRequest>
+  | EventBase<"tool.result", { callId: string; result: ToolResult }>
   | EventBase<"run.completed", { messageId: string }>
   | EventBase<"run.cancelled", { partialText: string }>
   | EventBase<"run.failed", NormalizedError>;
@@ -202,6 +220,9 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
   }
   if (candidate.type === "run.start") return typeof candidate.prompt === "string";
   if (candidate.type === "run.cancel") return typeof candidate.runId === "string";
+  if (candidate.type === "action.approve" || candidate.type === "action.deny") {
+    return typeof candidate.runId === "string" && typeof candidate.callId === "string";
+  }
   return false;
 }
 

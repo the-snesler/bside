@@ -97,6 +97,13 @@ export class TabController {
   }
 
   async execute(call: ToolCall): Promise<ExecuteOutcome> {
+    const outcome = await this.#executeInner(call);
+    return outcome.result.ok && outcome.snapshot
+      ? { result: { ...outcome.result, summary: appendSnapshotSummary(outcome.result.summary, outcome.snapshot) }, snapshot: outcome.snapshot }
+      : outcome;
+  }
+
+  async #executeInner(call: ToolCall): Promise<ExecuteOutcome> {
     if (this.#tabId === null) {
       return { result: { ok: false, code: "UNSUPPORTED_PAGE", summary: "No page is attached." }, snapshot: null };
     }
@@ -251,6 +258,37 @@ export class TabController {
 
 function invalidArgs(): ToolResult {
   return { ok: false, code: "INVALID_TOOL_ARGUMENTS", summary: "Invalid or missing arguments for this tool call." };
+}
+
+const MAX_SUMMARY_NODES = 40;
+const MAX_SUMMARY_TEXT_LEN = 800;
+
+/** Appends a bounded description of the fresh snapshot so the model can observe refs/values/text without a separate page_snapshot call. */
+function appendSnapshotSummary(summary: string, snapshot: PageSnapshotV1): string {
+  const description = summarizeSnapshot(snapshot);
+  return description ? `${summary} ${description}` : summary;
+}
+
+function summarizeSnapshot(snapshot: PageSnapshotV1): string {
+  if (snapshot.nodes.length > 0) {
+    const lines = snapshot.nodes.slice(0, MAX_SUMMARY_NODES).map(describeNode);
+    const suffix = snapshot.nodes.length > MAX_SUMMARY_NODES ? ` (+${snapshot.nodes.length - MAX_SUMMARY_NODES} more elements)` : "";
+    return `Elements: ${lines.join("; ")}${suffix}`;
+  }
+  if (snapshot.readableText) {
+    const truncated = snapshot.readableText.length > MAX_SUMMARY_TEXT_LEN;
+    const text = truncated ? `${snapshot.readableText.slice(0, MAX_SUMMARY_TEXT_LEN)}…` : snapshot.readableText;
+    return `Page text: ${text}`;
+  }
+  return "";
+}
+
+function describeNode(node: PageSnapshotV1["nodes"][number]): string {
+  const bits = [node.ref, node.role, node.name ? `"${node.name}"` : ""];
+  if (node.value !== undefined) bits.push(`value=${JSON.stringify(node.value)}`);
+  if (node.state.checked !== undefined) bits.push(node.state.checked ? "checked" : "unchecked");
+  if (node.state.disabled) bits.push("disabled");
+  return bits.filter(Boolean).join(" ");
 }
 
 function pageError(code: PageErrorCode, message: string): { ok: false; error: NormalizedError } {
