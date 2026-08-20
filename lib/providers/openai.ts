@@ -192,7 +192,7 @@ function mapStreamEvent(event: ResponseStreamEvent): ProviderEvent | null {
 /** Complete OpenAI output/reasoning/function items, normalized for resubmission without `previous_response_id`. */
 function buildReplayState(response: Response): JsonValue {
   const outputItems = toResponseInputItems(response.output);
-  return { outputItems, outputText: response.output_text } as unknown as JsonValue;
+  return { outputItems } as unknown as JsonValue;
 }
 
 function normalizeError(error: unknown): ProviderStreamError {

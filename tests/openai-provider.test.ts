@@ -178,7 +178,7 @@ describe("OpenAIProvider.streamTurn: normalization", () => {
         {
           type: "response.completed",
           sequence_number: 1,
-          response: fixtureResponse({ output: [functionCallItem], output_text: "done" }),
+          response: fixtureResponse({ output: [functionCallItem] }),
         },
       ] as ResponseStreamEvent[]),
     );
@@ -189,9 +189,8 @@ describe("OpenAIProvider.streamTurn: normalization", () => {
     expect(events).toHaveLength(1);
     const completed = events[0] as { type: "turn.completed"; replayState: unknown };
     expect(completed.type).toBe("turn.completed");
-    const replay = completed.replayState as { outputItems: unknown[]; outputText: string };
+    const replay = completed.replayState as { outputItems: unknown[] };
     expect(replay.outputItems).toEqual([functionCallItem]);
-    expect(replay.outputText).toBe("done");
   });
 });
 
