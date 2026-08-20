@@ -1,5 +1,7 @@
-import { SIDEBAR_PORT_NAME } from "@/lib/protocol";
+import { isCredentialRequest, isSettingsRequest, SIDEBAR_PORT_NAME } from "@/lib/protocol";
+import type { CredentialResponse, SettingsResponse } from "@/lib/protocol";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
+import { BackgroundRuntime } from "@/lib/background/runtime";
 
 export default defineBackground({
   persistent: true,
@@ -8,6 +10,8 @@ export default defineBackground({
     // background page's full listener set is (re)established synchronously
     // on every load, which MV2 persistent background pages require.
     const sidebarHub = new SidebarHub();
+    const runtime = new BackgroundRuntime(sidebarHub);
+    sidebarHub.delegate = runtime;
 
     browser.runtime.onConnect.addListener((port) => {
       if (port.name !== SIDEBAR_PORT_NAME) return;
@@ -23,5 +27,17 @@ export default defineBackground({
         void sidebarHub.refreshAttachment();
       }
     });
+
+    // Only the extension's own options page may read/write credentials or
+    // settings; the sidebar Port never exposes these methods.
+    const optionsUrl = browser.runtime.getURL("/options.html");
+    browser.runtime.onMessage.addListener((message: unknown, sender): Promise<CredentialResponse | SettingsResponse> | undefined => {
+      if (sender.id !== browser.runtime.id || sender.url !== optionsUrl) return undefined;
+      if (isCredentialRequest(message)) return runtime.handleCredentialRequest(message);
+      if (isSettingsRequest(message)) return runtime.handleSettingsRequest(message);
+      return undefined;
+    });
+
+    void runtime.initialize();
   },
 });

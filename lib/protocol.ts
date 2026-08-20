@@ -17,6 +17,8 @@ import type {
   PageToolName,
   ToolResult,
 } from "@/lib/domain/tools";
+import type { ConversationRecordV1 } from "@/lib/domain/conversation";
+import type { AppSettingsV1, ProviderDefinition } from "@/lib/domain/provider";
 
 // ---------------------------------------------------------------------------
 // Content script <-> background: PageRequest / PageResponse (tabs.sendMessage)
@@ -158,10 +160,17 @@ export interface NormalizedError {
 
 export const SIDEBAR_PORT_NAME = "agent-sidebar:v1";
 
-export type SidebarCommand = { v: 1; id: string; type: "state.subscribe"; lastSeq: number | null };
+export type SidebarCommand =
+  | { v: 1; id: string; type: "state.subscribe"; lastSeq: number | null }
+  | { v: 1; id: string; type: "run.start"; prompt: string }
+  | { v: 1; id: string; type: "run.cancel"; runId: string };
 
 export interface RuntimeSnapshot {
+  conversation: ConversationRecordV1;
+  credential: { configured: boolean; maskedSuffix: string | null };
+  settings: AppSettingsV1;
   page: PageArtifactSummary | null;
+  activeRun: { runId: string; status: "running" | "cancelling"; partialAssistantText: string } | null;
   lastSeq: number;
   notice: string | null;
 }
@@ -178,13 +187,62 @@ export interface EventBase<T extends string, P> {
 
 export type SidebarEvent =
   | EventBase<"state.snapshot", RuntimeSnapshot>
-  | EventBase<"page.attached", PageArtifactSummary | null>;
+  | EventBase<"page.attached", PageArtifactSummary | null>
+  | EventBase<"run.started", { prompt: string; page: PageArtifactSummary | null }>
+  | EventBase<"assistant.delta", { delta: string }>
+  | EventBase<"run.completed", { messageId: string }>
+  | EventBase<"run.cancelled", { partialText: string }>
+  | EventBase<"run.failed", NormalizedError>;
 
 export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (!isEnvelope(value)) return false;
   const candidate = value as Record<string, unknown>;
-  return (
-    candidate.type === "state.subscribe" &&
-    (candidate.lastSeq === null || typeof candidate.lastSeq === "number")
-  );
+  if (candidate.type === "state.subscribe") {
+    return candidate.lastSeq === null || typeof candidate.lastSeq === "number";
+  }
+  if (candidate.type === "run.start") return typeof candidate.prompt === "string";
+  if (candidate.type === "run.cancel") return typeof candidate.runId === "string";
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Options page <-> background: credential and settings (runtime.sendMessage)
+//
+// Accept these only when `sender.id === browser.runtime.id` and
+// `sender.url === browser.runtime.getURL("options.html")`; never expose
+// credential methods on the sidebar Port.
+// ---------------------------------------------------------------------------
+
+export type CredentialRequest =
+  | { v: 1; id: string; type: "credentials.openai.status" }
+  | { v: 1; id: string; type: "credentials.openai.save"; apiKey: string }
+  | { v: 1; id: string; type: "credentials.openai.delete" };
+
+export type CredentialResponse =
+  | { v: 1; id: string; ok: true; configured: boolean; maskedSuffix: string | null }
+  | { v: 1; id: string; ok: false; error: NormalizedError };
+
+export type SettingsRequest =
+  | { v: 1; id: string; type: "settings.get" }
+  | { v: 1; id: string; type: "settings.save"; settings: AppSettingsV1 };
+
+export type SettingsResponse =
+  | { v: 1; id: string; ok: true; settings: AppSettingsV1; provider: ProviderDefinition; notice: string | null }
+  | { v: 1; id: string; ok: false; error: NormalizedError };
+
+export function isCredentialRequest(value: unknown): value is CredentialRequest {
+  if (!isEnvelope(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.type === "credentials.openai.status") return true;
+  if (candidate.type === "credentials.openai.save") return typeof candidate.apiKey === "string";
+  if (candidate.type === "credentials.openai.delete") return true;
+  return false;
+}
+
+export function isSettingsRequest(value: unknown): value is SettingsRequest {
+  if (!isEnvelope(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.type === "settings.get") return true;
+  if (candidate.type === "settings.save") return typeof candidate.settings === "object" && candidate.settings !== null;
+  return false;
 }

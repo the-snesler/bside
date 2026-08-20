@@ -137,3 +137,18 @@ export function validateSnapshotArgs(args: JsonValue): SnapshotArgs | null {
   if (mode !== "readable" && mode !== "interactive") return null;
   return { mode };
 }
+
+const MAX_API_KEY_LEN = 512;
+const MAX_PROMPT_LEN = 16_000;
+
+export function validateApiKey(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_API_KEY_LEN) return null;
+  return trimmed;
+}
+
+export function validatePromptText(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_PROMPT_LEN) return null;
+  return trimmed;
+}
