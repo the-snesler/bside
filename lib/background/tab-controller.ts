@@ -263,10 +263,11 @@ function invalidArgs(): ToolResult {
 const MAX_SUMMARY_NODES = 40;
 const MAX_SUMMARY_TEXT_LEN = 800;
 
-/** Appends a bounded description of the fresh snapshot so the model can observe refs/values/text without a separate page_snapshot call. */
+/** Appends the fresh revision and a bounded description of the fresh snapshot so the model can observe the exact revision string these tools require, plus refs/values/text, without a separate page_snapshot call. */
 function appendSnapshotSummary(summary: string, snapshot: PageSnapshotV1): string {
   const description = summarizeSnapshot(snapshot);
-  return description ? `${summary} ${description}` : summary;
+  const revision = `Revision: ${snapshot.revision}.`;
+  return description ? `${summary} ${revision} ${description}` : `${summary} ${revision}`;
 }
 
 function summarizeSnapshot(snapshot: PageSnapshotV1): string {

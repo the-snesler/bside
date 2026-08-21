@@ -131,6 +131,7 @@ function buildInput(request: ProviderTurnRequest): ResponseInputItem[] {
         "BEGIN_UNTRUSTED_PAGE_ARTIFACT",
         `Title: ${artifact.snapshot.title}`,
         `URL: ${artifact.snapshot.url}`,
+        `Revision: ${artifact.snapshot.revision}`,
         artifact.snapshot.readableText,
         "END_UNTRUSTED_PAGE_ARTIFACT",
       ].join("\n"),

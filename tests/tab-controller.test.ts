@@ -241,6 +241,54 @@ describe("TabController: stale snapshot pass-through", () => {
   });
 });
 
+describe("TabController: revision grounding (regression)", () => {
+  it("includes the real snapshot revision in a successful tool result's summary, not a guessable placeholder", async () => {
+    const { api } = createBrowserApi("http://127.0.0.1:4173/agent-page.html", "Agent Fixture");
+    const controller = new TabController(api);
+    await controller.captureActivePage();
+
+    const outcome = await controller.execute({ id: "c1", name: "page_snapshot", arguments: { mode: "interactive" } });
+
+    expect(outcome.result.ok).toBe(true);
+    expect(outcome.snapshot).not.toBeNull();
+    // Without this, the model has no textual source for the revision string
+    // every ref-based tool call requires and can only guess (regression:
+    // model guessed "0" and every action failed STALE_SNAPSHOT forever).
+    expect(outcome.result.summary).toContain(`Revision: ${outcome.snapshot?.revision}`);
+  });
+
+  it("includes the real revision after a successful click, so the next call can use it", async () => {
+    const { api } = createBrowserApi("http://127.0.0.1:4173/agent-page.html", "Agent Fixture");
+    const baseSendMessage = api.tabs.sendMessage as SendMessage;
+    api.tabs.sendMessage = vi.fn(async (tabId: number, message: unknown) => {
+      const request = message as { id: string; type: string };
+      if (request.type === "page.execute") {
+        return {
+          v: 1,
+          id: request.id,
+          ok: true,
+          type: "page.execute",
+          result: { ok: true, summary: "Clicked link \"Guestbook\"." },
+          snapshot: buildSnapshot("http://127.0.0.1:4173/agent-page.html", "Agent Fixture"),
+        } satisfies PageResponse;
+      }
+      return baseSendMessage(tabId, message);
+    });
+
+    const controller = new TabController(api);
+    await controller.captureActivePage();
+
+    const outcome = await controller.execute({
+      id: "c1",
+      name: "page_click",
+      arguments: { ref: "e1", revision: "rev-http://127.0.0.1:4173/agent-page.html" },
+    });
+
+    expect(outcome.result.ok).toBe(true);
+    expect(outcome.result.summary).toContain(`Revision: ${outcome.snapshot?.revision}`);
+  });
+});
+
 describe("TabController: missing tab", () => {
   it("returns TAB_CHANGED when the bound tab is no longer reachable", async () => {
     const { api } = createBrowserApi("http://127.0.0.1:4173/agent-page.html", "Agent Fixture");

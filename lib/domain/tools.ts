@@ -124,7 +124,11 @@ export type ContextArtifact = PageContextArtifact;
 // ---------------------------------------------------------------------------
 
 const REF_SCHEMA: JsonValue = { type: "string", maxLength: 128 };
-const REVISION_SCHEMA: JsonValue = { type: "string", maxLength: 128 };
+const REVISION_SCHEMA: JsonValue = {
+  type: "string",
+  maxLength: 128,
+  description: "The exact `Revision:` value from the most recent page snapshot or tool result. Never invent or reuse an old one.",
+};
 
 export const PAGE_TOOL_DEFINITIONS: readonly ToolDefinition[] = [
   {

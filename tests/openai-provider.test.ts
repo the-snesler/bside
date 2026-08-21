@@ -258,6 +258,12 @@ describe("OpenAIProvider.streamTurn: request shape", () => {
     const developerItem = body.input.find((item) => item.role === "developer" && item.content.includes("BEGIN_UNTRUSTED_PAGE_ARTIFACT"));
     expect(developerItem?.content).toContain("BEGIN_UNTRUSTED_PAGE_ARTIFACT");
     expect(developerItem?.content).toContain("Orchid launch moved to Friday.");
+    // Regression: every ref-based tool requires a `revision` argument, but
+    // the model had no text anywhere telling it the real value — it could
+    // only guess (observed: it guessed "0" and every action failed
+    // STALE_SNAPSHOT forever). The initial attached-page context is the
+    // first place it can learn the real revision string.
+    expect(developerItem?.content).toContain("Revision: r1");
     expect(developerItem?.content).toContain("END_UNTRUSTED_PAGE_ARTIFACT");
   });
 
