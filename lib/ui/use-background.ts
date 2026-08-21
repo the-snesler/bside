@@ -8,7 +8,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import type { Browser } from "wxt/browser";
-import { SIDEBAR_PORT_NAME } from "@/lib/protocol";
+import { RUN_CANCELLED_SUFFIX, SIDEBAR_PORT_NAME } from "@/lib/protocol";
 import type { NormalizedError, RuntimeSnapshot, SidebarCommand, SidebarEvent } from "@/lib/protocol";
 import type { ConversationItem } from "@/lib/domain/conversation";
 
@@ -213,7 +213,22 @@ function applyEvent(
   }
   if (event.type === "run.cancelled") {
     activeRunIdRef.current = null;
-    setState((prev) => (prev.activeRun ? { ...prev, activeRun: null } : prev));
+    setState((prev) => {
+      if (!prev.activeRun) return prev;
+      if (!event.payload.messageId) return { ...prev, activeRun: null };
+      const assistantItem: ConversationItem = {
+        id: event.payload.messageId,
+        kind: "message",
+        role: "assistant",
+        text: `${prev.activeRun.partialAssistantText}${RUN_CANCELLED_SUFFIX}`,
+        at: event.at,
+      };
+      return {
+        ...prev,
+        activeRun: null,
+        conversation: { ...prev.conversation, items: [...prev.conversation.items, assistantItem], updatedAt: event.at },
+      };
+    });
     return;
   }
   if (event.type === "run.failed") {

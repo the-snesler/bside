@@ -4,6 +4,7 @@ import { AgentLoop } from "@/lib/background/agent-loop";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController } from "@/lib/background/tab-controller";
 import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
+import { ProviderStreamError } from "@/lib/providers/openai";
 import type { ProviderAdapter, ProviderAuth, ProviderEvent, ProviderTurnRequest } from "@/lib/domain/provider";
 import type { PageSnapshotV1, ToolCall } from "@/lib/domain/tools";
 import type { ApprovalRequest, SidebarEvent } from "@/lib/protocol";
@@ -350,5 +351,111 @@ describe("AgentLoop: cancellation while awaiting approval", () => {
     expect(approvalStates.at(-1)).toBeNull();
     const executeCalls = sendMessageMock.mock.calls.filter((call) => (call[1] as { type?: string }).type === "page.execute").length;
     expect(executeCalls).toBe(0);
+  });
+});
+
+describe("AgentLoop: page-effect tracking for retry gating", () => {
+  it("marks hadPageEffect true when a consequential call succeeded before the run failed", async () => {
+    const provider = new ScriptedProvider([
+      () => [toolCallEvent("call_1", "page_click", { ref: "e1", revision: "rev-1" }), { type: "turn.completed", replayState: null }],
+      () => {
+        throw new ProviderStreamError("Rate limited.", "RATE_LIMIT");
+      },
+    ]);
+    const { tabController } = await createTabController();
+    const hub = new SidebarHub();
+    const port = fakePort();
+    hub.handleConnect(port);
+    const loop = new AgentLoop(provider, tabController, hub);
+
+    const resultPromise = loop.run({
+      runId: "run1",
+      modelId: "gpt-5.6-terra",
+      reasoningEffort: "medium",
+      transcript: baseTranscript,
+      contextArtifact: artifact,
+      auth: AUTH,
+      signal: new AbortController().signal,
+      onDelta: () => {},
+      onItem: async () => {},
+      onApprovalPending: () => {},
+    });
+
+    await tick();
+    loop.approve("call_1");
+    const result = await resultPromise;
+
+    expect(result.status).toBe("failed");
+    if (result.status === "failed") {
+      expect(result.error.code).toBe("RATE_LIMIT");
+      expect(result.error.retryable).toBe(true);
+      // The provider error is retryable by type, but the extension must
+      // never claim retry-safety once a real page effect has committed.
+      expect(result.hadPageEffect).toBe(true);
+    }
+  });
+
+  it("marks hadPageEffect false when only a read-only call ran before the run failed", async () => {
+    const provider = new ScriptedProvider([
+      () => [toolCallEvent("call_1", "page_snapshot", { mode: "readable" }), { type: "turn.completed", replayState: null }],
+      () => {
+        throw new ProviderStreamError("Rate limited.", "RATE_LIMIT");
+      },
+    ]);
+    const { tabController } = await createTabController();
+    const hub = new SidebarHub();
+    const port = fakePort();
+    hub.handleConnect(port);
+    const loop = new AgentLoop(provider, tabController, hub);
+
+    const result = await loop.run({
+      runId: "run1",
+      modelId: "gpt-5.6-terra",
+      reasoningEffort: "medium",
+      transcript: baseTranscript,
+      contextArtifact: artifact,
+      auth: AUTH,
+      signal: new AbortController().signal,
+      onDelta: () => {},
+      onItem: async () => {},
+      onApprovalPending: () => {},
+    });
+
+    expect(result.status).toBe("failed");
+    if (result.status === "failed") expect(result.hadPageEffect).toBe(false);
+  });
+
+  it("marks hadPageEffect false when a consequential call was denied, not executed", async () => {
+    const provider = new ScriptedProvider([
+      () => [toolCallEvent("call_1", "page_click", { ref: "e1", revision: "rev-1" }), { type: "turn.completed", replayState: null }],
+      () => {
+        throw new ProviderStreamError("Rate limited.", "RATE_LIMIT");
+      },
+    ]);
+    const { tabController } = await createTabController();
+    const hub = new SidebarHub();
+    const port = fakePort();
+    hub.handleConnect(port);
+    const loop = new AgentLoop(provider, tabController, hub);
+
+    const resultPromise = loop.run({
+      runId: "run1",
+      modelId: "gpt-5.6-terra",
+      reasoningEffort: "medium",
+      transcript: baseTranscript,
+      contextArtifact: artifact,
+      auth: AUTH,
+      signal: new AbortController().signal,
+      onDelta: () => {},
+      onItem: async () => {},
+      onApprovalPending: () => {},
+    });
+
+    await tick();
+    loop.deny("call_1");
+    const result = await resultPromise;
+
+    expect(result.status).toBe("failed");
+    if (result.status === "failed") expect(result.hadPageEffect).toBe(false);
   });
 });

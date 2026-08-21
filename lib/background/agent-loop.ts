@@ -53,7 +53,7 @@ export interface AgentLoopParams {
 export type AgentLoopResult =
   | { status: "completed"; finalMessageId: string | null }
   | { status: "cancelled"; partialText: string }
-  | { status: "failed"; error: NormalizedError };
+  | { status: "failed"; error: NormalizedError; hadPageEffect: boolean };
 
 const AUTO_RUN_RISKS = new Set(["read", "low-effect"]);
 
@@ -62,6 +62,7 @@ export class AgentLoop {
   #tabController: TabController;
   #sidebarHub: SidebarHub;
   #executedCallIds = new Map<string, ToolResult>();
+  #hadPageEffect = false;
   #pendingApprovals = new Map<string, (approved: boolean) => void>();
   #round = 0;
   #latestSnapshot: PageSnapshotV1 | null = null;
@@ -125,7 +126,7 @@ export class AgentLoop {
         }
       } catch (error) {
         if (params.signal.aborted) return { status: "cancelled", partialText: roundText };
-        return { status: "failed", error: toNormalizedError(error) };
+        return { status: "failed", error: toNormalizedError(error), hadPageEffect: this.#hadPageEffect };
       }
 
       if (params.signal.aborted) {
@@ -204,6 +205,7 @@ export class AgentLoop {
 
     const outcome = await this.#tabController.execute(call);
     if (outcome.snapshot) this.#latestSnapshot = outcome.snapshot;
+    if (risk === "consequential" && outcome.result.ok) this.#hadPageEffect = true;
     this.#executedCallIds.set(call.id, outcome.result);
     this.#sidebarHub.publishRunEvent(params.runId, "tool.result", { callId: call.id, result: outcome.result });
     return outcome.result;

@@ -44,6 +44,7 @@ import type {
   SettingsResponse,
   SidebarCommand,
 } from "@/lib/protocol";
+import { RUN_CANCELLED_SUFFIX } from "@/lib/protocol";
 
 const CHECKPOINT_MIN_INTERVAL_MS = 1_000;
 const DELTA_COALESCE_MS = 16;
@@ -299,14 +300,27 @@ export class BackgroundRuntime {
       return;
     }
     if (result.status === "cancelled") {
-      this.#sidebarHub.publishRunEvent(runId, "run.cancelled", { partialText: result.partialText });
+      const messageId = result.partialText ? await this.#persistCancelledMessage(result.partialText) : null;
+      this.#sidebarHub.publishRunEvent(runId, "run.cancelled", { partialText: result.partialText, messageId });
       await clearRunCheckpoint();
       this.#activeRun = null;
       return;
     }
-    this.#sidebarHub.publishRunEvent(runId, "run.failed", result.error);
+    // Retry is only ever safe to offer when this run touched no page state;
+    // a provider-level retryable code (e.g. rate limit, network) must not
+    // imply retry-safety once a consequential tool call has already
+    // committed a real effect on the page.
+    const error: NormalizedError = result.hadPageEffect ? { ...result.error, retryable: false } : result.error;
+    this.#sidebarHub.publishRunEvent(runId, "run.failed", error);
     await clearRunCheckpoint();
     this.#activeRun = null;
+  }
+
+  /** Persists a cancelled run's uncommitted partial text so the interruption stays visible after reload; never fed back into a future provider request. */
+  async #persistCancelledMessage(partialText: string): Promise<string> {
+    const id = crypto.randomUUID();
+    await appendConversationItem({ id, kind: "message", role: "assistant", text: `${partialText}${RUN_CANCELLED_SUFFIX}`, at: Date.now() });
+    return id;
   }
 
 

@@ -4,8 +4,10 @@ import { BackgroundRuntime } from "@/lib/background/runtime";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController } from "@/lib/background/tab-controller";
 import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
+import { ProviderStreamError } from "@/lib/providers/openai";
 import { saveOpenAICredential } from "@/lib/storage";
 import type { ProviderAdapter, ProviderAuth, ProviderEvent, ProviderTurnRequest } from "@/lib/domain/provider";
+import type { PageSnapshotV1 } from "@/lib/domain/tools";
 import type { SidebarEvent } from "@/lib/protocol";
 
 /** A TabController bound to a browser API that always reports no attachable tab. */
@@ -17,6 +19,41 @@ function unsupportedPageTabControllerFactory(): TabController {
       goBack: vi.fn(async () => {}),
       sendMessage: vi.fn(async () => {
         throw new Error("no content script");
+      }),
+      onUpdated: { addListener: vi.fn(), removeListener: vi.fn() },
+    },
+  };
+  return new TabController(api);
+}
+
+/** A TabController bound to a browser API that reports one attachable tab with a clickable button. */
+function supportedPageTabControllerFactory(): TabController {
+  const snapshot: PageSnapshotV1 = {
+    version: 1,
+    tabId: 1,
+    revision: "rev-1",
+    url: "http://127.0.0.1:4173/agent-page.html",
+    origin: "http://127.0.0.1:4173",
+    title: "Agent Fixture",
+    readableText: "Orchid launch moved to Friday.",
+    selectionText: "",
+    viewport: { width: 0, height: 0, scrollX: 0, scrollY: 0 },
+    nodes: [{ ref: "e1", role: "button", name: "Submit", tag: "button", state: { disabled: false }, bounds: { x: 0, y: 0, width: 0, height: 0 }, inViewport: true }],
+    truncated: { readableText: false, nodes: false },
+    warnings: [],
+  };
+  const api: TabControllerBrowserApi = {
+    tabs: {
+      query: vi.fn(async () => [{ id: 1, url: snapshot.url, title: snapshot.title }]),
+      update: vi.fn(async () => {}),
+      goBack: vi.fn(async () => {}),
+      sendMessage: vi.fn(async (_tabId: number, message: unknown) => {
+        const request = message as { id: string; type: string };
+        if (request.type === "page.snapshot") return { v: 1, id: request.id, ok: true, type: "page.snapshot", snapshot };
+        if (request.type === "page.execute") {
+          return { v: 1, id: request.id, ok: true, type: "page.execute", result: { ok: true, summary: "Clicked Submit." }, snapshot };
+        }
+        throw new Error(`unhandled request type: ${request.type}`);
       }),
       onUpdated: { addListener: vi.fn(), removeListener: vi.fn() },
     },
@@ -182,6 +219,79 @@ describe("BackgroundRuntime: cancellation", () => {
     const finalSnapshot = await runtime.getSnapshot();
     expect(finalSnapshot.activeRun).toBeNull();
   });
+
+  it("persists cancelled partial text as a visible interrupted message matching the published event", async () => {
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    provider.script = (signal: AbortSignal) => ({
+      [Symbol.asyncIterator]: async function* () {
+        yield { type: "text.delta", delta: "The page says" } as ProviderEvent;
+        if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+        const { promise, reject } = Promise.withResolvers<never>();
+        signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+        await promise;
+      },
+    });
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+
+    const runCommand = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi" });
+    await tick();
+    const runId = (await runtime.getSnapshot()).activeRun?.runId as string;
+
+    await runtime.handleCommand({ v: 1, id: "2", type: "run.cancel", runId });
+    await runCommand;
+
+    const cancelled = port.received.find((e) => e.type === "run.cancelled");
+    expect(cancelled).toBeDefined();
+    if (cancelled?.type !== "run.cancelled") throw new Error("expected run.cancelled");
+    expect(cancelled.payload.partialText).toBe("The page says");
+    expect(cancelled.payload.messageId).not.toBeNull();
+
+    const snapshot = await runtime.getSnapshot();
+    const lastItem = snapshot.conversation.items.at(-1);
+    expect(lastItem?.kind).toBe("message");
+    if (lastItem?.kind !== "message") throw new Error("expected a message item");
+    expect(lastItem.role).toBe("assistant");
+    expect(lastItem.text).toContain("The page says");
+    expect(lastItem.text).toContain("Stopped");
+    // Never fed back into a future provider request: it is a persisted
+    // ConversationItem, not part of any run's replay state.
+    expect(lastItem.id).toBe(cancelled.payload.messageId);
+  });
+
+  it("ignores a second run.cancel for the same run without duplicating the terminal event", async () => {
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    provider.script = (signal: AbortSignal) => ({
+      [Symbol.asyncIterator]: async function* () {
+        yield { type: "text.delta", delta: "partial" } as ProviderEvent;
+        if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+        const { promise, reject } = Promise.withResolvers<never>();
+        signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+        await promise;
+      },
+    });
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+
+    const runCommand = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi" });
+    await tick();
+    const runId = (await runtime.getSnapshot()).activeRun?.runId as string;
+
+    await runtime.handleCommand({ v: 1, id: "2", type: "run.cancel", runId });
+    await runtime.handleCommand({ v: 1, id: "3", type: "run.cancel", runId });
+    await runCommand;
+
+    const cancelledEvents = port.received.filter((e) => e.type === "run.cancelled");
+    expect(cancelledEvents).toHaveLength(1);
+  });
 });
 
 describe("BackgroundRuntime: missing credential", () => {
@@ -249,5 +359,108 @@ describe("BackgroundRuntime: cross-run transcript (regression)", () => {
     expect(secondRunRequest).toBeDefined();
     expect(secondRunRequest?.transcript.every((item) => item.kind === "message")).toBe(true);
     expect(secondRunRequest?.replayState).toBeNull();
+  });
+});
+
+describe("BackgroundRuntime: unsupported page permits ordinary chat (regression)", () => {
+  it("completes a run with no page attachment when the active tab is unsupported", async () => {
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    provider.script = [
+      { type: "text.delta", delta: "I can still help without a page." },
+      { type: "turn.completed", replayState: null },
+    ];
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi, no page needed" });
+
+    const snapshot = await runtime.getSnapshot();
+    expect(snapshot.activeRun).toBeNull();
+    const userMessage = snapshot.conversation.items.find((item) => item.kind === "message" && item.role === "user");
+    expect(userMessage?.kind === "message" ? userMessage.context : undefined).toBeNull();
+    expect(provider.requests[0]?.contextArtifacts).toEqual([]);
+    expect(port.received.some((e) => e.type === "run.completed")).toBe(true);
+  });
+});
+
+describe("BackgroundRuntime: reconnect during approval (regression)", () => {
+  it("reconstructs the pending approval card on a fresh port subscribe", async () => {
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    provider.script = () => ({
+      [Symbol.asyncIterator]: async function* () {
+        yield { type: "tool.call", call: { id: "call_1", name: "page_click", arguments: { ref: "e1", revision: "rev-1" } } } as ProviderEvent;
+        yield { type: "turn.completed", replayState: null } as ProviderEvent;
+      },
+    });
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: supportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const firstPort = fakePort();
+    hub.handleConnect(firstPort);
+
+    void runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Click submit" });
+    await tick(200);
+
+    const reconnectedPort = fakePort();
+    hub.handleConnect(reconnectedPort);
+    await reconnectedPort.send({ v: 1, id: "2", type: "state.subscribe", lastSeq: null });
+
+    const snapshotEvent = reconnectedPort.received.find((e) => e.type === "state.snapshot");
+    expect(snapshotEvent).toBeDefined();
+    if (snapshotEvent?.type !== "state.snapshot") throw new Error("expected state.snapshot");
+    expect(snapshotEvent.payload.activeRun?.status).toBe("awaiting-approval");
+    expect(snapshotEvent.payload.activeRun?.pendingApproval?.call.id).toBe("call_1");
+  });
+});
+
+describe("BackgroundRuntime: retry gating on committed page effects (regression)", () => {
+  it("marks a rate-limit failure non-retryable once a consequential action already succeeded this run", async () => {
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    let round = 0;
+    provider.script = () => {
+      round += 1;
+      if (round === 1) {
+        return {
+          [Symbol.asyncIterator]: async function* () {
+            yield { type: "tool.call", call: { id: "call_1", name: "page_click", arguments: { ref: "e1", revision: "rev-1" } } } as ProviderEvent;
+            yield { type: "turn.completed", replayState: null } as ProviderEvent;
+          },
+        };
+      }
+      return {
+        [Symbol.asyncIterator]: async function* () {
+          throw new ProviderStreamError("Rate limited.", "RATE_LIMIT");
+        },
+      };
+    };
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: supportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+
+    const runCommand = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Click submit" });
+    await tick(200);
+    const running = await runtime.getSnapshot();
+    const runId = running.activeRun?.runId as string;
+    const callId = running.activeRun?.pendingApproval?.call.id as string;
+    expect(callId).toBeDefined();
+
+    await runtime.handleCommand({ v: 1, id: "2", type: "action.approve", runId, callId });
+    await runCommand;
+
+    const failed = port.received.find((e) => e.type === "run.failed");
+    expect(failed).toBeDefined();
+    if (failed?.type !== "run.failed") throw new Error("expected run.failed");
+    expect(failed.payload.code).toBe("RATE_LIMIT");
+    // RATE_LIMIT is retryable by provider-error type, but the click already
+    // committed a real page effect this run, so retry must never be offered.
+    expect(failed.payload.retryable).toBe(false);
   });
 });

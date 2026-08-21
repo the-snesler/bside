@@ -200,6 +200,9 @@ export interface EventBase<T extends string, P> {
   payload: P;
 }
 
+/** Appended to a cancelled run's uncommitted partial text before persisting it, so the interruption stays visible after reload without ever being fed back into a future provider request. */
+export const RUN_CANCELLED_SUFFIX = "\n\n[Stopped: cancelled before this response finished.]";
+
 export type SidebarEvent =
   | EventBase<"state.snapshot", RuntimeSnapshot>
   | EventBase<"page.attached", PageArtifactSummary | null>
@@ -209,7 +212,7 @@ export type SidebarEvent =
   | EventBase<"action.approval-required", ApprovalRequest>
   | EventBase<"tool.result", { callId: string; result: ToolResult }>
   | EventBase<"run.completed", { messageId: string }>
-  | EventBase<"run.cancelled", { partialText: string }>
+  | EventBase<"run.cancelled", { partialText: string; messageId: string | null }>
   | EventBase<"run.failed", NormalizedError>;
 
 export function isSidebarCommand(value: unknown): value is SidebarCommand {
