@@ -12,9 +12,18 @@ export default defineConfig({
   }),
   manifest: {
     icons: { "32": "icon.svg" },
-    permissions: ["storage", "https://api.openai.com/*", "http://*/*", "https://*/*"],
+    permissions: [
+      "storage",
+      "https://api.openai.com/*",
+      "http://*/*",
+      "https://*/*",
+    ],
     content_security_policy: {
       extension_pages: CSP,
+    },
+    browser_action: {
+      default_icon: "icon.svg",
+      default_title: "Toggle sidebar",
     },
   },
   hooks: {

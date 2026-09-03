@@ -18,6 +18,14 @@ export default defineBackground({
       sidebarHub.handleConnect(port);
     });
 
+    browser.browserAction.onClicked.addListener(() => {
+      const sidebarAction: { toggle: Function } = Reflect.get(
+        browser,
+        "sidebarAction",
+      );
+      void sidebarAction.toggle();
+    });
+
     browser.tabs.onActivated.addListener(() => {
       void sidebarHub.refreshAttachment();
     });
