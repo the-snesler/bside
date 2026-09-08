@@ -40,7 +40,7 @@ function handleHealth(request: PageHealthRequest): PageResponse {
 }
 
 function handleSnapshot(request: PageSnapshotRequest, registry: ElementRefRegistry): PageResponse {
-  const snapshot = extractSnapshot(document, request.tabId, registry, request.mode);
+  const snapshot = extractSnapshot(document, request.tabId, registry, request.mode, undefined, request.locator);
   return { v: 1, id: request.id, ok: true, type: "page.snapshot", snapshot };
 }
 
@@ -49,20 +49,10 @@ async function handleExecute(request: PageExecuteRequest, registry: ElementRefRe
   if (result.ok) {
     // Let layout/frameworks settle before re-reading the DOM for a fresh
     // snapshot; never guess a stale target instead.
-    await waitAnimationFrames(2);
+    // Hidden agent tabs may suspend requestAnimationFrame entirely. A timer
+    // still settles framework updates in background tabs (Firefox may throttle it).
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
   }
   const snapshot = extractSnapshot(document, request.tabId, registry, "interactive");
   return { v: 1, id: request.id, ok: true, type: "page.execute", result, snapshot };
-}
-
-function waitAnimationFrames(count: number): Promise<void> {
-  const { promise, resolve } = Promise.withResolvers<void>();
-  let remaining = count;
-  const step = () => {
-    remaining -= 1;
-    if (remaining <= 0) resolve();
-    else requestAnimationFrame(step);
-  };
-  requestAnimationFrame(step);
-  return promise;
 }

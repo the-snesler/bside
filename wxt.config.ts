@@ -14,6 +14,7 @@ export default defineConfig({
     icons: { "32": "icon.svg" },
     permissions: [
       "storage",
+      "tabHide",
       "https://api.openai.com/*",
       "http://*/*",
       "https://*/*",

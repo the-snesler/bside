@@ -179,6 +179,11 @@ export async function getConversation(): Promise<ConversationRecordV1> {
   return DEFAULT_CONVERSATION;
 }
 
+export async function resetConversation(): Promise<void> {
+  await conversationItem.setValue({ ...DEFAULT_CONVERSATION, items: [], updatedAt: Date.now() });
+  await clearRunCheckpoint();
+}
+
 export async function appendConversationItem(item: ConversationItem): Promise<ConversationRecordV1> {
   const conversation = await getConversation();
   const next: ConversationRecordV1 = {

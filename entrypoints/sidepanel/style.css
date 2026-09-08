@@ -19,6 +19,18 @@
   font-weight: 600;
 }
 
+.sidebar__context-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+}
+
+.sidebar__context-actions button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .sidebar__settings-link {
   display: flex;
   align-items: center;

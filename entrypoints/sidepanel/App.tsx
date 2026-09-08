@@ -24,6 +24,8 @@ function describeAttachment(page: PageArtifactSummary): string {
 
 /** Fallback label for a historical tool-call row; the richer live pseudo-code lives on the pending approval itself. */
 function describeToolCall(call: ToolCall): string {
+  if (call.name === "browser_program") return "Browser program";
+  if (call.name === "request_action_confirmation") return "Action confirmation";
   if (call.name === "page_snapshot") return "Captured a page snapshot";
   if (call.name === "page_scroll") return "Scrolled the page";
   if (call.name === "page_click") return "Clicked an element";
@@ -68,6 +70,8 @@ function ActivityRow(props: {
   const isPending = pendingDisplay !== null;
   const label = pendingDisplay ?? describeToolCall(entry.call);
   const status = isPending ? "Waiting for approval" : entry.result ? (entry.result.ok ? "Done" : entry.result.summary) : "Running…";
+  const args = entry.call.arguments;
+  const confirmation = entry.call.name === "request_action_confirmation" && args && typeof args === "object" && !Array.isArray(args) ? args : null;
 
   return (
     <li class="timeline__item timeline__item--tool">
@@ -79,7 +83,10 @@ function ActivityRow(props: {
           <span class="activity__label">{label}</span>
         </summary>
         <div class="activity__detail">
-          <code class="tool-call">{JSON.stringify(entry.call.arguments)}</code>
+          {confirmation ? <>
+            <p>{typeof confirmation.message === "string" ? confirmation.message : ""}</p>
+            {typeof confirmation.artifact === "string" && confirmation.artifact && <pre class="tool-call" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{confirmation.artifact}</pre>}
+          </> : <code class="tool-call">{JSON.stringify(entry.call.arguments)}</code>}
           {entry.result && <p class="activity__result">{entry.result.summary}</p>}
         </div>
         {isPending && (
@@ -98,7 +105,7 @@ function ActivityRow(props: {
 }
 
 export function App() {
-  const { conversation, page, activeRun, notice, lastError, credential, settings, sendPrompt, cancelRun, approveAction, denyAction } =
+  const { conversation, page, activeRun, notice, lastError, credential, settings, sendPrompt, cancelRun, approveAction, denyAction, resetContext, downloadContext } =
     useBackground();
   const [draft, setDraft] = useState("");
 
@@ -139,6 +146,11 @@ export function App() {
           </button>
         </div>
       </header>
+
+      <div class="sidebar__context-actions">
+        <button type="button" class="sidebar__settings" onClick={downloadContext} title="Download model context, conversation, and scratch files as Markdown">Download context</button>
+        <button type="button" class="sidebar__settings" disabled={activeRun !== null} onClick={resetContext} title={activeRun ? "Stop the current run before resetting" : "Clear conversation history and scratch files; keep tabs and settings"}>Reset context</button>
+      </div>
 
       <div class="sidebar__chip" title={page?.url}>
         {page ? describeAttachment(page) : "Unsupported page"}

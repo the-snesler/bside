@@ -17,6 +17,7 @@ import type {
   PageToolName,
   ToolCall,
   ToolResult,
+  SemanticLocator,
 } from "@/lib/domain/tools";
 import type { ConversationRecordV1 } from "@/lib/domain/conversation";
 import type { AppSettingsV1, ProviderDefinition } from "@/lib/domain/provider";
@@ -45,6 +46,7 @@ export interface PageSnapshotRequest {
   type: "page.snapshot";
   tabId: number;
   mode: "readable" | "interactive";
+  locator?: SemanticLocator;
 }
 
 export interface PageExecuteRequest {
@@ -104,7 +106,13 @@ export function isPageSnapshotRequest(value: unknown): value is PageSnapshotRequ
   const candidate = value as Record<string, unknown>;
   return (
     typeof candidate.tabId === "number" &&
-    (candidate.mode === "readable" || candidate.mode === "interactive")
+    (candidate.mode === "readable" || candidate.mode === "interactive") &&
+    (candidate.locator === undefined || (
+      candidate.mode === "interactive" && typeof candidate.locator === "object" && candidate.locator !== null &&
+      !Array.isArray(candidate.locator) && Object.keys(candidate.locator).length === 2 &&
+      typeof (candidate.locator as SemanticLocator).role === "string" && (candidate.locator as SemanticLocator).role.length > 0 && (candidate.locator as SemanticLocator).role.length <= 128 &&
+      typeof (candidate.locator as SemanticLocator).name === "string" && (candidate.locator as SemanticLocator).name.length <= 8000
+    ))
   );
 }
 
@@ -162,6 +170,7 @@ export interface NormalizedError {
 export const SIDEBAR_PORT_NAME = "agent-sidebar:v1";
 
 export type SidebarCommand =
+  | { v: 1; id: string; type: "context.reset" | "context.export" }
   | { v: 1; id: string; type: "state.subscribe"; lastSeq: number | null }
   | { v: 1; id: string; type: "run.start"; prompt: string }
   | { v: 1; id: string; type: "run.cancel"; runId: string }
@@ -204,6 +213,7 @@ export interface EventBase<T extends string, P> {
 export const RUN_CANCELLED_SUFFIX = "\n\n[Stopped: cancelled before this response finished.]";
 
 export type SidebarEvent =
+  | EventBase<"context.exported", { requestId: string; markdown: string; filename: string }>
   | EventBase<"state.snapshot", RuntimeSnapshot>
   | EventBase<"page.attached", PageArtifactSummary | null>
   | EventBase<"run.started", { prompt: string; page: PageArtifactSummary | null }>
@@ -218,6 +228,7 @@ export type SidebarEvent =
 export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (!isEnvelope(value)) return false;
   const candidate = value as Record<string, unknown>;
+  if (candidate.type === "context.reset" || candidate.type === "context.export") return true;
   if (candidate.type === "state.subscribe") {
     return candidate.lastSeq === null || typeof candidate.lastSeq === "number";
   }

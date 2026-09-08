@@ -20,10 +20,10 @@ const UNSUPPORTED_HOSTNAME_SUFFIXES = [".mozilla.org", ".mozilla.com"];
 
 export interface SidebarHubDelegate {
   getSnapshot(): Promise<RuntimeSnapshot>;
-  handleCommand(command: SidebarCommand): Promise<void>;
+  handleCommand(command: SidebarCommand): Promise<{ markdown: string; filename: string } | void>;
 }
 
-type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" }>;
+type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" | "context.exported" }>;
 
 export class SidebarHub {
   delegate: SidebarHubDelegate | null = null;
@@ -71,7 +71,7 @@ export class SidebarHub {
   }
 
   /** Publishes a run-local sequenced event to every connected port. */
-  publishRunEvent<T extends Exclude<SidebarEvent["type"], "state.snapshot" | "page.attached">>(
+  publishRunEvent<T extends Exclude<SidebarEvent["type"], "state.snapshot" | "page.attached" | "context.exported">>(
     runId: string,
     type: T,
     payload: Extract<SidebarEvent, { type: T }>["payload"],
@@ -104,7 +104,11 @@ export class SidebarHub {
       await this.#handleSubscribe(port, message.lastSeq);
       return;
     }
-    await this.delegate.handleCommand(message);
+    const result = await this.delegate.handleCommand(message);
+    if (message.type === "context.export" && result) port.postMessage({
+      v: 1, type: "context.exported", runId: null, conversationId: "default", seq: this.#lastSeq, at: Date.now(),
+      payload: { requestId: message.id, ...result },
+    } satisfies SidebarEvent);
   }
 
   async #handleSubscribe(port: Browser.runtime.Port, lastSeq: number | null): Promise<void> {

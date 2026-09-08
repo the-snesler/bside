@@ -5,9 +5,10 @@ import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController } from "@/lib/background/tab-controller";
 import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import { ProviderStreamError } from "@/lib/providers/openai";
-import type { ProviderAdapter, ProviderAuth, ProviderEvent, ProviderTurnRequest } from "@/lib/domain/provider";
+import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
 import type { PageSnapshotV1, ToolCall } from "@/lib/domain/tools";
 import type { ApprovalRequest, SidebarEvent } from "@/lib/protocol";
+import { TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
 
 function buildSnapshot(overrides: Partial<PageSnapshotV1> = {}): PageSnapshotV1 {
   return {
@@ -61,28 +62,31 @@ async function createTabController(handlers: {
 
 class ScriptedProvider implements ProviderAdapter {
   readonly definition = { id: "openai" as const, name: "OpenAI", authMethods: [], models: [] };
-  #rounds: Array<(request: ProviderTurnRequest) => ProviderEvent[]>;
+  #rounds: Array<(request: ProviderTurnRequest) => Iterable<ScriptedProviderEvent> | AsyncIterable<ScriptedProviderEvent>>;
   #callIndex = 0;
   requests: ProviderTurnRequest[] = [];
 
-  constructor(rounds: Array<(request: ProviderTurnRequest) => ProviderEvent[]>) {
+  constructor(rounds: Array<(request: ProviderTurnRequest) => Iterable<ScriptedProviderEvent> | AsyncIterable<ScriptedProviderEvent>>) {
     this.#rounds = rounds;
   }
 
   async validateAuth(): Promise<void> {}
 
-  async *streamTurn(request: ProviderTurnRequest, _auth: ProviderAuth, signal: AbortSignal): AsyncIterable<ProviderEvent> {
+  getModel() { return TEST_MODEL; }
+
+  streamTurn(request: ProviderTurnRequest, _auth: ProviderAuth, signal: AbortSignal) {
     this.requests.push(request);
-    const round = this.#rounds[this.#callIndex] ?? (() => [{ type: "turn.completed", replayState: null } as ProviderEvent]);
+    const round = this.#rounds[this.#callIndex] ?? (() => [{ type: "turn.completed", replayState: null } as ScriptedProviderEvent]);
     this.#callIndex += 1;
-    for (const event of round(request)) {
-      if (signal.aborted) throw new DOMException("Aborted", "AbortError");
-      yield event;
+    try {
+      return toPiStream(round(request), signal);
+    } catch (error) {
+      return toPiStream({ [Symbol.asyncIterator]: async function* () { throw error; } }, signal);
     }
   }
 }
 
-function toolCallEvent(id: string, name: ToolCall["name"], args: Record<string, unknown>): ProviderEvent {
+function toolCallEvent(id: string, name: ToolCall["name"], args: Record<string, unknown>): ScriptedProviderEvent {
   return { type: "tool.call", call: { id, name, arguments: args as never } };
 }
 
@@ -104,6 +108,7 @@ function fakePort(): FakePort {
 
 async function tick(times = 20): Promise<void> {
   for (let i = 0; i < times; i += 1) await Promise.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 const baseTranscript = [{ id: "u1", kind: "message" as const, role: "user" as const, text: "Do it", context: null, at: 1 }];
@@ -124,7 +129,7 @@ beforeEach(() => {
 describe("AgentLoop: read-only tool call", () => {
   it("auto-runs page_snapshot without approval", async () => {
     const provider = new ScriptedProvider([
-      () => [toolCallEvent("call_1", "page_snapshot", { mode: "readable" }), { type: "turn.completed", replayState: null }],
+      () => [toolCallEvent("call_1", "browser_program", { source: 'return await fs.read("/tabs/1/page.md");' }), { type: "turn.completed", replayState: null }],
       () => [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }],
     ]);
     const { tabController } = await createTabController();
@@ -151,6 +156,8 @@ describe("AgentLoop: read-only tool call", () => {
 
     expect(result.status).toBe("completed");
     expect(port.received.some((e) => e.type === "action.approval-required")).toBe(false);
+    expect(JSON.stringify(items)).not.toContain("Orchid launch moved to Friday.");
+    expect(provider.requests[1]?.context.messages.some((m) => m.role === "toolResult" && JSON.stringify(m.content).includes("Orchid launch moved to Friday."))).toBe(true);
     expect(port.received.some((e) => e.type === "tool.requested")).toBe(true);
     const toolResult = port.received.find((e) => e.type === "tool.result");
     expect(toolResult && toolResult.type === "tool.result" ? toolResult.payload.result.ok : undefined).toBe(true);
@@ -158,9 +165,9 @@ describe("AgentLoop: read-only tool call", () => {
 });
 
 describe("AgentLoop: approval pause/resume", () => {
-  it("pauses for a consequential call and resumes on approve, executing it", async () => {
+  it("pauses only for explicit confirmation and returns approval without a page effect", async () => {
     const provider = new ScriptedProvider([
-      () => [toolCallEvent("call_1", "page_click", { ref: "e1", revision: "rev-1" }), { type: "turn.completed", replayState: null }],
+      () => [toolCallEvent("call_1", "request_action_confirmation", { title: "Submit", message: "Submit this draft?", artifact: "Draft text" }), { type: "turn.completed", replayState: null }],
       () => [{ type: "text.delta", delta: "Clicked." }, { type: "turn.completed", replayState: null }],
     ]);
     const { tabController, sendMessageMock } = await createTabController();
@@ -186,7 +193,8 @@ describe("AgentLoop: approval pause/resume", () => {
     const approvalEvent = port.received.find((e) => e.type === "action.approval-required");
     expect(approvalEvent).toBeDefined();
     if (approvalEvent?.type === "action.approval-required") {
-      expect(approvalEvent.payload.display).toBe('page.click("Submit")');
+      expect(approvalEvent.payload.display).toBe('Submit');
+      expect(approvalEvent.payload.call.arguments).toMatchObject({ artifact: 'Draft text' });
     }
 
     const executeCallsBeforeApproval = sendMessageMock.mock.calls.filter((call) => (call[1] as { type?: string }).type === "page.execute").length;
@@ -197,14 +205,15 @@ describe("AgentLoop: approval pause/resume", () => {
 
     expect(result.status).toBe("completed");
     const executeCallsAfterApproval = sendMessageMock.mock.calls.filter((call) => (call[1] as { type?: string }).type === "page.execute").length;
-    expect(executeCallsAfterApproval).toBe(1);
+    expect(executeCallsAfterApproval).toBe(0);
+    expect(provider.requests[1]?.context.messages.some((m) => m.role === "toolResult" && JSON.stringify(m.content).includes("approved:true"))).toBe(true);
   });
 });
 
 describe("AgentLoop: denial as a tool result", () => {
   it("feeds ACTION_DENIED back to the model without executing the action", async () => {
     const provider = new ScriptedProvider([
-      () => [toolCallEvent("call_1", "page_click", { ref: "e1", revision: "rev-1" }), { type: "turn.completed", replayState: null }],
+      () => [toolCallEvent("call_1", "request_action_confirmation", { title: "Submit", message: "Submit this draft?", artifact: "Draft text" }), { type: "turn.completed", replayState: null }],
       () => [{ type: "text.delta", delta: "Understood." }, { type: "turn.completed", replayState: null }],
     ]);
     const { tabController, sendMessageMock } = await createTabController();
@@ -235,8 +244,8 @@ describe("AgentLoop: denial as a tool result", () => {
     expect(executeCalls).toBe(0);
 
     const round2Request = provider.requests[1];
-    const toolResultInput = round2Request?.transcript.find((item) => item.kind === "tool-result");
-    expect(toolResultInput && toolResultInput.kind === "tool-result" ? toolResultInput.result.code : undefined).toBe("ACTION_DENIED");
+    const toolResultInput = round2Request?.context.messages.find((item) => item.role === "toolResult");
+    expect(toolResultInput?.role === "toolResult" ? toolResultInput.content[0] : undefined).toMatchObject({ text: expect.stringContaining("ACTION_DENIED") });
   });
 });
 
@@ -244,8 +253,8 @@ describe("AgentLoop: exactly-once execution", () => {
   it("returns the recorded result for a repeated call.id without executing twice", async () => {
     const provider = new ScriptedProvider([
       () => [
-        toolCallEvent("call_1", "page_snapshot", { mode: "readable" }),
-        toolCallEvent("call_1", "page_snapshot", { mode: "readable" }),
+        toolCallEvent("call_1", "browser_program", { source: 'return await fs.read("/tabs/1/page.md");' }),
+        toolCallEvent("call_1", "browser_program", { source: 'return await fs.read("/tabs/1/page.md");' }),
         { type: "turn.completed", replayState: null },
       ],
       () => [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }],
@@ -280,7 +289,7 @@ describe("AgentLoop: exactly-once execution", () => {
 describe("AgentLoop: stale-ref recovery", () => {
   it("feeds STALE_SNAPSHOT back to the model as a non-terminal result", async () => {
     const provider = new ScriptedProvider([
-      () => [toolCallEvent("call_1", "page_click", { ref: "e1", revision: "stale-revision" }), { type: "turn.completed", replayState: null }],
+      () => [toolCallEvent("call_1", "browser_program", { source: 'await browser.tab("/tabs/1/page.md").getByRole("button", {name: "Submit", exact: true}).click();' }), { type: "turn.completed", replayState: null }],
       () => [{ type: "text.delta", delta: "Let me get a fresh snapshot." }, { type: "turn.completed", replayState: null }],
     ]);
     const { tabController } = await createTabController({
@@ -290,6 +299,7 @@ describe("AgentLoop: stale-ref recovery", () => {
     const port = fakePort();
     hub.handleConnect(port);
     const loop = new AgentLoop(provider, tabController, hub);
+    const savedItems: unknown[] = [];
 
     const resultPromise = loop.run({
       runId: "run1",
@@ -300,7 +310,7 @@ describe("AgentLoop: stale-ref recovery", () => {
       auth: AUTH,
       signal: new AbortController().signal,
       onDelta: () => {},
-      onItem: async () => {},
+      onItem: async (item) => { savedItems.push(item); },
       onApprovalPending: () => {},
     });
 
@@ -309,16 +319,19 @@ describe("AgentLoop: stale-ref recovery", () => {
     const result = await resultPromise;
 
     expect(result.status).toBe("completed");
+    expect(JSON.stringify(savedItems)).toContain("Stopped in statement 1");
+    expect(JSON.stringify(savedItems)).toContain("Stale.");
+    expect(JSON.stringify(savedItems)).not.toContain("Orchid launch moved");
     const round2Request = provider.requests[1];
-    const toolResultInput = round2Request?.transcript.find((item) => item.kind === "tool-result");
-    expect(toolResultInput && toolResultInput.kind === "tool-result" ? toolResultInput.result.code : undefined).toBe("STALE_SNAPSHOT");
+    const toolResultInput = round2Request?.context.messages.find((item) => item.role === "toolResult");
+    expect(toolResultInput?.role === "toolResult" ? toolResultInput.content[0] : undefined).toMatchObject({ text: expect.stringContaining("STALE_SNAPSHOT") });
   });
 });
 
 describe("AgentLoop: cancellation while awaiting approval", () => {
   it("resolves the pending gate without executing the action and terminates as cancelled", async () => {
     const provider = new ScriptedProvider([
-      () => [toolCallEvent("call_1", "page_click", { ref: "e1", revision: "rev-1" }), { type: "turn.completed", replayState: null }],
+      () => [toolCallEvent("call_1", "request_action_confirmation", { title: "Submit", message: "Submit this draft?", artifact: "Draft text" }), { type: "turn.completed", replayState: null }],
     ]);
     const { tabController, sendMessageMock } = await createTabController();
     const hub = new SidebarHub();
@@ -357,7 +370,7 @@ describe("AgentLoop: cancellation while awaiting approval", () => {
 describe("AgentLoop: page-effect tracking for retry gating", () => {
   it("marks hadPageEffect true when a consequential call succeeded before the run failed", async () => {
     const provider = new ScriptedProvider([
-      () => [toolCallEvent("call_1", "page_click", { ref: "e1", revision: "rev-1" }), { type: "turn.completed", replayState: null }],
+      () => [toolCallEvent("call_1", "browser_program", { source: 'await browser.tab("/tabs/1/page.md").getByRole("button", {name: "Submit", exact: true}).click();' }), { type: "turn.completed", replayState: null }],
       () => {
         throw new ProviderStreamError("Rate limited.", "RATE_LIMIT");
       },
@@ -397,7 +410,7 @@ describe("AgentLoop: page-effect tracking for retry gating", () => {
 
   it("marks hadPageEffect false when only a read-only call ran before the run failed", async () => {
     const provider = new ScriptedProvider([
-      () => [toolCallEvent("call_1", "page_snapshot", { mode: "readable" }), { type: "turn.completed", replayState: null }],
+      () => [toolCallEvent("call_1", "browser_program", { source: 'return await fs.read("/tabs/1/page.md");' }), { type: "turn.completed", replayState: null }],
       () => {
         throw new ProviderStreamError("Rate limited.", "RATE_LIMIT");
       },
@@ -427,7 +440,7 @@ describe("AgentLoop: page-effect tracking for retry gating", () => {
 
   it("marks hadPageEffect false when a consequential call was denied, not executed", async () => {
     const provider = new ScriptedProvider([
-      () => [toolCallEvent("call_1", "page_click", { ref: "e1", revision: "rev-1" }), { type: "turn.completed", replayState: null }],
+      () => [toolCallEvent("call_1", "request_action_confirmation", { title: "Submit", message: "Submit this draft?", artifact: "Draft text" }), { type: "turn.completed", replayState: null }],
       () => {
         throw new ProviderStreamError("Rate limited.", "RATE_LIMIT");
       },

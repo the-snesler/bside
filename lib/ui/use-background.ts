@@ -21,6 +21,8 @@ export interface BackgroundActions {
   cancelRun(): void;
   approveAction(callId: string): void;
   denyAction(callId: string): void;
+  resetContext(): void;
+  downloadContext(): void;
 }
 
 const INITIAL_STATE: BackgroundState = {
@@ -40,12 +42,27 @@ export function useBackground(): BackgroundState & BackgroundActions {
   const [state, setState] = useState<BackgroundState>(INITIAL_STATE);
   const portRef = useRef<Port | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
+  const exportRequestRef = useRef<string | null>(null);
 
   useEffect(() => {
     const port = browser.runtime.connect({ name: SIDEBAR_PORT_NAME });
     portRef.current = port;
 
     const onMessage = (message: unknown) => {
+      const event = message as SidebarEvent;
+      if (event.type === "context.exported") {
+        if (event.payload.requestId !== exportRequestRef.current) return;
+        exportRequestRef.current = null;
+        const url = URL.createObjectURL(new Blob([event.payload.markdown], { type: "text/markdown;charset=utf-8" }));
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = event.payload.filename;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 60_000);
+        return;
+      }
       applyEvent(message as SidebarEvent, setState, activeRunIdRef);
     };
     port.onMessage.addListener(onMessage);
@@ -86,7 +103,17 @@ export function useBackground(): BackgroundState & BackgroundActions {
     portRef.current?.postMessage(command);
   }, []);
 
-  return { ...state, sendPrompt, cancelRun, approveAction, denyAction };
+  const resetContext = useCallback(() => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "context.reset" } satisfies SidebarCommand);
+  }, []);
+
+  const downloadContext = useCallback(() => {
+    const id = crypto.randomUUID();
+    exportRequestRef.current = id;
+    portRef.current?.postMessage({ v: 1, id, type: "context.export" } satisfies SidebarCommand);
+  }, []);
+
+  return { ...state, sendPrompt, cancelRun, approveAction, denyAction, resetContext, downloadContext };
 }
 
 function commitPendingText(prev: BackgroundState): BackgroundState {

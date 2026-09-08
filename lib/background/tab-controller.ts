@@ -1,9 +1,10 @@
 /**
- * Binds one agent run to a single HTTP(S) tab and mediates every page tool
+ * Binds a controller to a single HTTP(S) tab and mediates every page tool
  * call against it: DOM effects are forwarded to the content script, while
  * navigate/go_back are driven directly through the tabs API with a fixed
  * settle/probe sequence. The bound tab never changes once captured; a
- * newly opened tab is never adopted.
+ * newly opened tab is never implicitly adopted. forTab creates a separate
+ * controller for an explicitly selected workspace tab.
  */
 
 import type {
@@ -15,7 +16,7 @@ import type {
   PageResponse,
   PageSnapshotRequest,
 } from "@/lib/protocol";
-import type { PageArtifactSummary, PageErrorCode, PageSnapshotV1, ToolCall, ToolResult } from "@/lib/domain/tools";
+import type { PageArtifactSummary, PageErrorCode, PageSnapshotV1, PageToolCall as ToolCall, ToolResult, SemanticLocator } from "@/lib/domain/tools";
 import {
   validateGoBackArgs,
   validateNavigateArgs,
@@ -26,12 +27,16 @@ const NAVIGATION_TIMEOUT_MS = 10_000;
 const PROBE_DELAYS_MS = [100, 200, 400, 800, 1_600, 3_200];
 const UNSUPPORTED_HOSTNAME_SUFFIXES = [".mozilla.org", ".mozilla.com"];
 
-type TabSnapshot = { id?: number; url?: string; title?: string };
+type TabSnapshot = { id?: number; url?: string; title?: string; hidden?: boolean };
 type TabUpdatedListener = (tabId: number, changeInfo: { status?: string }, tab: TabSnapshot) => void;
 
 export interface TabControllerBrowserApi {
   tabs: {
-    query(query: { active: boolean; lastFocusedWindow: boolean }): Promise<TabSnapshot[]>;
+    query(query: { active?: boolean; lastFocusedWindow?: boolean }): Promise<TabSnapshot[]>;
+    create?(properties: { url: string; active: boolean }): Promise<TabSnapshot>;
+    hide?(tabId: number): Promise<number[]>;
+    show?(tabId: number): Promise<void>;
+    remove?(tabId: number): Promise<void>;
     update(tabId: number, updateProperties: { url: string }): Promise<unknown>;
     goBack(tabId: number): Promise<void>;
     sendMessage(tabId: number, message: unknown): Promise<unknown>;
@@ -53,6 +58,60 @@ export class TabController {
 
   constructor(browserApi: TabControllerBrowserApi) {
     this.#browserApi = browserApi;
+  }
+
+  async listTabs(): Promise<TabSnapshot[]> {
+    return (await this.#browserApi.tabs.query({})).filter((tab) => tab.id !== undefined && isSupportedUrl(tab.url));
+  }
+
+  async forTab(tabId: number): Promise<TabController> {
+    const tab = (await this.listTabs()).find((tab) => tab.id === tabId);
+    if (!tab) throw new Error("Tab is closed or unsupported.");
+    const controller = new TabController(this.#browserApi);
+    controller.#tabId = tabId;
+    controller.#url = tab.url!;
+    controller.#title = tab.title ?? "";
+    return controller;
+  }
+
+  async createTab(url: string): Promise<number> {
+    if (!validateNavigateArgs({ url }) || !isSupportedUrl(url)) throw new Error("Expected a supported HTTP(S) URL.");
+    if (!this.#browserApi.tabs.create) throw new Error("Tab creation is unavailable.");
+    const tab = await this.#browserApi.tabs.create({ url, active: false });
+    if (tab.id === undefined) throw new Error("Tab creation failed.");
+    return tab.id;
+  }
+
+  async hideTab(tabId: number): Promise<void> {
+    if (!this.#browserApi.tabs.hide || !(await this.#browserApi.tabs.hide(tabId)).includes(tabId)) {
+      throw new Error("Firefox could not hide this tab (active or pinned tabs cannot be hidden).");
+    }
+  }
+
+  async showTab(tabId: number): Promise<void> {
+    if (!this.#browserApi.tabs.show) throw new Error("Showing tabs is unavailable.");
+    await this.#browserApi.tabs.show(tabId);
+  }
+
+  async closeTab(tabId: number): Promise<void> {
+    if (!this.#browserApi.tabs.remove) throw new Error("Closing tabs is unavailable.");
+    await this.#browserApi.tabs.remove(tabId);
+  }
+
+  async waitUntilReady(tabId: number, signal: AbortSignal): Promise<void> {
+    const deadline = Date.now() + NAVIGATION_TIMEOUT_MS;
+    for (const delay of [0, ...PROBE_DELAYS_MS]) {
+      signal.throwIfAborted();
+      if (delay) await new Promise<void>((resolve, reject) => {
+        const onAbort = () => { clearTimeout(timer); reject(signal.reason); };
+        const timer = setTimeout(() => { signal.removeEventListener("abort", onAbort); resolve(); }, delay);
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
+      signal.throwIfAborted();
+      if (await this.#probeHealth(tabId)) return;
+      if (Date.now() >= deadline) break;
+    }
+    throw new Error(`Tab ${tabId} opened but its page is not ready; list tabs and retry reading it. Do not open a duplicate.`);
   }
 
   currentAttachment(): PageArtifactSummary | null {
@@ -91,9 +150,9 @@ export class TabController {
     return { ok: true, value: { artifact, snapshot: outcome.value } };
   }
 
-  async snapshot(mode: "readable" | "interactive"): Promise<PageOutcome<PageSnapshotV1>> {
+  async snapshot(mode: "readable" | "interactive", locator?: SemanticLocator): Promise<PageOutcome<PageSnapshotV1>> {
     if (this.#tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
-    return this.#requestSnapshot(this.#tabId, mode);
+    return this.#requestSnapshot(this.#tabId, mode, locator);
   }
 
   async execute(call: ToolCall): Promise<ExecuteOutcome> {
@@ -198,8 +257,8 @@ export class TabController {
     return { result: { ok: true, summary: successSummary }, snapshot: outcome.value };
   }
 
-  async #requestSnapshot(tabId: number, mode: "readable" | "interactive"): Promise<PageOutcome<PageSnapshotV1>> {
-    const request: PageSnapshotRequest = { v: 1, id: crypto.randomUUID(), type: "page.snapshot", tabId, mode };
+  async #requestSnapshot(tabId: number, mode: "readable" | "interactive", locator?: SemanticLocator): Promise<PageOutcome<PageSnapshotV1>> {
+    const request: PageSnapshotRequest = { v: 1, id: crypto.randomUUID(), type: "page.snapshot", tabId, mode, ...(locator ? { locator } : {}) };
     let response: PageResponse | undefined;
     try {
       response = (await this.#browserApi.tabs.sendMessage(tabId, request)) as PageResponse | undefined;

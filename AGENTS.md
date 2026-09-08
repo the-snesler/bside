@@ -4,7 +4,7 @@ Firefox desktop extension built with WXT, Manifest V2, Preact, TypeScript, and p
 
 ## Toolchain and scripts
 
-- **Node:** `>=22.13`
+- **Node:** `>=22.19`
 - **Package manager:** pnpm `11.22.0`, pinned in `package.json`. Use `corepack` and `pnpm`; do not add npm/yarn lockfiles.
 - `pnpm dev` — start WXT development mode; load the generated Firefox extension through WXT/Firefox.
 - `pnpm typecheck` — strict TypeScript check (`tsc --noEmit`).
@@ -56,14 +56,16 @@ wxt.config.ts          Firefox MV2 manifest, permissions, CSP, and Preact Vite s
 - OpenAI SDK imports belong only in `lib/providers/openai.ts`.
 - The extension has one persisted conversation (`"default"`). Run-local replay state and full page snapshots must not enter persistent storage.
 - Ref-bearing page actions require the exact latest snapshot revision. Surface the real revision in text returned to the model; never guess stale targets.
-- Consequential page actions require background-enforced approval. `page_snapshot` and bounded `page_scroll` are the only auto-run tools.
+- The model uses `browser_program` for bounded capability programs and `request_action_confirmation(title, message, artifact)` before externally visible, destructive, or paid actions. Deciding when to ask is model policy; the background pauses only for explicit confirmation calls and records the decision. Do not reintroduce automatic per-action or per-program approvals.
+- Browser programs are parsed and interpreted, never evaluated as JavaScript. Locators resolve uniquely against a fresh snapshot before each effect. Stop on the first failure and retain earlier effects.
+- `/tabs/<id>/page.md` and `/agent-tabs/<id>/page.md` are live read-only snapshots. Explicit cross-mount moves hide/show tabs; removal closes them. `/workspace` is bounded scratch storage for the background session, never host filesystem access.
 
 ## Security and privacy boundaries
 
 - The API key lives only in background memory / `storage.local` and the options password field. Never put it in sidebar events, content-script messages, page DOM, fixtures, logs, tests, or source.
 - Page content, tool output, and model output are untrusted text. Render them as Preact text nodes; do not inject HTML.
 - Do not widen CSP or permissions casually. Production `connect-src` permits only `https://api.openai.com`; broad HTTP(S) host access exists for the declarative page content script, not for background fetching.
-- Never add arbitrary page JavaScript execution, CSS/XPath selectors, remote code, external fonts/scripts, cookies, clipboard, downloads, `tabs`, `scripting`, or `tabHide` permissions without an explicit design change.
+- Never add arbitrary page JavaScript execution, CSS/XPath selectors, remote code, external fonts/scripts, cookies, clipboard, downloads, `tabs`, or `scripting` permissions without an explicit design change. `tabHide` is used for the agent-tab workspace.
 - Keep `store:false`, `parallel_tool_calls:false`, and `maxRetries:0` in the OpenAI Responses API integration unless the run state machine is deliberately redesigned.
 
 ## Development practices

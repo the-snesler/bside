@@ -1,12 +1,10 @@
 /**
- * Provider-agnostic types for LLM inference: model/reasoning catalogs, auth,
- * and the streaming turn contract. Independent of WXT, Preact, Firefox, and
- * any specific provider SDK — a later provider adds one adapter and
- * definition here, never conditionals in sidebar/storage/agent-loop code.
+ * Provider-facing contracts around Pi's transport-neutral model and stream
+ * types. The background runtime owns credentials; providers receive them only
+ * for one request and the rest of the extension never imports a provider SDK.
  */
 
-import type { ConversationItem } from "@/lib/domain/conversation";
-import type { ContextArtifact, JsonValue, ToolCall, ToolDefinition } from "@/lib/domain/tools";
+import type { Api, AssistantMessageEventStream, Context, Model } from "@earendil-works/pi-ai";
 
 export type ProviderId = "openai";
 
@@ -45,23 +43,16 @@ export interface ProviderDefinition {
 export interface ProviderAdapter {
   readonly definition: ProviderDefinition;
   validateAuth(auth: ProviderAuth, signal: AbortSignal): Promise<void>;
+  getModel(modelId: string): Model<Api> | null;
   streamTurn(
     request: ProviderTurnRequest,
     auth: ProviderAuth,
     signal: AbortSignal,
-  ): AsyncIterable<ProviderEvent>;
+  ): AssistantMessageEventStream;
 }
 
-export type ProviderEvent =
-  | { type: "text.delta"; delta: string }
-  | { type: "tool.call"; call: ToolCall }
-  | { type: "turn.completed"; replayState: JsonValue };
-
 export interface ProviderTurnRequest {
-  modelId: string;
+  model: Model<Api>;
   reasoningEffort: ReasoningEffort;
-  transcript: readonly ConversationItem[];
-  contextArtifacts: readonly ContextArtifact[];
-  replayState: JsonValue | null;
-  tools: readonly ToolDefinition[];
+  context: Context;
 }

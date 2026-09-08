@@ -22,11 +22,38 @@ describe("extractSnapshot: readable extraction", () => {
     expect(snapshot.readableText).toContain("Orchid launch moved to Friday.");
   });
 
-  it("returns no interactive nodes in readable mode", () => {
+  it("includes controls in readable mode so navigation needs no second snapshot", () => {
     setBody(`<button>Submit</button>`);
     const registry = createElementRefRegistry();
     const snapshot = extractSnapshot(document, 1, registry, "readable");
-    expect(snapshot.nodes).toEqual([]);
+    expect(snapshot.nodes).toMatchObject([{ role: "button", name: "Submit" }]);
+  });
+
+  it("reads visible content and controls rather than hidden inventories or article-only text", () => {
+    setBody('<nav><a href="/sites">Sites</a></nav><main><label>Sort by <select><option>Activity</option></select></label><p>Visible ranking</p></main><div style="display:none">Hidden inventory in launch order</div><div hidden>Secret template</div>');
+    const snapshot = extractSnapshot(document, 1, createElementRefRegistry(), "readable");
+    expect(snapshot.readableText).toContain("Sort by");
+    expect(snapshot.readableText).toContain("Visible ranking");
+    expect(snapshot.readableText).not.toContain("Hidden inventory");
+    expect(snapshot.readableText).not.toContain("Secret template");
+    expect(snapshot.nodes[0]?.href).toContain("/sites");
+  });
+
+  it("exposes option labels and machine values together", () => {
+    setBody('<label for="priority">Priority</label><select id="priority"><option value="low">Low</option><option value="high">High</option></select>');
+    const snapshot = extractSnapshot(document, 1, createElementRefRegistry(), "readable");
+    expect(snapshot.nodes[0]?.options).toMatchObject([{ label: "Low", value: "low" }, { label: "High", value: "high" }]);
+  });
+
+  it("resolves exact locators beyond the display cap while detecting a late duplicate", () => {
+    setBody('<a href="/sites">Sites</a>' + '<button>Other</button>'.repeat(350));
+    const registry = createElementRefRegistry();
+    expect(extractSnapshot(document, 1, registry, "interactive").truncated.nodes).toBe(true);
+    const resolved = extractSnapshot(document, 1, registry, "interactive", undefined, { role: "link", name: "Sites" });
+    expect(resolved.nodes).toHaveLength(1);
+    expect(resolved.truncated.nodes).toBe(false);
+    document.body.insertAdjacentHTML("beforeend", '<a href="/other">Sites</a>');
+    expect(extractSnapshot(document, 1, registry, "interactive", undefined, { role: "link", name: "Sites" }).nodes).toHaveLength(2);
   });
 });
 

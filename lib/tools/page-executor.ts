@@ -7,9 +7,8 @@
  * generated JavaScript — it only ever sees a `Document` and opaque refs.
  */
 
-import { Readability } from "@mozilla/readability";
 import type { DomToolCall } from "@/lib/protocol";
-import type { PageNode, PageSnapshotV1, ToolResult } from "@/lib/domain/tools";
+import type { PageNode, PageSnapshotV1, ToolResult, SemanticLocator } from "@/lib/domain/tools";
 import {
   validateClickArgs,
   validateFillArgs,
@@ -42,17 +41,18 @@ export function extractSnapshot(
   registry: ElementRefRegistry,
   mode: "readable" | "interactive",
   limits: SnapshotLimits = DEFAULT_LIMITS,
+  locator?: SemanticLocator,
 ): PageSnapshotV1 {
   const revision = crypto.randomUUID();
   registry.revision = revision;
   registry.elements.clear();
 
-  const { readableText, truncatedText } = extractReadableText(document, limits.maxText);
+  const { readableText, truncatedText } = locator ? { readableText: "", truncatedText: false } : extractReadableText(document, limits.maxText);
 
   let nodes: PageNode[] = [];
   let truncatedNodes = false;
-  if (mode === "interactive") {
-    const extracted = extractInteractiveNodes(document, registry, limits.maxNodes);
+  {
+    const extracted = extractInteractiveNodes(document, registry, locator ? 2 : mode === "readable" ? Math.min(60, limits.maxNodes) : limits.maxNodes, locator);
     nodes = extracted.nodes;
     truncatedNodes = extracted.truncated;
   }
@@ -103,28 +103,25 @@ export function executeDomCall(
 // ---------------------------------------------------------------------------
 
 function extractReadableText(document: Document, maxText: number): { readableText: string; truncatedText: boolean } {
-  let text = "";
-  try {
-    const clone = document.cloneNode(true) as Document;
-    const article = new Readability(clone).parse();
-    text = trimText(article?.textContent ?? "");
-  } catch {
-    text = "";
+  // Article extraction can discard sorting controls and include hidden data
+  // templates. A browser agent needs the visible document, in document order.
+  const pending: Node[] = document.body ? [document.body] : [];
+  const parts: string[] = [];
+  let size = 0;
+  let scanned = 0;
+  while (pending.length && scanned++ < 20_000) {
+    const node = pending.pop()!;
+    if (node.nodeType === 3) {
+      const text = trimText(node.textContent ?? "");
+      if (text) { parts.push(text); size += text.length + 1; }
+      if (size > maxText) return { readableText: parts.join(" ").slice(0, maxText), truncatedText: true };
+    } else if (node.nodeType === 1) {
+      const element = node as Element;
+      if (!isLocallyExtractable(element)) continue;
+      for (let i = node.childNodes.length - 1; i >= 0; i--) pending.push(node.childNodes[i]!);
+    }
   }
-  if (!text) {
-    text = extractFallbackText(document);
-  }
-  const truncatedText = text.length > maxText;
-  return { readableText: truncatedText ? text.slice(0, maxText) : text, truncatedText };
-}
-
-function extractFallbackText(document: Document): string {
-  const clone = document.body?.cloneNode(true) as HTMLElement | undefined;
-  if (!clone) return "";
-  for (const node of Array.from(clone.querySelectorAll("script, style, noscript, template"))) {
-    node.remove();
-  }
-  return trimText(clone.textContent ?? "");
+  return { readableText: parts.join(" "), truncatedText: pending.length > 0 };
 }
 
 function trimText(text: string): string {
@@ -139,20 +136,24 @@ function extractInteractiveNodes(
   document: Document,
   registry: ElementRefRegistry,
   maxNodes: number,
+  locator?: SemanticLocator,
 ): { nodes: PageNode[]; truncated: boolean } {
   const candidates = Array.from(document.querySelectorAll(INTERACTIVE_SELECTOR));
   const nodes: PageNode[] = [];
 
+  let scanned = 0;
   for (const element of candidates) {
+    if (++scanned > 10_000) return { nodes, truncated: true };
     const role = computeRole(element);
     if (!role || !isExtractable(element)) continue;
+    const name = computeAccessibleName(element);
+    if (locator && (role !== locator.role || name !== locator.name)) continue;
 
     if (nodes.length >= maxNodes) {
       return { nodes, truncated: true };
     }
 
     const ref = `e${nodes.length + 1}`;
-    const name = computeAccessibleName(element);
     const tag = element.tagName.toLowerCase();
     const inputType = readInputType(element);
     const isFormControl = tag === "input" || tag === "textarea" || tag === "select";
@@ -174,6 +175,11 @@ function extractInteractiveNodes(
     };
     if (inputType) node.inputType = inputType;
     if (tag === "a") node.href = (element as HTMLAnchorElement).href;
+    if (tag === "select") {
+      const options = Array.from((element as HTMLSelectElement).options);
+      node.options = options.slice(0, 100).map((option) => ({ label: option.getAttribute("label") || trimText(option.textContent ?? ""), value: option.value, disabled: option.disabled, selected: option.selected }));
+      node.optionsTruncated = options.length > 100;
+    }
     if (!isFormControl) {
       const text = trimText(element.textContent ?? "");
       if (text) node.text = text;
@@ -259,17 +265,16 @@ function isExtractable(element: Element): boolean {
   if (!element.isConnected) return false;
   let node: Element | null = element;
   while (node) {
-    if (NON_CONTENT_TAGS[node.tagName.toLowerCase()]) return false;
-    if (node.hasAttribute("hidden")) return false;
-    if (node.getAttribute("aria-hidden") === "true") return false;
-    if ((node as HTMLElement).inert) return false;
-    const style = node.ownerDocument.defaultView?.getComputedStyle(node);
-    if (style && (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse")) {
-      return false;
-    }
+    if (!isLocallyExtractable(node)) return false;
     node = node.parentElement;
   }
   return true;
+}
+
+function isLocallyExtractable(element: Element): boolean {
+  if (NON_CONTENT_TAGS[element.tagName.toLowerCase()] || element.hasAttribute("hidden") || element.getAttribute("aria-hidden") === "true" || (element as HTMLElement).inert) return false;
+  const style = element.ownerDocument.defaultView?.getComputedStyle(element);
+  return !style || (style.display !== "none" && style.visibility !== "hidden" && style.visibility !== "collapse");
 }
 
 function isDisabled(element: Element): boolean {

@@ -11,6 +11,7 @@
  */
 
 import { AgentLoop } from "@/lib/background/agent-loop";
+import { WorkspaceState } from "@/lib/background/browser-program";
 import type { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController } from "@/lib/background/tab-controller";
 import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
@@ -21,6 +22,7 @@ import {
   clearRunCheckpoint,
   getAppSettings,
   getConversation,
+  resetConversation,
   getCredentialStatus,
   getOpenAICredential,
   recoverInterruptedRun,
@@ -68,6 +70,12 @@ export class BackgroundRuntime {
   #tabControllerFactory: () => TabController;
   #activeRun: ActiveRun | null = null;
   #notice: string | null = null;
+  #workspace = new WorkspaceState();
+  #latestContext: string | null = null;
+  #resetting = false;
+  #debugOutputs: string[] = [];
+  #debugOutputChars = 0;
+  #debugOutputTruncated = false;
 
   constructor(
     sidebarHub: SidebarHub,
@@ -109,7 +117,41 @@ export class BackgroundRuntime {
     };
   }
 
-  async handleCommand(command: SidebarCommand): Promise<void> {
+  async handleCommand(command: SidebarCommand): Promise<{ markdown: string; filename: string } | void> {
+    if (command.type === "context.export") {
+      const conversation = await getConversation();
+      const fence = (text: string) => {
+        const delimiter = "`".repeat(Math.max(3, ...[...text.matchAll(/`+/g)].map((match) => match[0].length + 1)));
+        return `${delimiter}\n${text}\n${delimiter}`;
+      };
+      return { filename: `bside-context-${new Date().toISOString().replace(/[:.]/g, "-")}.md`, markdown: [
+        "# bside context export", `Exported: ${new Date().toISOString()}`,
+        "## Latest model input", "This is the most recent request, not an exact live token count. It is held in memory only; after an extension restart only the saved conversation remains. It may include private page content. Credentials are not included.",
+        this.#latestContext ? fence(this.#latestContext) : "No model input captured in this background session.",
+        "## Full tool output — latest run", "Exact tool results, including bounded page snapshots and errors. Retained only until the next run, context reset, or extension restart. These are the snapshots exposed to the agent, not the entire page DOM.",
+        this.#debugOutputTruncated ? "Earlier results were dropped to keep the debug buffer below 2 million characters." : "No tool results dropped from this run.",
+        this.#debugOutputs.length ? fence(`[\n${this.#debugOutputs.join(",\n")}\n]`) : "No tool output captured in this run/session.",
+        "## Conversation log", fence(JSON.stringify(conversation, null, 2)),
+        "## Partial response", fence(this.#activeRun?.partialAssistantText ?? ""),
+        "## Scratch files", fence(JSON.stringify(Object.fromEntries(this.#workspace.files), null, 2)),
+      ].join("\n\n") };
+    }
+    if (command.type === "context.reset") {
+      if (this.#activeRun || this.#resetting) return;
+      this.#resetting = true;
+      try {
+        await resetConversation();
+        this.#latestContext = null;
+        this.#debugOutputs = [];
+        this.#debugOutputChars = 0;
+        this.#debugOutputTruncated = false;
+        this.#workspace.files.clear();
+        this.#sidebarHub.startRun();
+        this.#notice = "Context reset. Conversation history and scratch files cleared; tabs and settings kept.";
+        await this.#sidebarHub.broadcastSnapshot();
+      } finally { this.#resetting = false; }
+      return;
+    }
     if (command.type === "run.start") {
       await this.#startRun(command.prompt);
       return;
@@ -179,7 +221,7 @@ export class BackgroundRuntime {
   }
 
   async #startRun(rawPrompt: string): Promise<void> {
-    if (this.#activeRun) {
+    if (this.#activeRun || this.#resetting) {
       await this.#sidebarHub.broadcastSnapshot();
       return;
     }
@@ -197,7 +239,7 @@ export class BackgroundRuntime {
     const runId = crypto.randomUUID();
     const controller = new AbortController();
     const tabController = this.#tabControllerFactory();
-    const agentLoop = new AgentLoop(this.#provider, tabController, this.#sidebarHub);
+    const agentLoop = new AgentLoop(this.#provider, tabController, this.#sidebarHub, this.#workspace);
     this.#activeRun = {
       runId,
       controller,
@@ -218,6 +260,11 @@ export class BackgroundRuntime {
 
     this.#sidebarHub.startRun();
 
+    this.#latestContext = null;
+    this.#debugOutputs = [];
+    this.#debugOutputChars = 0;
+    this.#debugOutputTruncated = false;
+
     const captureOutcome = await tabController.captureActivePage();
     const artifact: ContextArtifact | null = captureOutcome.ok
       ? { ...captureOutcome.value.artifact, target: { kind: "tab", tabId: captureOutcome.value.snapshot.tabId }, snapshot: captureOutcome.value.snapshot }
@@ -236,10 +283,8 @@ export class BackgroundRuntime {
     this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt, page: userItem.kind === "message" ? userItem.context : null });
     await this.#writeCheckpoint(runId, "running", "");
 
-    // Tool-call/tool-result items only pair validly with the replay state
-    // from the run that produced them (the matching `function_call` item);
-    // that replay state is discarded when a run ends, so a new run must
-    // start from message history only, never from a prior run's tool items.
+    // Pi owns assistant/tool replay during this run. Persisted tool items are
+    // display/audit records only, so a new run starts from message history.
     const transcript = conversation.items.filter((item) => item.kind === "message");
     await this.#runAgentLoop(runId, transcript, artifact, credential.apiKey);
   }
@@ -267,6 +312,16 @@ export class BackgroundRuntime {
       transcript,
       contextArtifact: artifact,
       auth,
+      onContext: (context) => { this.#latestContext = context; },
+      onToolOutput: (call, result) => {
+        const output = JSON.stringify({ call, result }, null, 2);
+        this.#debugOutputs.push(output);
+        this.#debugOutputChars += output.length;
+        while (this.#debugOutputChars > 2_000_000 && this.#debugOutputs.length) {
+          this.#debugOutputChars -= this.#debugOutputs.shift()!.length;
+          this.#debugOutputTruncated = true;
+        }
+      },
       signal: run.controller.signal,
       onDelta: (delta) => {
         if (this.#activeRun?.runId !== runId) return;

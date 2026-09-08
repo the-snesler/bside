@@ -5,10 +5,11 @@ import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController } from "@/lib/background/tab-controller";
 import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import { ProviderStreamError } from "@/lib/providers/openai";
-import { saveOpenAICredential } from "@/lib/storage";
-import type { ProviderAdapter, ProviderAuth, ProviderEvent, ProviderTurnRequest } from "@/lib/domain/provider";
+import { saveOpenAICredential, appendConversationItem, getConversation, getOpenAICredential } from "@/lib/storage";
+import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
 import type { PageSnapshotV1 } from "@/lib/domain/tools";
 import type { SidebarEvent } from "@/lib/protocol";
+import { TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
 
 /** A TabController bound to a browser API that always reports no attachable tab. */
 function unsupportedPageTabControllerFactory(): TabController {
@@ -61,17 +62,76 @@ function supportedPageTabControllerFactory(): TabController {
   return new TabController(api);
 }
 
+describe("context controls", () => {
+  it("exports complete tool output for debugging without persisting page content", async () => {
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    let round = 0;
+    provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      if (round++ === 0) yield { type: "tool.call", call: { id: "read", name: "browser_program", arguments: { source: 'return fs.read("/tabs/1/page.md");' } } } as ScriptedProviderEvent;
+      yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+    } });
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: supportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    await runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Read the fixture" });
+    const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export" });
+    const outputs = exported?.markdown.split("## Full tool output — latest run")[1]?.split("## Conversation log")[0];
+    expect(outputs).toContain("Orchid launch moved to Friday.");
+    expect(outputs).toContain("Revision:");
+    expect(JSON.stringify(await getConversation())).not.toContain("Orchid launch moved to Friday.");
+    await runtime.handleCommand({ v: 1, id: "reset", type: "context.reset" });
+    expect((await runtime.handleCommand({ v: 1, id: "export2", type: "context.export" }))?.markdown).not.toContain("Orchid launch moved to Friday.");
+  });
+
+  it("exports the latest model input without credentials and resets saved conversation", async () => {
+    await saveOpenAICredential("sk-context-test-secret");
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    provider.script = [{ type: "text.delta", delta: "Hello." }, { type: "turn.completed", replayState: null }];
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Context export test" });
+    const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export" });
+    expect(exported?.filename).toMatch(/\.md$/);
+    expect(exported?.markdown).toContain("Context export test");
+    expect(exported?.markdown).toContain("browser_program");
+    expect(exported?.markdown).toContain("Hello.");
+    expect(exported?.markdown).not.toContain("sk-context-test-secret");
+    await runtime.handleCommand({ v: 1, id: "reset", type: "context.reset" });
+    expect((await getConversation()).items).toEqual([]);
+    expect((await getOpenAICredential())?.apiKey).toBe("sk-context-test-secret");
+    const cleared = await runtime.handleCommand({ v: 1, id: "export2", type: "context.export" });
+    expect(cleared?.markdown).not.toContain("Context export test");
+    expect(cleared?.markdown).toContain("No model input captured");
+  });
+
+  it("sends a download only to the requesting sidebar", async () => {
+    await appendConversationItem({ id: "u1", kind: "message", role: "user", text: "Saved context", context: null, at: 1 });
+    const hub = new SidebarHub();
+    hub.delegate = new BackgroundRuntime(hub, { provider: new FakeProvider() });
+    const first = fakePort();
+    const second = fakePort();
+    hub.handleConnect(first); hub.handleConnect(second);
+    await first.send({ v: 1, id: "download", type: "context.export" });
+    expect(first.received.find((event) => event.type === "context.exported")?.payload).toMatchObject({ requestId: "download", markdown: expect.stringContaining("Saved context") });
+    expect(second.received.some((event) => event.type === "context.exported")).toBe(false);
+  });
+});
+
 class FakeProvider implements ProviderAdapter {
   readonly definition = { id: "openai" as const, name: "OpenAI", authMethods: [], models: [] };
-  script: ProviderEvent[] | ((signal: AbortSignal) => AsyncIterable<ProviderEvent>) = [];
+  script: ScriptedProviderEvent[] | ((signal: AbortSignal) => AsyncIterable<ScriptedProviderEvent>) = [];
   requests: ProviderTurnRequest[] = [];
 
   async validateAuth(_auth: ProviderAuth, _signal: AbortSignal): Promise<void> {}
 
-  async *streamTurn(request: ProviderTurnRequest, _auth: ProviderAuth, signal: AbortSignal): AsyncIterable<ProviderEvent> {
+  getModel() { return TEST_MODEL; }
+
+  streamTurn(request: ProviderTurnRequest, _auth: ProviderAuth, signal: AbortSignal) {
     this.requests.push(request);
     const events = typeof this.script === "function" ? this.script(signal) : this.script;
-    yield* events;
+    return toPiStream(events, signal);
   }
 }
 
@@ -104,6 +164,7 @@ async function tick(times = 20): Promise<void> {
   for (let i = 0; i < times; i += 1) {
     await Promise.resolve();
   }
+  await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 beforeEach(() => {
@@ -181,7 +242,10 @@ describe("BackgroundRuntime: event sequencing", () => {
     const seqs = runEvents.map((e) => e.seq);
     expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
     expect(new Set(seqs).size).toBe(seqs.length);
-    expect(runEvents.map((e) => e.type)).toEqual(["run.started", "assistant.delta", "run.completed"]);
+    expect(runEvents[0]?.type).toBe("run.started");
+    expect(runEvents.at(-1)?.type).toBe("run.completed");
+    const deltas = runEvents.filter((event) => event.type === "assistant.delta");
+    expect(deltas.map((event) => event.payload.delta).join("")).toBe("Hello world");
   });
 });
 
@@ -192,7 +256,7 @@ describe("BackgroundRuntime: cancellation", () => {
     const provider = new FakeProvider();
     provider.script = (signal: AbortSignal) => ({
       [Symbol.asyncIterator]: async function* () {
-        yield { type: "text.delta", delta: "partial" } as ProviderEvent;
+        yield { type: "text.delta", delta: "partial" } as ScriptedProviderEvent;
         if (signal.aborted) throw new DOMException("Aborted", "AbortError");
         const { promise, reject } = Promise.withResolvers<never>();
         signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
@@ -226,7 +290,7 @@ describe("BackgroundRuntime: cancellation", () => {
     const provider = new FakeProvider();
     provider.script = (signal: AbortSignal) => ({
       [Symbol.asyncIterator]: async function* () {
-        yield { type: "text.delta", delta: "The page says" } as ProviderEvent;
+        yield { type: "text.delta", delta: "The page says" } as ScriptedProviderEvent;
         if (signal.aborted) throw new DOMException("Aborted", "AbortError");
         const { promise, reject } = Promise.withResolvers<never>();
         signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
@@ -269,7 +333,7 @@ describe("BackgroundRuntime: cancellation", () => {
     const provider = new FakeProvider();
     provider.script = (signal: AbortSignal) => ({
       [Symbol.asyncIterator]: async function* () {
-        yield { type: "text.delta", delta: "partial" } as ProviderEvent;
+        yield { type: "text.delta", delta: "partial" } as ScriptedProviderEvent;
         if (signal.aborted) throw new DOMException("Aborted", "AbortError");
         const { promise, reject } = Promise.withResolvers<never>();
         signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
@@ -329,9 +393,9 @@ describe("BackgroundRuntime: cross-run transcript (regression)", () => {
     // is unattached, so it resolves as a failed but still-persisted tool
     // result) then a final message; run 2 is plain text.
     let round = 0;
-    const rounds: ProviderEvent[][] = [
+    const rounds: ScriptedProviderEvent[][] = [
       [
-        { type: "tool.call", call: { id: "call_1", name: "page_snapshot", arguments: { mode: "readable" } } },
+        { type: "tool.call", call: { id: "call_1", name: "browser_program", arguments: { source: 'return await fs.read("/tabs/1/page.md");' } } },
         { type: "turn.completed", replayState: null },
       ],
       [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }],
@@ -357,8 +421,7 @@ describe("BackgroundRuntime: cross-run transcript (regression)", () => {
 
     const secondRunRequest = provider.requests[2];
     expect(secondRunRequest).toBeDefined();
-    expect(secondRunRequest?.transcript.every((item) => item.kind === "message")).toBe(true);
-    expect(secondRunRequest?.replayState).toBeNull();
+    expect(secondRunRequest?.context.messages.every((item) => item.role === "user" || item.role === "assistant")).toBe(true);
   });
 });
 
@@ -382,7 +445,7 @@ describe("BackgroundRuntime: unsupported page permits ordinary chat (regression)
     expect(snapshot.activeRun).toBeNull();
     const userMessage = snapshot.conversation.items.find((item) => item.kind === "message" && item.role === "user");
     expect(userMessage?.kind === "message" ? userMessage.context : undefined).toBeNull();
-    expect(provider.requests[0]?.contextArtifacts).toEqual([]);
+    expect(provider.requests[0]?.context.systemPrompt).not.toContain("BEGIN_UNTRUSTED_PAGE_ARTIFACT");
     expect(port.received.some((e) => e.type === "run.completed")).toBe(true);
   });
 });
@@ -394,8 +457,8 @@ describe("BackgroundRuntime: reconnect during approval (regression)", () => {
     const provider = new FakeProvider();
     provider.script = () => ({
       [Symbol.asyncIterator]: async function* () {
-        yield { type: "tool.call", call: { id: "call_1", name: "page_click", arguments: { ref: "e1", revision: "rev-1" } } } as ProviderEvent;
-        yield { type: "turn.completed", replayState: null } as ProviderEvent;
+        yield { type: "tool.call", call: { id: "call_1", name: "request_action_confirmation", arguments: { title: "Submit", message: "Submit the draft?", artifact: "Draft" } } } as ScriptedProviderEvent;
+        yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
       },
     });
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: supportedPageTabControllerFactory });
@@ -429,8 +492,8 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
       if (round === 1) {
         return {
           [Symbol.asyncIterator]: async function* () {
-            yield { type: "tool.call", call: { id: "call_1", name: "page_click", arguments: { ref: "e1", revision: "rev-1" } } } as ProviderEvent;
-            yield { type: "turn.completed", replayState: null } as ProviderEvent;
+            yield { type: "tool.call", call: { id: "call_1", name: "browser_program", arguments: { source: 'await browser.tab("/tabs/1/page.md").getByRole("button", {name: "Submit", exact: true}).click();' } } } as ScriptedProviderEvent;
+            yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
           },
         };
       }
@@ -446,13 +509,6 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
     hub.handleConnect(port);
 
     const runCommand = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Click submit" });
-    await tick(200);
-    const running = await runtime.getSnapshot();
-    const runId = running.activeRun?.runId as string;
-    const callId = running.activeRun?.pendingApproval?.call.id as string;
-    expect(callId).toBeDefined();
-
-    await runtime.handleCommand({ v: 1, id: "2", type: "action.approve", runId, callId });
     await runCommand;
 
     const failed = port.received.find((e) => e.type === "run.failed");
