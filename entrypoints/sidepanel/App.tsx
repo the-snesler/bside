@@ -1,7 +1,24 @@
 import { useState } from "preact/hooks";
+import Settings from "~icons/tabler/settings";
+import Download from "~icons/tabler/download";
+import Refresh from "~icons/tabler/refresh";
+import Globe from "~icons/tabler/world";
+import ArrowDown from "~icons/tabler/arrow-down";
+import Check from "~icons/tabler/check";
+import X from "~icons/tabler/x";
+import Loader from "~icons/tabler/loader-2";
+import Shield from "~icons/tabler/shield-check";
+import { Markdown } from "@/lib/ui/Markdown";
+import { Composer } from "@/lib/ui/Composer";
+import { useBottomScroll } from "@/lib/ui/use-bottom-scroll";
+import type { ReasoningEffort } from "@/lib/domain/provider";
 import { useBackground } from "@/lib/ui/use-background";
 import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
-import type { PageArtifactSummary, ToolCall, ToolResult } from "@/lib/domain/tools";
+import type {
+  PageArtifactSummary,
+  ToolCall,
+  ToolResult,
+} from "@/lib/domain/tools";
 import type { ConversationItem } from "@/lib/domain/conversation";
 
 function lastUserPrompt(items: ConversationItem[]): string | null {
@@ -24,7 +41,33 @@ function describeAttachment(page: PageArtifactSummary): string {
 
 /** Fallback label for a historical tool-call row; the richer live pseudo-code lives on the pending approval itself. */
 function describeToolCall(call: ToolCall): string {
-  if (call.name === "browser_program") return "Browser program";
+  if (call.name === "browser_program") {
+    const args = call.arguments;
+    const source =
+      args &&
+      typeof args === "object" &&
+      !Array.isArray(args) &&
+      typeof args.source === "string"
+        ? args.source
+        : "";
+    const actions: [RegExp, string][] = [
+      [/\.click\(/, "Clicking a page control"],
+      [/\.fill\(/, "Filling page fields"],
+      [/\.selectOption\(/, "Selecting an option"],
+      [/\.setChecked\(/, "Updating a checkbox"],
+      [/\.navigate\(|browser\.open\(/, "Opening a page"],
+      [/fs\.remove\(/, "Removing a file or tab"],
+      [/fs\.move\(/, "Moving a file or tab"],
+      [/fs\.write\(/, "Writing a scratch file"],
+      [/\.scroll\(/, "Scrolling the page"],
+      [/fs\.read\(|\.snapshot\(/, "Reading page content"],
+      [/fs\.list\(/, "Listing tabs and files"],
+    ];
+    return (
+      actions.find(([pattern]) => pattern.test(source))?.[1] ??
+      "Running browser program"
+    );
+  }
   if (call.name === "request_action_confirmation") return "Action confirmation";
   if (call.name === "page_snapshot") return "Captured a page snapshot";
   if (call.name === "page_scroll") return "Scrolled the page";
@@ -39,7 +82,12 @@ function describeToolCall(call: ToolCall): string {
 
 type TimelineEntry =
   | { kind: "message"; id: string; role: "user" | "assistant"; text: string }
-  | { kind: "activity"; id: string; call: ToolCall; result: Omit<ToolResult, "data"> | null };
+  | {
+      kind: "activity";
+      id: string;
+      call: ToolCall;
+      result: Omit<ToolResult, "data"> | null;
+    };
 
 function buildTimeline(items: ConversationItem[]): TimelineEntry[] {
   const entries: TimelineEntry[] = [];
@@ -47,10 +95,20 @@ function buildTimeline(items: ConversationItem[]): TimelineEntry[] {
 
   for (const item of items) {
     if (item.kind === "message") {
-      entries.push({ kind: "message", id: item.id, role: item.role, text: item.text });
+      entries.push({
+        kind: "message",
+        id: item.id,
+        role: item.role,
+        text: item.text,
+      });
     } else if (item.kind === "tool-call") {
       activityIndexByCallId.set(item.call.id, entries.length);
-      entries.push({ kind: "activity", id: item.id, call: item.call, result: null });
+      entries.push({
+        kind: "activity",
+        id: item.id,
+        call: item.call,
+        result: null,
+      });
     } else if (item.kind === "tool-result") {
       const index = activityIndexByCallId.get(item.callId);
       const entry = index !== undefined ? entries[index] : undefined;
@@ -69,25 +127,67 @@ function ActivityRow(props: {
   const { entry, pendingDisplay, onApprove, onDeny } = props;
   const isPending = pendingDisplay !== null;
   const label = pendingDisplay ?? describeToolCall(entry.call);
-  const status = isPending ? "Waiting for approval" : entry.result ? (entry.result.ok ? "Done" : entry.result.summary) : "Running…";
+  const status = isPending
+    ? "Waiting for approval"
+    : entry.result
+      ? entry.result.ok
+        ? "Done"
+        : entry.result.summary
+      : "Running…";
   const args = entry.call.arguments;
-  const confirmation = entry.call.name === "request_action_confirmation" && args && typeof args === "object" && !Array.isArray(args) ? args : null;
+  const confirmation =
+    entry.call.name === "request_action_confirmation" &&
+    args &&
+    typeof args === "object" &&
+    !Array.isArray(args)
+      ? args
+      : null;
 
   return (
     <li class="timeline__item timeline__item--tool">
       <details class="activity" open={isPending}>
         <summary class="activity__summary" aria-label={`${label}: ${status}`}>
-          <span class={`activity__status activity__status--${isPending ? "pending" : entry.result?.ok ? "ok" : entry.result ? "error" : "running"}`}>
-            {isPending ? "⏳" : entry.result?.ok ? "✓" : entry.result ? "✕" : "…"}
+          <span
+            class={`activity__status activity__status--${isPending ? "pending" : entry.result?.ok ? "ok" : entry.result ? "error" : "running"}`}
+          >
+            {isPending ? (
+              <Shield />
+            ) : entry.result?.ok ? (
+              <Check />
+            ) : entry.result ? (
+              <X />
+            ) : (
+              <Loader class="spin" />
+            )}
           </span>
           <span class="activity__label">{label}</span>
         </summary>
         <div class="activity__detail">
-          {confirmation ? <>
-            <p>{typeof confirmation.message === "string" ? confirmation.message : ""}</p>
-            {typeof confirmation.artifact === "string" && confirmation.artifact && <pre class="tool-call" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{confirmation.artifact}</pre>}
-          </> : <code class="tool-call">{JSON.stringify(entry.call.arguments)}</code>}
-          {entry.result && <p class="activity__result">{entry.result.summary}</p>}
+          {confirmation ? (
+            <>
+              <p>
+                {typeof confirmation.message === "string"
+                  ? confirmation.message
+                  : ""}
+              </p>
+              {typeof confirmation.artifact === "string" &&
+                confirmation.artifact && (
+                  <pre
+                    class="tool-call"
+                    style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
+                  >
+                    {confirmation.artifact}
+                  </pre>
+                )}
+            </>
+          ) : (
+            <code class="tool-call">
+              {JSON.stringify(entry.call.arguments)}
+            </code>
+          )}
+          {entry.result && (
+            <p class="activity__result">{entry.result.summary}</p>
+          )}
         </div>
         {isPending && (
           <div class="activity__actions">
@@ -105,28 +205,33 @@ function ActivityRow(props: {
 }
 
 export function App() {
-  const { conversation, page, activeRun, notice, lastError, credential, settings, sendPrompt, cancelRun, approveAction, denyAction, resetContext, downloadContext } =
-    useBackground();
-  const [draft, setDraft] = useState("");
+  const {
+    conversation,
+    page,
+    activeRun,
+    notice,
+    lastError,
+    credential,
+    settings,
+    tabs,
+    listTabs,
+    saveSettings,
+    sendPrompt,
+    cancelRun,
+    approveAction,
+    denyAction,
+    resetContext,
+    downloadContext,
+  } = useBackground();
+  const [confirmReset, setConfirmReset] = useState(false);
+  const scroll = useBottomScroll();
 
   const composerDisabled = activeRun !== null || !credential.configured;
-  const modelName = OPENAI_PROVIDER.models.find((model) => model.id === settings.modelId)?.name ?? settings.modelId;
+  const model =
+    OPENAI_PROVIDER.models.find((model) => model.id === settings.modelId) ??
+    OPENAI_PROVIDER.models[1];
   const timeline = buildTimeline(conversation.items);
   const pendingApproval = activeRun?.pendingApproval ?? null;
-
-  const submitDraft = () => {
-    const trimmed = draft.trim();
-    if (!trimmed || composerDisabled) return;
-    sendPrompt(trimmed);
-    setDraft("");
-  };
-
-  const handleKeyDown = (event: KeyboardEvent) => {
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      submitDraft();
-    }
-  };
 
   const handleRetry = () => {
     const prompt = lastUserPrompt(conversation.items);
@@ -137,91 +242,205 @@ export function App() {
     <div class="sidebar">
       <header class="sidebar__header">
         <h1 class="sidebar__title">bside</h1>
-        <div class="sidebar__settings-link">
-          <span class="sidebar__settings-summary">
-            {modelName} · {settings.reasoningEffort}
-          </span>
-          <button type="button" class="sidebar__settings" onClick={() => browser.runtime.openOptionsPage()}>
-            Settings
+        <div class="sidebar__header-actions">
+          <button
+            type="button"
+            class="icon-button"
+            onClick={downloadContext}
+            aria-label="Download context"
+            title="Download context (may contain private page content)"
+          >
+            <Download />
+          </button>
+          <button
+            type="button"
+            class="icon-button"
+            disabled={activeRun !== null}
+            onClick={() => setConfirmReset(!confirmReset)}
+            aria-label="Reset context"
+            title="Reset context"
+          >
+            <Refresh />
+          </button>
+          <button
+            type="button"
+            class="icon-button"
+            onClick={() => browser.runtime.openOptionsPage()}
+            aria-label="Settings"
+            title="Settings"
+          >
+            <Settings />
           </button>
         </div>
       </header>
-
-      <div class="sidebar__context-actions">
-        <button type="button" class="sidebar__settings" onClick={downloadContext} title="Download model context, conversation, and scratch files as Markdown">Download context</button>
-        <button type="button" class="sidebar__settings" disabled={activeRun !== null} onClick={resetContext} title={activeRun ? "Stop the current run before resetting" : "Clear conversation history and scratch files; keep tabs and settings"}>Reset context</button>
-      </div>
-
-      <div class="sidebar__chip" title={page?.url}>
-        {page ? describeAttachment(page) : "Unsupported page"}
-      </div>
-
-      <main class="sidebar__body">
-        {timeline.length === 0 && !activeRun ? (
-          <p class="sidebar__empty">
-            {page ? `Ask about ${page.title || "this page"}, or start a conversation.` : "Open a page, then start a conversation."}
+      {confirmReset && (
+        <div
+          class="reset-confirmation"
+          role="group"
+          aria-label="Confirm context reset"
+        >
+          <p>
+            Clear this conversation and scratch files? Tabs and settings stay.
           </p>
-        ) : (
-          <ul class="timeline">
-            {timeline.map((entry) =>
-              entry.kind === "message" ? (
-                <li key={entry.id} class={`timeline__item timeline__item--${entry.role}`}>
-                  <span class="timeline__role">{entry.role === "user" ? "You" : "bside"}</span>
-                  <p class="timeline__text">{entry.text}</p>
+          <button
+            type="button"
+            disabled={!!activeRun}
+            onClick={() => {
+              resetContext();
+              setConfirmReset(false);
+            }}
+          >
+            Clear context
+          </button>
+          <button type="button" onClick={() => setConfirmReset(false)}>
+            Cancel
+          </button>
+        </div>
+      )}
+      <main class="sidebar__body" ref={scroll.viewport}>
+        <div ref={scroll.content}>
+          {timeline.length === 0 && !activeRun ? (
+            <p class="sidebar__empty">
+              {page
+                ? `Ask about ${page.title || "this page"}, or start a conversation.`
+                : "Open a page, then start a conversation."}
+            </p>
+          ) : (
+            <ul class="timeline">
+              {timeline.map((entry) =>
+                entry.kind === "message" ? (
+                  <li
+                    key={entry.id}
+                    class={`timeline__item timeline__item--${entry.role}`}
+                  >
+                    {entry.role === "user" ? (
+                      <p class="timeline__text">{entry.text}</p>
+                    ) : (
+                      <Markdown text={entry.text} />
+                    )}
+                  </li>
+                ) : (
+                  <ActivityRow
+                    key={entry.id}
+                    entry={entry}
+                    pendingDisplay={
+                      pendingApproval?.call.id === entry.call.id
+                        ? pendingApproval.display
+                        : null
+                    }
+                    onApprove={() => approveAction(entry.call.id)}
+                    onDeny={() => denyAction(entry.call.id)}
+                  />
+                ),
+              )}
+              {activeRun?.partialAssistantText && (
+                <li class="timeline__item timeline__item--assistant timeline__item--streaming">
+                  <Markdown text={activeRun.partialAssistantText} />
                 </li>
-              ) : (
-                <ActivityRow
-                  key={entry.id}
-                  entry={entry}
-                  pendingDisplay={pendingApproval?.call.id === entry.call.id ? pendingApproval.display : null}
-                  onApprove={() => approveAction(entry.call.id)}
-                  onDeny={() => denyAction(entry.call.id)}
-                />
-              ),
-            )}
-            {activeRun?.partialAssistantText && (
-              <li class="timeline__item timeline__item--assistant timeline__item--streaming">
-                <span class="timeline__role">bside</span>
-                <p class="timeline__text">
-                  {activeRun.partialAssistantText}
-                  <span class="timeline__cursor" aria-hidden="true"></span>
-                </p>
-              </li>
-            )}
-          </ul>
-        )}
+              )}
+            </ul>
+          )}
 
-        {lastError && (
-          <p class="sidebar__error">
-            {lastError.message}
-            {lastError.retryable && (
-              <button type="button" class="sidebar__retry" onClick={handleRetry}>
-                Retry
-              </button>
-            )}
-          </p>
-        )}
-        {notice && <p class="sidebar__notice">{notice}</p>}
+          {lastError && (
+            <p class="sidebar__error">
+              {lastError.message}
+              {lastError.retryable && (
+                <button
+                  type="button"
+                  class="sidebar__retry"
+                  onClick={handleRetry}
+                >
+                  Retry
+                </button>
+              )}
+            </p>
+          )}
+          {notice && <p class="sidebar__notice">{notice}</p>}
+        </div>
       </main>
-
+      {!scroll.atBottom && (
+        <div class="scroll-latest">
+          <button
+            type="button"
+            class="icon-button"
+            onClick={scroll.scrollToBottom}
+            aria-label="Scroll to latest"
+            title="Scroll to latest"
+          >
+            <ArrowDown />
+          </button>
+        </div>
+      )}
       <footer class="sidebar__composer">
-        <textarea
-          class="sidebar__input"
-          value={draft}
-          disabled={composerDisabled}
-          placeholder={credential.configured ? "Ask about this page…" : "Add an API key in settings to start."}
-          onInput={(event) => setDraft((event.target as HTMLTextAreaElement).value)}
-          onKeyDown={handleKeyDown}
-        />
-        {activeRun ? (
-          <button type="button" class="sidebar__stop" onClick={cancelRun}>
-            Stop
-          </button>
-        ) : (
-          <button type="button" class="sidebar__send" onClick={submitDraft} disabled={composerDisabled || draft.trim().length === 0}>
-            Send
-          </button>
-        )}
+        <div class="composer">
+          {page && (
+            <div class="context-chip" title={describeAttachment(page)}>
+              <Globe />
+              <span>
+                <strong>{page.title || "Current tab"}</strong>
+                <small>{new URL(page.url).hostname}</small>
+              </span>
+            </div>
+          )}
+          <Composer
+            disabled={composerDisabled}
+            running={!!activeRun}
+            configured={credential.configured}
+            tabs={tabs}
+            onListTabs={listTabs}
+            onSend={(text) => {
+              scroll.scrollToBottom();
+              sendPrompt(text);
+            }}
+            onStop={cancelRun}
+          />
+        </div>
+        <div class="composer__settings">
+          <select
+            aria-label="Model"
+            title="Model"
+            value={settings.modelId}
+            disabled={!!activeRun}
+            onChange={(event) => {
+              const next = OPENAI_PROVIDER.models.find(
+                (candidate) => candidate.id === event.currentTarget.value,
+              )!;
+              saveSettings({
+                ...settings,
+                modelId: next.id,
+                reasoningEffort: next.reasoningEfforts.includes(
+                  settings.reasoningEffort,
+                )
+                  ? settings.reasoningEffort
+                  : next.defaultReasoningEffort,
+              });
+            }}
+          >
+            {OPENAI_PROVIDER.models.map((model) => (
+              <option key={model.id} value={model.id}>
+                {model.name}
+              </option>
+            ))}
+          </select>
+          <select
+            aria-label="Reasoning effort"
+            title="Reasoning effort"
+            value={settings.reasoningEffort}
+            disabled={!!activeRun}
+            onChange={(event) =>
+              saveSettings({
+                ...settings,
+                reasoningEffort: event.currentTarget.value as ReasoningEffort,
+              })
+            }
+          >
+            {model.reasoningEfforts.map((effort) => (
+              <option key={effort} value={effort}>
+                {effort[0]!.toUpperCase() + effort.slice(1)}
+              </option>
+            ))}
+          </select>
+        </div>
       </footer>
     </div>
   );

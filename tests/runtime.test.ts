@@ -63,6 +63,23 @@ function supportedPageTabControllerFactory(): TabController {
 }
 
 describe("context controls", () => {
+  it("lists real tab mention paths without capturing page content", async () => {
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: supportedPageTabControllerFactory });
+    expect(await runtime.handleCommand({ v: 1, id: "tabs", type: "tabs.list" })).toEqual({ tabs: [
+      { id: 1, title: "Agent Fixture", url: "http://127.0.0.1:4173/agent-page.html", path: "/tabs/1/page.md" },
+    ] });
+    expect((await getConversation()).items).toHaveLength(0);
+  });
+
+  it("saves inline model selection through the background", async () => {
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const settings = { version: 1 as const, providerId: "openai" as const, modelId: "gpt-5.6-sol", reasoningEffort: "high" as const };
+    await runtime.handleCommand({ v: 1, id: "settings", type: "settings.save", settings });
+    expect((await runtime.getSnapshot()).settings).toEqual(settings);
+  });
+
   it("exports complete tool output for debugging without persisting page content", async () => {
     await saveOpenAICredential("sk-test");
     const hub = new SidebarHub();

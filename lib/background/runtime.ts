@@ -117,7 +117,19 @@ export class BackgroundRuntime {
     };
   }
 
-  async handleCommand(command: SidebarCommand): Promise<{ markdown: string; filename: string } | void> {
+  handleCommand(command: { v: 1; id: string; type: "context.export" }): Promise<{ markdown: string; filename: string }>;
+  handleCommand(command: SidebarCommand): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]>;
+  async handleCommand(command: SidebarCommand): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]> {
+    if (command.type === "tabs.list") {
+      const tabs = await this.#tabControllerFactory().listTabs();
+      return { tabs: tabs.map((tab) => ({ id: tab.id!, title: tab.title ?? "", url: tab.url!, path: `/${this.#workspace.agentTabs.has(tab.id!) ? "agent-tabs" : "tabs"}/${tab.id}/page.md` })) };
+    }
+    if (command.type === "settings.save") {
+      if (this.#activeRun) return;
+      await this.handleSettingsRequest(command);
+      await this.#sidebarHub.broadcastSnapshot();
+      return;
+    }
     if (command.type === "context.export") {
       const conversation = await getConversation();
       const fence = (text: string) => {

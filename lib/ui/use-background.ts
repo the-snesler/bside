@@ -11,12 +11,17 @@ import type { Browser } from "wxt/browser";
 import { RUN_CANCELLED_SUFFIX, SIDEBAR_PORT_NAME } from "@/lib/protocol";
 import type { NormalizedError, RuntimeSnapshot, SidebarCommand, SidebarEvent } from "@/lib/protocol";
 import type { ConversationItem } from "@/lib/domain/conversation";
+import type { AppSettingsV1 } from "@/lib/domain/provider";
+import type { TabMention } from "@/lib/protocol";
 
 export interface BackgroundState extends RuntimeSnapshot {
+  tabs: TabMention[];
   lastError: NormalizedError | null;
 }
 
 export interface BackgroundActions {
+  listTabs(): void;
+  saveSettings(settings: AppSettingsV1): void;
   sendPrompt(prompt: string): void;
   cancelRun(): void;
   approveAction(callId: string): void;
@@ -26,6 +31,7 @@ export interface BackgroundActions {
 }
 
 const INITIAL_STATE: BackgroundState = {
+  tabs: [],
   conversation: { version: 1, id: "default", items: [], updatedAt: 0 },
   credential: { configured: false, maskedSuffix: null },
   settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
@@ -113,7 +119,14 @@ export function useBackground(): BackgroundState & BackgroundActions {
     portRef.current?.postMessage({ v: 1, id, type: "context.export" } satisfies SidebarCommand);
   }, []);
 
-  return { ...state, sendPrompt, cancelRun, approveAction, denyAction, resetContext, downloadContext };
+  const listTabs = useCallback(() => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "tabs.list" } satisfies SidebarCommand);
+  }, []);
+  const saveSettings = useCallback((settings: AppSettingsV1) => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "settings.save", settings } satisfies SidebarCommand);
+  }, []);
+
+  return { ...state, sendPrompt, cancelRun, approveAction, denyAction, resetContext, downloadContext, listTabs, saveSettings };
 }
 
 function commitPendingText(prev: BackgroundState): BackgroundState {
@@ -137,6 +150,10 @@ function applyEvent(
   setState: (updater: (prev: BackgroundState) => BackgroundState) => void,
   activeRunIdRef: { current: string | null },
 ): void {
+  if (event.type === "tabs.listed") {
+    setState((prev) => ({ ...prev, tabs: event.payload.tabs }));
+    return;
+  }
   if (event.type === "state.snapshot") {
     activeRunIdRef.current = event.payload.activeRun?.runId ?? null;
     setState((prev) => ({ ...prev, ...event.payload, lastError: null }));

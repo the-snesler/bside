@@ -12,7 +12,7 @@
 
 import type { Browser } from "wxt/browser";
 import { isSidebarCommand, SIDEBAR_PORT_NAME } from "@/lib/protocol";
-import type { RuntimeSnapshot, SidebarCommand, SidebarEvent } from "@/lib/protocol";
+import type { RuntimeSnapshot, SidebarCommand, SidebarEvent, TabMention } from "@/lib/protocol";
 import type { PageArtifactSummary } from "@/lib/domain/tools";
 
 const MAX_REPLAY_EVENTS = 512;
@@ -20,10 +20,10 @@ const UNSUPPORTED_HOSTNAME_SUFFIXES = [".mozilla.org", ".mozilla.com"];
 
 export interface SidebarHubDelegate {
   getSnapshot(): Promise<RuntimeSnapshot>;
-  handleCommand(command: SidebarCommand): Promise<{ markdown: string; filename: string } | void>;
+  handleCommand(command: SidebarCommand): Promise<{ markdown: string; filename: string } | { tabs: TabMention[] } | void>;
 }
 
-type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" | "context.exported" }>;
+type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" | "context.exported" | "tabs.listed" }>;
 
 export class SidebarHub {
   delegate: SidebarHubDelegate | null = null;
@@ -71,7 +71,7 @@ export class SidebarHub {
   }
 
   /** Publishes a run-local sequenced event to every connected port. */
-  publishRunEvent<T extends Exclude<SidebarEvent["type"], "state.snapshot" | "page.attached" | "context.exported">>(
+  publishRunEvent<T extends RunEvent["type"]>(
     runId: string,
     type: T,
     payload: Extract<SidebarEvent, { type: T }>["payload"],
@@ -105,7 +105,10 @@ export class SidebarHub {
       return;
     }
     const result = await this.delegate.handleCommand(message);
-    if (message.type === "context.export" && result) port.postMessage({
+    if (message.type === "tabs.list" && result && "tabs" in result) port.postMessage({
+      v: 1, type: "tabs.listed", runId: null, conversationId: "default", seq: this.#lastSeq, at: Date.now(), payload: result,
+    } satisfies SidebarEvent);
+    if (message.type === "context.export" && result && "markdown" in result) port.postMessage({
       v: 1, type: "context.exported", runId: null, conversationId: "default", seq: this.#lastSeq, at: Date.now(),
       payload: { requestId: message.id, ...result },
     } satisfies SidebarEvent);

@@ -1,0 +1,243 @@
+import { useMemo, useState } from "preact/hooks";
+import {
+  createEditor,
+  Editor,
+  Element,
+  Node,
+  Range,
+  Transforms,
+  type BaseEditor,
+  type Descendant,
+} from "slate";
+import { Editable, ReactEditor, Slate, withReact } from "slate-react";
+import { withHistory } from "slate-history";
+import type { TabMention } from "@/lib/protocol";
+import ArrowUp from "~icons/tabler/arrow-up";
+import PlayerStop from "~icons/tabler/player-stop";
+
+type Mention = {
+  type: "mention";
+  tab: TabMention;
+  children: [{ text: string }];
+};
+type Paragraph = {
+  type: "paragraph";
+  children: ({ text: string } | Mention)[];
+};
+declare module "slate" {
+  interface CustomTypes {
+    Editor: BaseEditor & ReactEditor;
+    Element: Paragraph | Mention;
+    Text: { text: string };
+  }
+}
+
+export function serializeDraft(nodes: Descendant[]): string {
+  const serialize = (node: Descendant): string =>
+    Element.isElement(node)
+      ? node.type === "mention"
+        ? `@${node.tab.title || node.tab.url} (tab ${node.tab.id}, ${node.tab.path}, ${node.tab.url})`
+        : node.children.map(serialize).join("")
+      : Node.string(node);
+  return nodes.map(serialize).join("\n").trim();
+}
+
+export function Composer(props: {
+  disabled: boolean;
+  running: boolean;
+  configured: boolean;
+  tabs: TabMention[];
+  onListTabs: () => void;
+  onSend: (text: string) => void;
+  onStop: () => void;
+}) {
+  const editor = useMemo(() => {
+    const editor = withReact(withHistory(createEditor()));
+    const { isInline, isVoid } = editor;
+    editor.isInline = (node) => node.type === "mention" || isInline(node);
+    editor.isVoid = (node) => node.type === "mention" || isVoid(node);
+    // Pasted rich text/Slate fragments are untrusted; accept plain text only.
+    editor.insertData = (data) => editor.insertText(data.getData("text/plain"));
+    return editor;
+  }, []);
+  const [target, setTarget] = useState<Range | null>(null);
+  const [search, setSearch] = useState("");
+  const [index, setIndex] = useState(0);
+  const [text, setText] = useState("");
+  const matches = props.tabs
+    .filter((tab) =>
+      `${tab.title} ${tab.url}`.toLowerCase().includes(search.toLowerCase()),
+    )
+    .slice(0, 8);
+  const send = () => {
+    const value = serializeDraft(editor.children);
+    if (!value || value.length > 16000 || props.disabled) return;
+    props.onSend(value);
+    Transforms.select(editor, Editor.range(editor, []));
+    Transforms.delete(editor);
+    setTarget(null);
+  };
+  const mention = (tab: TabMention) => {
+    if (!target) return;
+    Transforms.select(editor, target);
+    Transforms.insertNodes(editor, {
+      type: "mention",
+      tab,
+      children: [{ text: "" }],
+    });
+    Transforms.move(editor);
+    Transforms.insertText(editor, " ");
+    setTarget(null);
+    ReactEditor.focus(editor);
+  };
+  return (
+    <Slate
+      editor={editor}
+      initialValue={[{ type: "paragraph", children: [{ text: "" }] }]}
+      onChange={() => {
+        setText(serializeDraft(editor.children));
+        const selection = editor.selection;
+        if (selection && Range.isCollapsed(selection)) {
+          const start = Editor.start(editor, selection.anchor.path);
+          const before = Editor.string(editor, {
+            anchor: start,
+            focus: selection.anchor,
+          });
+          const match = /(?:^|\s)@([^@\n]*)$/.exec(before);
+          if (match) {
+            const anchor = {
+              ...selection.anchor,
+              offset: selection.anchor.offset - match[1]!.length - 1,
+            };
+            if (!target) props.onListTabs();
+            setTarget({ anchor, focus: selection.anchor });
+            setSearch(match[1]!);
+            setIndex(0);
+            return;
+          }
+        }
+        setTarget(null);
+      }}
+    >
+      <div class="composer__editor-row">
+        <Editable
+          className="composer__editor"
+          aria-label="Message"
+          readOnly={props.disabled}
+          role="textbox"
+          aria-multiline="true"
+          aria-autocomplete="list"
+          aria-expanded={!!target}
+          aria-controls={target ? "tab-suggestions" : undefined}
+          aria-activedescendant={
+            target && matches[index]
+              ? `tab-option-${matches[index]!.id}`
+              : undefined
+          }
+          placeholder={
+            props.configured
+              ? "Ask a task, @ for tabs…"
+              : "Add an API key in settings to start."
+          }
+          renderElement={({ attributes, children, element }) =>
+            element.type === "mention" ? (
+              <span
+                {...attributes}
+                className="tab-mention"
+                contentEditable={false}
+                title={element.tab.url}
+              >
+                {children}@{element.tab.title || element.tab.url}
+              </span>
+            ) : (
+              <div {...attributes}>{children}</div>
+            )
+          }
+          onKeyDown={(event) => {
+            if (event.isComposing) return;
+            if (target) {
+              if (event.key === "Escape") {
+                event.preventDefault();
+                setTarget(null);
+                return;
+              }
+              if (
+                matches.length &&
+                ["ArrowDown", "ArrowUp", "Enter", "Tab"].includes(event.key)
+              ) {
+                event.preventDefault();
+                if (event.key === "ArrowDown")
+                  setIndex((index + 1) % matches.length);
+                else if (event.key === "ArrowUp")
+                  setIndex((index + matches.length - 1) % matches.length);
+                else mention(matches[index]!);
+                return;
+              }
+            }
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
+              send();
+            }
+          }}
+        />
+        {props.running ? (
+          <button
+            class="composer__send"
+            type="button"
+            aria-label="Stop response"
+            title="Stop response"
+            onClick={props.onStop}
+          >
+            <PlayerStop />
+          </button>
+        ) : (
+          <button
+            class="composer__send"
+            type="button"
+            aria-label="Send message"
+            title="Send message"
+            disabled={props.disabled || !text || text.length > 16000}
+            onClick={send}
+          >
+            <ArrowUp />
+          </button>
+        )}
+      </div>
+      {text.length > 16000 && (
+        <p class="sidebar__error">
+          Message is too long (maximum 16,000 characters).
+        </p>
+      )}
+      {target && (
+        <div
+          class="tab-suggestions"
+          id="tab-suggestions"
+          role="listbox"
+          aria-label="Open tabs"
+        >
+          <div class="tab-suggestions__heading">Mention a tab</div>
+          {matches.length ? (
+            matches.map((tab, i) => (
+              <div
+                key={tab.id}
+                role="option"
+                id={`tab-option-${tab.id}`}
+                aria-selected={index === i}
+                class="tab-suggestions__option"
+                onMouseDown={(event) => {
+                  event.preventDefault();
+                  mention(tab);
+                }}
+              >
+                <strong>{tab.title || tab.url}</strong>
+                <small>{tab.url}</small>
+              </div>
+            ))
+          ) : (
+            <p>No matching tabs</p>
+          )}
+        </div>
+      )}
+    </Slate>
+  );
+}

@@ -1,5 +1,6 @@
 import { defineConfig } from "wxt";
 import preact from "@preact/preset-vite";
+import Icons from "unplugin-icons/vite";
 
 const CSP =
   "default-src 'self'; script-src 'self'; object-src 'none'; connect-src 'self' https://api.openai.com; img-src 'self' data:; style-src 'self' 'unsafe-inline'";
@@ -8,7 +9,7 @@ export default defineConfig({
   browser: "firefox",
   manifestVersion: 2,
   vite: () => ({
-    plugins: [preact()],
+    plugins: [preact(), Icons({ compiler: "jsx", jsx: "preact" })],
   }),
   manifest: {
     icons: { "32": "icon.svg" },

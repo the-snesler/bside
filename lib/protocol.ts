@@ -21,6 +21,7 @@ import type {
 } from "@/lib/domain/tools";
 import type { ConversationRecordV1 } from "@/lib/domain/conversation";
 import type { AppSettingsV1, ProviderDefinition } from "@/lib/domain/provider";
+import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
 
 // ---------------------------------------------------------------------------
 // Content script <-> background: PageRequest / PageResponse (tabs.sendMessage)
@@ -170,6 +171,8 @@ export interface NormalizedError {
 export const SIDEBAR_PORT_NAME = "agent-sidebar:v1";
 
 export type SidebarCommand =
+  | { v: 1; id: string; type: "tabs.list" }
+  | { v: 1; id: string; type: "settings.save"; settings: AppSettingsV1 }
   | { v: 1; id: string; type: "context.reset" | "context.export" }
   | { v: 1; id: string; type: "state.subscribe"; lastSeq: number | null }
   | { v: 1; id: string; type: "run.start"; prompt: string }
@@ -213,6 +216,7 @@ export interface EventBase<T extends string, P> {
 export const RUN_CANCELLED_SUFFIX = "\n\n[Stopped: cancelled before this response finished.]";
 
 export type SidebarEvent =
+  | EventBase<"tabs.listed", { tabs: TabMention[] }>
   | EventBase<"context.exported", { requestId: string; markdown: string; filename: string }>
   | EventBase<"state.snapshot", RuntimeSnapshot>
   | EventBase<"page.attached", PageArtifactSummary | null>
@@ -228,6 +232,8 @@ export type SidebarEvent =
 export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (!isEnvelope(value)) return false;
   const candidate = value as Record<string, unknown>;
+  if (candidate.type === "tabs.list") return true;
+  if (candidate.type === "settings.save") return isAppSettings(candidate.settings);
   if (candidate.type === "context.reset" || candidate.type === "context.export") return true;
   if (candidate.type === "state.subscribe") {
     return candidate.lastSeq === null || typeof candidate.lastSeq === "number";
@@ -278,6 +284,16 @@ export function isSettingsRequest(value: unknown): value is SettingsRequest {
   if (!isEnvelope(value)) return false;
   const candidate = value as Record<string, unknown>;
   if (candidate.type === "settings.get") return true;
-  if (candidate.type === "settings.save") return typeof candidate.settings === "object" && candidate.settings !== null;
+  if (candidate.type === "settings.save") return isAppSettings(candidate.settings);
   return false;
+}
+
+export interface TabMention { id: number; title: string; url: string; path: string }
+
+export function isAppSettings(value: unknown): value is AppSettingsV1 {
+  if (!value || typeof value !== "object") return false;
+  const settings = value as AppSettingsV1;
+  const model = OPENAI_PROVIDER.models.find((model) => model.id === settings.modelId);
+  return Object.keys(value).length === 4 && settings.version === 1 && settings.providerId === "openai" &&
+    !!model && (model.reasoningEfforts as readonly string[]).includes(settings.reasoningEffort);
 }
