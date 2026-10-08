@@ -10,7 +10,7 @@
  */
 
 import { storage } from "wxt/utils/storage";
-import type { AppSettingsV1, ReasoningEffort } from "@/lib/domain/provider";
+import type { AppSettingsV1, ModelDefinition, ReasoningEffort } from "@/lib/domain/provider";
 import type { ConversationItem, ConversationRecordV1 } from "@/lib/domain/conversation";
 import { DEFAULT_MODEL_ID, DEFAULT_REASONING_EFFORT } from "@/lib/providers/openai-models";
 
@@ -20,6 +20,22 @@ export interface OpenAICredentialV1 {
   version: 1;
   apiKey: string;
   updatedAt: number;
+}
+
+export interface ChatGPTCredentialV1 {
+  version: 1;
+  salt: string;
+  iv: string;
+  ciphertext: string;
+  models: ModelDefinition[];
+}
+
+export interface ChatGPTRegistrationV1 {
+  version: 1;
+  hostId: string;
+  clientId: string | null;
+  subject: string | null;
+  redirectUri: string;
 }
 
 export type RunStatus = "running" | "awaiting-approval" | "cancelled" | "failed" | "completed";
@@ -53,6 +69,9 @@ const appSettingsItem = storage.defineItem<AppSettingsV1>("local:appSettings", {
 const openaiCredentialItem = storage.defineItem<OpenAICredentialV1>("local:openaiCredential", {
   version: 1,
 });
+
+const chatgptCredentialItem = storage.defineItem<ChatGPTCredentialV1>("local:chatgptCredential", { version: 1 });
+const chatgptRegistrationItem = storage.defineItem<ChatGPTRegistrationV1>("local:chatgptRegistration", { version: 1 });
 
 const conversationItem = storage.defineItem<ConversationRecordV1>("local:conversation", {
   version: 1,
@@ -166,6 +185,44 @@ export async function getCredentialStatus(): Promise<CredentialStatus> {
   const credential = await getOpenAICredential();
   if (!credential) return { configured: false, maskedSuffix: null };
   return { configured: true, maskedSuffix: credential.apiKey.slice(-4) };
+}
+
+/** Background-only. OAuth tokens are encrypted; catalog metadata contains no credentials. */
+export async function getChatGPTCredential(): Promise<ChatGPTCredentialV1 | null> {
+  const raw = await chatgptCredentialItem.getValue();
+  if (raw?.version === 1 && typeof raw.salt === "string" && raw.salt.length === 24 &&
+    typeof raw.iv === "string" && raw.iv.length === 16 && typeof raw.ciphertext === "string" &&
+    raw.ciphertext.length > 0 && raw.ciphertext.length < 200_000 && Array.isArray(raw.models) &&
+    raw.models.length > 0 && raw.models.length <= 200 && raw.models.every((model) =>
+      model && typeof model.id === "string" && /^[\w.:-]{1,200}$/.test(model.id) &&
+      typeof model.name === "string" && model.name.length <= 200 && Array.isArray(model.reasoningEfforts) &&
+      model.reasoningEfforts.length > 0 && model.reasoningEfforts.every(isReasoningEffort) &&
+      isReasoningEffort(model.defaultReasoningEffort) && model.reasoningEfforts.includes(model.defaultReasoningEffort))) return raw;
+  if (raw !== null) await chatgptCredentialItem.removeValue();
+  return null;
+}
+
+export async function saveChatGPTCredential(credential: ChatGPTCredentialV1): Promise<void> {
+  await chatgptCredentialItem.setValue(credential);
+}
+
+export async function deleteChatGPTCredential(): Promise<void> {
+  await chatgptCredentialItem.removeValue();
+}
+
+/** Non-secret registration survives disconnect so reauthorization reuses the issued client ID. */
+export async function getChatGPTRegistration(): Promise<ChatGPTRegistrationV1 | null> {
+  const raw = await chatgptRegistrationItem.getValue();
+  if (raw?.version === 1 && typeof raw.hostId === "string" && /^urn:uuid:[\da-f-]{36}$/i.test(raw.hostId) &&
+    (raw.clientId === null || (typeof raw.clientId === "string" && /^[\w-]{1,200}$/.test(raw.clientId))) &&
+    (raw.subject === null || typeof raw.subject === "string") && typeof raw.redirectUri === "string" &&
+    /^http:\/\/127\.0\.0\.1\/mozoauth2\/[\w-]+$/.test(raw.redirectUri)) return raw;
+  if (raw !== null) await chatgptRegistrationItem.removeValue();
+  return null;
+}
+
+export async function saveChatGPTRegistration(registration: ChatGPTRegistrationV1): Promise<void> {
+  await chatgptRegistrationItem.setValue(registration);
 }
 
 // ---------------------------------------------------------------------------

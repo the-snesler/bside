@@ -13,7 +13,6 @@ import { Composer } from "@/lib/ui/Composer";
 import { useBottomScroll } from "@/lib/ui/use-bottom-scroll";
 import type { ReasoningEffort } from "@/lib/domain/provider";
 import { useBackground } from "@/lib/ui/use-background";
-import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
 import type {
   PageArtifactSummary,
   ToolCall,
@@ -207,6 +206,7 @@ export function App() {
     notice,
     lastError,
     credential,
+    provider,
     settings,
     tabs,
     listTabs,
@@ -223,8 +223,8 @@ export function App() {
 
   const composerDisabled = activeRun !== null || !credential.configured;
   const model =
-    OPENAI_PROVIDER.models.find((model) => model.id === settings.modelId) ??
-    OPENAI_PROVIDER.models[1];
+    provider.models.find((model) => model.id === settings.modelId) ??
+    provider.models[0];
   const timeline = buildTimeline(conversation.items);
   const pendingApproval = activeRun?.pendingApproval ?? null;
 
@@ -397,7 +397,7 @@ export function App() {
             value={settings.modelId}
             disabled={!!activeRun}
             onChange={(event) => {
-              const next = OPENAI_PROVIDER.models.find(
+              const next = provider.models.find(
                 (candidate) => candidate.id === event.currentTarget.value,
               )!;
               saveSettings({
@@ -411,7 +411,7 @@ export function App() {
               });
             }}
           >
-            {OPENAI_PROVIDER.models.map((model) => (
+            {provider.models.map((model) => (
               <option key={model.id} value={model.id}>
                 {model.name}
               </option>
@@ -429,7 +429,7 @@ export function App() {
               })
             }
           >
-            {model.reasoningEfforts.map((effort) => (
+            {model?.reasoningEfforts.map((effort) => (
               <option key={effort} value={effort}>
                 {effort[0]!.toUpperCase() + effort.slice(1)}
               </option>

@@ -1,10 +1,6 @@
 /**
- * Static, source-controlled OpenAI model/reasoning catalog. Provider
- * capabilities — not UI branches — supply model choices; the sidebar and
- * options selects read this definition rather than hardcoding options.
- *
- * Do not query `/models` to populate this catalog; `OpenAIProvider.validateAuth`
- * calls `models.list()` only to validate a new key.
+ * Source-controlled API-key model/reasoning defaults. The background replaces
+ * model choices with the signed-in account's catalog for ChatGPT subscriptions.
  */
 
 import type { ProviderDefinition } from "@/lib/domain/provider";
@@ -33,7 +29,10 @@ const OPENAI_MODELS = [
 export const OPENAI_PROVIDER = {
   id: "openai",
   name: "OpenAI",
-  authMethods: [{ id: "api-key", kind: "api-key", label: "OpenAI API key" }],
+  authMethods: [
+    { id: "api-key", kind: "api-key", label: "OpenAI API key" },
+    { id: "chatgpt", kind: "oauth", label: "ChatGPT subscription" },
+  ],
   models: OPENAI_MODELS,
 } as const satisfies ProviderDefinition;
 

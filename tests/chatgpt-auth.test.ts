@@ -1,0 +1,154 @@
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
+import { ChatGPTAuth, type ChatGPTIdentityApi } from "@/lib/background/chatgpt-auth";
+import { getChatGPTCredential, getChatGPTRegistration, saveOpenAICredential, getOpenAICredential } from "@/lib/storage";
+
+let keys: Awaited<ReturnType<typeof generateKeyPair>>;
+let jwk: Awaited<ReturnType<typeof exportJWK>>;
+beforeAll(async () => { keys = await generateKeyPair("RS256"); jwk = await exportJWK(keys.publicKey); });
+beforeEach(() => { fakeBrowser.reset(); vi.restoreAllMocks(); });
+
+function harness(options: { callback?: (url: URL) => void; nonce?: string; scopes?: string; refreshStatus?: number; revokeStatus?: number; issuer?: string; audience?: string } = {}) {
+  let authorization: URL;
+  const tokenRequests: URLSearchParams[] = [];
+  const identity: ChatGPTIdentityApi = {
+    getRedirectURL: () => "https://test-addon.extensions.allizom.org/",
+    launchWebAuthFlow: vi.fn(async (details) => {
+      authorization = new URL(details.url);
+      expect(details.redirect_uri).toBe("http://127.0.0.1/mozoauth2/test-addon");
+      const callback = new URL(details.redirect_uri);
+      callback.search = new URLSearchParams({ code: "test-code", state: authorization.searchParams.get("state")!, client_id: "oaiapp_test" }).toString();
+      options.callback?.(callback);
+      return callback.href;
+    }),
+  };
+  const fetcher = vi.fn<typeof fetch>(async (input, init) => {
+    const url = String(input);
+    if (url.endsWith("/oauth/token")) {
+      const request = new URLSearchParams(init?.body as URLSearchParams);
+      tokenRequests.push(request);
+      const refresh = request.get("grant_type") === "refresh_token";
+      if (refresh && options.refreshStatus) return new Response("private token error", { status: options.refreshStatus });
+      const idToken = await new SignJWT({ email: "user@example.test", nonce: options.nonce ?? authorization.searchParams.get("nonce") })
+        .setProtectedHeader({ alg: "RS256" }).setSubject("test-user").setIssuer(options.issuer ?? "https://auth.openai.com")
+        .setAudience(options.audience ?? "oaiapp_test").setIssuedAt().setExpirationTime("1h").sign(keys.privateKey);
+      return Response.json({ access_token: refresh ? "test-access-rotated" : "test-access", refresh_token: refresh ? "test-refresh-rotated" : "test-refresh",
+        ...(refresh ? {} : { id_token: idToken }), token_type: "Bearer", expires_in: 3600,
+        scope: options.scopes ?? "openid email offline_access resource.invoke chatgpt.tokens.use.direct" });
+    }
+    if (url.endsWith("/jwks.json")) return Response.json({ keys: [jwk] });
+    if (url.endsWith("/models")) return Response.json({ models: [
+      { slug: "gpt-5.6-terra", display_name: "GPT-5.6 Terra", visibility: "list" },
+      { slug: "gpt-6.1-sol", display_name: "GPT-6.1 Sol", visibility: "list" },
+      { slug: "hidden", display_name: "Hidden", visibility: "hidden" },
+    ] });
+    if (url.endsWith("/oauth/revoke")) return new Response("", { status: options.revokeStatus ?? 200 });
+    throw new Error("unexpected authentication request");
+  });
+  return { identity, fetcher, tokenRequests, auth: new ChatGPTAuth(identity, fetcher), authorization: () => authorization };
+}
+
+describe("ChatGPT subscription OAuth and encrypted storage", () => {
+  it("uses PKCE, validates the signed account, encrypts all tokens, and publishes only safe status", async () => {
+    const h = harness();
+    await h.auth.login("12345678");
+    const url = h.authorization();
+    expect(url.searchParams.get("client_id")).toBe("dynamic_agent_client");
+    expect(url.searchParams.get("agent_name_hint")).toBe("bside");
+    expect(url.searchParams.get("resource")).toBe("https://api.openai.com/v1");
+    expect(url.searchParams.get("scope")).toContain("chatgpt.tokens.use.direct");
+    const verifier = h.tokenRequests[0]!.get("code_verifier")!;
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
+    const challenge = btoa(Array.from(digest, (byte) => String.fromCharCode(byte)).join("")).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    expect(url.searchParams.get("code_challenge")).toBe(challenge);
+    expect(h.tokenRequests[0]!.get("client_id")).toBe("oaiapp_test");
+    expect(h.tokenRequests[0]!.get("redirect_uri")).toBe(url.searchParams.get("redirect_uri"));
+    const stored = JSON.stringify(await browser.storage.local.get(null));
+    for (const secret of ["test-access", "test-refresh", "12345678", "user@example.test", "id_token"]) expect(stored).not.toContain(secret);
+    const status = await h.auth.status();
+    expect(status).toEqual({ connected: true, locked: false, email: "user@example.test" });
+    expect(JSON.stringify(status)).not.toContain("test-access");
+    expect((await h.auth.models())?.map((model) => model.id)).toEqual(["gpt-5.6-terra", "gpt-6.1-sol"]);
+    expect(await h.auth.getAuth(new AbortController().signal)).toMatchObject({ method: "chatgpt", secret: "test-access" });
+  });
+
+  it("locks after restart, rejects the wrong PIN without overwriting storage, and unlocks with the right PIN", async () => {
+    const h = harness();
+    await h.auth.login("12345678");
+    const saved = await getChatGPTCredential();
+    const restarted = new ChatGPTAuth(h.identity, h.fetcher);
+    expect(await restarted.status()).toEqual({ connected: true, locked: true, email: null });
+    await expect(restarted.getAuth(new AbortController().signal)).rejects.toMatchObject({ code: "AUTHENTICATION" });
+    await expect(restarted.unlock("87654321")).rejects.toMatchObject({ message: expect.stringContaining("Incorrect PIN") });
+    expect(await getChatGPTCredential()).toEqual(saved);
+    await restarted.unlock("12345678");
+    expect(await restarted.getAuth(new AbortController().signal)).toMatchObject({ secret: "test-access" });
+    await restarted.lock();
+    expect((await restarted.status()).locked).toBe(true);
+  });
+
+  it("serializes rotating refresh tokens and saves a new IV with the replacement tokens", async () => {
+    const h = harness();
+    await h.auth.login("12345678");
+    const saved = await getChatGPTCredential();
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 3_600_000);
+    const [first, second] = await Promise.all([h.auth.getAuth(new AbortController().signal), h.auth.getAuth(new AbortController().signal)]);
+    expect(first.secret).toBe("test-access-rotated");
+    expect(second).toEqual(first);
+    expect(h.tokenRequests).toHaveLength(2);
+    expect(h.tokenRequests[1]!.get("refresh_token")).toBe("test-refresh");
+    const replacement = await getChatGPTCredential();
+    expect(replacement?.iv).not.toBe(saved?.iv);
+    expect(replacement?.salt).toBe(saved?.salt);
+    const restarted = new ChatGPTAuth(h.identity, h.fetcher);
+    await restarted.unlock("12345678");
+    expect((await restarted.getAuth(new AbortController().signal)).secret).toBe("test-access-rotated");
+  });
+
+  it.each([
+    { callback: (url: URL) => url.searchParams.set("state", "wrong-state") },
+    { callback: (url: URL) => { url.pathname += "-forged"; } },
+    { callback: (url: URL) => url.searchParams.delete("client_id") },
+    { nonce: "wrong-nonce" },
+    { issuer: "https://attacker.example" },
+    { audience: "wrong-client" },
+    { scopes: "openid email" },
+  ])("rejects invalid callbacks, identity, or missing plan consent before saving credentials", async (options) => {
+    const h = harness(options);
+    await expect(h.auth.login("12345678")).rejects.toMatchObject({ code: "AUTHENTICATION" });
+    expect(await getChatGPTCredential()).toBeNull();
+  });
+
+  it("reuses the registration and host ID when reconnecting, and supports changing a forgotten PIN", async () => {
+    const h = harness();
+    await h.auth.login("12345678");
+    const registration = await getChatGPTRegistration();
+    await h.auth.lock();
+    await h.auth.login("87654321");
+    expect(h.authorization().searchParams.get("client_id")).toBe("oaiapp_test");
+    expect(h.authorization().searchParams.has("agent_name_hint")).toBe(false);
+    expect(await getChatGPTRegistration()).toEqual(registration);
+    await h.auth.lock();
+    await expect(h.auth.unlock("12345678")).rejects.toMatchObject({ code: "AUTHENTICATION" });
+    await h.auth.unlock("87654321");
+  });
+
+  it("retains saved credentials on refresh failure and sanitizes upstream error bodies", async () => {
+    const h = harness({ refreshStatus: 500 });
+    await h.auth.login("12345678");
+    const saved = await getChatGPTCredential();
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 3_600_000);
+    await expect(h.auth.getAuth(new AbortController().signal)).rejects.toMatchObject({ code: "PROVIDER_UNAVAILABLE", retryable: true, message: expect.not.stringContaining("private token error") });
+    expect(await getChatGPTCredential()).toEqual(saved);
+  });
+
+  it("disconnects locally when revocation fails and leaves an existing API key intact", async () => {
+    const h = harness({ revokeStatus: 503 });
+    await saveOpenAICredential("sk-test-existing-key");
+    await h.auth.login("12345678");
+    expect(await h.auth.disconnect()).toBe(false);
+    expect(await h.auth.status()).toEqual({ connected: false, locked: false, email: null });
+    expect(await getChatGPTCredential()).toBeNull();
+    expect((await getOpenAICredential())?.apiKey).toBe("sk-test-existing-key");
+  });
+});

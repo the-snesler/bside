@@ -13,6 +13,7 @@ import type { NormalizedError, RuntimeSnapshot, SidebarCommand, SidebarEvent } f
 import type { ConversationItem } from "@/lib/domain/conversation";
 import type { AppSettingsV1 } from "@/lib/domain/provider";
 import type { TabMention } from "@/lib/protocol";
+import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
 
 export interface BackgroundState extends RuntimeSnapshot {
   tabs: TabMention[];
@@ -33,7 +34,8 @@ export interface BackgroundActions {
 const INITIAL_STATE: BackgroundState = {
   tabs: [],
   conversation: { version: 1, id: "default", items: [], updatedAt: 0 },
-  credential: { configured: false, maskedSuffix: null },
+  credential: { configured: false, maskedSuffix: null, chatgpt: { connected: false, locked: false, email: null } },
+  provider: OPENAI_PROVIDER,
   settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
   page: null,
   activeRun: null,

@@ -137,7 +137,7 @@ export function Composer(props: {
           placeholder={
             props.configured
               ? "Ask a task, @ for tabs…"
-              : "Add an API key in settings to start."
+              : "Connect or unlock OpenAI in settings to start."
           }
           renderElement={({ attributes, children, element }) =>
             element.type === "mention" ? (

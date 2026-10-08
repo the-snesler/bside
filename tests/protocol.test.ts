@@ -87,6 +87,21 @@ describe("isCredentialRequest: accepts every valid variant, rejects malformed in
     expect(isCredentialRequest({ v: 1, id: "1", type: "credentials.openai.delete" })).toBe(true);
   });
 
+  it("accepts ChatGPT account actions only with a valid PIN where required", () => {
+    for (const action of ["login", "unlock"]) {
+      const request = { v: 1, id: "1", type: `credentials.chatgpt.${action}`, pin: "12345678" };
+      expect(isCredentialRequest(request)).toBe(true);
+      expect(isSidebarCommand(request)).toBe(false);
+      for (const pin of [undefined, 12345678, "1234567", "abcd1234", "1".repeat(65)])
+        expect(isCredentialRequest({ ...request, pin })).toBe(false);
+    }
+    for (const action of ["lock", "disconnect", "test"]) {
+      const request = { v: 1, id: "1", type: `credentials.chatgpt.${action}` };
+      expect(isCredentialRequest(request)).toBe(true);
+      expect(isSidebarCommand(request)).toBe(false);
+    }
+  });
+
   it("rejects save with a missing apiKey", () => {
     expect(isCredentialRequest({ v: 1, id: "1", type: "credentials.openai.save" })).toBe(false);
   });

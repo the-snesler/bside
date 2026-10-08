@@ -10,7 +10,13 @@ export type ProviderId = "openai";
 
 export type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 
-export type ProviderAuth = { providerId: "openai"; method: "api-key"; secret: string };
+export type ProviderAuth = { providerId: "openai"; method: "api-key" | "chatgpt"; secret: string };
+
+export interface ChatGPTStatus {
+  connected: boolean;
+  locked: boolean;
+  email: string | null;
+}
 
 /** Persisted + wire-transmittable selection of provider/model/reasoning effort. */
 export interface AppSettingsV1 {

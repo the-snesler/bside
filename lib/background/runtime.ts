@@ -11,12 +11,13 @@
  */
 
 import { AgentLoop } from "@/lib/background/agent-loop";
+import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { WorkspaceState } from "@/lib/background/browser-program";
 import type { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController } from "@/lib/background/tab-controller";
 import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
-import { OpenAIProvider, ProviderStreamError } from "@/lib/providers/openai";
-import { OPENAI_PROVIDER, DEFAULT_MODEL_ID, DEFAULT_REASONING_EFFORT } from "@/lib/providers/openai-models";
+import { decodeProviderError, OpenAIProvider, ProviderStreamError } from "@/lib/providers/openai";
+import { OPENAI_PROVIDER, DEFAULT_MODEL_ID } from "@/lib/providers/openai-models";
 import {
   appendConversationItem,
   clearRunCheckpoint,
@@ -35,7 +36,7 @@ import type { RunStatus } from "@/lib/storage";
 import { validatePromptText } from "@/lib/validation";
 import type { ContextArtifact } from "@/lib/domain/tools";
 import type { ConversationItem } from "@/lib/domain/conversation";
-import type { AppSettingsV1, ProviderAdapter, ProviderAuth } from "@/lib/domain/provider";
+import type { AppSettingsV1, ModelDefinition, ProviderAdapter, ProviderAuth, ProviderDefinition } from "@/lib/domain/provider";
 import type {
   ApprovalRequest,
   CredentialRequest,
@@ -81,6 +82,8 @@ interface ActiveRun {
 export class BackgroundRuntime {
   #sidebarHub: SidebarHub;
   #provider: ProviderAdapter;
+  #chatgpt: ChatGPTAuth;
+  #modelCatalog: readonly ModelDefinition[] = OPENAI_PROVIDER.models;
   #tabControllerFactory: () => TabController;
   #activeRun: ActiveRun | null = null;
   #notice: string | null = null;
@@ -94,10 +97,14 @@ export class BackgroundRuntime {
 
   constructor(
     sidebarHub: SidebarHub,
-    options: { provider?: ProviderAdapter; tabControllerFactory?: () => TabController } = {},
+    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController } = {},
   ) {
     this.#sidebarHub = sidebarHub;
-    this.#provider = options.provider ?? new OpenAIProvider();
+    this.#chatgpt = options.chatgpt ?? new ChatGPTAuth();
+    this.#provider = options.provider ?? new OpenAIProvider(
+      async (auth, signal) => auth.method === "chatgpt" ? this.#chatgpt.getAuth(signal) : auth,
+      (id) => this.#modelCatalog.find((model) => model.id === id),
+    );
     this.#tabControllerFactory = options.tabControllerFactory ?? (() => new TabController(browser as unknown as TabControllerBrowserApi));
   }
 
@@ -107,16 +114,18 @@ export class BackgroundRuntime {
   }
 
   async getSnapshot(): Promise<RuntimeSnapshot> {
-    const [conversation, credential, settings] = await Promise.all([
+    const [conversation, credential, settings, provider] = await Promise.all([
       getConversation(),
-      getCredentialStatus(),
+      this.#getCredentialStatus(),
       this.#getValidatedSettings(),
+      this.#getProviderDefinition(),
     ]);
     const notice = this.#notice;
     this.#notice = null;
     return {
       conversation,
-      credential,
+      credential: { ...credential, configured: credential.chatgpt.connected ? !credential.chatgpt.locked : credential.configured },
+      provider,
       settings,
       page: this.#sidebarHub.currentAttachment(),
       activeRun: this.#activeRun
@@ -199,28 +208,50 @@ export class BackgroundRuntime {
   }
 
   async handleCredentialRequest(request: CredentialRequest): Promise<CredentialResponse> {
-    if (request.type === "credentials.openai.status") {
-      const status = await getCredentialStatus();
-      return { v: 1, id: request.id, ok: true, ...status };
-    }
-    if (request.type === "credentials.openai.delete") {
-      await deleteStoredCredential();
-      // Connected sidebars subscribe once; push the new credential state to them.
-      await this.#sidebarHub.broadcastSnapshot();
-      return { v: 1, id: request.id, ok: true, configured: false, maskedSuffix: null };
-    }
-
-    // credentials.openai.save: validate through the provider before ever replacing the prior key.
-    const auth: ProviderAuth = { providerId: "openai", method: "api-key", secret: request.apiKey };
     try {
-      await this.#provider.validateAuth(auth, new AbortController().signal);
+      let notice: string | null = null;
+      if (request.type !== "credentials.openai.status") {
+        if (this.#activeRun) throw new ProviderStreamError("Wait for the active run to finish before changing or testing credentials.", "INVALID_REQUEST");
+        if (request.type === "credentials.openai.save") {
+          await this.#provider.validateAuth({ providerId: "openai", method: "api-key", secret: request.apiKey }, new AbortController().signal);
+          await saveOpenAICredential(request.apiKey);
+        } else if (request.type === "credentials.openai.delete") await deleteStoredCredential();
+        else if (request.type === "credentials.chatgpt.login") await this.#chatgpt.login(request.pin);
+        else if (request.type === "credentials.chatgpt.unlock") await this.#chatgpt.unlock(request.pin);
+        else if (request.type === "credentials.chatgpt.lock") await this.#chatgpt.lock();
+        else if (request.type === "credentials.chatgpt.disconnect") {
+          if (!await this.#chatgpt.disconnect()) notice = "Disconnected locally. Remote revocation was not confirmed; disconnect bside in ChatGPT settings to revoke access.";
+        } else if (request.type === "credentials.chatgpt.test") {
+          const signal = AbortSignal.timeout(120_000);
+          const auth = await this.#chatgpt.getAuth(signal);
+          const settings = await this.#getValidatedSettings();
+          const model = this.#provider.getModel(settings.modelId);
+          if (!model) throw new ProviderStreamError("The selected model is unavailable.", "INVALID_REQUEST");
+          let completed = false;
+          for await (const event of this.#provider.streamTurn({ model, reasoningEffort: settings.reasoningEffort,
+            context: { messages: [{ role: "user", content: "Reply exactly: ChatGPT connection works.", timestamp: Date.now() }], tools: [] } }, auth, signal)) {
+            if (event.type === "error") throw decodeProviderError(event.error.errorMessage);
+            if (event.type === "done" && event.reason === "stop") completed = true;
+          }
+          if (!completed) throw new ProviderStreamError("ChatGPT did not complete the test response.", "PROVIDER_RESPONSE_FAILED");
+          notice = "ChatGPT connection works. A streamed response completed using your subscription.";
+        }
+        await this.#sidebarHub.broadcastSnapshot();
+      }
+      return { v: 1, id: request.id, ok: true, ...await this.#getCredentialStatus(), notice };
     } catch (error) {
       return { v: 1, id: request.id, ok: false, error: toNormalizedError(error, "setup") };
     }
-    await saveOpenAICredential(request.apiKey);
-    await this.#sidebarHub.broadcastSnapshot();
-    const status = await getCredentialStatus();
-    return { v: 1, id: request.id, ok: true, ...status };
+  }
+
+  async #getCredentialStatus() {
+    const [apiKey, chatgpt] = await Promise.all([getCredentialStatus(), this.#chatgpt.status()]);
+    return { ...apiKey, chatgpt };
+  }
+
+  async #getProviderDefinition(): Promise<ProviderDefinition> {
+    this.#modelCatalog = await this.#chatgpt.models() ?? OPENAI_PROVIDER.models;
+    return { ...OPENAI_PROVIDER, models: this.#modelCatalog };
   }
 
   async handleSettingsRequest(request: SettingsRequest): Promise<SettingsResponse> {
@@ -228,25 +259,31 @@ export class BackgroundRuntime {
       const settings = await this.#getValidatedSettings();
       const notice = this.#notice;
       this.#notice = null;
-      return { v: 1, id: request.id, ok: true, settings, provider: OPENAI_PROVIDER, notice };
+      return { v: 1, id: request.id, ok: true, settings, provider: await this.#getProviderDefinition(), notice };
     }
+    const provider = await this.#getProviderDefinition();
+    const model = provider.models.find((model) => model.id === request.settings.modelId);
+    if (this.#activeRun || !model || !model.reasoningEfforts.includes(request.settings.reasoningEffort))
+      return { v: 1, id: request.id, ok: false, error: toNormalizedError(new ProviderStreamError("The model/reasoning selection is unavailable or a run is active.", "INVALID_REQUEST"), "setup") };
     await saveAppSettings(request.settings);
     await this.#sidebarHub.broadcastSnapshot();
-    return { v: 1, id: request.id, ok: true, settings: request.settings, provider: OPENAI_PROVIDER, notice: null };
+    return { v: 1, id: request.id, ok: true, settings: request.settings, provider, notice: null };
   }
 
   /** Resets an invalid persisted model/effort combination once, surfacing a one-time notice. */
   async #getValidatedSettings(): Promise<AppSettingsV1> {
     const settings = await getAppSettings();
-    const model = OPENAI_PROVIDER.models.find((candidate) => candidate.id === settings.modelId);
+    const provider = await this.#getProviderDefinition();
+    const model = provider.models.find((candidate) => candidate.id === settings.modelId);
     if (model && (model.reasoningEfforts as readonly string[]).includes(settings.reasoningEffort)) {
       return settings;
     }
+    const defaultModel = provider.models.find((candidate) => candidate.id === DEFAULT_MODEL_ID) ?? provider.models[0]!;
     const fallback: AppSettingsV1 = {
       version: 1,
       providerId: "openai",
-      modelId: DEFAULT_MODEL_ID,
-      reasoningEffort: DEFAULT_REASONING_EFFORT,
+      modelId: defaultModel.id,
+      reasoningEffort: defaultModel.defaultReasoningEffort,
     };
     await saveAppSettings(fallback);
     this.#notice = "Your saved model/reasoning combination was invalid, so settings were reset to defaults.";
@@ -283,10 +320,15 @@ export class BackgroundRuntime {
       lastCheckpointAt: 0,
     };
 
-    const credential = await getOpenAICredential();
-    if (!credential) {
+    let auth: ProviderAuth;
+    try {
+      const chatgpt = await this.#chatgpt.status();
+      const credential = chatgpt.connected ? null : await getOpenAICredential();
+      if (!chatgpt.connected && !credential) throw new ProviderStreamError("Sign in with ChatGPT or add an OpenAI API key in settings before starting a conversation.", "AUTHENTICATION");
+      auth = chatgpt.connected ? await this.#chatgpt.getAuth(controller.signal) : { providerId: "openai", method: "api-key", secret: credential!.apiKey };
+    } catch (error) {
       this.#activeRun = null;
-      this.#notice = "Add an OpenAI API key in settings before starting a conversation.";
+      this.#notice = toNormalizedError(error, "setup").message;
       await this.#sidebarHub.broadcastSnapshot();
       return;
     }
@@ -319,15 +361,14 @@ export class BackgroundRuntime {
     // Pi owns assistant/tool replay during this run. Persisted tool items are
     // display/audit records only, so a new run starts from message history.
     const transcript = conversation.items.filter((item) => item.kind === "message");
-    await this.#runAgentLoop(runId, transcript, artifact, credential.apiKey);
+    await this.#runAgentLoop(runId, transcript, artifact, auth);
   }
 
-  async #runAgentLoop(runId: string, transcript: ConversationItem[], artifact: ContextArtifact | null, apiKey: string): Promise<void> {
+  async #runAgentLoop(runId: string, transcript: ConversationItem[], artifact: ContextArtifact | null, auth: ProviderAuth): Promise<void> {
     const run = this.#activeRun;
     if (!run || run.runId !== runId) return;
 
     const settings = await this.#getValidatedSettings();
-    const auth: ProviderAuth = { providerId: "openai", method: "api-key", secret: apiKey };
     const record: RunRecord = {
       runId, modelId: settings.modelId, reasoningEffort: settings.reasoningEffort, startedAt: Date.now(), endedAt: null, status: "running", error: null,
       providerResponses: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0 }, toolCalls: [],

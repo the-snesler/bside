@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Browser } from "wxt/browser";
 import { BackgroundRuntime } from "@/lib/background/runtime";
+import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController } from "@/lib/background/tab-controller";
 import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
@@ -381,6 +382,71 @@ describe("BackgroundRuntime: cancellation", () => {
 });
 
 describe("BackgroundRuntime: credential and settings changes from the options page", () => {
+  function subscription(locked = false) {
+    const auth = new ChatGPTAuth();
+    vi.spyOn(auth, "status").mockResolvedValue({ connected: true, locked, email: locked ? null : "user@example.test" });
+    vi.spyOn(auth, "models").mockResolvedValue([{ id: "account-model", name: "Account model", reasoningEfforts: ["none"], defaultReasoningEffort: "none" }]);
+    vi.spyOn(auth, "getAuth").mockImplementation(async () => {
+      if (locked) throw new ProviderStreamError("Unlock ChatGPT in settings.", "AUTHENTICATION");
+      return { providerId: "openai", method: "chatgpt", secret: "test-subscription-token" };
+    });
+    return auth;
+  }
+
+  it("uses the subscription and account model while keeping tokens out of snapshots and exports", async () => {
+    await saveOpenAICredential("sk-test-existing-key");
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    const stream = vi.spyOn(provider, "streamTurn");
+    provider.script = [{ type: "text.delta", delta: "Hello." }, { type: "turn.completed", replayState: null }];
+    const runtime = new BackgroundRuntime(hub, { provider, chatgpt: subscription(), tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Hello" });
+    expect(stream.mock.calls[0]?.[1]).toMatchObject({ method: "chatgpt", secret: "test-subscription-token" });
+    const snapshot = await runtime.getSnapshot();
+    expect(snapshot.settings).toMatchObject({ modelId: "account-model", reasoningEffort: "none" });
+    expect(snapshot.provider.models.map((model) => model.id)).toEqual(["account-model"]);
+    expect(snapshot.credential).toMatchObject({ configured: true, chatgpt: { connected: true, locked: false } });
+    const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export" });
+    for (const value of [JSON.stringify(snapshot), exported.markdown]) {
+      expect(value).not.toContain("test-subscription-token");
+      expect(value).not.toContain("sk-test-existing-key");
+    }
+  });
+
+  it("blocks a locked subscription without falling back to the saved API key", async () => {
+    await saveOpenAICredential("sk-test-existing-key");
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    const runtime = new BackgroundRuntime(hub, { provider, chatgpt: subscription(true), tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Hello" });
+    expect(provider.requests).toEqual([]);
+    expect((await getConversation()).items).toEqual([]);
+    expect((await runtime.getSnapshot()).credential.configured).toBe(false);
+  });
+
+  it("runs the connection test without page tools or changing the conversation", async () => {
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    provider.script = [{ type: "text.delta", delta: "ChatGPT connection works." }, { type: "turn.completed", replayState: null }];
+    const runtime = new BackgroundRuntime(hub, { provider, chatgpt: subscription(), tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const result = await runtime.handleCredentialRequest({ v: 1, id: "test", type: "credentials.chatgpt.test" });
+    expect(result).toMatchObject({ ok: true, notice: expect.stringContaining("connection works") });
+    expect(provider.requests[0]?.context.tools).toEqual([]);
+    expect((await getConversation()).items).toEqual([]);
+    expect((await runtime.getSnapshot()).activeRun).toBeNull();
+    expect(JSON.stringify(result)).not.toContain("test-subscription-token");
+  });
+
+  it("rejects models and reasoning efforts outside the account catalog", async () => {
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), chatgpt: subscription() });
+    const settings = { version: 1 as const, providerId: "openai" as const, modelId: "account-model", reasoningEffort: "high" as const };
+    expect(await runtime.handleSettingsRequest({ v: 1, id: "effort", type: "settings.save", settings })).toMatchObject({ ok: false });
+    expect(await runtime.handleSettingsRequest({ v: 1, id: "model", type: "settings.save", settings: { ...settings, modelId: "not-in-account" } })).toMatchObject({ ok: false });
+  });
+
   it("pushes new credential state to already-connected sidebars without reconnecting", async () => {
     const hub = new SidebarHub();
     const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });

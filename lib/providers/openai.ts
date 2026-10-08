@@ -17,6 +17,7 @@ import type {
   ProviderAuth,
   ProviderDefinition,
   ProviderTurnRequest,
+  ModelDefinition,
 } from "@/lib/domain/provider";
 import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
 
@@ -62,12 +63,32 @@ const provider = openaiProvider();
 
 export class OpenAIProvider implements ProviderAdapter {
   readonly definition: ProviderDefinition = OPENAI_PROVIDER;
+  #resolveAuth: (auth: ProviderAuth, signal: AbortSignal) => Promise<ProviderAuth>;
+  #findModel: (id: string) => ModelDefinition | undefined;
+
+  constructor(
+    resolveAuth = async (auth: ProviderAuth, _signal: AbortSignal) => auth,
+    findModel: (id: string) => ModelDefinition | undefined = () => undefined,
+  ) {
+    this.#resolveAuth = resolveAuth;
+    this.#findModel = findModel;
+  }
 
   getModel(modelId: string): Model<Api> | null {
-    return provider.getModels().find((candidate) => candidate.id === modelId) ?? null;
+    const known = provider.getModels().find((candidate) => candidate.id === modelId);
+    if (known) return known;
+    const accountModel = this.#findModel(modelId);
+    // A server-listed model can be newer than Pi's bundled catalog. Omit
+    // reasoning controls and pricing/limit assumptions for unknown models.
+    return accountModel ? {
+      id: modelId, name: accountModel.name, api: "openai-responses", provider: "openai", baseUrl: API_BASE_URL,
+      reasoning: false, input: ["text", "image"], contextWindow: 0, maxTokens: MAX_OUTPUT_TOKENS,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, compat: { supportsStrictMode: true },
+    } : null;
   }
 
   async validateAuth(auth: ProviderAuth, signal: AbortSignal): Promise<void> {
+    auth = await this.#resolveAuth(auth, signal);
     let response: Response;
     try {
       response = await fetch(`${API_BASE_URL}/models`, {
@@ -78,7 +99,7 @@ export class OpenAIProvider implements ProviderAdapter {
       if (signal.aborted) throw new ProviderStreamError("The request was cancelled.", "TIMEOUT");
       throw new ProviderStreamError(error instanceof TypeError ? "Could not reach OpenAI." : "OpenAI authentication failed.", "NETWORK");
     }
-    if (!response.ok) throw fromStatus(response.status, response.headers.get("x-request-id") ?? undefined);
+    if (!response.ok) throw fromStatus(response.status, response.headers.get("x-request-id") ?? undefined, auth.method);
   }
 
   streamTurn(request: ProviderTurnRequest, auth: ProviderAuth, signal: AbortSignal) {
@@ -101,33 +122,42 @@ export class OpenAIProvider implements ProviderAdapter {
     if (!hasApi(request.model, "openai-responses")) {
       throw new ProviderStreamError("The selected model is not compatible with OpenAI Responses.", "INVALID_REQUEST");
     }
-    const source = provider.streamSimple(request.model, request.context, {
-      apiKey: auth.secret,
-      signal,
-      fetch: safeFetch,
-      reasoning: request.reasoningEffort === "none" ? undefined : request.reasoningEffort,
-      maxTokens: MAX_OUTPUT_TOKENS,
-      timeoutMs: REQUEST_TIMEOUT_MS,
-      maxRetries: 0,
-      cacheRetention: "none",
-      transport: "sse",
-      onPayload: enforceRequestPolicy,
-    });
-
+    const model = request.model;
     void (async () => {
-      for await (const event of source) {
-        if (event.type !== "error") {
-          output.push(event);
-          continue;
+      try {
+        auth = await this.#resolveAuth(auth, signal);
+        const source = provider.streamSimple(auth.method === "chatgpt" ? {
+          ...model, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        } : model, request.context, {
+          apiKey: auth.secret, signal, fetch: safeFetch,
+          reasoning: request.reasoningEffort === "none" ? undefined : request.reasoningEffort,
+          maxTokens: MAX_OUTPUT_TOKENS, timeoutMs: REQUEST_TIMEOUT_MS, maxRetries: 0, cacheRetention: "none", transport: "sse",
+          onPayload: (payload) => enforceRequestPolicy(payload, auth.method),
+        });
+        for await (const event of source) {
+          if (event.type !== "error") {
+            output.push(event);
+            continue;
+          }
+          const normalized = signal.aborted
+            ? new ProviderStreamError("The request was cancelled.", "TIMEOUT")
+            : networkFailed
+              ? new ProviderStreamError("Could not reach OpenAI.", "NETWORK")
+              : auth.method === "chatgpt" && /subscription_sharing_usage_(limit_exceeded|unavailable)/.test(event.error.errorMessage ?? "")
+                ? new ProviderStreamError("ChatGPT plan usage is unavailable or its limit has been reached. Review usage in ChatGPT settings.", "RATE_LIMIT", responseMeta.status, responseMeta.requestId)
+                : responseMeta.status !== undefined
+                  ? fromStatus(responseMeta.status, responseMeta.requestId, auth.method)
+                  : new ProviderStreamError("OpenAI did not complete the response.", "PROVIDER_RESPONSE_FAILED");
+          output.push({ ...event, error: withSafeError(event.error, normalized) });
         }
-        const normalized = signal.aborted
-          ? new ProviderStreamError("The request was cancelled.", "TIMEOUT")
-          : networkFailed
-            ? new ProviderStreamError("Could not reach OpenAI.", "NETWORK")
-            : responseMeta.status !== undefined
-              ? fromStatus(responseMeta.status, responseMeta.requestId)
-              : new ProviderStreamError("OpenAI did not complete the response.", "PROVIDER_RESPONSE_FAILED");
-        output.push({ ...event, error: withSafeError(event.error, normalized) });
+      } catch (error) {
+        const normalized = signal.aborted ? new ProviderStreamError("The request was cancelled.", "TIMEOUT") :
+          error instanceof ProviderStreamError ? error : new ProviderStreamError("OpenAI did not complete the response.", "PROVIDER_RESPONSE_FAILED");
+        output.push({ type: "error", reason: "error", error: {
+          role: "assistant", content: [], api: request.model.api, provider: request.model.provider, model: request.model.id,
+          timestamp: Date.now(), stopReason: "error", errorMessage: encodeProviderErrorMessage(normalized),
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        } });
       }
       output.end();
     })();
@@ -158,17 +188,28 @@ export function encodeProviderErrorMessage(error: ProviderStreamError): string {
   return `${SAFE_ERROR_PREFIX}${JSON.stringify(safe)}`;
 }
 
-function enforceRequestPolicy(payload: unknown): unknown {
+function enforceRequestPolicy(payload: unknown, method: ProviderAuth["method"]): unknown {
   if (!isRecord(payload)) return payload;
-  return { ...payload, store: false, parallel_tool_calls: false };
+  const result = { ...payload, store: false, parallel_tool_calls: false };
+  if (method === "api-key") return result;
+  const subscription: Record<string, unknown> = result;
+  for (const field of ["background", "conversation", "max_output_tokens", "max_tool_calls", "metadata", "moderation", "multi_agent",
+    "prompt", "prompt_cache_retention", "prompt_cache_options", "safety_identifier", "temperature", "top_logprobs", "top_p", "truncation", "user", "previous_response_id"])
+    delete subscription[field];
+  const input = Array.isArray(subscription.input) ? subscription.input.map((item) =>
+    isRecord(item) && item.role === "system" ? { ...item, role: "developer" } : item) : [];
+  // additional_tools keeps our tool names and Pi's tool-call replay intact.
+  if (Array.isArray(subscription.tools) && subscription.tools.length) input.unshift({ type: "additional_tools", role: "developer", tools: subscription.tools });
+  delete subscription.tools;
+  return { ...subscription, input, stream: true };
 }
 
 function withSafeError(message: AssistantMessage, error: ProviderStreamError): AssistantMessage {
   return { ...message, errorMessage: encodeProviderErrorMessage(error) };
 }
 
-function fromStatus(status: number, requestId?: string): ProviderStreamError {
-  if (status === 401 || status === 403) return new ProviderStreamError("The OpenAI API key was rejected.", "AUTHENTICATION", status, requestId);
+function fromStatus(status: number, requestId?: string, method: ProviderAuth["method"] = "api-key"): ProviderStreamError {
+  if (status === 401 || status === 403) return new ProviderStreamError(method === "chatgpt" ? "The ChatGPT connection was rejected. Reconnect in settings." : "The OpenAI API key was rejected.", "AUTHENTICATION", status, requestId);
   if (status === 429) return new ProviderStreamError("OpenAI is rate limiting requests. Try again shortly.", "RATE_LIMIT", status, requestId);
   if (status === 408) return new ProviderStreamError("The OpenAI request timed out.", "TIMEOUT", status, requestId);
   if (status >= 400 && status < 500) return new ProviderStreamError("OpenAI rejected the request.", "INVALID_REQUEST", status, requestId);

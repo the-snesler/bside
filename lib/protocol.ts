@@ -20,8 +20,7 @@ import type {
   ToolResult,
 } from "@/lib/domain/tools";
 import type { ConversationRecordV1 } from "@/lib/domain/conversation";
-import type { AppSettingsV1, ProviderDefinition } from "@/lib/domain/provider";
-import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
+import type { AppSettingsV1, ChatGPTStatus, ProviderDefinition } from "@/lib/domain/provider";
 import { validateDomAction } from "@/lib/validation";
 
 // ---------------------------------------------------------------------------
@@ -223,7 +222,8 @@ export interface ApprovalRequest {
 
 export interface RuntimeSnapshot {
   conversation: ConversationRecordV1;
-  credential: { configured: boolean; maskedSuffix: string | null };
+  credential: { configured: boolean; maskedSuffix: string | null; chatgpt: ChatGPTStatus };
+  provider: ProviderDefinition;
   settings: AppSettingsV1;
   page: PageArtifactSummary | null;
   activeRun: {
@@ -291,10 +291,12 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
 export type CredentialRequest =
   | { v: 1; id: string; type: "credentials.openai.status" }
   | { v: 1; id: string; type: "credentials.openai.save"; apiKey: string }
-  | { v: 1; id: string; type: "credentials.openai.delete" };
+  | { v: 1; id: string; type: "credentials.openai.delete" }
+  | { v: 1; id: string; type: "credentials.chatgpt.login" | "credentials.chatgpt.unlock"; pin: string }
+  | { v: 1; id: string; type: "credentials.chatgpt.lock" | "credentials.chatgpt.disconnect" | "credentials.chatgpt.test" };
 
 export type CredentialResponse =
-  | { v: 1; id: string; ok: true; configured: boolean; maskedSuffix: string | null }
+  | { v: 1; id: string; ok: true; configured: boolean; maskedSuffix: string | null; chatgpt: ChatGPTStatus; notice: string | null }
   | { v: 1; id: string; ok: false; error: NormalizedError };
 
 export type SettingsRequest =
@@ -311,6 +313,9 @@ export function isCredentialRequest(value: unknown): value is CredentialRequest 
   if (candidate.type === "credentials.openai.status") return true;
   if (candidate.type === "credentials.openai.save") return typeof candidate.apiKey === "string";
   if (candidate.type === "credentials.openai.delete") return true;
+  if (candidate.type === "credentials.chatgpt.login" || candidate.type === "credentials.chatgpt.unlock")
+    return typeof candidate.pin === "string" && /^\d{8,64}$/.test(candidate.pin);
+  if (candidate.type === "credentials.chatgpt.lock" || candidate.type === "credentials.chatgpt.disconnect" || candidate.type === "credentials.chatgpt.test") return true;
   return false;
 }
 
@@ -327,7 +332,7 @@ export interface TabMention { id: number; title: string; url: string; path: stri
 export function isAppSettings(value: unknown): value is AppSettingsV1 {
   if (!value || typeof value !== "object") return false;
   const settings = value as AppSettingsV1;
-  const model = OPENAI_PROVIDER.models.find((model) => model.id === settings.modelId);
   return Object.keys(value).length === 4 && settings.version === 1 && settings.providerId === "openai" &&
-    !!model && (model.reasoningEfforts as readonly string[]).includes(settings.reasoningEffort);
+    typeof settings.modelId === "string" && /^[\w.:-]{1,200}$/.test(settings.modelId) &&
+    ["none", "low", "medium", "high", "xhigh", "max"].includes(settings.reasoningEffort);
 }
