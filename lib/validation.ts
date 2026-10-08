@@ -5,110 +5,118 @@
  * on, by the agent loop after the provider returns complete arguments.
  */
 
-import type { JsonValue } from "@/lib/domain/tools";
+import type { DomAction, ElementTarget, JsonValue, PressKey, UploadFile } from "@/lib/domain/tools";
 
-const MAX_REF_LEN = 128;
-const MAX_REVISION_LEN = 128;
-const MAX_FILL_TEXT_LEN = 8000;
+const MAX_REF_LEN = 32;
+const MAX_DOCUMENT_ID_LEN = 64;
+const MAX_ROLE_LEN = 64;
+const MAX_NAME_LEN = 1000;
+const MAX_FILL_TEXT_LEN = 16_000;
 const MAX_URL_LEN = 2048;
 const MAX_SELECT_VALUES = 20;
 const MAX_SELECT_VALUE_LEN = 256;
+export const MAX_UPLOAD_FILES = 5;
+export const MAX_UPLOAD_FILE_CHARS = 32_000;
+export const PRESS_KEYS: readonly PressKey[] = ["Enter", "Tab", "Escape", "Space", "Backspace", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"];
 
 export function isRecord(value: JsonValue): value is { [key: string]: JsonValue } {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isBoundedString(value: JsonValue | undefined, maxLength: number): value is string {
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isBoundedString(value: unknown, maxLength: number): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= maxLength;
 }
 
-export interface ClickArgs {
-  ref: string;
-  revision: string;
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value);
+  return actual.length === keys.length && keys.every((key) => key in value);
 }
 
-export function validateClickArgs(args: JsonValue): ClickArgs | null {
-  if (!isRecord(args)) return null;
-  const { ref, revision, ...rest } = args;
-  if (Object.keys(rest).length > 0) return null;
-  if (!isBoundedString(ref, MAX_REF_LEN) || !isBoundedString(revision, MAX_REVISION_LEN)) return null;
-  return { ref, revision };
-}
-
-export interface FillArgs {
-  ref: string;
-  revision: string;
-  text: string;
-}
-
-export function validateFillArgs(args: JsonValue): FillArgs | null {
-  if (!isRecord(args)) return null;
-  const { ref, revision, text, ...rest } = args;
-  if (Object.keys(rest).length > 0) return null;
-  if (!isBoundedString(ref, MAX_REF_LEN) || !isBoundedString(revision, MAX_REVISION_LEN)) return null;
-  if (typeof text !== "string" || text.length > MAX_FILL_TEXT_LEN) return null;
-  return { ref, revision, text };
-}
-
-export interface SelectOptionArgs {
-  ref: string;
-  revision: string;
-  values: string[];
-}
-
-export function validateSelectOptionArgs(args: JsonValue): SelectOptionArgs | null {
-  if (!isRecord(args)) return null;
-  const { ref, revision, values, ...rest } = args;
-  if (Object.keys(rest).length > 0) return null;
-  if (!isBoundedString(ref, MAX_REF_LEN) || !isBoundedString(revision, MAX_REVISION_LEN)) return null;
-  if (!Array.isArray(values) || values.length === 0 || values.length > MAX_SELECT_VALUES) return null;
-  for (const value of values) {
-    if (typeof value !== "string" || value.length === 0 || value.length > MAX_SELECT_VALUE_LEN) return null;
+export function validateElementTarget(raw: unknown): ElementTarget | null {
+  if (!isObject(raw)) return null;
+  if (raw.kind === "ref") {
+    if (!hasExactKeys(raw, ["kind", "ref", "documentId"])) return null;
+    if (typeof raw.ref !== "string" || !/^e[1-9]\d{0,8}$/.test(raw.ref) || raw.ref.length > MAX_REF_LEN) return null;
+    if (!isBoundedString(raw.documentId, MAX_DOCUMENT_ID_LEN)) return null;
+    return { kind: "ref", ref: raw.ref, documentId: raw.documentId };
   }
-  return { ref, revision, values: values as string[] };
+  if (raw.kind === "role") {
+    if (!hasExactKeys(raw, ["kind", "role", "name", "exact"])) return null;
+    if (!isBoundedString(raw.role, MAX_ROLE_LEN) || typeof raw.exact !== "boolean") return null;
+    if (raw.name !== null && (typeof raw.name !== "string" || raw.name.length > MAX_NAME_LEN)) return null;
+    return { kind: "role", role: raw.role, name: raw.name, exact: raw.exact };
+  }
+  return null;
 }
 
-export interface SetCheckedArgs {
-  ref: string;
-  revision: string;
-  checked: boolean;
+function validateUploadFile(raw: unknown): UploadFile | null {
+  if (!isObject(raw) || !hasExactKeys(raw, ["name", "mimeType", "text"])) return null;
+  if (!isBoundedString(raw.name, 255) || /[\\/\x00-\x1f]/.test(raw.name)) return null;
+  if (typeof raw.mimeType !== "string" || !/^[a-z]+\/[a-z0-9.+-]+$/i.test(raw.mimeType)) return null;
+  if (typeof raw.text !== "string" || raw.text.length > MAX_UPLOAD_FILE_CHARS) return null;
+  return { name: raw.name, mimeType: raw.mimeType, text: raw.text };
 }
 
-export function validateSetCheckedArgs(args: JsonValue): SetCheckedArgs | null {
-  if (!isRecord(args)) return null;
-  const { ref, revision, checked, ...rest } = args;
-  if (Object.keys(rest).length > 0) return null;
-  if (!isBoundedString(ref, MAX_REF_LEN) || !isBoundedString(revision, MAX_REVISION_LEN)) return null;
-  if (typeof checked !== "boolean") return null;
-  return { ref, revision, checked };
+/** Strict, `additionalProperties:false`-equivalent validation of the closed DOM action union. */
+export function validateDomAction(raw: unknown): DomAction | null {
+  if (!isObject(raw)) return null;
+  const target = () => validateElementTarget(raw.target);
+  switch (raw.kind) {
+    case "click": {
+      const t = target();
+      return t && hasExactKeys(raw, ["kind", "target"]) ? { kind: "click", target: t } : null;
+    }
+    case "fill": {
+      const t = target();
+      if (!t || !hasExactKeys(raw, ["kind", "target", "text"])) return null;
+      if (typeof raw.text !== "string" || raw.text.length > MAX_FILL_TEXT_LEN) return null;
+      return { kind: "fill", target: t, text: raw.text };
+    }
+    case "select": {
+      const t = target();
+      if (!t || !hasExactKeys(raw, ["kind", "target", "values"])) return null;
+      if (!Array.isArray(raw.values) || raw.values.length === 0 || raw.values.length > MAX_SELECT_VALUES) return null;
+      if (!raw.values.every((value) => typeof value === "string" && value.length <= MAX_SELECT_VALUE_LEN)) return null;
+      return { kind: "select", target: t, values: raw.values as string[] };
+    }
+    case "check": {
+      const t = target();
+      if (!t || !hasExactKeys(raw, ["kind", "target", "checked"]) || typeof raw.checked !== "boolean") return null;
+      return { kind: "check", target: t, checked: raw.checked };
+    }
+    case "press": {
+      const t = target();
+      if (!t || !hasExactKeys(raw, ["kind", "target", "key"])) return null;
+      if (!(PRESS_KEYS as readonly unknown[]).includes(raw.key)) return null;
+      return { kind: "press", target: t, key: raw.key as PressKey };
+    }
+    case "upload": {
+      const t = target();
+      if (!t || !hasExactKeys(raw, ["kind", "target", "files"])) return null;
+      if (!Array.isArray(raw.files) || raw.files.length === 0 || raw.files.length > MAX_UPLOAD_FILES) return null;
+      const files = raw.files.map(validateUploadFile);
+      if (files.some((file) => file === null)) return null;
+      return { kind: "upload", target: t, files: files as UploadFile[] };
+    }
+    case "scroll": {
+      if (!hasExactKeys(raw, ["kind", "target", "direction", "amount"])) return null;
+      const t = raw.target === null ? null : target();
+      if (raw.target !== null && !t) return null;
+      if (raw.direction !== "up" && raw.direction !== "down" && raw.direction !== "left" && raw.direction !== "right") return null;
+      if (raw.amount !== "line" && raw.amount !== "page") return null;
+      return { kind: "scroll", target: t, direction: raw.direction, amount: raw.amount };
+    }
+    default:
+      return null;
+  }
 }
 
-export interface ScrollArgs {
-  ref: string | null;
-  revision: string;
-  direction: "up" | "down" | "left" | "right";
-  amount: "line" | "page";
-}
-
-export function validateScrollArgs(args: JsonValue): ScrollArgs | null {
-  if (!isRecord(args)) return null;
-  const { ref, revision, direction, amount, ...rest } = args;
-  if (Object.keys(rest).length > 0) return null;
-  if (ref !== null && !isBoundedString(ref, MAX_REF_LEN)) return null;
-  if (!isBoundedString(revision, MAX_REVISION_LEN)) return null;
-  if (direction !== "up" && direction !== "down" && direction !== "left" && direction !== "right") return null;
-  if (amount !== "line" && amount !== "page") return null;
-  return { ref: ref === null ? null : ref, revision, direction, amount };
-}
-
-export interface NavigateArgs {
-  url: string;
-}
-
-export function validateNavigateArgs(args: JsonValue): NavigateArgs | null {
-  if (!isRecord(args)) return null;
-  const { url, ...rest } = args;
-  if (Object.keys(rest).length > 0) return null;
+/** Accepts only absolute HTTP(S) URLs within the length bound. */
+export function validateHttpUrl(url: unknown): string | null {
   if (!isBoundedString(url, MAX_URL_LEN)) return null;
   let parsed: URL;
   try {
@@ -117,25 +125,7 @@ export function validateNavigateArgs(args: JsonValue): NavigateArgs | null {
     return null;
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
-  return { url };
-}
-
-export function validateGoBackArgs(args: JsonValue): Record<string, never> | null {
-  if (!isRecord(args)) return null;
-  if (Object.keys(args).length > 0) return null;
-  return {};
-}
-
-export interface SnapshotArgs {
-  mode: "readable" | "interactive";
-}
-
-export function validateSnapshotArgs(args: JsonValue): SnapshotArgs | null {
-  if (!isRecord(args)) return null;
-  const { mode, ...rest } = args;
-  if (Object.keys(rest).length > 0) return null;
-  if (mode !== "readable" && mode !== "interactive") return null;
-  return { mode };
+  return url;
 }
 
 const MAX_API_KEY_LEN = 512;

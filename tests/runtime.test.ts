@@ -7,7 +7,7 @@ import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import { ProviderStreamError } from "@/lib/providers/openai";
 import { saveOpenAICredential, appendConversationItem, getConversation, getOpenAICredential } from "@/lib/storage";
 import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
-import type { PageSnapshotV1 } from "@/lib/domain/tools";
+import type { PageSnapshot } from "@/lib/domain/tools";
 import type { SidebarEvent } from "@/lib/protocol";
 import { TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
 
@@ -29,19 +29,18 @@ function unsupportedPageTabControllerFactory(): TabController {
 
 /** A TabController bound to a browser API that reports one attachable tab with a clickable button. */
 function supportedPageTabControllerFactory(): TabController {
-  const snapshot: PageSnapshotV1 = {
-    version: 1,
+  const text = 'Orchid launch moved to Friday.\n[e1 button "Submit"]';
+  const snapshot: PageSnapshot = {
+    version: 2,
     tabId: 1,
-    revision: "rev-1",
+    documentId: "doc-1",
     url: "http://127.0.0.1:4173/agent-page.html",
-    origin: "http://127.0.0.1:4173",
     title: "Agent Fixture",
-    readableText: "Orchid launch moved to Friday.",
+    text,
+    offset: 0,
+    end: text.length,
+    totalChars: text.length,
     selectionText: "",
-    viewport: { width: 0, height: 0, scrollX: 0, scrollY: 0 },
-    nodes: [{ ref: "e1", role: "button", name: "Submit", tag: "button", state: { disabled: false }, bounds: { x: 0, y: 0, width: 0, height: 0 }, inViewport: true }],
-    truncated: { readableText: false, nodes: false },
-    warnings: [],
   };
   const api: TabControllerBrowserApi = {
     tabs: {
@@ -52,7 +51,7 @@ function supportedPageTabControllerFactory(): TabController {
         const request = message as { id: string; type: string };
         if (request.type === "page.snapshot") return { v: 1, id: request.id, ok: true, type: "page.snapshot", snapshot };
         if (request.type === "page.execute") {
-          return { v: 1, id: request.id, ok: true, type: "page.execute", result: { ok: true, summary: "Clicked Submit." }, snapshot };
+          return { v: 1, id: request.id, ok: true, type: "page.execute", result: { ok: true, summary: "Clicked Submit." }, documentId: snapshot.documentId };
         }
         throw new Error(`unhandled request type: ${request.type}`);
       }),
@@ -95,7 +94,13 @@ describe("context controls", () => {
     const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export" });
     const outputs = exported?.markdown.split("## Full tool output — latest run")[1]?.split("## Conversation log")[0];
     expect(outputs).toContain("Orchid launch moved to Friday.");
-    expect(outputs).toContain("Revision:");
+    expect(outputs).toContain("Document: doc-1");
+    expect(outputs).toContain('"durationMs"');
+    const latestRun = exported?.markdown.split("## Latest run")[1]?.split("## Latest model input")[0];
+    expect(latestRun).toContain('"modelId"');
+    expect(latestRun).toContain('"status": "completed"');
+    expect(latestRun).toContain('"providerResponses": 2');
+    expect(latestRun).toContain('"name": "browser_program"');
     expect(JSON.stringify(await getConversation())).not.toContain("Orchid launch moved to Friday.");
     await runtime.handleCommand({ v: 1, id: "reset", type: "context.reset" });
     expect((await runtime.handleCommand({ v: 1, id: "export2", type: "context.export" }))?.markdown).not.toContain("Orchid launch moved to Friday.");
@@ -372,6 +377,52 @@ describe("BackgroundRuntime: cancellation", () => {
 
     const cancelledEvents = port.received.filter((e) => e.type === "run.cancelled");
     expect(cancelledEvents).toHaveLength(1);
+  });
+});
+
+describe("BackgroundRuntime: credential and settings changes from the options page", () => {
+  it("pushes new credential state to already-connected sidebars without reconnecting", async () => {
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+    await port.send({ v: 1, id: "sub", type: "state.subscribe", lastSeq: null });
+    const credentialStates = () => port.received.flatMap((event) => event.type === "state.snapshot" ? [event.payload.credential.configured] : []);
+    expect(credentialStates()).toEqual([false]);
+
+    expect(await runtime.handleCredentialRequest({ v: 1, id: "save", type: "credentials.openai.save", apiKey: "sk-test-1234" })).toMatchObject({ ok: true, configured: true });
+    expect(credentialStates()).toEqual([false, true]);
+    const latest = port.received.at(-1);
+    expect(latest?.type === "state.snapshot" ? latest.payload.credential.maskedSuffix : null).toBe("1234");
+    expect(JSON.stringify(port.received)).not.toContain("sk-test-1234");
+
+    await runtime.handleCredentialRequest({ v: 1, id: "delete", type: "credentials.openai.delete" });
+    expect(credentialStates()).toEqual([false, true, false]);
+  });
+
+  it("does not broadcast when key validation fails", async () => {
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    provider.validateAuth = async () => { throw new ProviderStreamError("The OpenAI API key was rejected.", "AUTHENTICATION", 401); };
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+    expect(await runtime.handleCredentialRequest({ v: 1, id: "save", type: "credentials.openai.save", apiKey: "sk-bad" })).toMatchObject({ ok: false });
+    expect(port.received.some((event) => event.type === "state.snapshot")).toBe(false);
+  });
+
+  it("pushes model changes saved from the options page to connected sidebars", async () => {
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+    const settings = { version: 1 as const, providerId: "openai" as const, modelId: "gpt-5.6-sol", reasoningEffort: "high" as const };
+    await runtime.handleSettingsRequest({ v: 1, id: "s", type: "settings.save", settings });
+    const latest = port.received.at(-1);
+    expect(latest?.type === "state.snapshot" ? latest.payload.settings : null).toEqual(settings);
   });
 });
 

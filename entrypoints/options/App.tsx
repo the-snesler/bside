@@ -29,7 +29,7 @@ export function App() {
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    void (async () => {
+    const refresh = async () => {
       const [credentialResponse, settingsResponse] = await Promise.all([
         sendCredentialRequest({ type: "credentials.openai.status" }),
         sendSettingsRequest({ type: "settings.get" }),
@@ -37,9 +37,16 @@ export function App() {
       if (credentialResponse.ok) setCredential({ configured: credentialResponse.configured, maskedSuffix: credentialResponse.maskedSuffix });
       if (settingsResponse.ok) {
         setSettings(settingsResponse.settings);
-        setNotice(settingsResponse.notice);
+        if (settingsResponse.notice) setNotice(settingsResponse.notice);
       }
-    })();
+    };
+    // Re-read background-owned state when returning to this tab (e.g. after
+    // changing the model in the sidebar). storage.onChanged is avoided on
+    // purpose: its payload would carry the raw key into this page.
+    const onFocus = () => void refresh();
+    void refresh();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
   }, []);
 
   const handleSaveKey = async (event: Event) => {

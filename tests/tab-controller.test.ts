@@ -2,26 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TabController } from "@/lib/background/tab-controller";
 import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import type { PageResponse } from "@/lib/protocol";
-import type { PageSnapshotV1 } from "@/lib/domain/tools";
+import type { PageSnapshot } from "@/lib/domain/tools";
 
 type UpdatedListener = (tabId: number, changeInfo: { status?: string }, tab: { url?: string }) => void;
 type SendMessage = TabControllerBrowserApi["tabs"]["sendMessage"];
 
-function buildSnapshot(url: string, title: string): PageSnapshotV1 {
-  return {
-    version: 1,
-    tabId: 1,
-    revision: `rev-${url}`,
-    url,
-    origin: new URL(url).origin,
-    title,
-    readableText: "",
-    selectionText: "",
-    viewport: { width: 0, height: 0, scrollX: 0, scrollY: 0 },
-    nodes: [],
-    truncated: { readableText: false, nodes: false },
-    warnings: [],
-  };
+function buildSnapshot(url: string, title: string): PageSnapshot {
+  return { version: 2, tabId: 1, documentId: `doc-${url}`, url, title, text: "", offset: 0, end: 0, totalChars: 0, selectionText: "" };
 }
 
 function snapshotResponse(id: string, url: string, title: string): PageResponse {
@@ -116,22 +103,29 @@ describe("TabController: capture and binding", () => {
   });
 });
 
+const CLICK = { kind: "click", target: { kind: "ref", ref: "e1", documentId: "doc" } } as const;
+
 describe("TabController: navigate/back success", () => {
-  it("navigates the bound tab and returns a fresh snapshot", async () => {
+  it("navigates the bound tab and reports the settled URL and title", async () => {
     const { api } = createBrowserApi("http://127.0.0.1:4173/agent-page.html", "Agent Fixture");
     const controller = new TabController(api);
     await controller.captureActivePage();
 
-    const executePromise = controller.execute({
-      id: "c1",
-      name: "page_navigate",
-      arguments: { url: "http://127.0.0.1:4173/next-page.html" },
-    });
+    const navigatePromise = controller.navigate("http://127.0.0.1:4173/next-page.html");
     await vi.advanceTimersByTimeAsync(200);
-    const outcome = await executePromise;
+    const result = await navigatePromise;
 
-    expect(outcome.result.ok).toBe(true);
-    expect(outcome.snapshot?.url).toBe("http://127.0.0.1:4173/next-page.html");
+    expect(result.ok).toBe(true);
+    expect(result.summary).toContain("Navigated to http://127.0.0.1:4173/next-page.html");
+    expect(controller.currentAttachment()?.url).toBe("http://127.0.0.1:4173/next-page.html");
+  });
+
+  it("rejects non-HTTP navigation targets without touching the tab", async () => {
+    const { api } = createBrowserApi("http://127.0.0.1:4173/agent-page.html", "Agent Fixture");
+    const controller = new TabController(api);
+    await controller.captureActivePage();
+    expect(await controller.navigate("javascript:alert(1)")).toMatchObject({ ok: false, code: "INVALID_TOOL_ARGUMENTS" });
+    expect(api.tabs.update).not.toHaveBeenCalled();
   });
 
   it("goes back to the previous page", async () => {
@@ -139,12 +133,9 @@ describe("TabController: navigate/back success", () => {
     const controller = new TabController(api);
     await controller.captureActivePage();
 
-    const executePromise = controller.execute({ id: "c2", name: "page_go_back", arguments: {} });
+    const backPromise = controller.goBack();
     await vi.advanceTimersByTimeAsync(200);
-    const outcome = await executePromise;
-
-    expect(outcome.result.ok).toBe(true);
-    expect(outcome.snapshot).not.toBeNull();
+    expect((await backPromise).ok).toBe(true);
   });
 });
 
@@ -165,21 +156,28 @@ describe("TabController: click-disconnect navigation settlement", () => {
     const controller = new TabController(api);
     await controller.captureActivePage();
 
-    const executePromise = controller.execute({
-      id: "c1",
-      name: "page_click",
-      arguments: { ref: "e1", revision: "rev-http://127.0.0.1:4173/agent-page.html" },
-    });
+    const actPromise = controller.act(CLICK);
     // Let the click's rejection propagate and the settle-navigation listener register.
     await vi.advanceTimersByTimeAsync(0);
     triggerUpdated("complete", "http://127.0.0.1:4173/next-page.html");
     await vi.advanceTimersByTimeAsync(200);
 
-    const outcome = await executePromise;
+    const outcome = await actPromise;
 
     expect(executeAttempts).toBe(1);
     expect(outcome.result.ok).toBe(true);
-    expect(outcome.snapshot).not.toBeNull();
+    expect(outcome.result.summary).toContain("the page navigated");
+    expect(outcome.documentId).toBeNull();
+  });
+
+  it("does not treat a lost fill response as navigation", async () => {
+    const { api } = createBrowserApi("http://127.0.0.1:4173/agent-page.html", "Agent Fixture");
+    const controller = new TabController(api);
+    await controller.captureActivePage();
+    api.tabs.sendMessage = vi.fn(async () => { throw new Error("Invalid tab ID: 1"); });
+
+    const outcome = await controller.act({ kind: "fill", target: CLICK.target, text: "hi" });
+    expect(outcome.result).toMatchObject({ ok: false, code: "TAB_CHANGED" });
   });
 });
 
@@ -195,34 +193,20 @@ describe("TabController: navigation timeout", () => {
       // content script never responds.
     });
 
-    const executePromise = controller.execute({
-      id: "c1",
-      name: "page_navigate",
-      arguments: { url: "http://127.0.0.1:4173/next-page.html" },
-    });
+    const navigatePromise = controller.navigate("http://127.0.0.1:4173/next-page.html");
     await vi.advanceTimersByTimeAsync(10_100);
-    const outcome = await executePromise;
-
-    expect(outcome.result.ok).toBe(false);
-    expect(outcome.result.code).toBe("NAVIGATION_INTERRUPTED");
+    expect(await navigatePromise).toMatchObject({ ok: false, code: "NAVIGATION_INTERRUPTED" });
   });
 });
 
-describe("TabController: stale snapshot pass-through", () => {
-  it("passes through STALE_SNAPSHOT when the page changed underneath a ref", async () => {
+describe("TabController: action results pass through", () => {
+  it("passes through STALE_SNAPSHOT and the executing document id", async () => {
     const { api } = createBrowserApi("http://127.0.0.1:4173/agent-page.html", "Agent Fixture");
     const baseSendMessage = api.tabs.sendMessage as SendMessage;
     api.tabs.sendMessage = vi.fn(async (tabId: number, message: unknown) => {
       const request = message as { id: string; type: string };
       if (request.type === "page.execute") {
-        return {
-          v: 1,
-          id: request.id,
-          ok: true,
-          type: "page.execute",
-          result: { ok: false, code: "STALE_SNAPSHOT", summary: "Snapshot revision is stale." },
-          snapshot: buildSnapshot("http://127.0.0.1:4173/agent-page.html", "Agent Fixture"),
-        } satisfies PageResponse;
+        return { v: 1, id: request.id, ok: true, type: "page.execute", result: { ok: false, code: "STALE_SNAPSHOT", summary: "Ref came from an earlier page load." }, documentId: "doc-new" } satisfies PageResponse;
       }
       return baseSendMessage(tabId, message);
     });
@@ -230,82 +214,17 @@ describe("TabController: stale snapshot pass-through", () => {
     const controller = new TabController(api);
     await controller.captureActivePage();
 
-    const outcome = await controller.execute({
-      id: "c1",
-      name: "page_click",
-      arguments: { ref: "e1", revision: "an-old-revision" },
-    });
-
-    expect(outcome.result.ok).toBe(false);
-    expect(outcome.result.code).toBe("STALE_SNAPSHOT");
+    const outcome = await controller.act(CLICK);
+    expect(outcome.result).toMatchObject({ ok: false, code: "STALE_SNAPSHOT" });
+    expect(outcome.documentId).toBe("doc-new");
   });
-});
 
-describe("TabController: revision grounding (regression)", () => {
-  it("includes the real snapshot revision in a successful tool result's summary, not a guessable placeholder", async () => {
+  it("requests bounded snapshot slices from the bound tab", async () => {
     const { api } = createBrowserApi("http://127.0.0.1:4173/agent-page.html", "Agent Fixture");
     const controller = new TabController(api);
     await controller.captureActivePage();
-
-    const outcome = await controller.execute({ id: "c1", name: "page_snapshot", arguments: { mode: "interactive" } });
-
-    expect(outcome.result.ok).toBe(true);
-    expect(outcome.snapshot).not.toBeNull();
-    // Without this, the model has no textual source for the revision string
-    // every ref-based tool call requires and can only guess (regression:
-    // model guessed "0" and every action failed STALE_SNAPSHOT forever).
-    expect(outcome.result.summary).toContain(`Revision: ${outcome.snapshot?.revision}`);
-  });
-
-  it("includes the real revision after a successful click, so the next call can use it", async () => {
-    const { api } = createBrowserApi("http://127.0.0.1:4173/agent-page.html", "Agent Fixture");
-    const baseSendMessage = api.tabs.sendMessage as SendMessage;
-    api.tabs.sendMessage = vi.fn(async (tabId: number, message: unknown) => {
-      const request = message as { id: string; type: string };
-      if (request.type === "page.execute") {
-        return {
-          v: 1,
-          id: request.id,
-          ok: true,
-          type: "page.execute",
-          result: { ok: true, summary: "Clicked link \"Guestbook\"." },
-          snapshot: buildSnapshot("http://127.0.0.1:4173/agent-page.html", "Agent Fixture"),
-        } satisfies PageResponse;
-      }
-      return baseSendMessage(tabId, message);
-    });
-
-    const controller = new TabController(api);
-    await controller.captureActivePage();
-
-    const outcome = await controller.execute({
-      id: "c1",
-      name: "page_click",
-      arguments: { ref: "e1", revision: "rev-http://127.0.0.1:4173/agent-page.html" },
-    });
-
-    expect(outcome.result.ok).toBe(true);
-    expect(outcome.result.summary).toContain(`Revision: ${outcome.snapshot?.revision}`);
-  });
-});
-
-describe("TabController: missing tab", () => {
-  it("returns TAB_CHANGED when the bound tab is no longer reachable", async () => {
-    const { api } = createBrowserApi("http://127.0.0.1:4173/agent-page.html", "Agent Fixture");
-    const controller = new TabController(api);
-    await controller.captureActivePage();
-
-    api.tabs.sendMessage = vi.fn(async () => {
-      throw new Error("Invalid tab ID: 1");
-    });
-
-    const outcome = await controller.execute({
-      id: "c1",
-      name: "page_fill",
-      arguments: { ref: "e1", revision: "rev", text: "hi" },
-    });
-
-    expect(outcome.result.ok).toBe(false);
-    expect(outcome.result.code).toBe("TAB_CHANGED");
+    const outcome = await controller.snapshot({ offset: 500, maxChars: 2000 });
+    expect(outcome.ok).toBe(true);
+    expect(api.tabs.sendMessage).toHaveBeenLastCalledWith(1, expect.objectContaining({ type: "page.snapshot", offset: 500, maxChars: 2000 }));
   });
 });

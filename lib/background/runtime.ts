@@ -54,6 +54,20 @@ const DELTA_COALESCE_BYTES = 1024;
 
 type RunLifecycleStatus = "running" | "awaiting-approval" | "cancelling";
 
+/** Run-level diagnostics for context export; held in memory only. */
+interface RunRecord {
+  runId: string;
+  modelId: string;
+  reasoningEffort: string;
+  startedAt: number;
+  endedAt: number | null;
+  status: "running" | "completed" | "cancelled" | "failed";
+  error: NormalizedError | null;
+  providerResponses: number;
+  usage: { input: number; output: number; cacheRead: number; cacheWrite: number; totalTokens: number; cost: number };
+  toolCalls: { callId: string; name: string; startedAt: string; durationMs: number; ok: boolean; code: string | null; outputChars: number; truncatedOutput: boolean }[];
+}
+
 interface ActiveRun {
   runId: string;
   controller: AbortController;
@@ -76,6 +90,7 @@ export class BackgroundRuntime {
   #debugOutputs: string[] = [];
   #debugOutputChars = 0;
   #debugOutputTruncated = false;
+  #runRecord: RunRecord | null = null;
 
   constructor(
     sidebarHub: SidebarHub,
@@ -127,7 +142,6 @@ export class BackgroundRuntime {
     if (command.type === "settings.save") {
       if (this.#activeRun) return;
       await this.handleSettingsRequest(command);
-      await this.#sidebarHub.broadcastSnapshot();
       return;
     }
     if (command.type === "context.export") {
@@ -137,7 +151,9 @@ export class BackgroundRuntime {
         return `${delimiter}\n${text}\n${delimiter}`;
       };
       return { filename: `bside-context-${new Date().toISOString().replace(/[:.]/g, "-")}.md`, markdown: [
-        "# bside context export", `Exported: ${new Date().toISOString()}`,
+        "# bside context export", `Exported: ${new Date().toISOString()}`, `Extension version: ${extensionVersion()}`,
+        "## Latest run", "Model, timing, usage, and per-call results for the latest run in this background session.",
+        this.#runRecord ? fence(JSON.stringify(this.#runRecord, null, 2)) : "No run recorded in this background session.",
         "## Latest model input", "This is the most recent request, not an exact live token count. It is held in memory only; after an extension restart only the saved conversation remains. It may include private page content. Credentials are not included.",
         this.#latestContext ? fence(this.#latestContext) : "No model input captured in this background session.",
         "## Full tool output — latest run", "Exact tool results, including bounded page snapshots and errors. Retained only until the next run, context reset, or extension restart. These are the snapshots exposed to the agent, not the entire page DOM.",
@@ -154,6 +170,7 @@ export class BackgroundRuntime {
       try {
         await resetConversation();
         this.#latestContext = null;
+        this.#runRecord = null;
         this.#debugOutputs = [];
         this.#debugOutputChars = 0;
         this.#debugOutputTruncated = false;
@@ -188,6 +205,8 @@ export class BackgroundRuntime {
     }
     if (request.type === "credentials.openai.delete") {
       await deleteStoredCredential();
+      // Connected sidebars subscribe once; push the new credential state to them.
+      await this.#sidebarHub.broadcastSnapshot();
       return { v: 1, id: request.id, ok: true, configured: false, maskedSuffix: null };
     }
 
@@ -199,6 +218,7 @@ export class BackgroundRuntime {
       return { v: 1, id: request.id, ok: false, error: toNormalizedError(error, "setup") };
     }
     await saveOpenAICredential(request.apiKey);
+    await this.#sidebarHub.broadcastSnapshot();
     const status = await getCredentialStatus();
     return { v: 1, id: request.id, ok: true, ...status };
   }
@@ -211,6 +231,7 @@ export class BackgroundRuntime {
       return { v: 1, id: request.id, ok: true, settings, provider: OPENAI_PROVIDER, notice };
     }
     await saveAppSettings(request.settings);
+    await this.#sidebarHub.broadcastSnapshot();
     return { v: 1, id: request.id, ok: true, settings: request.settings, provider: OPENAI_PROVIDER, notice: null };
   }
 
@@ -307,6 +328,11 @@ export class BackgroundRuntime {
 
     const settings = await this.#getValidatedSettings();
     const auth: ProviderAuth = { providerId: "openai", method: "api-key", secret: apiKey };
+    const record: RunRecord = {
+      runId, modelId: settings.modelId, reasoningEffort: settings.reasoningEffort, startedAt: Date.now(), endedAt: null, status: "running", error: null,
+      providerResponses: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0 }, toolCalls: [],
+    };
+    this.#runRecord = record;
     let coalesced = "";
     let lastFlush = Date.now();
 
@@ -325,8 +351,21 @@ export class BackgroundRuntime {
       contextArtifact: artifact,
       auth,
       onContext: (context) => { this.#latestContext = context; },
-      onToolOutput: (call, result) => {
-        const output = JSON.stringify({ call, result }, null, 2);
+      onUsage: (usage) => {
+        record.providerResponses += 1;
+        record.usage.input += usage.input;
+        record.usage.output += usage.output;
+        record.usage.cacheRead += usage.cacheRead;
+        record.usage.cacheWrite += usage.cacheWrite;
+        record.usage.totalTokens += usage.totalTokens;
+        record.usage.cost += usage.cost.total;
+      },
+      onToolOutput: (call, result, timing) => {
+        record.toolCalls.push({
+          callId: call.id, name: call.name, startedAt: new Date(timing.startedAt).toISOString(), durationMs: timing.endedAt - timing.startedAt,
+          ok: result.ok, code: result.code ?? null, outputChars: result.summary.length, truncatedOutput: result.summary.includes("[Output truncated:"),
+        });
+        const output = JSON.stringify({ call, result, timing: { startedAt: new Date(timing.startedAt).toISOString(), durationMs: timing.endedAt - timing.startedAt } }, null, 2);
         this.#debugOutputs.push(output);
         this.#debugOutputChars += output.length;
         while (this.#debugOutputChars > 2_000_000 && this.#debugOutputs.length) {
@@ -356,6 +395,9 @@ export class BackgroundRuntime {
       },
     });
 
+    record.endedAt = Date.now();
+    record.status = result.status;
+    if (result.status === "failed") record.error = result.error;
     if (this.#activeRun?.runId !== runId) return;
     flushDelta();
 
@@ -427,6 +469,14 @@ export class BackgroundRuntime {
     if (this.#activeRun.pendingApproval?.call.id !== callId) return;
     if (approved) this.#activeRun.agentLoop.approve(callId);
     else this.#activeRun.agentLoop.deny(callId);
+  }
+}
+
+function extensionVersion(): string {
+  try {
+    return browser.runtime.getManifest().version;
+  } catch {
+    return "unknown";
   }
 }
 

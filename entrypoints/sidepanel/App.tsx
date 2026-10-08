@@ -51,15 +51,18 @@ function describeToolCall(call: ToolCall): string {
         ? args.source
         : "";
     const actions: [RegExp, string][] = [
-      [/\.click\(/, "Clicking a page control"],
+      [/\.setInputFiles\(/, "Attaching a file"],
+      [/\.click\(|\.press\(/, "Clicking a page control"],
       [/\.fill\(/, "Filling page fields"],
       [/\.selectOption\(/, "Selecting an option"],
-      [/\.setChecked\(/, "Updating a checkbox"],
-      [/\.navigate\(|browser\.open\(/, "Opening a page"],
+      [/\.setChecked\(|\.check\(|\.uncheck\(/, "Updating a checkbox"],
+      [/web\.search\(/, "Searching the web"],
+      [/\.navigate\(|\.goBack\(|browser\.open\(/, "Opening a page"],
       [/fs\.remove\(/, "Removing a file or tab"],
       [/fs\.move\(/, "Moving a file or tab"],
       [/fs\.write\(/, "Writing a scratch file"],
       [/\.scroll\(/, "Scrolling the page"],
+      [/\.find\(|\.waitFor\(/, "Searching page content"],
       [/fs\.read\(|\.snapshot\(/, "Reading page content"],
       [/fs\.list\(/, "Listing tabs and files"],
     ];
@@ -69,14 +72,6 @@ function describeToolCall(call: ToolCall): string {
     );
   }
   if (call.name === "request_action_confirmation") return "Action confirmation";
-  if (call.name === "page_snapshot") return "Captured a page snapshot";
-  if (call.name === "page_scroll") return "Scrolled the page";
-  if (call.name === "page_click") return "Clicked an element";
-  if (call.name === "page_fill") return "Filled a field";
-  if (call.name === "page_select_option") return "Selected an option";
-  if (call.name === "page_set_checked") return "Checked/unchecked a control";
-  if (call.name === "page_navigate") return "Navigated to a new page";
-  if (call.name === "page_go_back") return "Went back";
   return call.name;
 }
 

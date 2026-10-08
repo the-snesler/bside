@@ -1,31 +1,29 @@
 /**
- * Binds a controller to a single HTTP(S) tab and mediates every page tool
- * call against it: DOM effects are forwarded to the content script, while
- * navigate/go_back are driven directly through the tabs API with a fixed
- * settle/probe sequence. The bound tab never changes once captured; a
+ * Binds a controller to a single HTTP(S) tab and mediates every page request
+ * against it: snapshots, find, and DOM actions are forwarded to the content
+ * script, while navigate/go_back are driven directly through the tabs API with
+ * a fixed settle/probe sequence. The bound tab never changes once captured; a
  * newly opened tab is never implicitly adopted. forTab creates a separate
  * controller for an explicitly selected workspace tab.
  */
 
 import type {
-  DomPageToolName,
-  DomToolCall,
   NormalizedError,
   PageExecuteRequest,
+  PageFindRequest,
   PageHealthRequest,
   PageResponse,
+  PageSearchResultsRequest,
   PageSnapshotRequest,
 } from "@/lib/protocol";
-import type { PageArtifactSummary, PageErrorCode, PageSnapshotV1, PageToolCall as ToolCall, ToolResult, SemanticLocator } from "@/lib/domain/tools";
-import {
-  validateGoBackArgs,
-  validateNavigateArgs,
-  validateSnapshotArgs,
-} from "@/lib/validation";
+import type { DomAction, PageArtifactSummary, PageErrorCode, PageFindResult, PageSnapshot, SearchResult, ToolResult } from "@/lib/domain/tools";
+import { validateHttpUrl } from "@/lib/validation";
 
 const NAVIGATION_TIMEOUT_MS = 10_000;
 const PROBE_DELAYS_MS = [100, 200, 400, 800, 1_600, 3_200];
 const UNSUPPORTED_HOSTNAME_SUFFIXES = [".mozilla.org", ".mozilla.com"];
+export const DEFAULT_SNAPSHOT_CHARS = 16_000;
+export const ARTIFACT_SNAPSHOT_CHARS = 8_000;
 
 type TabSnapshot = { id?: number; url?: string; title?: string; hidden?: boolean };
 type TabUpdatedListener = (tabId: number, changeInfo: { status?: string }, tab: TabSnapshot) => void;
@@ -47,8 +45,9 @@ export interface TabControllerBrowserApi {
   };
 }
 
-type PageOutcome<T> = { ok: true; value: T } | { ok: false; error: NormalizedError };
-type ExecuteOutcome = { result: ToolResult; snapshot: PageSnapshotV1 | null };
+export type PageOutcome<T> = { ok: true; value: T } | { ok: false; error: NormalizedError };
+/** A DOM action's result plus the document it ran in (null when the page navigated away). */
+export type ActionOutcome = { result: ToolResult; documentId: string | null };
 
 export class TabController {
   #browserApi: TabControllerBrowserApi;
@@ -58,6 +57,10 @@ export class TabController {
 
   constructor(browserApi: TabControllerBrowserApi) {
     this.#browserApi = browserApi;
+  }
+
+  get tabId(): number | null {
+    return this.#tabId;
   }
 
   async listTabs(): Promise<TabSnapshot[]> {
@@ -75,7 +78,7 @@ export class TabController {
   }
 
   async createTab(url: string): Promise<number> {
-    if (!validateNavigateArgs({ url }) || !isSupportedUrl(url)) throw new Error("Expected a supported HTTP(S) URL.");
+    if (!validateHttpUrl(url) || !isSupportedUrl(url)) throw new Error("Expected a supported HTTP(S) URL.");
     if (!this.#browserApi.tabs.create) throw new Error("Tab creation is unavailable.");
     const tab = await this.#browserApi.tabs.create({ url, active: false });
     if (tab.id === undefined) throw new Error("Tab creation failed.");
@@ -125,15 +128,15 @@ export class TabController {
     };
   }
 
-  /** Binds this controller to the active HTTP(S) tab and captures a readable snapshot. */
-  async captureActivePage(): Promise<PageOutcome<{ artifact: PageArtifactSummary; snapshot: PageSnapshotV1 }>> {
+  /** Binds this controller to the active HTTP(S) tab and captures the head of its outline. */
+  async captureActivePage(): Promise<PageOutcome<{ artifact: PageArtifactSummary; snapshot: PageSnapshot }>> {
     const tabs = await this.#browserApi.tabs.query({ active: true, lastFocusedWindow: true });
     const tab = tabs[0];
     if (!tab || tab.id === undefined || !isSupportedUrl(tab.url)) {
       return pageError("UNSUPPORTED_PAGE", "This page cannot be attached.");
     }
 
-    const outcome = await this.#requestSnapshot(tab.id, "readable");
+    const outcome = await this.#request<PageSnapshot>(tab.id, { type: "page.snapshot", tabId: tab.id, offset: 0, maxChars: ARTIFACT_SNAPSHOT_CHARS }, "page.snapshot");
     if (!outcome.ok) return outcome;
 
     this.#tabId = tab.id;
@@ -141,7 +144,7 @@ export class TabController {
     this.#title = outcome.value.title;
 
     const artifact: PageArtifactSummary = {
-      artifactId: `page:${tab.id}:${outcome.value.revision}`,
+      artifactId: `page:${tab.id}:${outcome.value.documentId}`,
       kind: "page",
       title: outcome.value.title,
       url: outcome.value.url,
@@ -150,115 +153,84 @@ export class TabController {
     return { ok: true, value: { artifact, snapshot: outcome.value } };
   }
 
-  async snapshot(mode: "readable" | "interactive", locator?: SemanticLocator): Promise<PageOutcome<PageSnapshotV1>> {
+  async snapshot(options: { offset: number; maxChars: number } = { offset: 0, maxChars: DEFAULT_SNAPSHOT_CHARS }): Promise<PageOutcome<PageSnapshot>> {
     if (this.#tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
-    return this.#requestSnapshot(this.#tabId, mode, locator);
+    return this.#request<PageSnapshot>(this.#tabId, { type: "page.snapshot", tabId: this.#tabId, ...options }, "page.snapshot");
   }
 
-  async execute(call: ToolCall): Promise<ExecuteOutcome> {
-    const outcome = await this.#executeInner(call);
-    return outcome.result.ok && outcome.snapshot
-      ? { result: { ...outcome.result, summary: appendSnapshotSummary(outcome.result.summary, outcome.snapshot) }, snapshot: outcome.snapshot }
-      : outcome;
+  async find(query: string): Promise<PageOutcome<PageFindResult>> {
+    if (this.#tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
+    return this.#request<PageFindResult>(this.#tabId, { type: "page.find", tabId: this.#tabId, query }, "page.find");
   }
 
-  async #executeInner(call: ToolCall): Promise<ExecuteOutcome> {
-    if (this.#tabId === null) {
-      return { result: { ok: false, code: "UNSUPPORTED_PAGE", summary: "No page is attached." }, snapshot: null };
-    }
-
-    if (call.name === "page_snapshot") {
-      const args = validateSnapshotArgs(call.arguments);
-      if (!args) return { result: invalidArgs(), snapshot: null };
-      const outcome = await this.snapshot(args.mode);
-      if (!outcome.ok) {
-        return { result: { ok: false, code: toToolResultCode(outcome.error.code), summary: outcome.error.message }, snapshot: null };
-      }
-      return { result: { ok: true, summary: "Captured a fresh page snapshot." }, snapshot: outcome.value };
-    }
-
-    if (call.name === "page_navigate") {
-      const args = validateNavigateArgs(call.arguments);
-      if (!args) return { result: invalidArgs(), snapshot: null };
-      await this.#browserApi.tabs.update(this.#tabId, { url: args.url });
-      return this.#afterNavigation(`Navigated to ${args.url}.`);
-    }
-
-    if (call.name === "page_go_back") {
-      const args = validateGoBackArgs(call.arguments);
-      if (!args) return { result: invalidArgs(), snapshot: null };
-      await this.#browserApi.tabs.goBack(this.#tabId);
-      return this.#afterNavigation("Went back to the previous page.");
-    }
-
-    return this.#executeDomForwarded(call);
+  async searchResults(): Promise<PageOutcome<{ results: SearchResult[]; url: string; excerpt: string }>> {
+    if (this.#tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
+    return this.#request(this.#tabId, { type: "page.search-results", tabId: this.#tabId }, "page.search-results");
   }
 
-  async #executeDomForwarded(call: ToolCall): Promise<ExecuteOutcome> {
+  /** Forwards one DOM action. A click/press that tears down the document settles like a navigation instead of repeating. */
+  async act(action: DomAction): Promise<ActionOutcome> {
     const tabId = this.#tabId;
-    if (tabId === null) {
-      return { result: { ok: false, code: "UNSUPPORTED_PAGE", summary: "No page is attached." }, snapshot: null };
-    }
-
-    const domCall: DomToolCall = { id: call.id, name: call.name as DomPageToolName, arguments: call.arguments };
-    const request: PageExecuteRequest = { v: 1, id: crypto.randomUUID(), type: "page.execute", tabId, call: domCall };
+    if (tabId === null) return { result: { ok: false, code: "UNSUPPORTED_PAGE", summary: "No page is attached." }, documentId: null };
+    const request: PageExecuteRequest = { v: 1, id: crypto.randomUUID(), type: "page.execute", tabId, action };
 
     let response: PageResponse | undefined;
     try {
       response = (await this.#browserApi.tabs.sendMessage(tabId, request)) as PageResponse | undefined;
     } catch {
-      // The content script's execution context may have been destroyed by a
-      // navigation the click itself triggered. Settle the same way
-      // navigate/go_back would, then return a fresh snapshot without
-      // repeating the action.
-      if (call.name !== "page_click") {
-        return { result: { ok: false, code: "TAB_CHANGED", summary: "Lost contact with the page." }, snapshot: null };
+      if (action.kind !== "click" && action.kind !== "press") {
+        return { result: { ok: false, code: "TAB_CHANGED", summary: "Lost contact with the page." }, documentId: null };
       }
       const settled = await this.#settleNavigation(tabId);
       if (!settled.ok) {
-        return { result: { ok: false, code: "NAVIGATION_INTERRUPTED", summary: "The page did not settle after the click." }, snapshot: null };
+        return { result: { ok: false, code: "NAVIGATION_INTERRUPTED", summary: "The page did not settle after the action." }, documentId: null };
       }
-      const outcome = await this.#requestSnapshot(tabId, "interactive");
-      if (!outcome.ok) {
-        return { result: { ok: false, code: toToolResultCode(outcome.error.code), summary: outcome.error.message }, snapshot: null };
-      }
-      this.#url = outcome.value.url;
-      this.#title = outcome.value.title;
-      return { result: { ok: true, summary: "Clicked; the page navigated." }, snapshot: outcome.value };
+      await this.#refreshMetadata(settled.value.url);
+      return {
+        result: { ok: true, summary: `${action.kind === "click" ? "Clicked" : `Pressed ${action.key}`}; the page navigated to ${this.#url} (${JSON.stringify(this.#title ?? "")}). Earlier refs are invalid; read a snapshot or use page.find().` },
+        documentId: null,
+      };
     }
 
-    if (!response) {
-      return { result: { ok: false, code: "TAB_CHANGED", summary: "The page did not respond." }, snapshot: null };
-    }
-    if (!response.ok) {
-      return { result: { ok: false, code: toToolResultCode(response.error.code), summary: response.error.message }, snapshot: null };
-    }
-    if (response.type !== "page.execute") {
-      return { result: { ok: false, code: "TARGET_MISSING", summary: "Unexpected response from the page." }, snapshot: null };
-    }
-    return { result: response.result, snapshot: response.snapshot };
+    if (!response) return { result: { ok: false, code: "TAB_CHANGED", summary: "The page did not respond." }, documentId: null };
+    if (!response.ok) return { result: { ok: false, code: toToolResultCode(response.error.code), summary: response.error.message }, documentId: null };
+    if (response.type !== "page.execute") return { result: { ok: false, code: "TARGET_MISSING", summary: "Unexpected response from the page." }, documentId: null };
+    return { result: response.result, documentId: response.documentId };
   }
 
-  async #afterNavigation(successSummary: string): Promise<ExecuteOutcome> {
-    const tabId = this.#tabId;
-    if (tabId === null) {
-      return { result: { ok: false, code: "UNSUPPORTED_PAGE", summary: "No page is attached." }, snapshot: null };
-    }
+  async navigate(url: string): Promise<ToolResult> {
+    if (this.#tabId === null) return { ok: false, code: "UNSUPPORTED_PAGE", summary: "No page is attached." };
+    if (!validateHttpUrl(url) || !isSupportedUrl(url)) return { ok: false, code: "INVALID_TOOL_ARGUMENTS", summary: "Expected a supported absolute HTTP(S) URL." };
+    await this.#browserApi.tabs.update(this.#tabId, { url });
+    return this.#afterNavigation("Navigated");
+  }
+
+  async goBack(): Promise<ToolResult> {
+    if (this.#tabId === null) return { ok: false, code: "UNSUPPORTED_PAGE", summary: "No page is attached." };
+    await this.#browserApi.tabs.goBack(this.#tabId);
+    return this.#afterNavigation("Went back");
+  }
+
+  async #afterNavigation(verb: string): Promise<ToolResult> {
+    const tabId = this.#tabId!;
     const settled = await this.#settleNavigation(tabId);
-    if (!settled.ok) {
-      return { result: { ok: false, code: "NAVIGATION_INTERRUPTED", summary: "Navigation did not complete in time." }, snapshot: null };
-    }
-    const outcome = await this.#requestSnapshot(tabId, "readable");
-    if (!outcome.ok) {
-      return { result: { ok: false, code: toToolResultCode(outcome.error.code), summary: outcome.error.message }, snapshot: null };
-    }
-    this.#url = outcome.value.url;
-    this.#title = outcome.value.title;
-    return { result: { ok: true, summary: successSummary }, snapshot: outcome.value };
+    if (!settled.ok) return { ok: false, code: "NAVIGATION_INTERRUPTED", summary: "Navigation did not complete in time." };
+    await this.#refreshMetadata(settled.value.url);
+    return { ok: true, summary: `${verb} to ${this.#url} (${JSON.stringify(this.#title ?? "")}). Read it with page.snapshot() or page.find(text).` };
   }
 
-  async #requestSnapshot(tabId: number, mode: "readable" | "interactive", locator?: SemanticLocator): Promise<PageOutcome<PageSnapshotV1>> {
-    const request: PageSnapshotRequest = { v: 1, id: crypto.randomUUID(), type: "page.snapshot", tabId, mode, ...(locator ? { locator } : {}) };
+  async #refreshMetadata(url: string): Promise<void> {
+    const tab = (await this.#browserApi.tabs.query({})).find((candidate) => candidate.id === this.#tabId);
+    this.#url = url;
+    this.#title = tab?.title ?? this.#title;
+  }
+
+  async #request<T>(
+    tabId: number,
+    body: Omit<PageSnapshotRequest, "v" | "id"> | Omit<PageFindRequest, "v" | "id"> | Omit<PageSearchResultsRequest, "v" | "id">,
+    type: "page.snapshot" | "page.find" | "page.search-results",
+  ): Promise<PageOutcome<T>> {
+    const request = { v: 1, id: crypto.randomUUID(), ...body };
     let response: PageResponse | undefined;
     try {
       response = (await this.#browserApi.tabs.sendMessage(tabId, request)) as PageResponse | undefined;
@@ -267,8 +239,11 @@ export class TabController {
     }
     if (!response) return pageError("TAB_CHANGED", "The page did not respond.");
     if (!response.ok) return { ok: false, error: response.error };
-    if (response.type !== "page.snapshot") return pageError("TAB_CHANGED", "Unexpected response from the page.");
-    return { ok: true, value: response.snapshot };
+    if (response.type !== type) return pageError("TAB_CHANGED", "Unexpected response from the page.");
+    if (response.type === "page.snapshot") return { ok: true, value: response.snapshot as T };
+    if (response.type === "page.find") return { ok: true, value: response.result as T };
+    if (response.type === "page.search-results") return { ok: true, value: { results: response.results, url: response.url, excerpt: response.excerpt } as T };
+    return pageError("TAB_CHANGED", "Unexpected response from the page.");
   }
 
   /** Waits for `tabs.onUpdated` completion, then probes `page.health` on a backoff until the deadline. */
@@ -313,42 +288,6 @@ export class TabController {
     }
     return null;
   }
-}
-
-function invalidArgs(): ToolResult {
-  return { ok: false, code: "INVALID_TOOL_ARGUMENTS", summary: "Invalid or missing arguments for this tool call." };
-}
-
-const MAX_SUMMARY_NODES = 40;
-const MAX_SUMMARY_TEXT_LEN = 800;
-
-/** Appends the fresh revision and a bounded description of the fresh snapshot so the model can observe the exact revision string these tools require, plus refs/values/text, without a separate page_snapshot call. */
-function appendSnapshotSummary(summary: string, snapshot: PageSnapshotV1): string {
-  const description = summarizeSnapshot(snapshot);
-  const revision = `Revision: ${snapshot.revision}.`;
-  return description ? `${summary} ${revision} ${description}` : `${summary} ${revision}`;
-}
-
-function summarizeSnapshot(snapshot: PageSnapshotV1): string {
-  if (snapshot.nodes.length > 0) {
-    const lines = snapshot.nodes.slice(0, MAX_SUMMARY_NODES).map(describeNode);
-    const suffix = snapshot.nodes.length > MAX_SUMMARY_NODES ? ` (+${snapshot.nodes.length - MAX_SUMMARY_NODES} more elements)` : "";
-    return `Elements: ${lines.join("; ")}${suffix}`;
-  }
-  if (snapshot.readableText) {
-    const truncated = snapshot.readableText.length > MAX_SUMMARY_TEXT_LEN;
-    const text = truncated ? `${snapshot.readableText.slice(0, MAX_SUMMARY_TEXT_LEN)}…` : snapshot.readableText;
-    return `Page text: ${text}`;
-  }
-  return "";
-}
-
-function describeNode(node: PageSnapshotV1["nodes"][number]): string {
-  const bits = [node.ref, node.role, node.name ? `"${node.name}"` : ""];
-  if (node.value !== undefined) bits.push(`value=${JSON.stringify(node.value)}`);
-  if (node.state.checked !== undefined) bits.push(node.state.checked ? "checked" : "unchecked");
-  if (node.state.disabled) bits.push("disabled");
-  return bits.filter(Boolean).join(" ");
 }
 
 function pageError(code: PageErrorCode, message: string): { ok: false; error: NormalizedError } {

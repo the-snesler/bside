@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { validateDomAction } from "@/lib/validation";
 import {
   isCredentialRequest,
   isPageExecuteRequest,
+  isPageFindRequest,
   isPageHealthRequest,
   isPageSnapshotRequest,
   isSettingsRequest,
@@ -143,62 +145,67 @@ describe("isPageHealthRequest: accepts valid, rejects malformed input", () => {
 });
 
 describe("isPageSnapshotRequest: accepts valid, rejects malformed input", () => {
-  it("accepts readable and interactive modes", () => {
-    expect(isPageSnapshotRequest({ v: 1, id: "1", type: "page.snapshot", tabId: 1, mode: "readable" })).toBe(true);
-    expect(isPageSnapshotRequest({ v: 1, id: "1", type: "page.snapshot", tabId: 1, mode: "interactive" })).toBe(true);
+  const valid = { v: 1, id: "1", type: "page.snapshot", tabId: 1, offset: 0, maxChars: 16000 };
+
+  it("accepts a bounded slice request", () => {
+    expect(isPageSnapshotRequest(valid)).toBe(true);
+    expect(isPageSnapshotRequest({ ...valid, offset: 32000, maxChars: 40000 })).toBe(true);
   });
 
-  it("rejects a missing tabId", () => {
-    expect(isPageSnapshotRequest({ v: 1, id: "1", type: "page.snapshot", mode: "readable" })).toBe(false);
+  it("rejects missing or non-numeric tab ids", () => {
+    expect(isPageSnapshotRequest({ ...valid, tabId: undefined })).toBe(false);
+    expect(isPageSnapshotRequest({ ...valid, tabId: "1" })).toBe(false);
   });
 
-  it("rejects a non-numeric tabId", () => {
-    expect(isPageSnapshotRequest({ v: 1, id: "1", type: "page.snapshot", tabId: "1", mode: "readable" })).toBe(false);
-  });
-
-  it("rejects an invalid mode", () => {
-    expect(isPageSnapshotRequest({ v: 1, id: "1", type: "page.snapshot", tabId: 1, mode: "full" })).toBe(false);
-  });
-
-  it("rejects a missing mode", () => {
-    expect(isPageSnapshotRequest({ v: 1, id: "1", type: "page.snapshot", tabId: 1 })).toBe(false);
+  it("rejects unbounded or malformed slices", () => {
+    expect(isPageSnapshotRequest({ ...valid, maxChars: 40001 })).toBe(false);
+    expect(isPageSnapshotRequest({ ...valid, maxChars: 10 })).toBe(false);
+    expect(isPageSnapshotRequest({ ...valid, offset: -1 })).toBe(false);
+    expect(isPageSnapshotRequest({ ...valid, offset: 1.5 })).toBe(false);
   });
 });
 
-describe("isPageExecuteRequest: accepts valid, rejects malformed input", () => {
-  it("accepts a well-formed execute request", () => {
-    expect(
-      isPageExecuteRequest({
-        v: 1,
-        id: "1",
-        type: "page.execute",
-        tabId: 1,
-        call: { id: "c1", name: "page_click", arguments: { ref: "e1", revision: "rev-1" } },
-      }),
-    ).toBe(true);
+describe("isPageFindRequest", () => {
+  it("accepts bounded non-empty queries only", () => {
+    expect(isPageFindRequest({ v: 1, id: "1", type: "page.find", tabId: 1, query: "User Score" })).toBe(true);
+    expect(isPageFindRequest({ v: 1, id: "1", type: "page.find", tabId: 1, query: "  " })).toBe(false);
+    expect(isPageFindRequest({ v: 1, id: "1", type: "page.find", tabId: 1, query: "x".repeat(201) })).toBe(false);
+  });
+});
+
+describe("isPageExecuteRequest: accepts the closed action union only", () => {
+  const ref = { kind: "ref", ref: "e1", documentId: "doc-1" };
+  const execute = (action: unknown) => ({ v: 1, id: "1", type: "page.execute", tabId: 1, action });
+
+  it("accepts every action kind with ref and role targets", () => {
+    for (const action of [
+      { kind: "click", target: ref },
+      { kind: "click", target: { kind: "role", role: "button", name: "Save", exact: false } },
+      { kind: "click", target: { kind: "role", role: "textbox", name: null, exact: false } },
+      { kind: "fill", target: ref, text: "x" },
+      { kind: "select", target: ref, values: ["us"] },
+      { kind: "check", target: ref, checked: true },
+      { kind: "press", target: ref, key: "Enter" },
+      { kind: "upload", target: ref, files: [{ name: "a.txt", mimeType: "text/plain", text: "hi" }] },
+      { kind: "scroll", target: null, direction: "down", amount: "page" },
+    ]) expect(validateDomAction(action), JSON.stringify(action)).not.toBeNull();
+    expect(isPageExecuteRequest(execute({ kind: "click", target: ref }))).toBe(true);
   });
 
-  it("rejects a missing tabId", () => {
-    expect(
-      isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", call: { id: "c1", name: "page_click", arguments: {} } }),
-    ).toBe(false);
-  });
-
-  it("rejects a missing call", () => {
-    expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", tabId: 1 })).toBe(false);
-  });
-
-  it("rejects a call missing id", () => {
-    expect(
-      isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", tabId: 1, call: { name: "page_click", arguments: {} } }),
-    ).toBe(false);
-  });
-
-  it("rejects a call missing name", () => {
-    expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", tabId: 1, call: { id: "c1", arguments: {} } })).toBe(false);
-  });
-
-  it("rejects a null call", () => {
-    expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", tabId: 1, call: null })).toBe(false);
+  it("rejects unknown kinds, extra keys, selectors, and malformed targets", () => {
+    for (const action of [
+      { kind: "evaluate", target: ref, script: "alert(1)" },
+      { kind: "click", target: ref, extra: true },
+      { kind: "click", target: { kind: "css", selector: "#email" } },
+      { kind: "click", target: { kind: "ref", ref: "#email", documentId: "doc" } },
+      { kind: "click", target: { kind: "ref", ref: "e1" } },
+      { kind: "press", target: ref, key: "F12" },
+      { kind: "upload", target: ref, files: [{ name: "../etc/passwd", mimeType: "text/plain", text: "" }] },
+      { kind: "upload", target: ref, files: [] },
+      { kind: "select", target: ref, values: [] },
+      { kind: "fill", target: ref, text: "x".repeat(16_001) },
+    ]) expect(validateDomAction(action), JSON.stringify(action)).toBeNull();
+    expect(isPageExecuteRequest(execute({ kind: "click" }))).toBe(false);
+    expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", action: { kind: "click", target: ref } })).toBe(false);
   });
 });

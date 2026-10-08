@@ -6,41 +6,40 @@ import { TabController } from "@/lib/background/tab-controller";
 import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import { ProviderStreamError } from "@/lib/providers/openai";
 import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
-import type { PageSnapshotV1, ToolCall } from "@/lib/domain/tools";
+import type { PageSnapshot, ToolCall } from "@/lib/domain/tools";
 import type { ApprovalRequest, SidebarEvent } from "@/lib/protocol";
 import { TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
 
-function buildSnapshot(overrides: Partial<PageSnapshotV1> = {}): PageSnapshotV1 {
+function buildSnapshot(overrides: Partial<PageSnapshot> = {}): PageSnapshot {
+  const text = 'Orchid launch moved to Friday.\n[e1 button "Submit"]';
   return {
-    version: 1,
+    version: 2,
     tabId: 1,
-    revision: "rev-1",
+    documentId: "doc-1",
     url: "http://127.0.0.1:4173/agent-page.html",
-    origin: "http://127.0.0.1:4173",
     title: "Agent Fixture",
-    readableText: "Orchid launch moved to Friday.",
+    text,
+    offset: 0,
+    end: text.length,
+    totalChars: text.length,
     selectionText: "",
-    viewport: { width: 0, height: 0, scrollX: 0, scrollY: 0 },
-    nodes: [{ ref: "e1", role: "button", name: "Submit", tag: "button", state: { disabled: false }, bounds: { x: 0, y: 0, width: 0, height: 0 }, inViewport: true }],
-    truncated: { readableText: false, nodes: false },
-    warnings: [],
     ...overrides,
   };
 }
 
 /** A TabController bound to a scriptable fake browser tabs API. */
 async function createTabController(handlers: {
-  onExecute?: (call: unknown) => { result: unknown; snapshot: PageSnapshotV1 };
+  onExecute?: (action: unknown) => { result: unknown; documentId: string };
 } = {}): Promise<{ tabController: TabController; sendMessageMock: ReturnType<typeof vi.fn> }> {
   const snapshot = buildSnapshot();
   const sendMessageMock = vi.fn(async (_tabId: number, message: unknown) => {
-    const request = message as { id: string; type: string; call?: { name: string; arguments: unknown } };
+    const request = message as { id: string; type: string; action?: unknown };
     if (request.type === "page.snapshot") {
       return { v: 1, id: request.id, ok: true, type: "page.snapshot", snapshot };
     }
     if (request.type === "page.execute") {
-      const outcome = handlers.onExecute?.(request.call) ?? { result: { ok: true, summary: "Done." }, snapshot };
-      return { v: 1, id: request.id, ok: true, type: "page.execute", result: outcome.result, snapshot: outcome.snapshot };
+      const outcome = handlers.onExecute?.(request.action) ?? { result: { ok: true, summary: "Done." }, documentId: snapshot.documentId };
+      return { v: 1, id: request.id, ok: true, type: "page.execute", result: outcome.result, documentId: outcome.documentId };
     }
     throw new Error(`unhandled request type: ${request.type}`);
   });
@@ -161,6 +160,30 @@ describe("AgentLoop: read-only tool call", () => {
     expect(port.received.some((e) => e.type === "tool.requested")).toBe(true);
     const toolResult = port.received.find((e) => e.type === "tool.result");
     expect(toolResult && toolResult.type === "tool.result" ? toolResult.payload.result.ok : undefined).toBe(true);
+  });
+});
+
+describe("AgentLoop: initial page artifact", () => {
+  it("shows the attached page outline and lets the model act on its refs immediately", async () => {
+    const provider = new ScriptedProvider([
+      () => [toolCallEvent("call_1", "browser_program", { source: 'await browser.tab("/tabs/1/page.md").ref("e1").click();' }), { type: "turn.completed", replayState: null }],
+      () => [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }],
+    ]);
+    const actions: unknown[] = [];
+    const { tabController } = await createTabController({ onExecute: (action) => { actions.push(action); return { result: { ok: true, summary: "Clicked." }, documentId: "doc-1" }; } });
+    const loop = new AgentLoop(provider, tabController, new SidebarHub());
+
+    const result = await loop.run({
+      runId: "run1", modelId: "gpt-5.6-terra", reasoningEffort: "medium", transcript: baseTranscript, contextArtifact: artifact,
+      auth: AUTH, signal: new AbortController().signal, onDelta: () => {}, onItem: async () => {}, onApprovalPending: () => {},
+    });
+
+    expect(result.status).toBe("completed");
+    const systemPrompt = provider.requests[0]?.context.systemPrompt ?? "";
+    expect(systemPrompt).toContain("Verify outcomes before claiming them");
+    expect(systemPrompt).toContain('Orchid launch moved to Friday.\n[e1 button "Submit"]');
+    expect(systemPrompt).toContain("Document: doc-1");
+    expect(actions).toEqual([{ kind: "click", target: { kind: "ref", ref: "e1", documentId: "doc-1" } }]);
   });
 });
 
@@ -293,7 +316,7 @@ describe("AgentLoop: stale-ref recovery", () => {
       () => [{ type: "text.delta", delta: "Let me get a fresh snapshot." }, { type: "turn.completed", replayState: null }],
     ]);
     const { tabController } = await createTabController({
-      onExecute: () => ({ result: { ok: false, code: "STALE_SNAPSHOT", summary: "Stale." }, snapshot: buildSnapshot({ revision: "rev-2" }) }),
+      onExecute: () => ({ result: { ok: false, code: "STALE_SNAPSHOT", summary: "Stale." }, documentId: "doc-2" }),
     });
     const hub = new SidebarHub();
     const port = fakePort();

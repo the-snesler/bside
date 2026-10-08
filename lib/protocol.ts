@@ -10,30 +10,26 @@
  */
 
 import type {
-  JsonValue,
+  DomAction,
   PageArtifactSummary,
   PageErrorCode,
-  PageSnapshotV1,
-  PageToolName,
+  PageFindResult,
+  PageSnapshot,
+  SearchResult,
   ToolCall,
   ToolResult,
-  SemanticLocator,
 } from "@/lib/domain/tools";
 import type { ConversationRecordV1 } from "@/lib/domain/conversation";
 import type { AppSettingsV1, ProviderDefinition } from "@/lib/domain/provider";
 import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
+import { validateDomAction } from "@/lib/validation";
 
 // ---------------------------------------------------------------------------
 // Content script <-> background: PageRequest / PageResponse (tabs.sendMessage)
 // ---------------------------------------------------------------------------
 
-export type DomPageToolName = Exclude<PageToolName, "page_navigate" | "page_go_back">;
-
-export interface DomToolCall {
-  id: string;
-  name: DomPageToolName;
-  arguments: JsonValue;
-}
+export const MAX_SNAPSHOT_CHARS = 40_000;
+export const MAX_FIND_QUERY_LEN = 200;
 
 export interface PageHealthRequest {
   v: 1;
@@ -46,8 +42,23 @@ export interface PageSnapshotRequest {
   id: string;
   type: "page.snapshot";
   tabId: number;
-  mode: "readable" | "interactive";
-  locator?: SemanticLocator;
+  offset: number;
+  maxChars: number;
+}
+
+export interface PageFindRequest {
+  v: 1;
+  id: string;
+  type: "page.find";
+  tabId: number;
+  query: string;
+}
+
+export interface PageSearchResultsRequest {
+  v: 1;
+  id: string;
+  type: "page.search-results";
+  tabId: number;
 }
 
 export interface PageExecuteRequest {
@@ -55,10 +66,10 @@ export interface PageExecuteRequest {
   id: string;
   type: "page.execute";
   tabId: number;
-  call: DomToolCall;
+  action: DomAction;
 }
 
-export type PageRequest = PageHealthRequest | PageSnapshotRequest | PageExecuteRequest;
+export type PageRequest = PageHealthRequest | PageSnapshotRequest | PageFindRequest | PageSearchResultsRequest | PageExecuteRequest;
 
 export interface PageHealthResponse {
   v: 1;
@@ -73,7 +84,25 @@ export interface PageSnapshotResponse {
   id: string;
   ok: true;
   type: "page.snapshot";
-  snapshot: PageSnapshotV1;
+  snapshot: PageSnapshot;
+}
+
+export interface PageFindResponse {
+  v: 1;
+  id: string;
+  ok: true;
+  type: "page.find";
+  result: PageFindResult;
+}
+
+export interface PageSearchResultsResponse {
+  v: 1;
+  id: string;
+  ok: true;
+  type: "page.search-results";
+  results: SearchResult[];
+  url: string;
+  excerpt: string;
 }
 
 export interface PageExecuteResponse {
@@ -82,7 +111,7 @@ export interface PageExecuteResponse {
   ok: true;
   type: "page.execute";
   result: ToolResult;
-  snapshot: PageSnapshotV1;
+  documentId: string;
 }
 
 export interface PageErrorResponse {
@@ -95,6 +124,8 @@ export interface PageErrorResponse {
 export type PageResponse =
   | PageHealthResponse
   | PageSnapshotResponse
+  | PageFindResponse
+  | PageSearchResultsResponse
   | PageExecuteResponse
   | PageErrorResponse;
 
@@ -106,28 +137,31 @@ export function isPageSnapshotRequest(value: unknown): value is PageSnapshotRequ
   if (!isEnvelope(value) || value.type !== "page.snapshot") return false;
   const candidate = value as Record<string, unknown>;
   return (
-    typeof candidate.tabId === "number" &&
-    (candidate.mode === "readable" || candidate.mode === "interactive") &&
-    (candidate.locator === undefined || (
-      candidate.mode === "interactive" && typeof candidate.locator === "object" && candidate.locator !== null &&
-      !Array.isArray(candidate.locator) && Object.keys(candidate.locator).length === 2 &&
-      typeof (candidate.locator as SemanticLocator).role === "string" && (candidate.locator as SemanticLocator).role.length > 0 && (candidate.locator as SemanticLocator).role.length <= 128 &&
-      typeof (candidate.locator as SemanticLocator).name === "string" && (candidate.locator as SemanticLocator).name.length <= 8000
-    ))
+    isTabId(candidate.tabId) &&
+    Number.isSafeInteger(candidate.offset) && (candidate.offset as number) >= 0 &&
+    Number.isSafeInteger(candidate.maxChars) && (candidate.maxChars as number) >= 500 && (candidate.maxChars as number) <= MAX_SNAPSHOT_CHARS
   );
+}
+
+export function isPageFindRequest(value: unknown): value is PageFindRequest {
+  if (!isEnvelope(value) || value.type !== "page.find") return false;
+  const candidate = value as Record<string, unknown>;
+  return isTabId(candidate.tabId) && typeof candidate.query === "string" &&
+    candidate.query.trim().length > 0 && candidate.query.length <= MAX_FIND_QUERY_LEN;
+}
+
+export function isPageSearchResultsRequest(value: unknown): value is PageSearchResultsRequest {
+  return isEnvelope(value) && value.type === "page.search-results" && isTabId((value as Record<string, unknown>).tabId);
 }
 
 export function isPageExecuteRequest(value: unknown): value is PageExecuteRequest {
   if (!isEnvelope(value) || value.type !== "page.execute") return false;
   const candidate = value as Record<string, unknown>;
-  const call = candidate.call;
-  return (
-    typeof candidate.tabId === "number" &&
-    typeof call === "object" &&
-    call !== null &&
-    typeof (call as Record<string, unknown>).id === "string" &&
-    typeof (call as Record<string, unknown>).name === "string"
-  );
+  return isTabId(candidate.tabId) && validateDomAction(candidate.action) !== null;
+}
+
+function isTabId(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
 function isEnvelope(value: unknown): value is { v: 1; id: string; type: string } {
