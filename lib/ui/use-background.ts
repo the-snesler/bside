@@ -22,6 +22,7 @@ export interface BackgroundState extends RuntimeSnapshot {
 
 export interface BackgroundActions {
   listTabs(): void;
+  focusTab(tabId: number): void;
   saveSettings(settings: AppSettingsV1): void;
   sendPrompt(prompt: string): void;
   cancelRun(): void;
@@ -124,11 +125,14 @@ export function useBackground(): BackgroundState & BackgroundActions {
   const listTabs = useCallback(() => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "tabs.list" } satisfies SidebarCommand);
   }, []);
+  const focusTab = useCallback((tabId: number) => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "tabs.focus", tabId } satisfies SidebarCommand);
+  }, []);
   const saveSettings = useCallback((settings: AppSettingsV1) => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "settings.save", settings } satisfies SidebarCommand);
   }, []);
 
-  return { ...state, sendPrompt, cancelRun, approveAction, denyAction, resetContext, downloadContext, listTabs, saveSettings };
+  return { ...state, sendPrompt, cancelRun, approveAction, denyAction, resetContext, downloadContext, listTabs, focusTab, saveSettings };
 }
 
 function commitPendingText(prev: BackgroundState): BackgroundState {

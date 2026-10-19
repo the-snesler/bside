@@ -205,6 +205,7 @@ export const SIDEBAR_PORT_NAME = "agent-sidebar:v1";
 
 export type SidebarCommand =
   | { v: 1; id: string; type: "tabs.list" }
+  | { v: 1; id: string; type: "tabs.focus"; tabId: number }
   | { v: 1; id: string; type: "settings.save"; settings: AppSettingsV1 }
   | { v: 1; id: string; type: "context.reset" | "context.export" }
   | { v: 1; id: string; type: "state.subscribe"; lastSeq: number | null }
@@ -267,6 +268,7 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (!isEnvelope(value)) return false;
   const candidate = value as Record<string, unknown>;
   if (candidate.type === "tabs.list") return true;
+  if (candidate.type === "tabs.focus") return Number.isSafeInteger(candidate.tabId);
   if (candidate.type === "settings.save") return isAppSettings(candidate.settings);
   if (candidate.type === "context.reset" || candidate.type === "context.export") return true;
   if (candidate.type === "state.subscribe") {

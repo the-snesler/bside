@@ -3,9 +3,22 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { h, render } from "preact";
 import { act } from "preact/test-utils";
 import { Markdown } from "@/lib/ui/Markdown";
-import { serializeDraft } from "@/lib/ui/Composer";
+import { parsePromptMentions, serializeDraft } from "@/lib/ui/Composer";
 import { useBottomScroll } from "@/lib/ui/use-bottom-scroll";
 import { isSidebarCommand } from "@/lib/protocol";
+import { buildTurns, formatDuration } from "@/lib/ui/turns";
+import { TurnTrace } from "@/lib/ui/TurnTrace";
+import type { ConversationItem } from "@/lib/domain/conversation";
+
+const turnItems: ConversationItem[] = [
+  { id: "u1", kind: "message", role: "user", text: "Fill the form", context: null, at: 0 },
+  { id: "c1", kind: "tool-call", call: { id: "call-1", name: "browser_program", arguments: { source: "await page.fill(x, 'y')" } }, at: 1_000 },
+  { id: "r1", kind: "tool-result", callId: "call-1", result: { ok: false, code: "TARGET_MISSING", summary: "No field <b>x</b>" }, at: 3_000 },
+  { id: "a1", kind: "message", role: "assistant", text: "Retrying with another field.", at: 4_000 },
+  { id: "c2", kind: "tool-call", call: { id: "call-2", name: "request_action_confirmation", arguments: { title: "Submit form", message: "Send it?", artifact: "" } }, at: 5_000 },
+  { id: "r2", kind: "tool-result", callId: "call-2", result: { ok: false, code: "ACTION_DENIED", summary: "approved:false" }, at: 6_000 },
+  { id: "a2", kind: "message", role: "assistant", text: "Okay, not submitted.", at: 64_000 },
+];
 
 afterEach(() => {
   document.body.innerHTML = "";
@@ -53,6 +66,69 @@ describe("sidebar UI contracts", () => {
     ).toBe(
       "Read @Example (tab 42, /agent-tabs/42/page.md, https://example.com/)",
     );
+  });
+
+  it("parses serialized mentions back into display segments", () => {
+    expect(
+      parsePromptMentions(
+        "@Quiz: Exam 1 (draft) (tab 57, /tabs/57/page.md, https://canvas.example/q?x=1) and @Doc (tab 9, /agent-tabs/9/page.md, https://example.com/)\nthanks",
+      ),
+    ).toEqual([
+      { kind: "mention", label: "Quiz: Exam 1 (draft)", tabId: 57, agentTab: false, url: "https://canvas.example/q?x=1" },
+      { kind: "text", text: " and " },
+      { kind: "mention", label: "Doc", tabId: 9, agentTab: true, url: "https://example.com/" },
+      { kind: "text", text: "\nthanks" },
+    ]);
+    expect(parsePromptMentions("email me @ 5 (tab 1, /tabs/2/page.md, x)")).toEqual([
+      { kind: "text", text: "email me @ 5 (tab 1, /tabs/2/page.md, x)" },
+    ]);
+    expect(isSidebarCommand({ v: 1, id: "f", type: "tabs.focus", tabId: 57 })).toBe(true);
+    expect(isSidebarCommand({ v: 1, id: "f", type: "tabs.focus", tabId: "57" })).toBe(false);
+  });
+
+  it("groups items into turns with interim work and a final answer", () => {
+    const [turn] = buildTurns(turnItems, false);
+    expect(turn!.prompt?.text).toBe("Fill the form");
+    expect(turn!.steps.map((step) => step.kind)).toEqual(["activity", "text", "activity"]);
+    expect(turn!.steps[0]).toMatchObject({ startedAt: 1_000, endedAt: 3_000, result: { ok: false } });
+    expect(turn!.answer).toEqual({ id: "a2", text: "Okay, not submitted." });
+    expect(formatDuration(turn!.endedAt - turn!.startedAt)).toBe("1m 4s");
+    // While running, trailing text may still be followed by more tool calls.
+    expect(buildTurns(turnItems, true)[0]!.answer).toBeNull();
+  });
+
+  it("renders a completed turn collapsed with status in words and untrusted text as text", () => {
+    const root = document.createElement("div");
+    document.body.append(root);
+    const [turn] = buildTurns(turnItems, false);
+    render(h(TurnTrace, { turn: turn!, active: false, pendingApproval: null, onApprove: () => {}, onDeny: () => {} }), root);
+    const header = root.querySelector("details")!;
+    expect(header.open).toBe(false);
+    expect(header.querySelector("summary")?.textContent).toContain("Worked for 1m 4s, 1 failed");
+    const titles = [...root.querySelectorAll(".trace__content .trace__title")].map((node) => node.textContent);
+    expect(titles).toEqual(["Couldn't fill page fields", "Denied: Submit form"]);
+    expect(root.querySelector("b")).toBeNull();
+    expect(root.textContent).toContain("No field <b>x</b>");
+    render(null, root);
+  });
+
+  it("keeps an active turn open with the pending approval reachable", () => {
+    const root = document.createElement("div");
+    document.body.append(root);
+    const items = turnItems.slice(0, 5);
+    const [turn] = buildTurns(items, true);
+    const approve = vi.fn();
+    const call = items[4]!.kind === "tool-call" ? items[4]!.call : null;
+    render(h(TurnTrace, {
+      turn: turn!, active: true, pendingApproval: { call: call!, origin: "", display: "Submit form", target: {} },
+      onApprove: approve, onDeny: () => {},
+    }), root);
+    expect(root.querySelector("summary")?.textContent).toContain("Waiting for your approval");
+    expect([...root.querySelectorAll("details")].every((details) => details.open || !details.querySelector(".trace__actions"))).toBe(true);
+    expect(root.textContent).toContain("Waiting for approval: Submit form");
+    (root.querySelector(".trace__approve") as HTMLButtonElement).click();
+    expect(approve).toHaveBeenCalledWith("call-2");
+    render(null, root);
   });
 
   it("validates inline model settings and keeps credential commands off the sidebar", () => {

@@ -71,6 +71,15 @@ describe("context controls", () => {
     expect((await getConversation()).items).toHaveLength(0);
   });
 
+  it("focuses a mentioned tab without capturing page content", async () => {
+    const controller = supportedPageTabControllerFactory();
+    const focusTab = vi.spyOn(controller, "focusTab");
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: () => controller });
+    await runtime.handleCommand({ v: 1, id: "focus", type: "tabs.focus", tabId: 1 });
+    expect(focusTab).toHaveBeenCalledWith(1);
+    expect((await getConversation()).items).toHaveLength(0);
+  });
+
   it("saves inline model selection through the background", async () => {
     const hub = new SidebarHub();
     const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });

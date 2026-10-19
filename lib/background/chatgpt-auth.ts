@@ -3,6 +3,7 @@ import { createLocalJWKSet, jwtVerify, type JSONWebKeySet } from "jose";
 import type { ChatGPTStatus, ModelDefinition, ProviderAuth } from "@/lib/domain/provider";
 import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
 import { ProviderStreamError } from "@/lib/providers/openai";
+import { FirefoxChatGPTAuthBrowser, type ChatGPTAuthBrowser } from "@/lib/background/chatgpt-browser-auth";
 import {
   deleteChatGPTCredential, getChatGPTCredential, getChatGPTRegistration,
   saveChatGPTCredential, saveChatGPTRegistration,
@@ -26,11 +27,6 @@ interface ChatGPTCredential {
   scopes: string[];
 }
 
-export interface ChatGPTIdentityApi {
-  getRedirectURL(): string;
-  launchWebAuthFlow(details: { url: string; interactive: boolean; redirect_uri: string }): Promise<string | undefined>;
-}
-
 function base64(bytes: Uint8Array): string {
   return btoa(Array.from(bytes, (byte) => String.fromCharCode(byte)).join(""));
 }
@@ -51,7 +47,7 @@ async function pinKey(pin: string, salt: Uint8Array<ArrayBuffer>): Promise<Crypt
 }
 
 export class ChatGPTAuth {
-  #identity: ChatGPTIdentityApi;
+  #browser: ChatGPTAuthBrowser;
   #fetch: typeof fetch;
   #credential: ChatGPTCredential | null = null;
   #key: CryptoKey | null = null;
@@ -59,8 +55,8 @@ export class ChatGPTAuth {
   #busy = false;
   #refresh: Promise<ProviderAuth> | null = null;
 
-  constructor(identity: ChatGPTIdentityApi = browser.identity, fetcher: typeof fetch = (...args) => fetch(...args)) {
-    this.#identity = identity;
+  constructor(authBrowser: ChatGPTAuthBrowser = new FirefoxChatGPTAuthBrowser(), fetcher: typeof fetch = (...args) => fetch(...args)) {
+    this.#browser = authBrowser;
     this.#fetch = fetcher;
   }
 
@@ -77,12 +73,16 @@ export class ChatGPTAuth {
     return this.#operation(async () => {
       const salt = crypto.getRandomValues(new Uint8Array(16));
       const key = await pinKey(pin, salt);
-      const subdomain = new URL(this.#identity.getRedirectURL()).hostname.split(".")[0];
-      const redirectUri = `http://127.0.0.1/mozoauth2/${subdomain}`;
-      const registration: ChatGPTRegistrationV1 = await getChatGPTRegistration() ?? {
+      const subdomain = new URL(this.#browser.getRedirectURL()).hostname.split(".")[0];
+      const redirectUri = `http://127.0.0.1:1455/mozoauth2/${subdomain}`;
+      const saved = await getChatGPTRegistration();
+      // Only the port may change on an existing registration. Preserve the
+      // original host ID and issued client ID from the portless prototype.
+      if (saved && new URL(saved.redirectUri).pathname !== new URL(redirectUri).pathname)
+        throw new ProviderStreamError("The extension's login callback changed. Reinstall this extension with its original add-on ID.", "AUTHENTICATION");
+      const registration: ChatGPTRegistrationV1 = saved ? { ...saved, redirectUri } : {
         version: 1, hostId: `urn:uuid:${crypto.randomUUID()}`, clientId: null, subject: null, redirectUri,
       };
-      if (registration.redirectUri !== redirectUri) throw new ProviderStreamError("The extension's login callback changed. Reinstall this extension with its original add-on ID.", "AUTHENTICATION");
       await saveChatGPTRegistration(registration);
       const state = randomValue();
       const nonce = randomValue();
@@ -96,19 +96,7 @@ export class ChatGPTAuth {
         scope: SCOPES, resource: RESOURCE, state, nonce, code_challenge_method: "S256", code_challenge: challenge,
         ...(!registration.clientId ? { agent_name_hint: "bside" } : {}),
       }).toString();
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      let returned: string;
-      try {
-        const result = await Promise.race([
-          this.#identity.launchWebAuthFlow({ url: url.href, interactive: true, redirect_uri: redirectUri }),
-          new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new ProviderStreamError("ChatGPT sign-in timed out. Close the sign-in window and try again.", "TIMEOUT")), 10 * 60_000); }),
-        ]);
-        if (!result) throw new ProviderStreamError("ChatGPT sign-in did not return a callback.", "AUTHENTICATION");
-        returned = result;
-      } catch (error) {
-        if (error instanceof ProviderStreamError) throw error;
-        throw new ProviderStreamError("ChatGPT sign-in was cancelled or could not complete.", "AUTHENTICATION");
-      } finally { clearTimeout(timer); }
+      const returned = await this.#browser.authorize(url.href, redirectUri, AbortSignal.timeout(10 * 60_000));
       const callback = new URL(returned);
       if (`${callback.origin}${callback.pathname}` !== redirectUri || callback.searchParams.get("state") !== state)
         throw new ProviderStreamError("ChatGPT sign-in returned an invalid callback.", "AUTHENTICATION");
@@ -205,7 +193,11 @@ export class ChatGPTAuth {
     this.#busy = true;
     try { return await action(); }
     catch (error) {
-      if (error instanceof ProviderStreamError) throw error;
+      if (error instanceof ProviderStreamError) {
+        console.warn("[bside] ChatGPT authentication failed:", error.code, error.message);
+        throw error;
+      }
+      console.warn("[bside] ChatGPT authentication failed:", "Unrecognized authentication error");
       throw new ProviderStreamError("ChatGPT authentication could not complete. Try again.", "AUTHENTICATION");
     } finally { this.#busy = false; }
   }

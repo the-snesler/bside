@@ -1,23 +1,18 @@
+import { Fragment } from "preact";
 import { useState } from "preact/hooks";
 import Settings from "~icons/tabler/settings";
 import Download from "~icons/tabler/download";
 import Refresh from "~icons/tabler/refresh";
 import Globe from "~icons/tabler/world";
 import ArrowDown from "~icons/tabler/arrow-down";
-import Check from "~icons/tabler/check";
-import X from "~icons/tabler/x";
-import Loader from "~icons/tabler/loader-2";
-import Shield from "~icons/tabler/shield-check";
 import { Markdown } from "@/lib/ui/Markdown";
-import { Composer } from "@/lib/ui/Composer";
+import { Composer, parsePromptMentions } from "@/lib/ui/Composer";
 import { useBottomScroll } from "@/lib/ui/use-bottom-scroll";
 import type { ReasoningEffort } from "@/lib/domain/provider";
 import { useBackground } from "@/lib/ui/use-background";
-import type {
-  PageArtifactSummary,
-  ToolCall,
-  ToolResult,
-} from "@/lib/domain/tools";
+import type { PageArtifactSummary } from "@/lib/domain/tools";
+import { TurnTrace } from "@/lib/ui/TurnTrace";
+import { buildTurns } from "@/lib/ui/turns";
 import type { ConversationItem } from "@/lib/domain/conversation";
 
 function lastUserPrompt(items: ConversationItem[]): string | null {
@@ -38,166 +33,6 @@ function describeAttachment(page: PageArtifactSummary): string {
   return page.title ? `${page.title} · ${origin}` : origin;
 }
 
-/** Fallback label for a historical tool-call row; the richer live pseudo-code lives on the pending approval itself. */
-function describeToolCall(call: ToolCall): string {
-  if (call.name === "browser_program") {
-    const args = call.arguments;
-    const source =
-      args &&
-      typeof args === "object" &&
-      !Array.isArray(args) &&
-      typeof args.source === "string"
-        ? args.source
-        : "";
-    const actions: [RegExp, string][] = [
-      [/\.setInputFiles\(/, "Attaching a file"],
-      [/\.click\(|\.press\(/, "Clicking a page control"],
-      [/\.fill\(/, "Filling page fields"],
-      [/\.selectOption\(/, "Selecting an option"],
-      [/\.setChecked\(|\.check\(|\.uncheck\(/, "Updating a checkbox"],
-      [/web\.search\(/, "Searching the web"],
-      [/\.navigate\(|\.goBack\(|browser\.open\(/, "Opening a page"],
-      [/fs\.remove\(/, "Removing a file or tab"],
-      [/fs\.move\(/, "Moving a file or tab"],
-      [/fs\.write\(/, "Writing a scratch file"],
-      [/\.scroll\(/, "Scrolling the page"],
-      [/\.find\(|\.waitFor\(/, "Searching page content"],
-      [/fs\.read\(|\.snapshot\(/, "Reading page content"],
-      [/fs\.list\(/, "Listing tabs and files"],
-    ];
-    return (
-      actions.find(([pattern]) => pattern.test(source))?.[1] ??
-      "Running browser program"
-    );
-  }
-  if (call.name === "request_action_confirmation") return "Action confirmation";
-  return call.name;
-}
-
-type TimelineEntry =
-  | { kind: "message"; id: string; role: "user" | "assistant"; text: string }
-  | {
-      kind: "activity";
-      id: string;
-      call: ToolCall;
-      result: Omit<ToolResult, "data"> | null;
-    };
-
-function buildTimeline(items: ConversationItem[]): TimelineEntry[] {
-  const entries: TimelineEntry[] = [];
-  const activityIndexByCallId = new Map<string, number>();
-
-  for (const item of items) {
-    if (item.kind === "message") {
-      entries.push({
-        kind: "message",
-        id: item.id,
-        role: item.role,
-        text: item.text,
-      });
-    } else if (item.kind === "tool-call") {
-      activityIndexByCallId.set(item.call.id, entries.length);
-      entries.push({
-        kind: "activity",
-        id: item.id,
-        call: item.call,
-        result: null,
-      });
-    } else if (item.kind === "tool-result") {
-      const index = activityIndexByCallId.get(item.callId);
-      const entry = index !== undefined ? entries[index] : undefined;
-      if (entry?.kind === "activity") entry.result = item.result;
-    }
-  }
-  return entries;
-}
-
-function ActivityRow(props: {
-  entry: Extract<TimelineEntry, { kind: "activity" }>;
-  pendingDisplay: string | null;
-  onApprove: () => void;
-  onDeny: () => void;
-}) {
-  const { entry, pendingDisplay, onApprove, onDeny } = props;
-  const isPending = pendingDisplay !== null;
-  const label = pendingDisplay ?? describeToolCall(entry.call);
-  const status = isPending
-    ? "Waiting for approval"
-    : entry.result
-      ? entry.result.ok
-        ? "Done"
-        : entry.result.summary
-      : "Running…";
-  const args = entry.call.arguments;
-  const confirmation =
-    entry.call.name === "request_action_confirmation" &&
-    args &&
-    typeof args === "object" &&
-    !Array.isArray(args)
-      ? args
-      : null;
-
-  return (
-    <li class="timeline__item timeline__item--tool">
-      <details class="activity" open={isPending}>
-        <summary class="activity__summary" aria-label={`${label}: ${status}`}>
-          <span
-            class={`activity__status activity__status--${isPending ? "pending" : entry.result?.ok ? "ok" : entry.result ? "error" : "running"}`}
-          >
-            {isPending ? (
-              <Shield />
-            ) : entry.result?.ok ? (
-              <Check />
-            ) : entry.result ? (
-              <X />
-            ) : (
-              <Loader class="spin" />
-            )}
-          </span>
-          <span class="activity__label">{label}</span>
-        </summary>
-        <div class="activity__detail">
-          {confirmation ? (
-            <>
-              <p>
-                {typeof confirmation.message === "string"
-                  ? confirmation.message
-                  : ""}
-              </p>
-              {typeof confirmation.artifact === "string" &&
-                confirmation.artifact && (
-                  <pre
-                    class="tool-call"
-                    style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
-                  >
-                    {confirmation.artifact}
-                  </pre>
-                )}
-            </>
-          ) : (
-            <code class="tool-call">
-              {JSON.stringify(entry.call.arguments)}
-            </code>
-          )}
-          {entry.result && (
-            <p class="activity__result">{entry.result.summary}</p>
-          )}
-        </div>
-        {isPending && (
-          <div class="activity__actions">
-            <button type="button" class="activity__approve" onClick={onApprove}>
-              Approve
-            </button>
-            <button type="button" class="activity__deny" onClick={onDeny}>
-              Deny
-            </button>
-          </div>
-        )}
-      </details>
-    </li>
-  );
-}
-
 export function App() {
   const {
     conversation,
@@ -210,6 +45,7 @@ export function App() {
     settings,
     tabs,
     listTabs,
+    focusTab,
     saveSettings,
     sendPrompt,
     cancelRun,
@@ -225,7 +61,7 @@ export function App() {
   const model =
     provider.models.find((model) => model.id === settings.modelId) ??
     provider.models[0];
-  const timeline = buildTimeline(conversation.items);
+  const turns = buildTurns(conversation.items, activeRun !== null);
   const pendingApproval = activeRun?.pendingApproval ?? null;
 
   const handleRetry = () => {
@@ -294,7 +130,7 @@ export function App() {
       )}
       <main class="sidebar__body" ref={scroll.viewport}>
         <div ref={scroll.content}>
-          {timeline.length === 0 && !activeRun ? (
+          {turns.length === 0 && !activeRun ? (
             <p class="sidebar__empty">
               {page
                 ? `Ask about ${page.title || "this page"}, or start a conversation.`
@@ -302,32 +138,51 @@ export function App() {
             </p>
           ) : (
             <ul class="timeline">
-              {timeline.map((entry) =>
-                entry.kind === "message" ? (
-                  <li
-                    key={entry.id}
-                    class={`timeline__item timeline__item--${entry.role}`}
-                  >
-                    {entry.role === "user" ? (
-                      <p class="timeline__text">{entry.text}</p>
-                    ) : (
-                      <Markdown text={entry.text} />
-                    )}
-                  </li>
-                ) : (
-                  <ActivityRow
-                    key={entry.id}
-                    entry={entry}
-                    pendingDisplay={
-                      pendingApproval?.call.id === entry.call.id
-                        ? pendingApproval.display
-                        : null
-                    }
-                    onApprove={() => approveAction(entry.call.id)}
-                    onDeny={() => denyAction(entry.call.id)}
-                  />
-                ),
-              )}
+              {turns.map((turn, index) => (
+                <Fragment key={turn.id}>
+                  {turn.prompt && (
+                    <li class="timeline__item timeline__item--user">
+                      <p class="timeline__text">
+                        {parsePromptMentions(turn.prompt.text).map((segment) =>
+                          segment.kind === "text" ? (
+                            segment.text
+                          ) : segment.agentTab ? (
+                            <span class="tab-mention" title={segment.url}>
+                              @{segment.label}
+                            </span>
+                          ) : (
+                            <button
+                              type="button"
+                              class="tab-mention tab-mention--link"
+                              title={`Switch to ${segment.url}`}
+                              onClick={() => focusTab(segment.tabId)}
+                            >
+                              @{segment.label}
+                            </button>
+                          ),
+                        )}
+                      </p>
+                    </li>
+                  )}
+                  {(turn.steps.length > 0 ||
+                    (activeRun && index === turns.length - 1)) && (
+                    <li class="timeline__item timeline__item--work">
+                      <TurnTrace
+                        turn={turn}
+                        active={!!activeRun && index === turns.length - 1}
+                        pendingApproval={pendingApproval}
+                        onApprove={approveAction}
+                        onDeny={denyAction}
+                      />
+                    </li>
+                  )}
+                  {turn.answer && (
+                    <li class="timeline__item timeline__item--assistant">
+                      <Markdown text={turn.answer.text} />
+                    </li>
+                  )}
+                </Fragment>
+              ))}
               {activeRun?.partialAssistantText && (
                 <li class="timeline__item timeline__item--assistant timeline__item--streaming">
                   <Markdown text={activeRun.partialAssistantText} />

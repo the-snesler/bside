@@ -15,12 +15,22 @@ Forgotten PIN: enter a new PIN and choose **Sign in again** to replace the saved
 
 ## Callback and storage
 
-Firefox's [`identity.launchWebAuthFlow`](https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/API/identity/launchWebAuthFlow) captures `http://127.0.0.1/mozoauth2/<extension-identity>` before loading it. The fixed add-on ID keeps that path stable. OpenAI requires a `127.0.0.1` callback with the original scheme, host, and path on subsequent sign-ins. Live testing must confirm that OpenAI accepts this Firefox callback; a rejected callback is an integration failure, not a reason to copy tokens from a website or install a native listener.
+The callback is `http://127.0.0.1:1455/mozoauth2/<extension-identity>`. OpenAI rejected the prototype's portless URL; anonymous browser probes confirmed that adding `:1455` reaches OpenAI's login page with the same path. Firefox's built-in identity flow cannot capture this ported URL, so the background opens its own sign-in popup and registers a blocking `webRequest.onBeforeRequest` listener before navigating it. The listener is limited to the popup's tab, top-level navigation, and callback path; it verifies the exact origin/path, captures the callback, and cancels the HTTP request. No local server is required, and no callback code is sent to a local service. Listeners and the popup are removed on success, cancellation, timeout, and navigation failure.
+
+This design adds `webRequest` and `webRequestBlocking` permissions. Existing host permissions cover the callback. The `identity` permission remains only to derive the stable extension callback path with `getRedirectURL()`. OpenAI requires the original scheme, host, and path on later sign-ins; only the port may change. Existing prototype registrations keep their host/client IDs when the explicit port is added. Passing authorization URL validation does not prove account consent, code exchange, or inference works; those remain live smoke-test steps.
 
 All OAuth tokens, expiry, granted scopes, and account email are AES-GCM encrypted in extension `storage.local`, using a nonextractable key derived from the PIN with PBKDF2-SHA256 (600,000 iterations, random 16-byte salt). Every write gets a fresh 12-byte IV. The PIN and encryption key are never persisted; unlocked tokens and the key live in background memory only. Registration IDs and model labels are nonsecret metadata. Website storage is unused, and content scripts/sidebar messages never receive tokens or the PIN. The existing API-key storage path is unchanged and remains unencrypted.
 
 ## Automated checks
 
-`corepack pnpm test tests/chatgpt-auth.test.ts tests/chatgpt-provider.test.ts tests/options-ui.test.ts tests/runtime.test.ts tests/protocol.test.ts`
+`corepack pnpm test tests/chatgpt-auth.test.ts tests/chatgpt-browser-auth.test.ts tests/chatgpt-provider.test.ts tests/options-ui.test.ts tests/runtime.test.ts tests/protocol.test.ts`
 
 These use synthetic tokens and signed test identities. They cover PKCE/callback/ID-token validation, PIN encryption and restart unlock, serialized refresh rotation, local disconnect, credential isolation, subscription priority, account model validation, connection testing, and actual Pi SSE tool-call replay. They do not prove a real account can authorize this callback or infer successfully.
+
+## Debug a sign-in failure
+
+The options page sends a message to `ChatGPTAuth.login` in the persistent background, which opens a Firefox popup. Inspect the sign-in popup's Network panel for authorization traffic. Token exchange, JWKS, account model loading, and inference requests appear in the extension's background inspector after a callback is captured.
+
+Open **Tools → Browser Tools → Browser Console** (macOS: **Cmd+Shift+J**; Windows/Linux: **Ctrl+Shift+J**) and filter for `[bside]`. bside logs only normalized errors, never the PIN, OAuth URL, callback, or tokens. For all browser-owned network traffic, use the [Browser Toolbox](https://firefox-source-docs.mozilla.org/devtools-user/browser_toolbox/) Network panel and filter for `auth.openai.com`.
+
+An unrecognized rejection can be inspected in **about:debugging → This Firefox → bside → Inspect → Debugger** with **Pause on exceptions** and **Pause on caught exceptions** enabled. Arbitrary exception text is deliberately excluded from logs and UI errors. If OpenAI shows `param: redirect_uri`, confirm the authorization URL uses an explicit `127.0.0.1:1455` port and the saved callback path.

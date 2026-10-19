@@ -176,7 +176,8 @@ export class AgentLoop {
       ? { ok: result.ok, ...(result.code ? { code: result.code } : {}), summary: result.ok ? "Browser program completed." : diagnostic }
       : stripData(result);
     await params.onItem({ id: crypto.randomUUID(), kind: "tool-result", callId: call.id, result: persistedResult, at: Date.now() });
-    this.#sidebarHub.publishRunEvent(params.runId, "tool.result", { callId: call.id, result });
+    // Publish the persisted shape so live rows match what a reload renders.
+    this.#sidebarHub.publishRunEvent(params.runId, "tool.result", { callId: call.id, result: persistedResult });
   }
 
   #createTools(params: AgentLoopParams): AgentTool<TSchema, { toolResult: ToolResult }>[] {

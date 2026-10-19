@@ -17,6 +17,8 @@ export default defineConfig({
     permissions: [
       "storage",
       "identity",
+      "webRequest",
+      "webRequestBlocking",
       "tabHide",
       "https://api.openai.com/*",
       "https://auth.openai.com/*",

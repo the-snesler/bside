@@ -1,22 +1,25 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
-import { ChatGPTAuth, type ChatGPTIdentityApi } from "@/lib/background/chatgpt-auth";
-import { getChatGPTCredential, getChatGPTRegistration, saveOpenAICredential, getOpenAICredential } from "@/lib/storage";
+import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
+import type { ChatGPTAuthBrowser } from "@/lib/background/chatgpt-browser-auth";
+import { getChatGPTCredential, getChatGPTRegistration, saveChatGPTRegistration, saveOpenAICredential, getOpenAICredential } from "@/lib/storage";
 
 let keys: Awaited<ReturnType<typeof generateKeyPair>>;
 let jwk: Awaited<ReturnType<typeof exportJWK>>;
 beforeAll(async () => { keys = await generateKeyPair("RS256"); jwk = await exportJWK(keys.publicKey); });
-beforeEach(() => { fakeBrowser.reset(); vi.restoreAllMocks(); });
+beforeEach(() => { fakeBrowser.reset(); vi.restoreAllMocks(); vi.spyOn(console, "warn").mockImplementation(() => {}); });
 
-function harness(options: { callback?: (url: URL) => void; nonce?: string; scopes?: string; refreshStatus?: number; revokeStatus?: number; issuer?: string; audience?: string } = {}) {
+function harness(options: { callback?: (url: URL) => void; nonce?: string; scopes?: string; refreshStatus?: number; revokeStatus?: number; issuer?: string; audience?: string; browserError?: string } = {}) {
   let authorization: URL;
   const tokenRequests: URLSearchParams[] = [];
-  const identity: ChatGPTIdentityApi = {
+  const authBrowser: ChatGPTAuthBrowser = {
     getRedirectURL: () => "https://test-addon.extensions.allizom.org/",
-    launchWebAuthFlow: vi.fn(async (details) => {
-      authorization = new URL(details.url);
-      expect(details.redirect_uri).toBe("http://127.0.0.1/mozoauth2/test-addon");
-      const callback = new URL(details.redirect_uri);
+    authorize: vi.fn(async (url, redirectUri) => {
+      if (options.browserError) throw { message: options.browserError };
+      authorization = new URL(url);
+      expect(redirectUri).toBe("http://127.0.0.1:1455/mozoauth2/test-addon");
+      expect(authorization.searchParams.get("redirect_uri")).toBe(redirectUri);
+      const callback = new URL(redirectUri);
       callback.search = new URLSearchParams({ code: "test-code", state: authorization.searchParams.get("state")!, client_id: "oaiapp_test" }).toString();
       options.callback?.(callback);
       return callback.href;
@@ -45,10 +48,18 @@ function harness(options: { callback?: (url: URL) => void; nonce?: string; scope
     if (url.endsWith("/oauth/revoke")) return new Response("", { status: options.revokeStatus ?? 200 });
     throw new Error("unexpected authentication request");
   });
-  return { identity, fetcher, tokenRequests, auth: new ChatGPTAuth(identity, fetcher), authorization: () => authorization };
+  return { authBrowser, fetcher, tokenRequests, auth: new ChatGPTAuth(authBrowser, fetcher), authorization: () => authorization };
 }
 
 describe("ChatGPT subscription OAuth and encrypted storage", () => {
+  it("does not expose arbitrary browser errors in the UI or console", async () => {
+    const h = harness({ browserError: "private callback?code=test-secret&state=test-state" });
+    await expect(h.auth.login("12345678")).rejects.toMatchObject({ code: "AUTHENTICATION", message: expect.not.stringContaining("test-secret") });
+    expect(JSON.stringify(vi.mocked(console.warn).mock.calls)).not.toContain("test-secret");
+    expect(h.fetcher).not.toHaveBeenCalled();
+    expect(await getChatGPTCredential()).toBeNull();
+  });
+
   it("uses PKCE, validates the signed account, encrypts all tokens, and publishes only safe status", async () => {
     const h = harness();
     await h.auth.login("12345678");
@@ -76,7 +87,7 @@ describe("ChatGPT subscription OAuth and encrypted storage", () => {
     const h = harness();
     await h.auth.login("12345678");
     const saved = await getChatGPTCredential();
-    const restarted = new ChatGPTAuth(h.identity, h.fetcher);
+    const restarted = new ChatGPTAuth(h.authBrowser, h.fetcher);
     expect(await restarted.status()).toEqual({ connected: true, locked: true, email: null });
     await expect(restarted.getAuth(new AbortController().signal)).rejects.toMatchObject({ code: "AUTHENTICATION" });
     await expect(restarted.unlock("87654321")).rejects.toMatchObject({ message: expect.stringContaining("Incorrect PIN") });
@@ -100,7 +111,7 @@ describe("ChatGPT subscription OAuth and encrypted storage", () => {
     const replacement = await getChatGPTCredential();
     expect(replacement?.iv).not.toBe(saved?.iv);
     expect(replacement?.salt).toBe(saved?.salt);
-    const restarted = new ChatGPTAuth(h.identity, h.fetcher);
+    const restarted = new ChatGPTAuth(h.authBrowser, h.fetcher);
     await restarted.unlock("12345678");
     expect((await restarted.getAuth(new AbortController().signal)).secret).toBe("test-access-rotated");
   });
@@ -131,6 +142,16 @@ describe("ChatGPT subscription OAuth and encrypted storage", () => {
     await h.auth.lock();
     await expect(h.auth.unlock("12345678")).rejects.toMatchObject({ code: "AUTHENTICATION" });
     await h.auth.unlock("87654321");
+  });
+
+  it("adds an explicit port to a saved prototype registration without replacing its identity", async () => {
+    const h = harness();
+    const registration = { version: 1 as const, hostId: `urn:uuid:${crypto.randomUUID()}`, clientId: null, subject: null,
+      redirectUri: "http://127.0.0.1/mozoauth2/test-addon" };
+    await saveChatGPTRegistration(registration);
+    await h.auth.login("12345678");
+    expect(h.authorization().searchParams.get("ext_agent_host_id")).toBe(registration.hostId);
+    expect(await getChatGPTRegistration()).toMatchObject({ hostId: registration.hostId, redirectUri: "http://127.0.0.1:1455/mozoauth2/test-addon" });
   });
 
   it("retains saved credentials on refresh failure and sanitizes upstream error bodies", async () => {

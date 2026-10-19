@@ -216,7 +216,7 @@ export async function getChatGPTRegistration(): Promise<ChatGPTRegistrationV1 | 
   if (raw?.version === 1 && typeof raw.hostId === "string" && /^urn:uuid:[\da-f-]{36}$/i.test(raw.hostId) &&
     (raw.clientId === null || (typeof raw.clientId === "string" && /^[\w-]{1,200}$/.test(raw.clientId))) &&
     (raw.subject === null || typeof raw.subject === "string") && typeof raw.redirectUri === "string" &&
-    /^http:\/\/127\.0\.0\.1\/mozoauth2\/[\w-]+$/.test(raw.redirectUri)) return raw;
+    /^http:\/\/127\.0\.0\.1(?::\d{1,5})?\/mozoauth2\/[\w-]+$/.test(raw.redirectUri)) return raw;
   if (raw !== null) await chatgptRegistrationItem.removeValue();
   return null;
 }

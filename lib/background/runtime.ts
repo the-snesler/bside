@@ -148,6 +148,11 @@ export class BackgroundRuntime {
       const tabs = await this.#tabControllerFactory().listTabs();
       return { tabs: tabs.map((tab) => ({ id: tab.id!, title: tab.title ?? "", url: tab.url!, path: `/${this.#workspace.agentTabs.has(tab.id!) ? "agent-tabs" : "tabs"}/${tab.id}/page.md` })) };
     }
+    if (command.type === "tabs.focus") {
+      // Agent tabs are hidden workspace tabs; activating one would unhide it.
+      if (!this.#workspace.agentTabs.has(command.tabId)) await this.#tabControllerFactory().focusTab(command.tabId);
+      return;
+    }
     if (command.type === "settings.save") {
       if (this.#activeRun) return;
       await this.handleSettingsRequest(command);

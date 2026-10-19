@@ -35,7 +35,7 @@ export interface TabControllerBrowserApi {
     hide?(tabId: number): Promise<number[]>;
     show?(tabId: number): Promise<void>;
     remove?(tabId: number): Promise<void>;
-    update(tabId: number, updateProperties: { url: string }): Promise<unknown>;
+    update(tabId: number, updateProperties: { url: string } | { active: true }): Promise<unknown>;
     goBack(tabId: number): Promise<void>;
     sendMessage(tabId: number, message: unknown): Promise<unknown>;
     onUpdated: {
@@ -94,6 +94,12 @@ export class TabController {
   async showTab(tabId: number): Promise<void> {
     if (!this.#browserApi.tabs.show) throw new Error("Showing tabs is unavailable.");
     await this.#browserApi.tabs.show(tabId);
+  }
+
+  async focusTab(tabId: number): Promise<void> {
+    const tab = (await this.listTabs()).find((tab) => tab.id === tabId);
+    if (!tab || tab.hidden) return;
+    await this.#browserApi.tabs.update(tabId, { active: true });
   }
 
   async closeTab(tabId: number): Promise<void> {

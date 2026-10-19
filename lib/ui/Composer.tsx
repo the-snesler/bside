@@ -42,6 +42,24 @@ export function serializeDraft(nodes: Descendant[]): string {
   return nodes.map(serialize).join("\n").trim();
 }
 
+export type PromptSegment =
+  | { kind: "text"; text: string }
+  | { kind: "mention"; label: string; tabId: number; agentTab: boolean; url: string };
+
+/** Splits a sent prompt back into text and the mentions `serializeDraft` encoded. */
+export function parsePromptMentions(prompt: string): PromptSegment[] {
+  const segments: PromptSegment[] = [];
+  const pattern = /@([^\n]+?) \(tab (\d+), \/(agent-tabs|tabs)\/\2\/page\.md, (\S+)\)/g;
+  let last = 0;
+  for (const match of prompt.matchAll(pattern)) {
+    if (match.index > last) segments.push({ kind: "text", text: prompt.slice(last, match.index) });
+    segments.push({ kind: "mention", label: match[1]!, tabId: Number(match[2]), agentTab: match[3] === "agent-tabs", url: match[4]! });
+    last = match.index + match[0].length;
+  }
+  if (last < prompt.length) segments.push({ kind: "text", text: prompt.slice(last) });
+  return segments;
+}
+
 export function Composer(props: {
   disabled: boolean;
   running: boolean;
