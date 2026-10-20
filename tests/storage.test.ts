@@ -156,6 +156,23 @@ describe("storage: credential migration", () => {
     expect(await hasChatGPTSignInNotice()).toBe(true);
   });
 
+  it("never deletes a legacy ChatGPT credential without recording the sign-in notice", async () => {
+    await browser.storage.local.set({ chatgptCredential: legacyChatGPT });
+    const set = browser.storage.local.set.bind(browser.storage.local);
+    const spy = vi.spyOn(browser.storage.local, "set").mockImplementation(async (items) => {
+      if ("chatgptSignInNotice" in items) throw new Error("Interrupted");
+      return set(items);
+    });
+    await expect(migrateCredentials()).rejects.toThrow("Interrupted");
+    spy.mockRestore();
+    // Either both survive for the next startup to retry, or the notice is set.
+    const stored = await browser.storage.local.get(null);
+    expect(stored.chatgptCredential !== undefined || await hasChatGPTSignInNotice()).toBe(true);
+    await migrateCredentials();
+    expect((await browser.storage.local.get(null)).chatgptCredential).toBeUndefined();
+    expect(await hasChatGPTSignInNotice()).toBe(true);
+  });
+
   it("re-encrypts a plaintext API key and removes the plaintext copy", async () => {
     await browser.storage.local.set({ openaiCredential: legacyApiKey });
     await migrateCredentials();
