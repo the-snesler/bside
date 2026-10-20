@@ -210,6 +210,8 @@ export type SidebarCommand =
   | { v: 1; id: string; type: "context.reset" | "context.export" }
   | { v: 1; id: string; type: "state.subscribe"; lastSeq: number | null }
   | { v: 1; id: string; type: "run.start"; prompt: string }
+  /** Re-runs the last turn's existing user message; accepted only when no run is active and that turn ended failed, cancelled, or interrupted. */
+  | { v: 1; id: string; type: "run.retry" }
   | { v: 1; id: string; type: "run.cancel"; runId: string }
   | { v: 1; id: string; type: "action.approve"; runId: string; callId: string }
   | { v: 1; id: string; type: "action.deny"; runId: string; callId: string };
@@ -255,7 +257,7 @@ export type SidebarEvent =
   | EventBase<"context.exported", { requestId: string; markdown: string; filename: string }>
   | EventBase<"state.snapshot", RuntimeSnapshot>
   | EventBase<"page.attached", PageArtifactSummary | null>
-  | EventBase<"run.started", { prompt: string; page: PageArtifactSummary | null }>
+  | EventBase<"run.started", { prompt: string; page: PageArtifactSummary | null; retry: boolean }>
   | EventBase<"assistant.delta", { delta: string }>
   | EventBase<"tool.requested", { call: ToolCall; display: string }>
   | EventBase<"action.approval-required", ApprovalRequest>
@@ -275,6 +277,7 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
     return candidate.lastSeq === null || typeof candidate.lastSeq === "number";
   }
   if (candidate.type === "run.start") return typeof candidate.prompt === "string";
+  if (candidate.type === "run.retry") return true;
   if (candidate.type === "run.cancel") return typeof candidate.runId === "string";
   if (candidate.type === "action.approve" || candidate.type === "action.deny") {
     return typeof candidate.runId === "string" && typeof candidate.callId === "string";

@@ -277,13 +277,14 @@ const INTERRUPTED_SUFFIX = "\n\n[Interrupted: the extension restarted before thi
  * Startup recovery: a checkpoint left "running"/"awaiting-approval" means the
  * background died mid-run. Convert it into a visible interrupted assistant
  * message rather than silently dropping it or claiming stream resumption.
+ * Returns whether a run was interrupted.
  */
-export async function recoverInterruptedRun(): Promise<void> {
+export async function recoverInterruptedRun(): Promise<boolean> {
   const checkpoint = await getRunCheckpoint();
-  if (!checkpoint) return;
+  if (!checkpoint) return false;
   if (checkpoint.status !== "running" && checkpoint.status !== "awaiting-approval") {
     await clearRunCheckpoint();
-    return;
+    return false;
   }
 
   const text = checkpoint.partialAssistantText
@@ -298,4 +299,5 @@ export async function recoverInterruptedRun(): Promise<void> {
     at: Date.now(),
   });
   await clearRunCheckpoint();
+  return true;
 }

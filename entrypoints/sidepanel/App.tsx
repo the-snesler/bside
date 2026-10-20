@@ -13,15 +13,6 @@ import { useBackground } from "@/lib/ui/use-background";
 import type { PageArtifactSummary } from "@/lib/domain/tools";
 import { TurnTrace } from "@/lib/ui/TurnTrace";
 import { buildTurns } from "@/lib/ui/turns";
-import type { ConversationItem } from "@/lib/domain/conversation";
-
-function lastUserPrompt(items: ConversationItem[]): string | null {
-  for (let i = items.length - 1; i >= 0; i -= 1) {
-    const item = items[i];
-    if (item?.kind === "message" && item.role === "user") return item.text;
-  }
-  return null;
-}
 
 function describeAttachment(page: PageArtifactSummary): string {
   let origin = page.url;
@@ -48,6 +39,7 @@ export function App() {
     focusTab,
     saveSettings,
     sendPrompt,
+    retryRun,
     cancelRun,
     approveAction,
     denyAction,
@@ -63,11 +55,6 @@ export function App() {
     provider.models[0];
   const turns = buildTurns(conversation.items, activeRun !== null);
   const pendingApproval = activeRun?.pendingApproval ?? null;
-
-  const handleRetry = () => {
-    const prompt = lastUserPrompt(conversation.items);
-    if (prompt) sendPrompt(prompt);
-  };
 
   return (
     <div class="sidebar">
@@ -198,7 +185,7 @@ export function App() {
                 <button
                   type="button"
                   class="sidebar__retry"
-                  onClick={handleRetry}
+                  onClick={retryRun}
                 >
                   Retry
                 </button>

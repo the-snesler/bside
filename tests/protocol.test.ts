@@ -23,6 +23,10 @@ describe("isSidebarCommand: accepts every valid variant", () => {
     expect(isSidebarCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi" })).toBe(true);
   });
 
+  it("accepts run.retry, which carries no prompt", () => {
+    expect(isSidebarCommand({ v: 1, id: "1", type: "run.retry" })).toBe(true);
+  });
+
   it("accepts run.cancel", () => {
     expect(isSidebarCommand({ v: 1, id: "1", type: "run.cancel", runId: "r1" })).toBe(true);
   });
@@ -52,7 +56,7 @@ describe("isSidebarCommand: rejects malformed input", () => {
   });
 
   it("rejects an unknown command type", () => {
-    expect(isSidebarCommand({ v: 1, id: "1", type: "run.retry" })).toBe(false);
+    expect(isSidebarCommand({ v: 1, id: "1", type: "run.resume" })).toBe(false);
   });
 
   it("rejects state.subscribe with a non-numeric, non-null lastSeq", () => {
@@ -65,6 +69,11 @@ describe("isSidebarCommand: rejects malformed input", () => {
 
   it("rejects run.start with a missing prompt", () => {
     expect(isSidebarCommand({ v: 1, id: "1", type: "run.start" })).toBe(false);
+  });
+
+  it("rejects run.retry with a wrong envelope", () => {
+    expect(isSidebarCommand({ v: 2, id: "1", type: "run.retry" })).toBe(false);
+    expect(isSidebarCommand({ v: 1, type: "run.retry" })).toBe(false);
   });
 
   it("rejects run.cancel with a missing runId", () => {
