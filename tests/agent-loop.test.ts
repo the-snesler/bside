@@ -139,7 +139,7 @@ describe("AgentLoop: read-only tool call", () => {
     const items: unknown[] = [];
 
     const result = await loop.run({
-      runId: "run1",
+      runId: "run1", conversationId: "default",
       modelId: "gpt-5.6-terra",
       reasoningEffort: "medium",
       transcript: baseTranscript,
@@ -174,16 +174,48 @@ describe("AgentLoop: initial page artifact", () => {
     const loop = new AgentLoop(provider, tabController, new SidebarHub());
 
     const result = await loop.run({
-      runId: "run1", modelId: "gpt-5.6-terra", reasoningEffort: "medium", transcript: baseTranscript, contextArtifact: artifact,
+      runId: "run1", conversationId: "default", modelId: "gpt-5.6-terra", reasoningEffort: "medium", transcript: baseTranscript, contextArtifact: artifact,
       auth: AUTH, signal: new AbortController().signal, onDelta: () => {}, onItem: async () => {}, onApprovalPending: () => {},
     });
 
     expect(result.status).toBe("completed");
-    const systemPrompt = provider.requests[0]?.context.systemPrompt ?? "";
-    expect(systemPrompt).toContain("Verify outcomes before claiming them");
-    expect(systemPrompt).toContain('Orchid launch moved to Friday.\n[e1 button "Submit"]');
-    expect(systemPrompt).toContain("Document: doc-1");
+    const userTurn = JSON.stringify(provider.requests[0]?.context.messages.at(-1));
+    expect(userTurn).toContain("Do it");
+    expect(userTurn).toContain(JSON.stringify('Orchid launch moved to Friday.\n[e1 button "Submit"]').slice(1, -1));
+    expect(userTurn).toContain("Document: doc-1");
     expect(actions).toEqual([{ kind: "click", target: { kind: "ref", ref: "e1", documentId: "doc-1" } }]);
+  });
+
+  it("keeps the system prompt and tools byte-identical with or without a page, across rounds", async () => {
+    const run = async (contextArtifact: typeof artifact | null) => {
+      const provider = new ScriptedProvider([
+        () => [toolCallEvent("call_1", "browser_program", { source: "return 1;" }), { type: "turn.completed", replayState: null }],
+        () => [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }],
+      ]);
+      const { tabController } = await createTabController();
+      const transcript = [
+        { id: "u0", kind: "message" as const, role: "user" as const, text: "Earlier", context: null, at: 0 },
+        { id: "a0", kind: "message" as const, role: "assistant" as const, text: "Earlier reply", at: 0 },
+        ...baseTranscript,
+      ];
+      await new AgentLoop(provider, tabController, new SidebarHub()).run({
+        runId: "run1", conversationId: "default", modelId: "gpt-5.6-terra", reasoningEffort: "medium", transcript, contextArtifact,
+        auth: AUTH, signal: new AbortController().signal, onDelta: () => {}, onItem: async () => {}, onApprovalPending: () => {},
+      });
+      return provider.requests;
+    };
+    const withPage = await run(artifact);
+    const withoutPage = await run(null);
+
+    const prefixes = [...withPage, ...withoutPage].map((request) => JSON.stringify({ systemPrompt: request.context.systemPrompt, tools: request.context.tools }));
+    expect(new Set(prefixes).size).toBe(1);
+    expect(withPage[0]?.context.systemPrompt).toContain("Verify outcomes before claiming them");
+    expect(withPage[0]?.context.systemPrompt).not.toContain("Orchid launch");
+    expect([...withPage, ...withoutPage].every((request) => request.sessionId === "default")).toBe(true);
+    // Only the current user turn carries the outline; earlier history stays plain text.
+    expect(withPage[0]?.context.messages[0]).toMatchObject({ role: "user", content: "Earlier" });
+    expect(JSON.stringify(withPage[1]?.context.messages[2])).toContain("Orchid launch moved to Friday.");
+    expect(withoutPage[0]?.context.messages[2]).toMatchObject({ role: "user", content: "Do it" });
   });
 });
 
@@ -200,7 +232,7 @@ describe("AgentLoop: approval pause/resume", () => {
     const loop = new AgentLoop(provider, tabController, hub);
 
     const resultPromise = loop.run({
-      runId: "run1",
+      runId: "run1", conversationId: "default",
       modelId: "gpt-5.6-terra",
       reasoningEffort: "medium",
       transcript: baseTranscript,
@@ -246,7 +278,7 @@ describe("AgentLoop: denial as a tool result", () => {
     const loop = new AgentLoop(provider, tabController, hub);
 
     const resultPromise = loop.run({
-      runId: "run1",
+      runId: "run1", conversationId: "default",
       modelId: "gpt-5.6-terra",
       reasoningEffort: "medium",
       transcript: baseTranscript,
@@ -290,7 +322,7 @@ describe("AgentLoop: exactly-once execution", () => {
     const loop = new AgentLoop(provider, tabController, hub);
 
     const result = await loop.run({
-      runId: "run1",
+      runId: "run1", conversationId: "default",
       modelId: "gpt-5.6-terra",
       reasoningEffort: "medium",
       transcript: baseTranscript,
@@ -325,7 +357,7 @@ describe("AgentLoop: stale-ref recovery", () => {
     const savedItems: unknown[] = [];
 
     const resultPromise = loop.run({
-      runId: "run1",
+      runId: "run1", conversationId: "default",
       modelId: "gpt-5.6-terra",
       reasoningEffort: "medium",
       transcript: baseTranscript,
@@ -365,7 +397,7 @@ describe("AgentLoop: cancellation while awaiting approval", () => {
     const approvalStates: (ApprovalRequest | null)[] = [];
 
     const resultPromise = loop.run({
-      runId: "run1",
+      runId: "run1", conversationId: "default",
       modelId: "gpt-5.6-terra",
       reasoningEffort: "medium",
       transcript: baseTranscript,
@@ -405,7 +437,7 @@ describe("AgentLoop: page-effect tracking for retry gating", () => {
     const loop = new AgentLoop(provider, tabController, hub);
 
     const resultPromise = loop.run({
-      runId: "run1",
+      runId: "run1", conversationId: "default",
       modelId: "gpt-5.6-terra",
       reasoningEffort: "medium",
       transcript: baseTranscript,
@@ -445,7 +477,7 @@ describe("AgentLoop: page-effect tracking for retry gating", () => {
     const loop = new AgentLoop(provider, tabController, hub);
 
     const result = await loop.run({
-      runId: "run1",
+      runId: "run1", conversationId: "default",
       modelId: "gpt-5.6-terra",
       reasoningEffort: "medium",
       transcript: baseTranscript,
@@ -475,7 +507,7 @@ describe("AgentLoop: page-effect tracking for retry gating", () => {
     const loop = new AgentLoop(provider, tabController, hub);
 
     const resultPromise = loop.run({
-      runId: "run1",
+      runId: "run1", conversationId: "default",
       modelId: "gpt-5.6-terra",
       reasoningEffort: "medium",
       transcript: baseTranscript,

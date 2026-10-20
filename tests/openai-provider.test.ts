@@ -84,9 +84,9 @@ describe("OpenAIProvider Pi adapter", () => {
       return completedStream();
     });
     const { OpenAIProvider } = await import("@/lib/providers/openai");
-    await collect(new OpenAIProvider().streamTurn(request(), AUTH, new AbortController().signal));
+    await collect(new OpenAIProvider().streamTurn({ ...request(), sessionId: "default" }, AUTH, new AbortController().signal));
 
-    expect(options).toMatchObject({ apiKey: "sk-test-key", reasoning: "high", maxTokens: 8192, timeoutMs: 120_000, maxRetries: 0, cacheRetention: "none", transport: "sse" });
+    expect(options).toMatchObject({ apiKey: "sk-test-key", reasoning: "high", maxTokens: 8192, timeoutMs: 120_000, maxRetries: 0, cacheRetention: "short", sessionId: "default", transport: "sse" });
     expect(await options?.onPayload?.({ model: "gpt-5.6-terra", store: true }, MODEL)).toEqual({
       model: "gpt-5.6-terra",
       store: false,

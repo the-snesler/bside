@@ -61,4 +61,6 @@ export interface ProviderTurnRequest {
   model: Model<Api>;
   reasoningEffort: ReasoningEffort;
   context: Context;
+  /** Conversation id used as the provider prompt-cache key; omitted for one-off requests. */
+  sessionId?: string;
 }

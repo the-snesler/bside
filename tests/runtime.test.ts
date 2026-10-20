@@ -568,6 +568,31 @@ describe("BackgroundRuntime: cross-run transcript (regression)", () => {
   });
 });
 
+describe("BackgroundRuntime: prompt-cache usage", () => {
+  it("keys requests by conversation and accumulates cached input tokens into the run record", async () => {
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    let round = 0;
+    provider.script = () => {
+      round += 1;
+      const events: ScriptedProviderEvent[] = round === 1
+        ? [{ type: "tool.call", call: { id: "call_1", name: "browser_program", arguments: { source: "return 1;" } } }, { type: "turn.completed", replayState: null, usage: { input: 900, cacheRead: 0 } }]
+        : [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null, usage: { input: 100, cacheRead: 896 } }];
+      return { [Symbol.asyncIterator]: async function* () { yield* events; } };
+    };
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hello" });
+
+    expect(provider.requests.map((request) => request.sessionId)).toEqual(["default", "default"]);
+    const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export" });
+    expect(exported?.markdown).toContain('"providerResponses": 2');
+    expect(exported?.markdown).toContain('"cacheRead": 896');
+  });
+});
+
 describe("BackgroundRuntime: unsupported page permits ordinary chat (regression)", () => {
   it("completes a run with no page attachment when the active tab is unsupported", async () => {
     await saveOpenAICredential("sk-test");
