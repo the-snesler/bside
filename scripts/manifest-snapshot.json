@@ -1,0 +1,32 @@
+{
+  "manifest_version": 2,
+  "gecko_id": "bside@extension.local",
+  "background_persistent": true,
+  "permissions": [
+    "http://*/*",
+    "https://*/*",
+    "https://api.openai.com/*",
+    "https://auth.openai.com/*",
+    "identity",
+    "storage",
+    "tabHide",
+    "webRequest",
+    "webRequestBlocking"
+  ],
+  "optional_permissions": [],
+  "content_security_policy": [
+    "default-src 'self'",
+    "script-src 'self'",
+    "object-src 'none'",
+    "connect-src 'self' https://api.openai.com https://auth.openai.com",
+    "img-src 'self' data:",
+    "style-src 'self' 'unsafe-inline'"
+  ],
+  "content_scripts_matches": [
+    [
+      "http://*/*",
+      "https://*/*"
+    ]
+  ],
+  "web_accessible_resources": []
+}
