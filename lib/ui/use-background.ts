@@ -37,7 +37,7 @@ export interface BackgroundActions {
 const INITIAL_STATE: BackgroundState = {
   tabs: [],
   conversation: { version: 1, id: "default", items: [], updatedAt: 0 },
-  credential: { configured: false, maskedSuffix: null, chatgpt: { connected: false, locked: false, email: null } },
+  credential: { configured: false, maskedSuffix: null, chatgpt: { connected: false, email: null } },
   provider: OPENAI_PROVIDER,
   settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
   page: null,

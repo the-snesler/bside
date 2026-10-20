@@ -1,20 +1,19 @@
-/** OAuth and PIN encryption live only in the persistent background page. */
+/** OAuth and the device-key-sealed tokens live only in the persistent background page. */
 import { createLocalJWKSet, jwtVerify, type JSONWebKeySet } from "jose";
 import type { ChatGPTStatus, ModelDefinition, ProviderAuth } from "@/lib/domain/provider";
 import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
 import { ProviderStreamError } from "@/lib/providers/openai";
 import { FirefoxChatGPTAuthBrowser, type ChatGPTAuthBrowser } from "@/lib/background/chatgpt-browser-auth";
+import { deviceKey, type DeviceKey } from "@/lib/background/device-key";
 import {
   deleteChatGPTCredential, deleteChatGPTRegistration, getChatGPTCredential, getChatGPTRegistration,
-  saveChatGPTCredential, saveChatGPTRegistration,
-  type ChatGPTCredentialV1, type ChatGPTRegistrationV1,
+  saveChatGPTCredential, saveChatGPTRegistration, type ChatGPTRegistrationV1,
 } from "@/lib/storage";
 
 const ISSUER = "https://auth.openai.com";
 const RESOURCE = "https://api.openai.com/v1";
 const SCOPES = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
-const PIN_ITERATIONS = 600_000;
-const ENCRYPTION_CONTEXT = new TextEncoder().encode("bside:chatgpt-credential:v1");
+const ENCRYPTION_CONTEXT = "bside:chatgpt-credential:v2";
 
 interface ChatGPTCredential {
   clientId: string;
@@ -31,48 +30,48 @@ function base64(bytes: Uint8Array): string {
   return btoa(Array.from(bytes, (byte) => String.fromCharCode(byte)).join(""));
 }
 
-function bytes(value: string): Uint8Array<ArrayBuffer> {
-  return Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
-}
-
 function randomValue(): string {
   return base64(crypto.getRandomValues(new Uint8Array(32))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-async function pinKey(pin: string, salt: Uint8Array<ArrayBuffer>): Promise<CryptoKey> {
-  if (!/^\d{8,64}$/.test(pin)) throw new ProviderStreamError("Use a PIN with at least 8 digits.", "INVALID_REQUEST");
-  const material = await crypto.subtle.importKey("raw", new TextEncoder().encode(pin), "PBKDF2", false, ["deriveKey"]);
-  return crypto.subtle.deriveKey({ name: "PBKDF2", hash: "SHA-256", salt, iterations: PIN_ITERATIONS }, material,
-    { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+function parseCredential(plaintext: string): ChatGPTCredential | null {
+  try {
+    const credential = JSON.parse(plaintext) as ChatGPTCredential;
+    if (!credential || typeof credential.accessToken !== "string" || typeof credential.refreshToken !== "string" ||
+      typeof credential.idToken !== "string" || typeof credential.clientId !== "string" || typeof credential.subject !== "string" ||
+      !(credential.email === null || typeof credential.email === "string") || !Number.isFinite(credential.expiresAt) ||
+      !Array.isArray(credential.scopes) || !credential.scopes.includes("chatgpt.tokens.use.direct")) return null;
+    return credential;
+  } catch { return null; }
 }
 
 export class ChatGPTAuth {
   #browser: ChatGPTAuthBrowser;
   #fetch: typeof fetch;
+  #deviceKey: DeviceKey;
   #credential: ChatGPTCredential | null = null;
-  #key: CryptoKey | null = null;
-  #salt: string | null = null;
   #busy = false;
   #refresh: Promise<ProviderAuth> | null = null;
 
-  constructor(authBrowser: ChatGPTAuthBrowser = new FirefoxChatGPTAuthBrowser(), fetcher: typeof fetch = (...args) => fetch(...args)) {
+  constructor(authBrowser: ChatGPTAuthBrowser = new FirefoxChatGPTAuthBrowser(), fetcher: typeof fetch = (...args) => fetch(...args),
+    key: DeviceKey = deviceKey) {
     this.#browser = authBrowser;
     this.#fetch = fetcher;
+    this.#deviceKey = key;
   }
 
   async status(): Promise<ChatGPTStatus> {
-    const connected = (await getChatGPTCredential()) !== null;
-    return { connected, locked: connected && this.#credential === null, email: this.#credential?.email ?? null };
+    const credential = await this.#load();
+    return { connected: credential !== null, email: credential?.email ?? null };
   }
 
   async models(): Promise<ModelDefinition[] | null> {
+    if (!await this.#load()) return null;
     return (await getChatGPTCredential())?.models ?? null;
   }
 
-  async login(pin: string): Promise<void> {
+  async login(): Promise<void> {
     return this.#operation(async () => {
-      const salt = crypto.getRandomValues(new Uint8Array(16));
-      const key = await pinKey(pin, salt);
       const subdomain = new URL(this.#browser.getRedirectURL()).hostname.split(".")[0];
       const redirectUri = `http://127.0.0.1:1455/mozoauth2/${subdomain}`;
       let saved = await getChatGPTRegistration();
@@ -83,7 +82,7 @@ export class ChatGPTAuth {
       if (saved && new URL(saved.redirectUri).pathname !== new URL(redirectUri).pathname) {
         await deleteChatGPTCredential();
         await deleteChatGPTRegistration();
-        this.#credential = null; this.#key = null; this.#salt = null;
+        this.#credential = null;
         saved = null;
       }
       const registration: ChatGPTRegistrationV1 = saved ? { ...saved, redirectUri } : {
@@ -122,76 +121,72 @@ export class ChatGPTAuth {
         throw new ProviderStreamError("ChatGPT returned a different account for this registration.", "AUTHENTICATION");
       const credential = this.#readTokens(token, { clientId, ...identity, idToken });
       const models = await this.#loadModels(credential.accessToken);
-      await this.#save(credential, key, base64(salt), models);
+      await this.#save(credential, models);
       await saveChatGPTRegistration({ ...registration, clientId, subject: identity.subject });
       this.#credential = credential;
-      this.#key = key;
-      this.#salt = base64(salt);
     });
-  }
-
-  async unlock(pin: string): Promise<void> {
-    return this.#operation(async () => {
-      const saved = await getChatGPTCredential();
-      if (!saved) throw new ProviderStreamError("Sign in with ChatGPT first.", "AUTHENTICATION");
-      const key = await pinKey(pin, bytes(saved.salt));
-      let credential: ChatGPTCredential;
-      try {
-        const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv: bytes(saved.iv), additionalData: ENCRYPTION_CONTEXT }, key, bytes(saved.ciphertext));
-        credential = JSON.parse(new TextDecoder().decode(plaintext)) as ChatGPTCredential;
-        if (!credential || typeof credential.accessToken !== "string" || typeof credential.refreshToken !== "string" ||
-          typeof credential.idToken !== "string" || typeof credential.clientId !== "string" || typeof credential.subject !== "string" ||
-          !(credential.email === null || typeof credential.email === "string") || !Number.isFinite(credential.expiresAt) ||
-          !Array.isArray(credential.scopes) || !credential.scopes.includes("chatgpt.tokens.use.direct")) throw new Error();
-      } catch {
-        throw new ProviderStreamError("Incorrect PIN or damaged saved connection. Sign in again if you forgot your PIN.", "AUTHENTICATION");
-      }
-      this.#credential = credential;
-      this.#key = key;
-      this.#salt = saved.salt;
-    });
-  }
-
-  async lock(): Promise<void> {
-    return this.#operation(async () => { this.#credential = null; this.#key = null; this.#salt = null; });
   }
 
   async disconnect(): Promise<boolean> {
     return this.#operation(async () => {
       let revoked = false;
-      if (this.#credential) {
+      const credential = await this.#load();
+      if (credential) {
         try {
           const response = await this.#request(`${ISSUER}/api/accounts/oauth/revoke`, {
             method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body: new URLSearchParams({ token: this.#credential.refreshToken, token_type_hint: "refresh_token", client_id: this.#credential.clientId }),
+            body: new URLSearchParams({ token: credential.refreshToken, token_type_hint: "refresh_token", client_id: credential.clientId }),
           });
           revoked = response.ok;
         } catch { /* Local disconnect must still work offline. */ }
       }
       await deleteChatGPTCredential();
-      this.#credential = null; this.#key = null; this.#salt = null;
+      this.#credential = null;
       return revoked;
     });
   }
 
   async getAuth(signal: AbortSignal): Promise<ProviderAuth> {
     signal.throwIfAborted();
-    if (!this.#credential) throw new ProviderStreamError("Unlock ChatGPT in settings before starting a conversation.", "AUTHENTICATION");
+    const saved = await this.#load();
+    if (!saved) throw new ProviderStreamError("Sign in with ChatGPT in settings before starting a conversation.", "AUTHENTICATION");
     if (this.#refresh) return this.#refresh;
-    if (this.#credential.expiresAt > Date.now() + 60_000) return { providerId: "openai", method: "chatgpt", secret: this.#credential.accessToken };
+    if (saved.expiresAt > Date.now() + 60_000) return { providerId: "openai", method: "chatgpt", secret: saved.accessToken };
     this.#refresh = this.#operation(async () => {
-      const current = this.#credential!;
+      const current = this.#credential;
+      if (!current) throw new ProviderStreamError("Sign in with ChatGPT in settings before starting a conversation.", "AUTHENTICATION");
       const token = await this.#tokens({ grant_type: "refresh_token", client_id: current.clientId, refresh_token: current.refreshToken, resource: RESOURCE }, signal);
       let identity = { subject: current.subject, email: current.email };
       if (typeof token.id_token === "string") identity = await this.#verifyIdentity(token.id_token, current.clientId);
       if (identity.subject !== current.subject) throw new ProviderStreamError("ChatGPT refresh returned a different account. Reconnect in settings.", "AUTHENTICATION");
       const credential = this.#readTokens(token, { ...current, ...identity, idToken: typeof token.id_token === "string" ? token.id_token : current.idToken });
       const models = (await getChatGPTCredential())!.models;
-      await this.#save(credential, this.#key!, this.#salt!, models);
+      await this.#save(credential, models);
       this.#credential = credential;
       return { providerId: "openai", method: "chatgpt", secret: credential.accessToken } as const;
     });
     try { return await this.#refresh; } finally { this.#refresh = null; }
+  }
+
+  /**
+   * Decrypts the saved tokens once per background session. A record the
+   * device key cannot open is deleted so the account reads as not connected;
+   * an unavailable key store leaves it in place and also reads as absent.
+   */
+  async #load(): Promise<ChatGPTCredential | null> {
+    if (this.#credential) return this.#credential;
+    const saved = await getChatGPTCredential();
+    if (!saved) return null;
+    let plaintext: string | null;
+    try { plaintext = await this.#deviceKey.open(saved, ENCRYPTION_CONTEXT); }
+    catch { return null; }
+    const credential = plaintext === null ? null : parseCredential(plaintext);
+    if (!credential) {
+      await deleteChatGPTCredential();
+      return null;
+    }
+    this.#credential = credential;
+    return credential;
   }
 
   async #operation<T>(action: () => Promise<T>): Promise<T> {
@@ -262,11 +257,8 @@ export class ChatGPTAuth {
     return models;
   }
 
-  async #save(credential: ChatGPTCredential, key: CryptoKey, salt: string, models: ModelDefinition[]): Promise<void> {
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: ENCRYPTION_CONTEXT }, key,
-      new TextEncoder().encode(JSON.stringify(credential)));
-    const record: ChatGPTCredentialV1 = { version: 1, salt, iv: base64(iv), ciphertext: base64(new Uint8Array(ciphertext)), models };
-    await saveChatGPTCredential(record);
+  async #save(credential: ChatGPTCredential, models: ModelDefinition[]): Promise<void> {
+    const sealed = await this.#deviceKey.seal(JSON.stringify(credential), ENCRYPTION_CONTEXT);
+    await saveChatGPTCredential({ version: 2, ...sealed, models });
   }
 }

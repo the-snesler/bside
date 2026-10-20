@@ -27,7 +27,6 @@ export function App() {
   const [provider, setProvider] = useState<ProviderDefinition>(OPENAI_PROVIDER);
   const [notice, setNotice] = useState<string | null>(null);
   const [apiKeyInput, setApiKeyInput] = useState("");
-  const [pinInput, setPinInput] = useState("");
   const [credentialNotice, setCredentialNotice] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -76,12 +75,6 @@ export function App() {
     await action;
   };
 
-  const handleChatGPT = async (type: "credentials.chatgpt.login" | "credentials.chatgpt.unlock") => {
-    const action = performCredentialAction({ type, pin: pinInput });
-    setPinInput("");
-    await action;
-  };
-
   const handleModelChange = async (event: Event) => {
     if (!settings) return;
     const modelId = (event.target as HTMLSelectElement).value;
@@ -104,7 +97,6 @@ export function App() {
   };
 
   const currentModel = settings ? provider.models.find((model) => model.id === settings.modelId) : undefined;
-  const pinValid = /^\d{8,64}$/.test(pinInput);
   const chatgpt = credential?.chatgpt;
 
   return (
@@ -113,35 +105,19 @@ export function App() {
 
       <section class="options__section">
         <h2 class="options__heading">ChatGPT subscription</h2>
-        <p class="options__disclosure">Use your ChatGPT plan. Your PIN encrypts the saved connection; unlock it after restarting Firefox. While connected, ChatGPT takes priority over an API key.</p>
+        <p class="options__disclosure">Use your ChatGPT plan. The saved connection is encrypted in this Firefox profile. While connected, ChatGPT takes priority over an API key.</p>
         <p class="options__status" role="status">
-          {!chatgpt?.connected ? "Not connected." : chatgpt.locked ? "Locked. Enter your PIN to continue." : `Connected${chatgpt.email ? ` as ${chatgpt.email}` : ""}.`}
+          {chatgpt?.connected ? `Connected${chatgpt.email ? ` as ${chatgpt.email}` : ""}.` : "Not connected."}
         </p>
-        {(!chatgpt?.connected || chatgpt.locked) && (
-          <form class="options__form options__form--wrap" onSubmit={(event) => {
-            event.preventDefault();
-            void handleChatGPT(chatgpt?.connected ? "credentials.chatgpt.unlock" : "credentials.chatgpt.login");
-          }}>
-            <label class="options__field options__pin">
-              {chatgpt?.connected ? "PIN" : "Create a PIN (at least 8 digits)"}
-              <input type="password" inputMode="numeric" autoComplete="off" minLength={8} maxLength={64} pattern="[0-9]{8,64}"
-                value={pinInput} disabled={saving} onInput={(event) => setPinInput(event.currentTarget.value)} />
-            </label>
-            <button type="submit" disabled={saving || !pinValid}>{chatgpt?.connected ? "Unlock" : "Continue with ChatGPT"}</button>
-            {chatgpt?.connected && <button type="button" disabled={saving || !pinValid} onClick={() => void handleChatGPT("credentials.chatgpt.login")}>Sign in again</button>}
-          </form>
-        )}
-        {chatgpt?.connected && (
-          <div class="options__form options__form--wrap">
-            {!chatgpt.locked && <>
-              <button type="button" disabled={saving} onClick={() => void performCredentialAction({ type: "credentials.chatgpt.test" })}>Test connection</button>
-              <button type="button" disabled={saving} onClick={() => void performCredentialAction({ type: "credentials.chatgpt.lock" })}>Lock</button>
-            </>}
+        <div class="options__form options__form--wrap">
+          {chatgpt?.connected ? <>
+            <button type="button" disabled={saving} onClick={() => void performCredentialAction({ type: "credentials.chatgpt.test" })}>Test connection</button>
             <button type="button" disabled={saving} onClick={() => void performCredentialAction({ type: "credentials.chatgpt.disconnect" })}>Disconnect</button>
-          </div>
-        )}
+          </> : (
+            <button type="button" disabled={saving || !credential} onClick={() => void performCredentialAction({ type: "credentials.chatgpt.login" })}>Continue with ChatGPT</button>
+          )}
+        </div>
         {saving && <p class="options__status" role="status">Working… Complete the sign-in window if it opened.</p>}
-        {chatgpt?.locked && <p class="options__disclosure">Forgot your PIN? Enter a new PIN and choose Sign in again.</p>}
         {credentialNotice && <p class="options__status" role="status">{credentialNotice}</p>}
         {saveError && <p class="options__error" role="alert">{saveError}</p>}
       </section>

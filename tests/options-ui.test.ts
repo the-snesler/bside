@@ -9,13 +9,15 @@ import type { CredentialRequest, SettingsRequest } from "@/lib/protocol";
 let root: HTMLDivElement;
 afterEach(() => { if (root) render(null, root); document.body.innerHTML = ""; vi.restoreAllMocks(); });
 
-async function mount(locked = false) {
+async function mount(connected = false) {
   const send = vi.spyOn(browser.runtime, "sendMessage").mockImplementation(async (message: unknown) => {
     const request = message as CredentialRequest | SettingsRequest;
     if (request.type === "settings.get") return { v: 1, id: request.id, ok: true, notice: null, provider: OPENAI_PROVIDER,
       settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" } };
+    if (request.type === "credentials.chatgpt.login") connected = true;
+    if (request.type === "credentials.chatgpt.disconnect") connected = false;
     return { v: 1, id: request.id, ok: true, configured: false, maskedSuffix: null, notice: null,
-      chatgpt: { connected: locked || request.type === "credentials.chatgpt.login", locked: locked && request.type !== "credentials.chatgpt.unlock", email: null } };
+      chatgpt: { connected, email: connected ? "user@example.test" : null } };
   });
   root = document.createElement("div"); document.body.append(root);
   await act(async () => render(h(App, {}), root));
@@ -23,34 +25,31 @@ async function mount(locked = false) {
   return send;
 }
 
+function button(label: string): HTMLButtonElement | undefined {
+  return [...root.querySelectorAll("button")].find((candidate) => candidate.textContent === label);
+}
+
 describe("ChatGPT settings controls", () => {
-  it("requires a valid PIN, opens login through the background, and clears the input", async () => {
+  it("signs in with a single button through the background and asks for no PIN", async () => {
     const send = await mount();
-    const pin = root.querySelector<HTMLInputElement>("input[inputmode=numeric]")!;
-    const connect = root.querySelector<HTMLButtonElement>("button[type=submit]")!;
-    expect(connect.disabled).toBe(true);
-    await act(async () => { pin.value = "12345678"; pin.dispatchEvent(new Event("input", { bubbles: true })); });
-    expect(connect.disabled).toBe(false);
-    await act(async () => { connect.form!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
-    await vi.waitFor(() => expect(root.textContent).toContain("Connected."));
-    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: "credentials.chatgpt.login", pin: "12345678" }));
-    expect(root.textContent).toContain("Connected.");
-    expect(root.textContent).toContain("Test connection");
+    expect(root.textContent).toContain("Not connected.");
+    expect(root.textContent).not.toMatch(/PIN|unlock/i);
     expect(root.querySelector("input[inputmode=numeric]")).toBeNull();
-    expect(root.innerHTML).not.toContain("12345678");
+    await act(async () => { button("Continue with ChatGPT")!.click(); });
+    await vi.waitFor(() => expect(root.textContent).toContain("Connected as user@example.test."));
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: "credentials.chatgpt.login" }));
+    expect(JSON.stringify(send.mock.calls)).not.toContain("pin");
+    expect(button("Continue with ChatGPT")).toBeUndefined();
+    expect(button("Test connection")).toBeDefined();
   });
 
-  it("unlocks a saved connection and offers sign-in recovery for a forgotten PIN", async () => {
+  it("keeps Disconnect for a saved connection", async () => {
     const send = await mount(true);
-    expect(root.textContent).toContain("Locked. Enter your PIN to continue.");
-    expect(root.textContent).toContain("Sign in again");
-    expect(root.textContent).not.toContain("Test connection");
-    const pin = root.querySelector<HTMLInputElement>("input[inputmode=numeric]")!;
-    await act(async () => { pin.value = "12345678"; pin.dispatchEvent(new Event("input", { bubbles: true })); });
-    await act(async () => { pin.form!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
-    await vi.waitFor(() => expect(root.textContent).toContain("Test connection"));
-    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: "credentials.chatgpt.unlock", pin: "12345678" }));
-    expect(root.textContent).toContain("Test connection");
-    expect(root.textContent).not.toContain("12345678");
+    expect(root.textContent).toContain("Connected as user@example.test.");
+    expect(button("Lock")).toBeUndefined();
+    await act(async () => { button("Disconnect")!.click(); });
+    await vi.waitFor(() => expect(root.textContent).toContain("Not connected."));
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: "credentials.chatgpt.disconnect" }));
+    expect(button("Continue with ChatGPT")).toBeDefined();
   });
 });

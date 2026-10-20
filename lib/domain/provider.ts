@@ -14,7 +14,6 @@ export type ProviderAuth = { providerId: "openai"; method: "api-key" | "chatgpt"
 
 export interface ChatGPTStatus {
   connected: boolean;
-  locked: boolean;
   email: string | null;
 }
 

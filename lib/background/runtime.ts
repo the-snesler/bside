@@ -291,7 +291,7 @@ export class BackgroundRuntime {
     this.#notice = null;
     return {
       conversation,
-      credential: { ...credential, configured: credential.chatgpt.connected ? !credential.chatgpt.locked : credential.configured },
+      credential: { ...credential, configured: credential.chatgpt.connected || credential.configured },
       provider,
       settings,
       page: this.#sidebarHub.currentAttachment(),
@@ -403,9 +403,7 @@ export class BackgroundRuntime {
           await this.#provider.validateAuth({ providerId: "openai", method: "api-key", secret: request.apiKey }, new AbortController().signal);
           await saveOpenAICredential(request.apiKey);
         } else if (request.type === "credentials.openai.delete") await deleteStoredCredential();
-        else if (request.type === "credentials.chatgpt.login") await this.#chatgpt.login(request.pin);
-        else if (request.type === "credentials.chatgpt.unlock") await this.#chatgpt.unlock(request.pin);
-        else if (request.type === "credentials.chatgpt.lock") await this.#chatgpt.lock();
+        else if (request.type === "credentials.chatgpt.login") await this.#chatgpt.login();
         else if (request.type === "credentials.chatgpt.disconnect") {
           if (!await this.#chatgpt.disconnect()) notice = "Disconnected locally. Remote revocation was not confirmed; disconnect bside in ChatGPT settings to revoke access.";
         } else if (request.type === "credentials.chatgpt.test") {

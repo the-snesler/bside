@@ -32,9 +32,9 @@ export interface OpenAICredential {
   updatedAt: number;
 }
 
-export interface ChatGPTCredentialV1 {
-  version: 1;
-  salt: string;
+/** ChatGPT tokens sealed with the device key, plus the account's non-secret model catalog. */
+export interface ChatGPTCredentialV2 {
+  version: 2;
   iv: string;
   ciphertext: string;
   models: ModelDefinition[];
@@ -82,7 +82,7 @@ const openaiCredentialItem = storage.defineItem<OpenAICredentialV2>("local:opena
 
 const OPENAI_CREDENTIAL_CONTEXT = "bside:openai-credential:v2";
 
-const chatgptCredentialItem = storage.defineItem<ChatGPTCredentialV1>("local:chatgptCredential", { version: 1 });
+const chatgptCredentialItem = storage.defineItem<ChatGPTCredentialV2>("local:chatgptCredential", { version: 2 });
 const chatgptRegistrationItem = storage.defineItem<ChatGPTRegistrationV1>("local:chatgptRegistration", { version: 1 });
 
 const conversationItem = storage.defineItem<ConversationRecordV1>("local:conversation", {
@@ -214,10 +214,9 @@ export async function getCredentialStatus(): Promise<CredentialStatus> {
 }
 
 /** Background-only. OAuth tokens are encrypted; catalog metadata contains no credentials. */
-export async function getChatGPTCredential(): Promise<ChatGPTCredentialV1 | null> {
+export async function getChatGPTCredential(): Promise<ChatGPTCredentialV2 | null> {
   const raw = await chatgptCredentialItem.getValue();
-  if (raw?.version === 1 && typeof raw.salt === "string" && raw.salt.length === 24 &&
-    typeof raw.iv === "string" && raw.iv.length === 16 && typeof raw.ciphertext === "string" &&
+  if (raw?.version === 2 && typeof raw.iv === "string" && raw.iv.length === 16 && typeof raw.ciphertext === "string" &&
     raw.ciphertext.length > 0 && raw.ciphertext.length < 200_000 && Array.isArray(raw.models) &&
     raw.models.length > 0 && raw.models.length <= 200 && raw.models.every((model) =>
       model && typeof model.id === "string" && /^[\w.:-]{1,200}$/.test(model.id) &&
@@ -228,7 +227,7 @@ export async function getChatGPTCredential(): Promise<ChatGPTCredentialV1 | null
   return null;
 }
 
-export async function saveChatGPTCredential(credential: ChatGPTCredentialV1): Promise<void> {
+export async function saveChatGPTCredential(credential: ChatGPTCredentialV2): Promise<void> {
   await chatgptCredentialItem.setValue(credential);
 }
 
