@@ -1,11 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Browser } from "wxt/browser";
-import { BackgroundRuntime } from "@/lib/background/runtime";
+import { AGENT_TAB_IDLE_MS, BackgroundRuntime } from "@/lib/background/runtime";
 import { ApprovalBadge } from "@/lib/background/approval-badge";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController } from "@/lib/background/tab-controller";
 import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
+import type { RuntimeClock } from "@/lib/background/runtime";
 import { ProviderStreamError } from "@/lib/providers/openai";
 import { saveOpenAICredential, appendConversationItem, getAgentTabs, getConversation, getOpenAICredential, saveAgentTabs, saveRunCheckpoint } from "@/lib/storage";
 import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
@@ -1045,6 +1046,137 @@ describe("BackgroundRuntime: agent-tab ownership across restarts", () => {
     scripted(provider, programRound('return fs.remove("/agent-tabs/100/page.md");'));
     await runtime.handleCommand({ v: 1, id: "close", type: "run.start", prompt: "Close it" });
     await vi.waitFor(async () => expect((await getAgentTabs()).tabs).toEqual({}));
+    expect(tabs.map((tab) => tab.id)).toEqual([1]);
+  });
+});
+
+/** A manual clock: `sweep()` fires the runtime's idle timer and waits for it to settle. */
+function manualClock(start = 10_000_000) {
+  let time = start;
+  let timer: (() => void) | null = null;
+  const clock: RuntimeClock = { now: () => time, setInterval: (callback) => { timer = callback; return 1; } };
+  return {
+    clock,
+    advance(ms: number) { time += ms; },
+    async sweep() { timer!(); await tick(); },
+  };
+}
+
+/** A provider whose single round blocks until `release()`, keeping a run active. */
+function blockingProvider(): { provider: FakeProvider; release: () => void } {
+  const provider = new FakeProvider();
+  const gate = Promise.withResolvers<void>();
+  provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+    await gate.promise;
+    yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+  } });
+  return { provider, release: () => gate.resolve() };
+}
+
+describe("BackgroundRuntime: closing agent tabs", () => {
+  const minute = 60_000;
+  const userTab = { id: 1, url: "https://user.test/", title: "User", hidden: false };
+  const agentTab = (id: number) => ({ id, url: `https://agent-${id}.test/`, title: "", hidden: true });
+  const owned = (now: number, ...entries: [number, number][]) => saveAgentTabs({ version: 1, searchTabId: entries[0]?.[0] ?? null,
+    tabs: Object.fromEntries(entries.map(([id, idleMs]) => [String(id), { url: `https://agent-${id}.test/`, lastUsedAt: now - idleMs }])) });
+
+  it("closes every agent tab, including the search tab, on request and leaves user tabs alone", async () => {
+    const { clock } = manualClock();
+    await owned(clock.now(), [5, 0], [6, 0]);
+    const tabs = [userTab, agentTab(5), agentTab(6)];
+    const { factory } = fakeTabsApi(tabs);
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: factory, clock });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+    await runtime.initialize();
+    expect((await runtime.getSnapshot()).agentTabs).toBe(2);
+
+    await port.send({ v: 1, id: "close", type: "tabs.closeAgentTabs" });
+    expect(tabs.map((tab) => tab.id)).toEqual([1]);
+    expect(await getAgentTabs()).toEqual({ version: 1, tabs: {}, searchTabId: null });
+    expect((await runtime.getSnapshot()).agentTabs).toBe(0);
+    const counts = port.received.flatMap((event) => event.type === "agent-tabs.changed" ? [event.payload.count] : []);
+    expect(counts).toEqual([2, 0]);
+  });
+
+  it("refuses to close agent tabs while a run is active", async () => {
+    const { clock } = manualClock();
+    await owned(clock.now(), [5, 0]);
+    const tabs = [userTab, agentTab(5)];
+    const { factory } = fakeTabsApi(tabs);
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const { provider, release } = blockingProvider();
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory, clock });
+    hub.delegate = runtime;
+    await runtime.initialize();
+
+    const run = runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Wait" });
+    await tick();
+    expect((await runtime.getSnapshot()).activeRun).not.toBeNull();
+    await runtime.handleCommand({ v: 1, id: "close", type: "tabs.closeAgentTabs" });
+    expect(tabs.map((tab) => tab.id)).toEqual([1, 5]);
+    release();
+    await run;
+    await runtime.handleCommand({ v: 1, id: "close", type: "tabs.closeAgentTabs" });
+    expect(tabs.map((tab) => tab.id)).toEqual([1]);
+  });
+
+  it("auto-closes agent tabs once no run has used them for the idle period", async () => {
+    const { clock, advance, sweep } = manualClock();
+    await owned(clock.now(), [5, AGENT_TAB_IDLE_MS + minute], [6, 5 * minute]);
+    const tabs = [userTab, agentTab(5), agentTab(6)];
+    const { factory } = fakeTabsApi(tabs);
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: factory, clock });
+    await runtime.initialize();
+
+    await sweep();
+    expect(tabs.map((tab) => tab.id)).toEqual([1, 6]);
+    expect(await getAgentTabs()).toEqual({ version: 1, searchTabId: null, tabs: { "6": { url: "https://agent-6.test/", lastUsedAt: clock.now() - 5 * minute } } });
+
+    advance(AGENT_TAB_IDLE_MS - 6 * minute);
+    await sweep();
+    expect(tabs.map((tab) => tab.id)).toEqual([1, 6]);
+    advance(2 * minute);
+    await sweep();
+    expect(tabs.map((tab) => tab.id)).toEqual([1]);
+  });
+
+  it("never auto-closes while a run is active, and restarts the idle period of tabs the run used", async () => {
+    const { clock, advance, sweep } = manualClock();
+    const tabs = [userTab, agentTab(5)];
+    await owned(clock.now(), [5, minute]);
+    const { factory } = fakeTabsApi(tabs);
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    const gate = Promise.withResolvers<void>();
+    let round = 0;
+    provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      if (round++ === 0) {
+        yield { type: "tool.call", call: { id: "open", name: "browser_program", arguments: { source: 'const page = await browser.open("https://example.test/"); return page.path();' } } } as ScriptedProviderEvent;
+      } else await gate.promise;
+      yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+    } });
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory, clock });
+    hub.delegate = runtime;
+    await runtime.initialize();
+
+    const run = runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Open example and think for a long time" });
+    await vi.waitFor(() => expect(tabs.map((tab) => tab.id)).toEqual([1, 5, 100]));
+    advance(AGENT_TAB_IDLE_MS + 10 * minute);
+    await sweep();
+    // Tab 5 is idle and tab 100 was opened long ago, but a run is active.
+    expect(tabs.map((tab) => tab.id)).toEqual([1, 5, 100]);
+
+    gate.resolve();
+    await run;
+    await sweep();
+    expect(tabs.map((tab) => tab.id)).toEqual([1, 100]);
+    advance(AGENT_TAB_IDLE_MS + minute);
+    await sweep();
     expect(tabs.map((tab) => tab.id)).toEqual([1]);
   });
 });

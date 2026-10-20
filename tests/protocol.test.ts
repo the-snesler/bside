@@ -35,6 +35,12 @@ describe("isSidebarCommand: accepts every valid variant", () => {
     expect(isSidebarCommand({ v: 1, id: "1", type: "action.approve", runId: "r1", callId: "c1" })).toBe(true);
     expect(isSidebarCommand({ v: 1, id: "1", type: "action.deny", runId: "r1", callId: "c1" })).toBe(true);
   });
+
+  it("accepts tabs.closeAgentTabs only in a v1 envelope", () => {
+    expect(isSidebarCommand({ v: 1, id: "1", type: "tabs.closeAgentTabs" })).toBe(true);
+    expect(isSidebarCommand({ v: 2, id: "1", type: "tabs.closeAgentTabs" })).toBe(false);
+    expect(isSidebarCommand({ v: 1, type: "tabs.closeAgentTabs" })).toBe(false);
+  });
 });
 
 describe("isSidebarCommand: rejects malformed input", () => {

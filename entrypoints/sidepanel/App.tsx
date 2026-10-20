@@ -5,6 +5,7 @@ import Download from "~icons/tabler/download";
 import Refresh from "~icons/tabler/refresh";
 import Globe from "~icons/tabler/world";
 import ArrowDown from "~icons/tabler/arrow-down";
+import BrowserX from "~icons/tabler/browser-x";
 import { Markdown } from "@/lib/ui/Markdown";
 import { Composer, parsePromptMentions } from "@/lib/ui/Composer";
 import { useBottomScroll } from "@/lib/ui/use-bottom-scroll";
@@ -37,6 +38,8 @@ export function App() {
     tabs,
     listTabs,
     focusTab,
+    agentTabs,
+    closeAgentTabs,
     saveSettings,
     sendPrompt,
     retryRun,
@@ -61,6 +64,19 @@ export function App() {
       <header class="sidebar__header">
         <h1 class="sidebar__title">bside</h1>
         <div class="sidebar__header-actions">
+          {agentTabs > 0 && (
+            <button
+              type="button"
+              class="icon-button agent-tabs-button"
+              disabled={activeRun !== null}
+              onClick={closeAgentTabs}
+              aria-label={`Close ${agentTabs} agent ${agentTabs === 1 ? "tab" : "tabs"}`}
+              title={`Close ${agentTabs} hidden agent ${agentTabs === 1 ? "tab" : "tabs"} (unused ones close after 30 minutes)`}
+            >
+              <BrowserX />
+              <span>{agentTabs}</span>
+            </button>
+          )}
           <button
             type="button"
             class="icon-button"

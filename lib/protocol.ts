@@ -206,6 +206,7 @@ export const SIDEBAR_PORT_NAME = "agent-sidebar:v1";
 export type SidebarCommand =
   | { v: 1; id: string; type: "tabs.list" }
   | { v: 1; id: string; type: "tabs.focus"; tabId: number }
+  | { v: 1; id: string; type: "tabs.closeAgentTabs" }
   | { v: 1; id: string; type: "settings.save"; settings: AppSettingsV1 }
   | { v: 1; id: string; type: "context.reset" | "context.export" }
   | { v: 1; id: string; type: "state.subscribe"; lastSeq: number | null }
@@ -229,6 +230,8 @@ export interface RuntimeSnapshot {
   provider: ProviderDefinition;
   settings: AppSettingsV1;
   page: PageArtifactSummary | null;
+  /** Number of hidden agent-owned tabs, including the search tab. */
+  agentTabs: number;
   activeRun: {
     runId: string;
     status: "running" | "awaiting-approval" | "cancelling";
@@ -257,6 +260,7 @@ export type SidebarEvent =
   | EventBase<"context.exported", { requestId: string; markdown: string; filename: string }>
   | EventBase<"state.snapshot", RuntimeSnapshot>
   | EventBase<"page.attached", PageArtifactSummary | null>
+  | EventBase<"agent-tabs.changed", { count: number }>
   | EventBase<"run.started", { prompt: string; page: PageArtifactSummary | null; retry: boolean }>
   | EventBase<"assistant.delta", { delta: string }>
   | EventBase<"tool.requested", { call: ToolCall; display: string }>
@@ -271,6 +275,7 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
   const candidate = value as Record<string, unknown>;
   if (candidate.type === "tabs.list") return true;
   if (candidate.type === "tabs.focus") return Number.isSafeInteger(candidate.tabId);
+  if (candidate.type === "tabs.closeAgentTabs") return true;
   if (candidate.type === "settings.save") return isAppSettings(candidate.settings);
   if (candidate.type === "context.reset" || candidate.type === "context.export") return true;
   if (candidate.type === "state.subscribe") {

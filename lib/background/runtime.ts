@@ -55,6 +55,17 @@ import { RUN_CANCELLED_SUFFIX } from "@/lib/protocol";
 const CHECKPOINT_MIN_INTERVAL_MS = 1_000;
 const DELTA_COALESCE_MS = 16;
 const DELTA_COALESCE_BYTES = 1024;
+/** Agent tabs no run has used for this long are closed. */
+export const AGENT_TAB_IDLE_MS = 30 * 60_000;
+const AGENT_TAB_SWEEP_MS = 60_000;
+
+/** Time source for agent-tab idle tracking; background-page timers, since the MV2 page is persistent. */
+export interface RuntimeClock {
+  now(): number;
+  setInterval(callback: () => void, ms: number): unknown;
+}
+
+const SYSTEM_CLOCK: RuntimeClock = { now: () => Date.now(), setInterval: (callback, ms) => setInterval(callback, ms) };
 
 type RunLifecycleStatus = "running" | "awaiting-approval" | "cancelling";
 
@@ -91,7 +102,8 @@ export class BackgroundRuntime {
   #approvalBadge: ApprovalBadge | null;
   #activeRun: ActiveRun | null = null;
   #notice: string | null = null;
-  #workspace = new WorkspaceState();
+  #clock: RuntimeClock;
+  #workspace: WorkspaceState;
   #latestContext: string | null = null;
   #resetting = false;
   /** Whether the last turn ended failed, cancelled, or interrupted, so `run.retry` may re-run it. */
@@ -104,12 +116,15 @@ export class BackgroundRuntime {
   #ready: Promise<void> = Promise.resolve();
   #agentTabSync: Promise<void> = Promise.resolve();
   #agentTabSyncQueued = false;
+  #publishedAgentTabs = 0;
 
   constructor(
     sidebarHub: SidebarHub,
-    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController; approvalBadge?: ApprovalBadge } = {},
+    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController; approvalBadge?: ApprovalBadge; clock?: RuntimeClock } = {},
   ) {
     this.#sidebarHub = sidebarHub;
+    this.#clock = options.clock ?? SYSTEM_CLOCK;
+    this.#workspace = new WorkspaceState(() => this.#clock.now());
     this.#chatgpt = options.chatgpt ?? new ChatGPTAuth();
     this.#provider = options.provider ?? new OpenAIProvider(
       async (auth, signal) => auth.method === "chatgpt" ? this.#chatgpt.getAuth(signal) : auth,
@@ -129,6 +144,34 @@ export class BackgroundRuntime {
     this.#ready = startup.then(() => {}, () => {});
     const [recovered] = await startup;
     this.#lastTurnRetryable = recovered;
+    this.#clock.setInterval(() => void this.#closeIdleAgentTabs(), AGENT_TAB_SWEEP_MS);
+  }
+
+  /** Idle auto-close. Skipped entirely while a run is active, so a tab a run may be using is never closed under it. */
+  async #closeIdleAgentTabs(): Promise<void> {
+    if (this.#activeRun || this.#resetting) return;
+    const cutoff = this.#clock.now() - AGENT_TAB_IDLE_MS;
+    await this.#closeAgentTabs((lastUsedAt) => lastUsedAt <= cutoff);
+  }
+
+  /** Closes owned agent tabs matching `shouldClose`, stopping as soon as a run starts. */
+  async #closeAgentTabs(shouldClose: (lastUsedAt: number) => boolean): Promise<void> {
+    const tabController = this.#tabControllerFactory();
+    for (const id of [...this.#workspace.agentTabs.keys()]) {
+      // Re-read after every await: a run may have started or used the tab meanwhile.
+      const lastUsedAt = this.#workspace.agentTabs.get(id);
+      if (this.#activeRun) break;
+      if (lastUsedAt === undefined || !shouldClose(lastUsedAt)) continue;
+      try {
+        await tabController.closeTab(id);
+      } catch {
+        // Already closed elsewhere; the sync below drops tabs that no longer exist.
+        continue;
+      }
+      this.#workspace.observed.delete(id);
+      this.#workspace.releaseTab(id);
+    }
+    await this.#queueAgentTabSync();
   }
 
   /**
@@ -171,6 +214,10 @@ export class BackgroundRuntime {
     if (this.#workspace.searchTabId !== null && !this.#workspace.agentTabs.has(this.#workspace.searchTabId)) this.#workspace.searchTabId = null;
     if (this.#workspace.searchTabId !== null && record.tabs[this.#workspace.searchTabId]) record.searchTabId = this.#workspace.searchTabId;
     await saveAgentTabs(record);
+    if (this.#workspace.agentTabs.size !== this.#publishedAgentTabs) {
+      this.#publishedAgentTabs = this.#workspace.agentTabs.size;
+      this.#sidebarHub.publishAgentTabs(this.#publishedAgentTabs);
+    }
   }
 
   async getSnapshot(): Promise<RuntimeSnapshot> {
@@ -189,6 +236,7 @@ export class BackgroundRuntime {
       provider,
       settings,
       page: this.#sidebarHub.currentAttachment(),
+      agentTabs: this.#workspace.agentTabs.size,
       activeRun: this.#activeRun
         ? {
             runId: this.#activeRun.runId,
@@ -213,6 +261,13 @@ export class BackgroundRuntime {
     if (command.type === "tabs.focus") {
       // Agent tabs are hidden workspace tabs; activating one would unhide it.
       if (!this.#workspace.agentTabs.has(command.tabId)) await this.#tabControllerFactory().focusTab(command.tabId);
+      return;
+    }
+    if (command.type === "tabs.closeAgentTabs") {
+      // Refused rather than deferred while a run is active: the run may be using
+      // these tabs, and a deferred close would fire after the user moved on.
+      if (this.#activeRun || this.#resetting) return;
+      await this.#closeAgentTabs(() => true);
       return;
     }
     if (command.type === "settings.save") {
@@ -469,6 +524,7 @@ export class BackgroundRuntime {
       lastFlush = Date.now();
     };
 
+    const runStartedAt = this.#clock.now();
     const result = await run.agentLoop.run({
       runId,
       conversationId: "default",
@@ -523,6 +579,7 @@ export class BackgroundRuntime {
       },
     });
 
+    this.#keepRunTabsAlive(runStartedAt);
     record.endedAt = Date.now();
     record.status = result.status;
     if (result.status === "failed") record.error = result.error;
@@ -554,6 +611,18 @@ export class BackgroundRuntime {
     await clearRunCheckpoint();
     this.#lastTurnRetryable = true;
     this.#activeRun = null;
+  }
+
+  /** Restarts the idle period of every agent tab used since `since`, so tabs a long run used are not closed right after it ends. */
+  #keepRunTabsAlive(since: number): void {
+    const now = this.#clock.now();
+    let touched = false;
+    for (const [id, lastUsedAt] of this.#workspace.agentTabs) {
+      if (lastUsedAt < since) continue;
+      this.#workspace.agentTabs.set(id, now);
+      touched = true;
+    }
+    if (touched) void this.#queueAgentTabSync();
   }
 
   /** Persists a cancelled run's uncommitted partial text so the interruption stays visible after reload; never fed back into a future provider request. */

@@ -43,6 +43,14 @@ select:disabled {
   opacity: 0.45;
   cursor: default;
 }
+.agent-tabs-button {
+  width: auto;
+  min-width: 32px;
+  padding: 0 var(--space-2);
+  gap: var(--space-1);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
 .icon-button:hover:not(:disabled) {
   background: var(--surface);
   color: var(--ink);
