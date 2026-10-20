@@ -225,6 +225,10 @@ export async function saveChatGPTRegistration(registration: ChatGPTRegistrationV
   await chatgptRegistrationItem.setValue(registration);
 }
 
+export async function deleteChatGPTRegistration(): Promise<void> {
+  await chatgptRegistrationItem.removeValue();
+}
+
 // ---------------------------------------------------------------------------
 // Conversation — one local thread.
 // ---------------------------------------------------------------------------

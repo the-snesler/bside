@@ -154,6 +154,25 @@ describe("ChatGPT subscription OAuth and encrypted storage", () => {
     expect(await getChatGPTRegistration()).toMatchObject({ hostId: registration.hostId, redirectUri: "http://127.0.0.1:1455/mozoauth2/test-addon" });
   });
 
+  it("discards a registration and credential from a different add-on ID and registers fresh", async () => {
+    const h = harness();
+    await h.auth.login("12345678");
+    const stale = { version: 1 as const, hostId: `urn:uuid:${crypto.randomUUID()}`, clientId: "oaiapp_old", subject: "old-user",
+      redirectUri: "http://127.0.0.1:1455/mozoauth2/old-addon" };
+    await saveChatGPTRegistration(stale);
+    const failed = harness({ browserError: "cancelled" });
+    await expect(failed.auth.login("12345678")).rejects.toMatchObject({ code: "AUTHENTICATION" });
+    expect(await getChatGPTCredential()).toBeNull();
+    expect(await getChatGPTRegistration()).toMatchObject({ clientId: null, subject: null, redirectUri: "http://127.0.0.1:1455/mozoauth2/test-addon" });
+
+    await saveChatGPTRegistration(stale);
+    await h.auth.login("12345678");
+    expect(h.authorization().searchParams.get("client_id")).toBe("dynamic_agent_client");
+    expect(h.authorization().searchParams.get("ext_agent_host_id")).not.toBe(stale.hostId);
+    expect(await getChatGPTRegistration()).toMatchObject({ clientId: "oaiapp_test", subject: "test-user", redirectUri: "http://127.0.0.1:1455/mozoauth2/test-addon" });
+    expect(await h.auth.getAuth(new AbortController().signal)).toMatchObject({ secret: "test-access" });
+  });
+
   it("retains saved credentials on refresh failure and sanitizes upstream error bodies", async () => {
     const h = harness({ refreshStatus: 500 });
     await h.auth.login("12345678");
