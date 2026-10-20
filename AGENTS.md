@@ -1,6 +1,6 @@
 # ai-firefox-extension
 
-Firefox desktop extension built with WXT, Manifest V2, Preact, TypeScript, and pnpm.
+bside: a Firefox desktop extension built with WXT, Manifest V2, Preact, TypeScript, Pi (`@earendil-works/pi-ai`, `pi-agent-core`), and pnpm.
 
 ## Toolchain and scripts
 
@@ -28,25 +28,37 @@ entrypoints/
 
 lib/
   background/
-    runtime.ts         Sole owner of runs, persistence, cancellation, terminal transitions.
-    agent-loop.ts      Provider/tool orchestration, approvals, exactly-once tool ledger.
+    runtime.ts         Sole owner of runs, persistence, cancellation, retry, terminal transitions, agent-tab ownership.
+    agent-loop.ts      Pi Agent orchestration, system policy, run budgets, approvals, exactly-once tool ledger.
+    browser-program.ts browser_program parser/interpreter, tab mounts, /workspace, web.search, agent-tab state.
+    tab-controller.ts  Bound-tab capture, page RPC, navigation settlement, tab hide/close.
     sidebar-hub.ts     Sidebar Port transport, snapshots, sequencing, replay buffer.
-    tab-controller.ts  Bound-tab capture, page RPC, navigation settlement.
+    approval-badge.ts  Toolbar "!" badge while a run awaits confirmation.
+    chatgpt-auth.ts    Sign in with ChatGPT: OAuth, token refresh, PIN-encrypted credential.
+    chatgpt-browser-auth.ts  Sign-in popup; captures the loopback OAuth callback with blocking webRequest.
   domain/              Framework-independent conversation, provider, and tool contracts.
   providers/
-    openai.ts          Only OpenAI SDK boundary; Responses API streaming and replay state.
-    openai-models.ts   Source-controlled OpenAI model catalog/defaults.
+    openai.ts          Pi OpenAI Responses adapter: request policy, cache options, safe error envelope.
+    openai-models.ts   Source-controlled API-key model catalog/defaults.
   tools/
     page-executor.ts   Pure DOM snapshot/action semantics used by the content script.
   ui/
     use-background.ts  Preact hook consuming the sidebar Port; renders background state.
+    turns.ts           Groups conversation items into turns and activities.
+    TurnTrace.tsx      Per-turn work trace (built on Trace.tsx).
+    Composer.tsx       Slate prompt editor with tab mentions.
+    Markdown.tsx       Model-text Markdown without raw HTML, remote images, or unsafe links.
   protocol.ts          Versioned cross-context request/event unions and type guards.
   validation.ts        Runtime validators for prompts and tool arguments.
   storage.ts           Versioned `storage.local` records and interrupted-run recovery.
 
 styles/theme.css       Shared system-adaptive design tokens.
 public/                Packaged static extension assets.
-tests/                 Vitest contract tests; fixtures hold deterministic test pages.
+tests/                 Vitest contract tests; helpers/pi-provider.ts fakes Pi streams; fixtures hold deterministic test pages.
+scripts/
+  check-manifest.mjs   Built-manifest drift and source-map guard (`pnpm check:manifest`).
+  manifest-snapshot.json  Committed expected permissions/CSP/content scripts/background/gecko ID.
+.github/workflows/ci.yml  CI checks listed above.
 wxt.config.ts          Firefox MV2 manifest, permissions, CSP, and Preact Vite setup.
 ```
 
@@ -56,19 +68,24 @@ wxt.config.ts          Firefox MV2 manifest, permissions, CSP, and Preact Vite s
 - The sidebar and options pages render background-owned state. They must not read credentials, own streams, or implement tool loops.
 - The content script owns the live DOM and executes only the closed page-tool union. Never pass provider credentials, raw prompts, generated JavaScript, or arbitrary selectors into it.
 - `lib/domain/*` and `lib/protocol.ts` are the cross-context contracts. Keep values JSON-compatible, versioned, and runtime-validated.
-- OpenAI SDK imports belong only in `lib/providers/openai.ts`.
+- Pi is the provider boundary. Outside tests, runtime `@earendil-works/pi-ai` imports belong only in `lib/providers/openai.ts` and `@earendil-works/pi-agent-core` only in `lib/background/agent-loop.ts`; `lib/domain/provider.ts` and `agent-loop.ts` may import Pi types. No other provider SDK.
+- The system prompt and tool definitions are a byte-stable cacheable prefix: no per-run content goes there. The attached page outline rides on the current user turn. Requests use `cacheRetention: "short"` with `sessionId` = conversation id, which Pi sends as `prompt_cache_key`.
+- Runs have budgets (`DEFAULT_RUN_LIMITS` in `agent-loop.ts`: provider rounds, active wall-clock time, output tokens), checked between rounds. Exceeding one fails the run with `LIMIT_EXCEEDED` and keeps committed effects. Time awaiting confirmation does not count.
 - The extension has one persisted conversation (`"default"`). Run-local replay state and full page snapshots must not enter persistent storage.
+- `run.retry` re-runs the last failed, cancelled, or interrupted turn against its existing user message and never appends a user item. It is refused if that attempt committed (or, after an interruption, may have committed) a page effect.
 - Ref-bearing page actions require the exact latest snapshot revision. Surface the real revision in text returned to the model; never guess stale targets.
-- The model uses `browser_program` for bounded capability programs and `request_action_confirmation(title, message, artifact)` before externally visible, destructive, or paid actions. Deciding when to ask is model policy; the background pauses only for explicit confirmation calls and records the decision. Do not reintroduce automatic per-action or per-program approvals.
+- The model uses `browser_program` for bounded capability programs and `request_action_confirmation(title, message, artifact)` before externally visible, destructive, or paid actions. Deciding when to ask is model policy; the background pauses only for explicit confirmation calls and records the decision. Do not reintroduce automatic per-action or per-program approvals. While a confirmation is pending, the toolbar shows a `!` badge, which clears on resolve, cancel, terminal state, and startup. Clicking the toolbar button then opens the sidebar instead of toggling it.
 - Browser programs are parsed and interpreted, never evaluated as JavaScript. Locators resolve uniquely against a fresh snapshot before each effect. Stop on the first failure and retain earlier effects.
 - `/tabs/<id>/page.md` and `/agent-tabs/<id>/page.md` are live read-only snapshots. Explicit cross-mount moves hide/show tabs; removal closes them. `/workspace` is bounded scratch storage for the background session, never host filesystem access.
+- Agent-tab ownership (`agentTabs`, `searchTabId`) persists in `storage.local` with each tab's URL. At startup a tab is re-adopted only if it still exists, is hidden, and shows its persisted URL, because Firefox reassigns tab IDs. Agent tabs unused for 30 minutes are auto-closed. Idle close and the "Close agent tabs" command are refused while a run is active.
 
 ## Security and privacy boundaries
 
-- The API key lives only in background memory / `storage.local` and the options password field. Never put it in sidebar events, content-script messages, page DOM, fixtures, logs, tests, or source.
-- Page content, tool output, and model output are untrusted text. Render them as Preact text nodes; do not inject HTML.
-- Do not widen CSP or permissions casually. Production `connect-src` permits only `https://api.openai.com`; broad HTTP(S) host access exists for the declarative page content script, not for background fetching.
-- Never add arbitrary page JavaScript execution, CSS/XPath selectors, remote code, external fonts/scripts, cookies, clipboard, downloads, `tabs`, or `scripting` permissions without an explicit design change. `tabHide` is used for the agent-tab workspace.
+- The API key lives only in background memory / `storage.local` and the options password field. ChatGPT tokens are stored in `storage.local` encrypted under a key derived from the user's PIN, and are decrypted only into background memory. Never put either in sidebar events, content-script messages, page DOM, fixtures, logs, tests, or source.
+- Page content, tool output, and model output are untrusted text. Render them as Preact text nodes (model Markdown only through `lib/ui/Markdown.tsx`); do not inject HTML.
+- Do not widen CSP or permissions casually. CI fails on drift; for an intentional change, run `pnpm check:manifest --update` and commit the snapshot. Production `connect-src` permits only `https://api.openai.com` (Responses, models) and `https://auth.openai.com` (ChatGPT OAuth).
+- Permissions: `storage`; `identity` for the redirect-URL subdomain in the ChatGPT callback path; `webRequest` + `webRequestBlocking` to cancel that `http://127.0.0.1` callback, filtered to the sign-in popup tab; `tabHide` for the agent-tab workspace; host access to `api.openai.com` and `auth.openai.com`; and `http://*/*` + `https://*/*` for the declarative page content script, tab URLs, and the callback filter, not for background fetching.
+- Never add arbitrary page JavaScript execution, CSS/XPath selectors, remote code, external fonts/scripts, cookies, clipboard, downloads, `tabs`, or `scripting` permissions without an explicit design change.
 - Keep `store:false`, `parallel_tool_calls:false`, and `maxRetries:0` in the OpenAI Responses API integration unless the run state machine is deliberately redesigned.
 
 ## Development practices
@@ -89,6 +106,6 @@ wxt.config.ts          Firefox MV2 manifest, permissions, CSP, and Preact Vite s
 2. Run `pnpm typecheck`.
 3. Run `pnpm test`.
 4. Run `pnpm build`.
-5. For manifest/CSP/permission changes, inspect `.output/firefox-mv2/manifest.json` after the production build. Confirm MV2 persistent background, `sidebar_action`, options UI, only expected permissions, and no source maps or remote executable assets.
+5. For manifest/CSP/permission changes, inspect `.output/firefox-mv2/manifest.json` after the production build and run `pnpm check:manifest`. Confirm MV2 persistent background, `sidebar_action`, options UI, only expected permissions, and no source maps or remote executable assets.
 6. For sidebar or options UI changes, load the extension in Firefox and exercise the actual native surface at narrow sidebar width.
 7. For page-control changes, use `tests/fixtures/agent-page.html` and confirm the changed action in Firefox, including approval behavior and stale-ref handling.
