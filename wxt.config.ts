@@ -12,7 +12,7 @@ export default defineConfig({
     plugins: [preact(), Icons({ compiler: "jsx", jsx: "preact" })],
   }),
   manifest: {
-    browser_specific_settings: { gecko: { id: "bside@extension.local" } },
+    browser_specific_settings: { gecko: { id: "bside@tsuni.dev" } },
     icons: { "32": "icon.svg" },
     permissions: [
       "storage",

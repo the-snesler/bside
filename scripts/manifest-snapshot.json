@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "gecko_id": "bside@extension.local",
+  "gecko_id": "bside@tsuni.dev",
   "background_persistent": true,
   "permissions": [
     "http://*/*",

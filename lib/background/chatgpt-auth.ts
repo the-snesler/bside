@@ -5,7 +5,7 @@ import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
 import { ProviderStreamError } from "@/lib/providers/openai";
 import { FirefoxChatGPTAuthBrowser, type ChatGPTAuthBrowser } from "@/lib/background/chatgpt-browser-auth";
 import {
-  deleteChatGPTCredential, getChatGPTCredential, getChatGPTRegistration,
+  deleteChatGPTCredential, deleteChatGPTRegistration, getChatGPTCredential, getChatGPTRegistration,
   saveChatGPTCredential, saveChatGPTRegistration,
   type ChatGPTCredentialV1, type ChatGPTRegistrationV1,
 } from "@/lib/storage";
@@ -75,11 +75,17 @@ export class ChatGPTAuth {
       const key = await pinKey(pin, salt);
       const subdomain = new URL(this.#browser.getRedirectURL()).hostname.split(".")[0];
       const redirectUri = `http://127.0.0.1:1455/mozoauth2/${subdomain}`;
-      const saved = await getChatGPTRegistration();
+      let saved = await getChatGPTRegistration();
       // Only the port may change on an existing registration. Preserve the
       // original host ID and issued client ID from the portless prototype.
-      if (saved && new URL(saved.redirectUri).pathname !== new URL(redirectUri).pathname)
-        throw new ProviderStreamError("The extension's login callback changed. Reinstall this extension with its original add-on ID.", "AUTHENTICATION");
+      // A different callback path means the add-on ID changed: that
+      // registration and any tokens issued to it are stale, so start fresh.
+      if (saved && new URL(saved.redirectUri).pathname !== new URL(redirectUri).pathname) {
+        await deleteChatGPTCredential();
+        await deleteChatGPTRegistration();
+        this.#credential = null; this.#key = null; this.#salt = null;
+        saved = null;
+      }
       const registration: ChatGPTRegistrationV1 = saved ? { ...saved, redirectUri } : {
         version: 1, hostId: `urn:uuid:${crypto.randomUUID()}`, clientId: null, subject: null, redirectUri,
       };
