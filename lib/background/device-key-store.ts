@@ -27,7 +27,9 @@ export const indexedDBDeviceKeyStore: DeviceKeyStore = {
   async save(key) {
     const database = await open();
     try {
-      const transaction = database.transaction(STORE, "readwrite");
+      // Credentials are sealed with this key right after it is saved; losing it to a
+      // crash before the write reaches disk would make them undecryptable.
+      const transaction = database.transaction(STORE, "readwrite", { durability: "strict" });
       transaction.objectStore(STORE).put(key, RECORD);
       await new Promise<void>((resolve, reject) => {
         transaction.oncomplete = () => resolve();
