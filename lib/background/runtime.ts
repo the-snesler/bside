@@ -16,17 +16,15 @@ import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { WorkspaceState } from "@/lib/background/browser-program";
 import type { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController } from "@/lib/background/tab-controller";
-import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
+import type { AgentTabTagV1, TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import { decodeProviderError, OpenAIProvider, ProviderStreamError } from "@/lib/providers/openai";
 import { OPENAI_PROVIDER, DEFAULT_MODEL_ID } from "@/lib/providers/openai-models";
 import {
   appendConversationItem,
   clearRunCheckpoint,
   getAppSettings,
-  getAgentTabs,
   getConversation,
   resetConversation,
-  saveAgentTabs,
   getCredentialStatus,
   getOpenAICredential,
   recoverInterruptedRun,
@@ -35,7 +33,7 @@ import {
   saveRunCheckpoint,
   deleteOpenAICredential as deleteStoredCredential,
 } from "@/lib/storage";
-import type { AgentTabsV1, RunStatus } from "@/lib/storage";
+import type { RunStatus } from "@/lib/storage";
 import { validatePromptText } from "@/lib/validation";
 import type { ContextArtifact } from "@/lib/domain/tools";
 import type { ConversationItem, ConversationRecordV1 } from "@/lib/domain/conversation";
@@ -122,6 +120,8 @@ export class BackgroundRuntime {
   #ready: Promise<void> = Promise.resolve();
   #agentTabSync: Promise<void> = Promise.resolve();
   #agentTabSyncQueued = false;
+  /** Serialized tag last read from or written to each owned tab, so unchanged tags are not rewritten. */
+  #agentTabTags = new Map<number, string>();
   #publishedAgentTabs = 0;
 
   constructor(
@@ -159,9 +159,19 @@ export class BackgroundRuntime {
     this.#clock.setInterval(() => void this.#closeIdleAgentTabs(), AGENT_TAB_SWEEP_MS);
   }
 
-  /** Re-persists an agent tab's URL after it navigates, so restart restoration still recognizes the tab. */
-  handleTabUrlChanged(tabId: number): void {
-    if (this.#workspace.agentTabs.has(tabId)) void this.#queueAgentTabSync();
+  /**
+   * Adopts a tagged tab that appears after startup: Firefox can restore a
+   * session or a closed window at any time, not only before the background starts.
+   */
+  async handleTabCreated(tabId: number): Promise<void> {
+    await this.#ready;
+    if (this.#workspace.agentTabs.has(tabId)) return;
+    const tabController = this.#tabControllerFactory();
+    const tag = await tabController.agentTabTag(tabId).catch(() => null);
+    // Untagged tabs, including bside's own tab before its tag is written, cost one read.
+    if (!tag) return;
+    const tab = (await tabController.allTabs()).find((candidate) => candidate.id === tabId);
+    if (tab && (await this.#claimTaggedTab(tabController, tabId, tag, tab.hidden ?? false))) await this.#queueAgentTabSync();
   }
 
   /** Idle auto-close. Skipped entirely while a run is active, so a tab a run may be using is never closed under it. */
@@ -192,19 +202,39 @@ export class BackgroundRuntime {
   }
 
   /**
-   * Restores persisted agent-tab ownership. A tab is kept only if it still
-   * exists, is hidden, and shows the persisted URL: Firefox reassigns tab IDs
-   * after a browser restart, and adopting a user's tab would let bside close it.
+   * Restores agent-tab ownership from session tags. Firefox reassigns tab IDs
+   * after a browser restart but keeps each tab's session values, so only a
+   * tagged tab is adopted, never one that merely has a former agent tab's ID or URL.
+   * Nothing is dropped for being absent at startup: the tag stays with the tab,
+   * and a tab session restore creates later is adopted by `handleTabCreated`.
    */
   async #restoreAgentTabs(): Promise<void> {
-    const stored = await getAgentTabs();
-    const tabs = new Map((await this.#tabControllerFactory().allTabs()).map((tab) => [tab.id!, tab]));
-    for (const [key, entry] of Object.entries(stored.tabs)) {
-      const tab = tabs.get(Number(key));
-      if (tab?.hidden && tab.url === entry.url) this.#workspace.agentTabs.set(Number(key), entry.lastUsedAt);
-    }
-    if (stored.searchTabId !== null && this.#workspace.agentTabs.has(stored.searchTabId)) this.#workspace.searchTabId = stored.searchTabId;
+    const tabController = this.#tabControllerFactory();
+    await Promise.all((await tabController.allTabs()).map(async (tab) => {
+      const tag = await tabController.agentTabTag(tab.id!).catch(() => null);
+      if (tag) await this.#claimTaggedTab(tabController, tab.id!, tag, tab.hidden ?? false);
+    }));
     await this.#queueAgentTabSync();
+  }
+
+  /**
+   * Adopts a tagged hidden tab. A tagged tab that is visible is released and
+   * untagged instead of re-hidden: the user can see it and may be using it
+   * (they selected it from the tab list, or Firefox showed it while bside was
+   * disabled). Firefox applies a restored tab's hidden state and session values
+   * in the same restore step, so a visible tag is not a tab still being restored.
+   * Returns whether the tab was adopted.
+   */
+  async #claimTaggedTab(tabController: TabController, tabId: number, tag: AgentTabTagV1, hidden: boolean): Promise<boolean> {
+    if (this.#workspace.agentTabs.has(tabId)) return false;
+    if (!hidden) {
+      await tabController.untagAgentTab(tabId).catch(() => {});
+      return false;
+    }
+    this.#workspace.agentTabs.set(tabId, tag.lastUsedAt);
+    this.#agentTabTags.set(tabId, JSON.stringify(tag));
+    if (tag.role === "search" && this.#workspace.searchTabId === null) this.#workspace.searchTabId = tabId;
+    return true;
   }
 
   /** Serializes agent-tab writes; changes made while a write is queued share it. */
@@ -218,22 +248,31 @@ export class BackgroundRuntime {
     return this.#agentTabSync;
   }
 
-  /** Persists agent-tab ownership, dropping tabs that were closed outside bside. */
+  /** Writes agent-tab ownership to session tags, dropping tabs that were closed outside bside. */
   async #syncAgentTabs(): Promise<void> {
     // A tab adopted while the list is being read is missing from it but not
     // closed; adoption queued another sync that will see it.
     const listed = new Set(this.#workspace.agentTabs.keys());
-    const tabs = new Map((await this.#tabControllerFactory().allTabs()).map((tab) => [tab.id!, tab]));
-    const record: AgentTabsV1 = { version: 1, tabs: {}, searchTabId: null };
-    for (const [id, lastUsedAt] of this.#workspace.agentTabs) {
-      const tab = tabs.get(id);
-      if (!tab && listed.has(id)) this.#workspace.agentTabs.delete(id);
-      // Without a URL (non-HTTP pages) the tab cannot be safely re-identified after a restart.
-      else if (tab?.url) record.tabs[id] = { url: tab.url, lastUsedAt };
-    }
+    const tabController = this.#tabControllerFactory();
+    const open = new Set((await tabController.allTabs()).map((tab) => tab.id!));
+    for (const id of listed) if (!open.has(id)) this.#workspace.agentTabs.delete(id);
     if (this.#workspace.searchTabId !== null && !this.#workspace.agentTabs.has(this.#workspace.searchTabId)) this.#workspace.searchTabId = null;
-    if (this.#workspace.searchTabId !== null && record.tabs[this.#workspace.searchTabId]) record.searchTabId = this.#workspace.searchTabId;
-    await saveAgentTabs(record);
+    const writes: Promise<void>[] = [];
+    for (const id of this.#agentTabTags.keys()) {
+      if (this.#workspace.agentTabs.has(id)) continue;
+      // A closed tab took its tag with it; a released one that is still open becomes an ordinary tab.
+      if (!open.has(id)) this.#agentTabTags.delete(id);
+      else writes.push(tabController.untagAgentTab(id).then(() => { this.#agentTabTags.delete(id); }));
+    }
+    for (const [id, lastUsedAt] of this.#workspace.agentTabs) {
+      if (!open.has(id)) continue;
+      const tag: AgentTabTagV1 = { v: 1, role: id === this.#workspace.searchTabId ? "search" : "agent", lastUsedAt };
+      const serialized = JSON.stringify(tag);
+      if (this.#agentTabTags.get(id) === serialized) continue;
+      writes.push(tabController.tagAgentTab(id, tag).then(() => { this.#agentTabTags.set(id, serialized); }));
+    }
+    // A failed write leaves its cached tag stale, so the next sync retries it.
+    await Promise.allSettled(writes);
     if (this.#workspace.agentTabs.size !== this.#publishedAgentTabs) {
       this.#publishedAgentTabs = this.#workspace.agentTabs.size;
       this.#sidebarHub.publishAgentTabs(this.#publishedAgentTabs);

@@ -8,6 +8,7 @@
     "https://api.openai.com/*",
     "https://auth.openai.com/*",
     "identity",
+    "sessions",
     "storage",
     "tabHide",
     "webRequest",

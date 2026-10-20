@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { TabController } from "@/lib/background/tab-controller";
+import { AGENT_TAB_TAG_KEY, TabController } from "@/lib/background/tab-controller";
 import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import type { PageResponse } from "@/lib/protocol";
 import type { PageSnapshot } from "@/lib/domain/tools";
@@ -226,5 +226,46 @@ describe("TabController: action results pass through", () => {
     const outcome = await controller.snapshot({ offset: 500, maxChars: 2000 });
     expect(outcome.ok).toBe(true);
     expect(api.tabs.sendMessage).toHaveBeenLastCalledWith(1, expect.objectContaining({ type: "page.snapshot", offset: 500, maxChars: 2000 }));
+  });
+});
+
+describe("TabController: agent-tab session tags", () => {
+  function sessionsApi(initial: unknown) {
+    const calls: string[] = [];
+    let value = initial;
+    const { api } = createBrowserApi("https://example.test/", "Example");
+    api.tabs.remove = vi.fn(async () => { calls.push("remove"); });
+    api.sessions = {
+      getTabValue: vi.fn(async () => value),
+      setTabValue: vi.fn(async (_tabId: number, _key: string, next: unknown) => { calls.push("set"); value = next; }),
+      removeTabValue: vi.fn(async () => { calls.push("untag"); value = undefined; }),
+    };
+    return { api, calls };
+  }
+
+  it("round-trips a tag under its session key", async () => {
+    const { api } = sessionsApi(undefined);
+    const controller = new TabController(api);
+    expect(await controller.agentTabTag(1)).toBeNull();
+    await controller.tagAgentTab(1, { v: 1, role: "search", lastUsedAt: 5 });
+    expect(api.sessions!.setTabValue).toHaveBeenCalledWith(1, AGENT_TAB_TAG_KEY, { v: 1, role: "search", lastUsedAt: 5 });
+    expect(await controller.agentTabTag(1)).toEqual({ v: 1, role: "search", lastUsedAt: 5 });
+  });
+
+  it.each([
+    ["an unknown version", { v: 2, role: "agent", lastUsedAt: 1 }],
+    ["an unknown role", { v: 1, role: "user", lastUsedAt: 1 }],
+    ["a non-numeric timestamp", { v: 1, role: "agent", lastUsedAt: "1" }],
+    ["a non-finite timestamp", { v: 1, role: "agent", lastUsedAt: Number.POSITIVE_INFINITY }],
+    ["a string", "agent"],
+    ["null", null],
+  ])("reads %s as untagged", async (_label, value) => {
+    expect(await new TabController(sessionsApi(value).api).agentTabTag(1)).toBeNull();
+  });
+
+  it("untags a tab before closing it, so reopening it from recently closed tabs yields an ordinary tab", async () => {
+    const { api, calls } = sessionsApi({ v: 1, role: "agent", lastUsedAt: 1 });
+    await new TabController(api).closeTab(1);
+    expect(calls).toEqual(["untag", "remove"]);
   });
 });

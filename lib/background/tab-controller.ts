@@ -4,7 +4,8 @@
  * script, while navigate/go_back are driven directly through the tabs API with
  * a fixed settle/probe sequence. The bound tab never changes once captured; a
  * newly opened tab is never implicitly adopted. forTab creates a separate
- * controller for an explicitly selected workspace tab.
+ * controller for an explicitly selected workspace tab. Agent-tab ownership is
+ * recorded as a session tab value (`AGENT_TAB_TAG_KEY`) on the tab itself.
  */
 
 import type {
@@ -25,6 +26,20 @@ const UNSUPPORTED_HOSTNAME_SUFFIXES = [".mozilla.org", ".mozilla.com"];
 export const DEFAULT_SNAPSHOT_CHARS = 16_000;
 export const ARTIFACT_SNAPSHOT_CHARS = 8_000;
 
+export const AGENT_TAB_TAG_KEY = "bside.agentTab";
+const AGENT_TAB_ROLES = ["agent", "search"] as const;
+
+/**
+ * Session value marking a tab bside owns. Firefox keeps it with the tab across
+ * browser restarts, session restore, and undo-close, whatever ID the tab gets.
+ */
+export interface AgentTabTagV1 {
+  v: 1;
+  role: (typeof AGENT_TAB_ROLES)[number];
+  /** When a program last used the tab; idle auto-close counts from this. */
+  lastUsedAt: number;
+}
+
 type TabSnapshot = { id?: number; url?: string; title?: string; hidden?: boolean };
 type TabUpdatedListener = (tabId: number, changeInfo: { status?: string }, tab: TabSnapshot) => void;
 
@@ -42,6 +57,11 @@ export interface TabControllerBrowserApi {
       addListener(callback: TabUpdatedListener): void;
       removeListener(callback: TabUpdatedListener): void;
     };
+  };
+  sessions?: {
+    getTabValue(tabId: number, key: string): Promise<unknown>;
+    setTabValue(tabId: number, key: string, value: unknown): Promise<void>;
+    removeTabValue(tabId: number, key: string): Promise<void>;
   };
 }
 
@@ -107,9 +127,27 @@ export class TabController {
     await this.#browserApi.tabs.update(tabId, { active: true });
   }
 
+  /** Untags the tab first, so reopening it from recently closed tabs yields an ordinary tab. */
   async closeTab(tabId: number): Promise<void> {
     if (!this.#browserApi.tabs.remove) throw new Error("Closing tabs is unavailable.");
+    await this.untagAgentTab(tabId).catch(() => {});
     await this.#browserApi.tabs.remove(tabId);
+  }
+
+  /** The tab's agent tag, or null when it has none or holds anything malformed. */
+  async agentTabTag(tabId: number): Promise<AgentTabTagV1 | null> {
+    const value = await this.#browserApi.sessions?.getTabValue(tabId, AGENT_TAB_TAG_KEY);
+    return isAgentTabTag(value) ? value : null;
+  }
+
+  async tagAgentTab(tabId: number, tag: AgentTabTagV1): Promise<void> {
+    if (!this.#browserApi.sessions) throw new Error("Session tab values are unavailable.");
+    await this.#browserApi.sessions.setTabValue(tabId, AGENT_TAB_TAG_KEY, tag);
+  }
+
+  async untagAgentTab(tabId: number): Promise<void> {
+    if (!this.#browserApi.sessions) throw new Error("Session tab values are unavailable.");
+    await this.#browserApi.sessions.removeTabValue(tabId, AGENT_TAB_TAG_KEY);
   }
 
   async waitUntilReady(tabId: number, signal: AbortSignal): Promise<void> {
@@ -299,6 +337,13 @@ export class TabController {
     }
     return null;
   }
+}
+
+function isAgentTabTag(value: unknown): value is AgentTabTagV1 {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return v.v === 1 && (AGENT_TAB_ROLES as readonly unknown[]).includes(v.role) &&
+    typeof v.lastUsedAt === "number" && Number.isFinite(v.lastUsedAt);
 }
 
 function pageError(code: PageErrorCode, message: string): { ok: false; error: NormalizedError } {
