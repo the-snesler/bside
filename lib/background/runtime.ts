@@ -391,6 +391,7 @@ export class BackgroundRuntime {
 
     const result = await run.agentLoop.run({
       runId,
+      conversationId: "default",
       modelId: settings.modelId,
       reasoningEffort: settings.reasoningEffort,
       transcript,

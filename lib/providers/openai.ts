@@ -131,7 +131,9 @@ export class OpenAIProvider implements ProviderAdapter {
         } : model, request.context, {
           apiKey: auth.secret, signal, fetch: safeFetch,
           reasoning: request.reasoningEffort === "none" ? undefined : request.reasoningEffort,
-          maxTokens: MAX_OUTPUT_TOKENS, timeoutMs: REQUEST_TIMEOUT_MS, maxRetries: 0, cacheRetention: "none", transport: "sse",
+          // "short" keeps OpenAI's default in-memory prompt cache (no 24h
+          // retention) and routes it by conversation via prompt_cache_key.
+          maxTokens: MAX_OUTPUT_TOKENS, timeoutMs: REQUEST_TIMEOUT_MS, maxRetries: 0, cacheRetention: "short", sessionId: request.sessionId, transport: "sse",
           onPayload: (payload) => enforceRequestPolicy(payload, auth.method),
         });
         for await (const event of source) {

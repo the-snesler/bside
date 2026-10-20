@@ -87,3 +87,36 @@ describe("ChatGPT requests through the real Pi Responses transport", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 });
+
+describe("Prompt caching through the real Pi Responses transport", () => {
+  it.each(["api-key", "chatgpt"] as const)("keys the in-memory cache by conversation on the %s path", async (method) => {
+    const bodies: Record<string, unknown>[] = [];
+    const headers: Headers[] = [];
+    const text = { type: "message", role: "assistant", id: "msg_test", content: [{ type: "output_text", text: "Done.", annotations: [] }], status: "completed" };
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input, init) => {
+      const request = new Request(input, init);
+      bodies.push(await request.json() as Record<string, unknown>);
+      headers.push(request.headers);
+      return sse([
+        { type: "response.output_item.done", output_index: 0, item: text },
+        { type: "response.completed", response: { id: "resp_1", status: "completed", output: [text], usage: { input_tokens: 2000, input_tokens_details: { cached_tokens: 1536 }, output_tokens: 5, total_tokens: 2005 } } },
+      ]);
+    }));
+    // A bundled GPT-5.6 model: it declares supportsExplicitPromptCacheMode, so
+    // "none" retention would have sent prompt_cache_options: {mode: "explicit"}.
+    const provider = new OpenAIProvider();
+    const model = provider.getModel("gpt-5.6-terra")!;
+    expect(model.compat).toMatchObject({ supportsExplicitPromptCacheMode: true });
+    const context: Context = { systemPrompt: "Browser policy.", messages: [{ role: "user", content: "Hi.", timestamp: 1 }], tools: [] };
+    const auth: ProviderAuth = { providerId: "openai", method, secret: "test-secret" };
+
+    const done = await provider.streamTurn({ model, reasoningEffort: "none", context, sessionId: "default" }, auth, new AbortController().signal).result();
+    await provider.streamTurn({ model, reasoningEffort: "none", context }, auth, new AbortController().signal).result();
+
+    expect(bodies[0]).toMatchObject({ prompt_cache_key: "default", store: false, parallel_tool_calls: false });
+    for (const field of ["prompt_cache_retention", "prompt_cache_options"]) expect(bodies[0]).not.toHaveProperty(field);
+    expect(headers[0]?.get("session_id")).toBe("default");
+    expect(bodies[1]).not.toHaveProperty("prompt_cache_key");
+    expect(done.usage).toMatchObject({ input: 464, cacheRead: 1536, output: 5 });
+  });
+});

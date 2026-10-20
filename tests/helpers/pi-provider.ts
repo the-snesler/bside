@@ -23,7 +23,7 @@ export const TEST_MODEL: Model<"openai-responses"> = {
 export type ScriptedProviderEvent =
   | { type: "text.delta"; delta: string }
   | { type: "tool.call"; call: { id: string; name: ToolCall["name"]; arguments: Record<string, JsonValue> } }
-  | { type: "turn.completed"; replayState: JsonValue | null };
+  | { type: "turn.completed"; replayState: JsonValue | null; usage?: Partial<Omit<AssistantMessage["usage"], "cost">> };
 
 export function toPiStream(
   events: Iterable<ScriptedProviderEvent> | AsyncIterable<ScriptedProviderEvent>,
@@ -56,6 +56,7 @@ export function toPiStream(
           message.content.push(toolCall);
           stream.push({ type: "toolcall_end", contentIndex: message.content.length - 1, toolCall, partial: { ...message } });
         } else {
+          message.usage = { ...message.usage, ...event.usage };
           message.stopReason = message.content.some((part) => part.type === "toolCall") ? "toolUse" : "stop";
           stream.push({ type: "done", reason: message.stopReason, message: { ...message } });
           stream.end();
