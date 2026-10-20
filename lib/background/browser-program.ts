@@ -20,10 +20,36 @@ Call request_action_confirmation BEFORE externally visible, destructive, or paid
 
 export class WorkspaceState {
   files = new Map<string, string>();
-  agentTabs = new Set<number>();
+  /** Hidden tabs the agent owns, mapped to when a program last used each one. */
+  agentTabs = new Map<number, number>();
   /** Document id of the latest outline shown to the model per tab; refs resolve against it. */
   observed = new Map<number, string>();
   searchTabId: number | null = null;
+  /** Called after agentTabs/searchTabId ownership changes so the runtime can persist it. */
+  onOwnershipChange: () => void = () => {};
+
+  constructor(readonly now: () => number = Date.now) {}
+
+  adoptTab(tabId: number): void {
+    this.agentTabs.set(tabId, this.now());
+    this.onOwnershipChange();
+  }
+
+  releaseTab(tabId: number): void {
+    this.agentTabs.delete(tabId);
+    if (this.searchTabId === tabId) this.searchTabId = null;
+    this.onOwnershipChange();
+  }
+
+  setSearchTab(tabId: number): void {
+    this.searchTabId = tabId;
+    this.onOwnershipChange();
+  }
+
+  /** Marks an owned tab as used now; idle auto-close counts from this. */
+  touchTab(tabId: number): void {
+    if (this.agentTabs.has(tabId)) this.agentTabs.set(tabId, this.now());
+  }
 }
 
 type Expr = { type: "literal"; value: JsonValue } | { type: "variable"; name: string } |
@@ -474,7 +500,7 @@ export class BrowserProgram {
   async #openTab(url: string, signal: AbortSignal): Promise<number> {
     this.onEffect();
     const tabId = await this.tabs.createTab(url);
-    this.state.agentTabs.add(tabId);
+    this.state.adoptTab(tabId);
     // Finish hiding a newly created tab even if cancelled during creation.
     try { await this.tabs.hideTab(tabId); }
     catch { throw new Error(`Created /agent-tabs/${tabId}/page.md but Firefox could not hide it. The tab remains visible.`); }
@@ -492,7 +518,7 @@ export class BrowserProgram {
       const url = engine.url(query);
       if (index === 0 && !reusable) {
         tabId = await this.#openTab(url, signal);
-        this.state.searchTabId = tabId;
+        this.state.setSearchTab(tabId);
       } else {
         const navigated = await (await this.#controller(tabId!)).navigate(url);
         if (!navigated.ok) throw this.#pageError({ code: navigated.code ?? "NAVIGATION_INTERRUPTED", message: navigated.summary }, tabId!);
@@ -517,6 +543,7 @@ export class BrowserProgram {
   }
 
   async #controller(tabId: number): Promise<TabController> {
+    this.state.touchTab(tabId);
     try {
       return await this.tabs.forTab(tabId);
     } catch {
@@ -581,16 +608,15 @@ export class BrowserProgram {
       }
       if (method === "remove") {
         if (args.length !== 1) throw new Error("fs.remove(path) takes one argument.");
-        this.onEffect(); await this.tabs.closeTab(id); this.state.agentTabs.delete(id); this.state.observed.delete(id);
-        if (this.state.searchTabId === id) this.state.searchTabId = null;
+        this.onEffect(); await this.tabs.closeTab(id); this.state.releaseTab(id); this.state.observed.delete(id);
         return `Closed ${path}.`;
       }
       if (method === "move") {
         const toAgent = !this.state.agentTabs.has(id);
         if (second !== `/${toAgent ? "agent-tabs" : "tabs"}/${id}/page.md`) throw new Error("Tab moves must preserve the ID and switch /tabs and /agent-tabs.");
         this.onEffect();
-        if (toAgent) { await this.tabs.hideTab(id); this.state.agentTabs.add(id); }
-        else { await this.tabs.showTab(id); this.state.agentTabs.delete(id); if (this.state.searchTabId === id) this.state.searchTabId = null; }
+        if (toAgent) { await this.tabs.hideTab(id); this.state.adoptTab(id); }
+        else { await this.tabs.showTab(id); this.state.releaseTab(id); }
         return `Moved to ${second}.`;
       }
     }

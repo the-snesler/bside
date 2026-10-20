@@ -49,6 +49,18 @@ export interface RunCheckpointV1 {
   updatedAt: number;
 }
 
+/**
+ * Hidden tabs the agent owns, keyed by tab ID. Firefox reuses tab IDs after a
+ * browser restart, so `url` lets startup reject an ID that now names a
+ * different tab. Scratch files are not part of this record.
+ */
+export interface AgentTabsV1 {
+  version: 1;
+  tabs: Record<string, { url: string; lastUsedAt: number }>;
+  searchTabId: number | null;
+}
+
+const MAX_AGENT_TABS = 500;
 const REASONING_EFFORTS: readonly ReasoningEffort[] = ["none", "low", "medium", "high", "xhigh", "max"];
 const RUN_STATUSES: readonly RunStatus[] = ["running", "awaiting-approval", "cancelled", "failed", "completed"];
 
@@ -81,6 +93,9 @@ const conversationItem = storage.defineItem<ConversationRecordV1>("local:convers
 const runCheckpointItem = storage.defineItem<RunCheckpointV1>("local:runCheckpoint", {
   version: 1,
 });
+
+const DEFAULT_AGENT_TABS: AgentTabsV1 = { version: 1, tabs: {}, searchTabId: null };
+const agentTabsItem = storage.defineItem<AgentTabsV1>("local:agentTabs", { version: 1, fallback: DEFAULT_AGENT_TABS });
 
 // ---------------------------------------------------------------------------
 // Shape validators — reject anything that doesn't match, never trust raw storage.
@@ -138,6 +153,23 @@ function isValidRunCheckpoint(value: unknown): value is RunCheckpointV1 {
     typeof v.partialAssistantText === "string" &&
     typeof v.lastSeq === "number" &&
     typeof v.updatedAt === "number"
+  );
+}
+
+function isValidAgentTabs(value: unknown): value is AgentTabsV1 {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  if (v.version !== 1 || typeof v.tabs !== "object" || v.tabs === null || Array.isArray(v.tabs)) return false;
+  const entries = Object.entries(v.tabs);
+  return (
+    entries.length <= MAX_AGENT_TABS &&
+    entries.every(([key, entry]) => {
+      if (!/^\d{1,15}$/.test(key) || typeof entry !== "object" || entry === null) return false;
+      const e = entry as Record<string, unknown>;
+      return typeof e.url === "string" && e.url.length > 0 && e.url.length <= 8_192 &&
+        typeof e.lastUsedAt === "number" && Number.isFinite(e.lastUsedAt);
+    }) &&
+    (v.searchTabId === null || (Number.isSafeInteger(v.searchTabId) && Object.hasOwn(v.tabs, String(v.searchTabId))))
   );
 }
 
@@ -271,7 +303,22 @@ export async function clearRunCheckpoint(): Promise<void> {
   await runCheckpointItem.removeValue();
 }
 
-const INTERRUPTED_SUFFIX = "\n\n[Interrupted: the extension restarted before this response finished.]";
+// ---------------------------------------------------------------------------
+// Agent tabs — ownership of hidden workspace tabs across background restarts.
+// ---------------------------------------------------------------------------
+
+export async function getAgentTabs(): Promise<AgentTabsV1> {
+  const raw = await agentTabsItem.getValue();
+  if (isValidAgentTabs(raw)) return raw;
+  if (raw !== null) await agentTabsItem.removeValue();
+  return DEFAULT_AGENT_TABS;
+}
+
+export async function saveAgentTabs(record: AgentTabsV1): Promise<void> {
+  await agentTabsItem.setValue(record);
+}
+
+const INTERRUPTED_SUFFIX ="\n\n[Interrupted: the extension restarted before this response finished.]";
 
 /**
  * Startup recovery: a checkpoint left "running"/"awaiting-approval" means the
