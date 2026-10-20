@@ -11,6 +11,7 @@
  */
 
 import { AgentLoop } from "@/lib/background/agent-loop";
+import type { ApprovalBadge } from "@/lib/background/approval-badge";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { WorkspaceState } from "@/lib/background/browser-program";
 import type { SidebarHub } from "@/lib/background/sidebar-hub";
@@ -85,6 +86,7 @@ export class BackgroundRuntime {
   #chatgpt: ChatGPTAuth;
   #modelCatalog: readonly ModelDefinition[] = OPENAI_PROVIDER.models;
   #tabControllerFactory: () => TabController;
+  #approvalBadge: ApprovalBadge | null;
   #activeRun: ActiveRun | null = null;
   #notice: string | null = null;
   #workspace = new WorkspaceState();
@@ -97,7 +99,7 @@ export class BackgroundRuntime {
 
   constructor(
     sidebarHub: SidebarHub,
-    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController } = {},
+    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController; approvalBadge?: ApprovalBadge } = {},
   ) {
     this.#sidebarHub = sidebarHub;
     this.#chatgpt = options.chatgpt ?? new ChatGPTAuth();
@@ -106,10 +108,13 @@ export class BackgroundRuntime {
       (id) => this.#modelCatalog.find((model) => model.id === id),
     );
     this.#tabControllerFactory = options.tabControllerFactory ?? (() => new TabController(browser as unknown as TabControllerBrowserApi));
+    this.#approvalBadge = options.approvalBadge ?? null;
   }
 
   /** Runs once at background startup, before any Port connects. */
   async initialize(): Promise<void> {
+    // An interrupted run can no longer be awaiting approval.
+    this.#approvalBadge?.set(false);
     await recoverInterruptedRun();
   }
 
@@ -438,6 +443,7 @@ export class BackgroundRuntime {
         flushDelta();
         run.pendingApproval = request;
         run.status = request ? "awaiting-approval" : "running";
+        this.#approvalBadge?.set(request !== null);
         void this.#sidebarHub.broadcastSnapshot();
       },
     });
@@ -447,6 +453,7 @@ export class BackgroundRuntime {
     if (result.status === "failed") record.error = result.error;
     if (this.#activeRun?.runId !== runId) return;
     flushDelta();
+    this.#approvalBadge?.set(false);
 
     if (result.status === "completed") {
       const messageId = result.finalMessageId ?? (await this.#persistEmptyFinalMessage());

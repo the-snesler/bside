@@ -1,12 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Browser } from "wxt/browser";
 import { BackgroundRuntime } from "@/lib/background/runtime";
+import { ApprovalBadge } from "@/lib/background/approval-badge";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController } from "@/lib/background/tab-controller";
 import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import { ProviderStreamError } from "@/lib/providers/openai";
-import { saveOpenAICredential, appendConversationItem, getConversation, getOpenAICredential } from "@/lib/storage";
+import { saveOpenAICredential, appendConversationItem, getConversation, getOpenAICredential, saveRunCheckpoint } from "@/lib/storage";
 import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
 import type { PageSnapshot } from "@/lib/domain/tools";
 import type { SidebarEvent } from "@/lib/protocol";
@@ -686,5 +687,100 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
     // RATE_LIMIT is retryable by provider-error type, but the click already
     // committed a real page effect this run, so retry must never be offered.
     expect(failed.payload.retryable).toBe(false);
+  });
+});
+
+describe("BackgroundRuntime: approval badge", () => {
+  function fakeBadge() {
+    const texts: string[] = [];
+    const colors: string[] = [];
+    const badge = new ApprovalBadge({
+      setBadgeText: async ({ text }) => { texts.push(text); },
+      setBadgeBackgroundColor: async ({ color }) => { colors.push(color); },
+    });
+    return { badge, texts, colors };
+  }
+
+  /** Round 1 asks for confirmation; later rounds answer, or wait for cancellation. */
+  function confirmationProvider(): FakeProvider {
+    const provider = new FakeProvider();
+    let round = 0;
+    provider.script = () => {
+      round += 1;
+      const events: ScriptedProviderEvent[] = round === 1
+        ? [{ type: "tool.call", call: { id: "call_1", name: "request_action_confirmation", arguments: { title: "Submit", message: "Submit the draft?", artifact: "Draft" } } }, { type: "turn.completed", replayState: null }]
+        : [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
+      return { [Symbol.asyncIterator]: async function* () { yield* events; } };
+    };
+    return provider;
+  }
+
+  async function startAwaitingApproval(badge: ApprovalBadge) {
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider: confirmationProvider(), tabControllerFactory: supportedPageTabControllerFactory, approvalBadge: badge });
+    hub.delegate = runtime;
+    const run = runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Submit it" });
+    await tick(200);
+    const snapshot = await runtime.getSnapshot();
+    expect(snapshot.activeRun?.status).toBe("awaiting-approval");
+    return { runtime, run, runId: snapshot.activeRun!.runId };
+  }
+
+  it("sets the badge while awaiting approval and clears it when approved and the run completes", async () => {
+    const { badge, texts, colors } = fakeBadge();
+    const { runtime, run, runId } = await startAwaitingApproval(badge);
+    expect(texts.at(-1)).toBe("!");
+    expect(colors).toHaveLength(1);
+    expect(badge.pending).toBe(true);
+
+    await runtime.handleCommand({ v: 1, id: "approve", type: "action.approve", runId, callId: "call_1" });
+    await run;
+    expect((await runtime.getSnapshot()).activeRun).toBeNull();
+    expect(texts.at(-1)).toBe("");
+    expect(badge.pending).toBe(false);
+  });
+
+  it("clears the badge when the approval is denied", async () => {
+    const { badge, texts } = fakeBadge();
+    const { runtime, run, runId } = await startAwaitingApproval(badge);
+    await runtime.handleCommand({ v: 1, id: "deny", type: "action.deny", runId, callId: "call_1" });
+    await tick();
+    expect(texts.at(-1)).toBe("");
+    await run;
+    expect(texts.at(-1)).toBe("");
+  });
+
+  it("clears the badge when the run is cancelled while awaiting approval", async () => {
+    const { badge, texts } = fakeBadge();
+    const { runtime, run, runId } = await startAwaitingApproval(badge);
+    await runtime.handleCommand({ v: 1, id: "cancel", type: "run.cancel", runId });
+    await run;
+    expect((await runtime.getSnapshot()).activeRun).toBeNull();
+    expect(texts.at(-1)).toBe("");
+    expect(badge.pending).toBe(false);
+  });
+
+  it("clears the badge on every terminal transition, including a failed run", async () => {
+    await saveOpenAICredential("sk-test");
+    const { badge, texts } = fakeBadge();
+    const provider = new FakeProvider();
+    provider.script = () => ({ [Symbol.asyncIterator]: async function* () { throw new ProviderStreamError("Rate limited.", "RATE_LIMIT"); } });
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory, approvalBadge: badge });
+    hub.delegate = runtime;
+    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Hi" });
+    await tick();
+    expect(texts).toEqual([""]);
+  });
+
+  it("clears a stale badge at startup while recovering an interrupted approval", async () => {
+    await saveRunCheckpoint({ version: 1, runId: "r1", status: "awaiting-approval", partialAssistantText: "", lastSeq: 3, updatedAt: 1 });
+    const { badge, texts } = fakeBadge();
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), approvalBadge: badge });
+    await runtime.initialize();
+    await tick();
+    expect(texts).toEqual([""]);
+    expect((await getConversation()).items.at(-1)).toMatchObject({ id: "interrupted-r1", role: "assistant" });
   });
 });
