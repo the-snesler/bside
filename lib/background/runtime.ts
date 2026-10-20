@@ -139,12 +139,19 @@ export class BackgroundRuntime {
   async initialize(): Promise<void> {
     // An interrupted run can no longer be awaiting approval.
     this.#approvalBadge?.set(false);
-    const startup = Promise.all([recoverInterruptedRun(), this.#restoreAgentTabs()]);
-    // A failed restore leaves no agent tabs owned, which is safe to proceed with.
-    this.#ready = startup.then(() => {}, () => {});
-    const [recovered] = await startup;
-    this.#lastTurnRetryable = recovered;
+    // Each step fails safe on its own: a failed recovery offers no retry, and a
+    // failed restore leaves no agent tabs owned. Neither may cut the other short.
+    this.#ready = Promise.allSettled([
+      recoverInterruptedRun().then((recovered) => { this.#lastTurnRetryable = recovered; }),
+      this.#restoreAgentTabs(),
+    ]).then(() => {});
+    await this.#ready;
     this.#clock.setInterval(() => void this.#closeIdleAgentTabs(), AGENT_TAB_SWEEP_MS);
+  }
+
+  /** Re-persists an agent tab's URL after it navigates, so restart restoration still recognizes the tab. */
+  handleTabUrlChanged(tabId: number): void {
+    if (this.#workspace.agentTabs.has(tabId)) void this.#queueAgentTabSync();
   }
 
   /** Idle auto-close. Skipped entirely while a run is active, so a tab a run may be using is never closed under it. */
@@ -203,13 +210,16 @@ export class BackgroundRuntime {
 
   /** Persists agent-tab ownership, dropping tabs that were closed outside bside. */
   async #syncAgentTabs(): Promise<void> {
+    // A tab adopted while the list is being read is missing from it but not
+    // closed; adoption queued another sync that will see it.
+    const listed = new Set(this.#workspace.agentTabs.keys());
     const tabs = new Map((await this.#tabControllerFactory().allTabs()).map((tab) => [tab.id!, tab]));
     const record: AgentTabsV1 = { version: 1, tabs: {}, searchTabId: null };
     for (const [id, lastUsedAt] of this.#workspace.agentTabs) {
       const tab = tabs.get(id);
-      if (!tab) this.#workspace.agentTabs.delete(id);
+      if (!tab && listed.has(id)) this.#workspace.agentTabs.delete(id);
       // Without a URL (non-HTTP pages) the tab cannot be safely re-identified after a restart.
-      else if (tab.url) record.tabs[id] = { url: tab.url, lastUsedAt };
+      else if (tab?.url) record.tabs[id] = { url: tab.url, lastUsedAt };
     }
     if (this.#workspace.searchTabId !== null && !this.#workspace.agentTabs.has(this.#workspace.searchTabId)) this.#workspace.searchTabId = null;
     if (this.#workspace.searchTabId !== null && record.tabs[this.#workspace.searchTabId]) record.searchTabId = this.#workspace.searchTabId;

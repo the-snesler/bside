@@ -1180,3 +1180,76 @@ describe("BackgroundRuntime: closing agent tabs", () => {
     expect(tabs.map((tab) => tab.id)).toEqual([1]);
   });
 });
+
+describe("BackgroundRuntime: Phase 0 integration (regression)", () => {
+  const userTab = { id: 1, url: "https://user.test/", title: "User", hidden: false };
+
+  it("finishes interrupted-run recovery and starts the idle sweep even when agent-tab restoration fails", async () => {
+    await saveOpenAICredential("sk-test");
+    await appendConversationItem({ id: "u1", kind: "message", role: "user", text: "Before restart", context: null, at: 1 });
+    await saveRunCheckpoint({ version: 1, runId: "r1", status: "running", partialAssistantText: "", lastSeq: 2, updatedAt: 1 });
+    const { api, factory } = fakeTabsApi([userTab]);
+    api.tabs.query.mockRejectedValueOnce(new Error("Tabs unavailable."));
+    const { clock, sweep } = manualClock();
+    const provider = new FakeProvider();
+    scripted(provider, [[{ type: "text.delta", delta: "After restart." }, { type: "turn.completed", replayState: null }]]);
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory, clock });
+    hub.delegate = runtime;
+
+    await runtime.initialize();
+    await sweep();
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    expect(provider.requests).toHaveLength(1);
+    expect((await getConversation()).items.at(-1)).toMatchObject({ role: "assistant", text: "After restart." });
+  });
+
+  it("keeps a tab adopted while an earlier ownership write is still reading the tab list", async () => {
+    await saveAgentTabs({ version: 1, searchTabId: null, tabs: { "5": { url: "https://agent-5.test/", lastUsedAt: 1 } } });
+    const tabs = [userTab, { id: 5, url: "https://agent-5.test/", title: "", hidden: true }];
+    const { api, factory } = fakeTabsApi(tabs);
+    // Hold the tab-list read that releasing tab 5 starts until the next tab is created and hidden.
+    const query = api.tabs.query.getMockImplementation()!;
+    const remove = api.tabs.remove.getMockImplementation()!;
+    const hide = api.tabs.hide.getMockImplementation()!;
+    const gate = Promise.withResolvers<void>();
+    let stallNext = false;
+    api.tabs.query.mockImplementation(async () => {
+      const listed = await query();
+      if (stallNext) { stallNext = false; await gate.promise; }
+      return listed;
+    });
+    api.tabs.remove.mockImplementation(async (tabId: number) => { await remove(tabId); stallNext = true; });
+    api.tabs.hide.mockImplementation(async (tabId: number) => { const hidden = await hide(tabId); gate.resolve(); return hidden; });
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    scripted(provider, programRound('await fs.remove("/agent-tabs/5/page.md"); const page = await browser.open("https://example.test/"); return page.path();'));
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory });
+    hub.delegate = runtime;
+    await runtime.initialize();
+
+    await runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Swap tabs" });
+    expect(modelInput(provider)).toContain("/agent-tabs/100/page.md");
+    await vi.waitFor(async () => expect(Object.keys((await getAgentTabs()).tabs)).toEqual(["100"]));
+    expect((await runtime.getSnapshot()).agentTabs).toBe(1);
+  });
+
+  it("re-persists an agent tab's URL after it navigates, so a restart still restores it", async () => {
+    await saveAgentTabs({ version: 1, searchTabId: null, tabs: { "5": { url: "https://agent-5.test/", lastUsedAt: 1 } } });
+    const tabs = [userTab, { id: 5, url: "https://agent-5.test/", title: "", hidden: true }];
+    const { factory } = fakeTabsApi(tabs);
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: factory });
+    await runtime.initialize();
+
+    tabs[1]!.url = "https://agent-5.test/next";
+    runtime.handleTabUrlChanged(5);
+    await vi.waitFor(async () => expect((await getAgentTabs()).tabs["5"]?.url).toBe("https://agent-5.test/next"));
+    // A user-tab navigation is not an ownership change.
+    runtime.handleTabUrlChanged(1);
+
+    const restarted = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: factory });
+    await restarted.initialize();
+    expect((await restarted.getSnapshot()).agentTabs).toBe(1);
+  });
+});

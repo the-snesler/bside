@@ -34,7 +34,8 @@ export default defineBackground({
       void sidebarHub.refreshAttachment();
     });
 
-    browser.tabs.onUpdated.addListener((_tabId, changeInfo) => {
+    browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
+      if (changeInfo.url !== undefined) runtime.handleTabUrlChanged(tabId);
       if (changeInfo.status === "complete") {
         void sidebarHub.refreshAttachment();
       }
