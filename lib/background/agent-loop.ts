@@ -41,7 +41,7 @@ export interface AgentLoopParams {
 
 export type AgentLoopResult =
   | { status: "completed"; finalMessageId: string | null }
-  | { status: "cancelled"; partialText: string }
+  | { status: "cancelled"; partialText: string; hadPageEffect: boolean }
   | { status: "failed"; error: NormalizedError; hadPageEffect: boolean };
 
 /**
@@ -183,7 +183,7 @@ export class AgentLoop {
       params.signal.removeEventListener("abort", onAbort);
     }
 
-    if (params.signal.aborted) return { status: "cancelled", partialText: currentRoundText };
+    if (params.signal.aborted) return { status: "cancelled", partialText: currentRoundText, hadPageEffect: this.#hadPageEffect };
     if (limitError) return { status: "failed", error: limitError, hadPageEffect: this.#hadPageEffect };
     if (agent.state.errorMessage) {
       return { status: "failed", error: toNormalizedError(decodeProviderError(agent.state.errorMessage)), hadPageEffect: this.#hadPageEffect };

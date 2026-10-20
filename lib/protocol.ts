@@ -211,7 +211,7 @@ export type SidebarCommand =
   | { v: 1; id: string; type: "context.reset" | "context.export" }
   | { v: 1; id: string; type: "state.subscribe"; lastSeq: number | null }
   | { v: 1; id: string; type: "run.start"; prompt: string }
-  /** Re-runs the last turn's existing user message; accepted only when no run is active and that turn ended failed, cancelled, or interrupted. */
+  /** Re-runs the last turn's existing user message; accepted only when no run is active and that turn ended failed, cancelled, or interrupted without a committed page effect. */
   | { v: 1; id: string; type: "run.retry" }
   | { v: 1; id: string; type: "run.cancel"; runId: string }
   | { v: 1; id: string; type: "action.approve"; runId: string; callId: string }
