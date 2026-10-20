@@ -108,6 +108,12 @@ export class BackgroundRuntime {
   #resetting = false;
   /** Whether the last turn ended failed, cancelled, or interrupted, so `run.retry` may re-run it. */
   #lastTurnRetryable = false;
+  /**
+   * Whether that turn's last attempt committed a consequential page effect
+   * (after an interruption: may have). Retrying it could repeat the effect,
+   * so `run.retry` is refused.
+   */
+  #lastTurnHadPageEffect = false;
   #debugOutputs: string[] = [];
   #debugOutputChars = 0;
   #debugOutputTruncated = false;
@@ -142,7 +148,11 @@ export class BackgroundRuntime {
     // Each step fails safe on its own: a failed recovery offers no retry, and a
     // failed restore leaves no agent tabs owned. Neither may cut the other short.
     this.#ready = Promise.allSettled([
-      recoverInterruptedRun().then((recovered) => { this.#lastTurnRetryable = recovered; }),
+      recoverInterruptedRun().then(async (recovered) => {
+        if (!recovered) return;
+        this.#lastTurnHadPageEffect = lastTurnRanProgram((await getConversation()).items);
+        this.#lastTurnRetryable = true;
+      }),
       this.#restoreAgentTabs(),
     ]).then(() => {});
     await this.#ready;
@@ -317,6 +327,7 @@ export class BackgroundRuntime {
         this.#debugOutputTruncated = false;
         this.#workspace.files.clear();
         this.#lastTurnRetryable = false;
+        this.#lastTurnHadPageEffect = false;
         this.#sidebarHub.startRun();
         this.#notice = "Context reset. Conversation history and scratch files cleared; tabs and settings kept.";
         await this.#sidebarHub.broadcastSnapshot();
@@ -434,6 +445,11 @@ export class BackgroundRuntime {
       await this.#sidebarHub.broadcastSnapshot();
       return;
     }
+    if (retry && this.#lastTurnHadPageEffect) {
+      this.#notice = "The last attempt already changed a page, so retrying it could repeat that change. Send a new message to continue.";
+      await this.#sidebarHub.broadcastSnapshot();
+      return;
+    }
 
     const prompt = retry ? null : validatePromptText(rawPrompt);
     if (!retry && !prompt) {
@@ -500,6 +516,7 @@ export class BackgroundRuntime {
     const userIndex = conversation.items.findLastIndex(isUserMessage);
     const userItem = conversation.items[userIndex] as UserMessage;
     this.#lastTurnRetryable = false;
+    this.#lastTurnHadPageEffect = false;
 
     this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt: userItem.text, page: userItem.context, retry });
     await this.#writeCheckpoint(runId, "running", "");
@@ -609,6 +626,7 @@ export class BackgroundRuntime {
       this.#sidebarHub.publishRunEvent(runId, "run.cancelled", { partialText: result.partialText, messageId });
       await clearRunCheckpoint();
       this.#lastTurnRetryable = true;
+      this.#lastTurnHadPageEffect = result.hadPageEffect;
       this.#activeRun = null;
       return;
     }
@@ -620,6 +638,7 @@ export class BackgroundRuntime {
     this.#sidebarHub.publishRunEvent(runId, "run.failed", error);
     await clearRunCheckpoint();
     this.#lastTurnRetryable = true;
+    this.#lastTurnHadPageEffect = result.hadPageEffect;
     this.#activeRun = null;
   }
 
@@ -686,6 +705,14 @@ type UserMessage = Extract<ConversationItem, { kind: "message"; role: "user" }>;
 
 function isUserMessage(item: ConversationItem): item is UserMessage {
   return item.kind === "message" && item.role === "user";
+}
+
+/**
+ * Whether the last turn started a browser program. Run checkpoints record no
+ * effects, so after an interruption any started program may have committed one.
+ */
+function lastTurnRanProgram(items: readonly ConversationItem[]): boolean {
+  return items.slice(items.findLastIndex(isUserMessage) + 1).some((item) => item.kind === "tool-call" && item.call.name === "browser_program");
 }
 
 function extensionVersion(): string {

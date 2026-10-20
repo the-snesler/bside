@@ -689,6 +689,105 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
     // committed a real page effect this run, so retry must never be offered.
     expect(failed.payload.retryable).toBe(false);
   });
+
+  const click = 'await browser.tab("/tabs/1/page.md").getByRole("button", {name: "Submit", exact: true}).click();';
+
+  function refusedRetry(provider: FakeProvider, port: FakePort, requestsBefore: number) {
+    expect(provider.requests).toHaveLength(requestsBefore);
+    const snapshot = port.received.at(-1);
+    if (snapshot?.type !== "state.snapshot") throw new Error("expected state.snapshot");
+    expect(snapshot.payload.activeRun).toBeNull();
+    expect(snapshot.payload.notice).toContain("already changed a page");
+  }
+
+  function setup(provider: FakeProvider) {
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: supportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+    return { runtime, port };
+  }
+
+  it("refuses run.retry after a failed attempt committed a page effect", async () => {
+    await saveOpenAICredential("sk-test");
+    const provider = new FakeProvider();
+    let round = 0;
+    provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      if (round++ > 0) throw new ProviderStreamError("Rate limited.", "RATE_LIMIT");
+      yield { type: "tool.call", call: { id: "call_1", name: "browser_program", arguments: { source: click } } } as ScriptedProviderEvent;
+      yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+    } });
+    const { runtime, port } = setup(provider);
+    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Click submit" });
+    expect(port.received.some((event) => event.type === "run.failed")).toBe(true);
+
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    refusedRetry(provider, port, 2);
+  });
+
+  it("refuses run.retry after a cancelled attempt committed a page effect", async () => {
+    await saveOpenAICredential("sk-test");
+    const provider = new FakeProvider();
+    let round = 0;
+    provider.script = (signal) => ({ [Symbol.asyncIterator]: async function* () {
+      if (round++ === 0) {
+        yield { type: "tool.call", call: { id: "call_1", name: "browser_program", arguments: { source: click } } } as ScriptedProviderEvent;
+        yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+        return;
+      }
+      if (round > 2) {
+        yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+        return;
+      }
+      const { promise, reject } = Promise.withResolvers<never>();
+      signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+      await promise;
+    } });
+    const { runtime, port } = setup(provider);
+    const run = runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Click submit" });
+    await vi.waitFor(() => expect(provider.requests).toHaveLength(2));
+    await runtime.handleCommand({ v: 1, id: "cancel", type: "run.cancel", runId: (await runtime.getSnapshot()).activeRun!.runId });
+    await run;
+    expect(port.received.some((event) => event.type === "run.cancelled")).toBe(true);
+
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    refusedRetry(provider, port, 2);
+  });
+
+  it("refuses run.retry after an interrupted attempt that had started a browser program", async () => {
+    await saveOpenAICredential("sk-test");
+    await appendConversationItem({ id: "u1", kind: "message", role: "user", text: "Click submit", context: null, at: 1 });
+    // The checkpoint does not record effects, so a program the interrupted attempt started may have committed one.
+    await appendConversationItem({ id: "c1", kind: "tool-call", call: { id: "call_1", name: "browser_program", arguments: { source: click } }, at: 2 });
+    await saveRunCheckpoint({ version: 1, runId: "r1", status: "running", partialAssistantText: "", lastSeq: 2, updatedAt: 1 });
+    const provider = new FakeProvider();
+    const { runtime, port } = setup(provider);
+    await runtime.initialize();
+
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    refusedRetry(provider, port, 0);
+  });
+
+  it("keeps a turn retryable across a failed retry that committed no page effect", async () => {
+    await saveOpenAICredential("sk-test");
+    await appendConversationItem({ id: "u1", kind: "message", role: "user", text: "Read it", context: null, at: 1 });
+    await saveRunCheckpoint({ version: 1, runId: "r1", status: "running", partialAssistantText: "", lastSeq: 2, updatedAt: 1 });
+    const provider = new FakeProvider();
+    let round = 0;
+    provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      if (round++ === 0) throw new ProviderStreamError("Rate limited.", "RATE_LIMIT");
+      yield { type: "text.delta", delta: "Done." } as ScriptedProviderEvent;
+      yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+    } });
+    const { runtime } = setup(provider);
+    await runtime.initialize();
+
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "retry-again", type: "run.retry" });
+    expect(provider.requests).toHaveLength(2);
+    expect((await getConversation()).items.at(-1)).toMatchObject({ role: "assistant", text: "Done." });
+  });
 });
 
 describe("BackgroundRuntime: approval badge", () => {
