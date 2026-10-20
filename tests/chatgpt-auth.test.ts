@@ -1,6 +1,8 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
+import { DeviceKey } from "@/lib/background/device-key";
+import { MemoryDeviceKeyStore } from "@/tests/helpers/memory-key-store";
 import type { ChatGPTAuthBrowser } from "@/lib/background/chatgpt-browser-auth";
 import { getChatGPTCredential, getChatGPTRegistration, saveChatGPTRegistration, saveOpenAICredential, getOpenAICredential } from "@/lib/storage";
 
@@ -54,7 +56,7 @@ function harness(options: { callback?: (url: URL) => void; nonce?: string; scope
 describe("ChatGPT subscription OAuth and encrypted storage", () => {
   it("does not expose arbitrary browser errors in the UI or console", async () => {
     const h = harness({ browserError: "private callback?code=test-secret&state=test-state" });
-    await expect(h.auth.login("12345678")).rejects.toMatchObject({ code: "AUTHENTICATION", message: expect.not.stringContaining("test-secret") });
+    await expect(h.auth.login()).rejects.toMatchObject({ code: "AUTHENTICATION", message: expect.not.stringContaining("test-secret") });
     expect(JSON.stringify(vi.mocked(console.warn).mock.calls)).not.toContain("test-secret");
     expect(h.fetcher).not.toHaveBeenCalled();
     expect(await getChatGPTCredential()).toBeNull();
@@ -62,7 +64,7 @@ describe("ChatGPT subscription OAuth and encrypted storage", () => {
 
   it("uses PKCE, validates the signed account, encrypts all tokens, and publishes only safe status", async () => {
     const h = harness();
-    await h.auth.login("12345678");
+    await h.auth.login();
     const url = h.authorization();
     expect(url.searchParams.get("client_id")).toBe("dynamic_agent_client");
     expect(url.searchParams.get("agent_name_hint")).toBe("bside");
@@ -75,32 +77,37 @@ describe("ChatGPT subscription OAuth and encrypted storage", () => {
     expect(h.tokenRequests[0]!.get("client_id")).toBe("oaiapp_test");
     expect(h.tokenRequests[0]!.get("redirect_uri")).toBe(url.searchParams.get("redirect_uri"));
     const stored = JSON.stringify(await browser.storage.local.get(null));
-    for (const secret of ["test-access", "test-refresh", "12345678", "user@example.test", "id_token"]) expect(stored).not.toContain(secret);
+    for (const secret of ["test-access", "test-refresh", "user@example.test", "id_token", "salt"]) expect(stored).not.toContain(secret);
+    expect(await getChatGPTCredential()).toMatchObject({ version: 2 });
     const status = await h.auth.status();
-    expect(status).toEqual({ connected: true, locked: false, email: "user@example.test" });
+    expect(status).toEqual({ connected: true, email: "user@example.test" });
     expect(JSON.stringify(status)).not.toContain("test-access");
     expect((await h.auth.models())?.map((model) => model.id)).toEqual(["gpt-5.6-terra", "gpt-6.1-sol"]);
     expect(await h.auth.getAuth(new AbortController().signal)).toMatchObject({ method: "chatgpt", secret: "test-access" });
   });
 
-  it("locks after restart, rejects the wrong PIN without overwriting storage, and unlocks with the right PIN", async () => {
+  it("reconnects silently after restart with the device key", async () => {
     const h = harness();
-    await h.auth.login("12345678");
-    const saved = await getChatGPTCredential();
+    await h.auth.login();
     const restarted = new ChatGPTAuth(h.authBrowser, h.fetcher);
-    expect(await restarted.status()).toEqual({ connected: true, locked: true, email: null });
-    await expect(restarted.getAuth(new AbortController().signal)).rejects.toMatchObject({ code: "AUTHENTICATION" });
-    await expect(restarted.unlock("87654321")).rejects.toMatchObject({ message: expect.stringContaining("Incorrect PIN") });
-    expect(await getChatGPTCredential()).toEqual(saved);
-    await restarted.unlock("12345678");
+    expect(await restarted.status()).toEqual({ connected: true, email: "user@example.test" });
     expect(await restarted.getAuth(new AbortController().signal)).toMatchObject({ secret: "test-access" });
-    await restarted.lock();
-    expect((await restarted.status()).locked).toBe(true);
+    expect(h.authBrowser.authorize).toHaveBeenCalledTimes(1);
+  });
+
+  it("deletes tokens the device key cannot open and reports not connected instead of failing", async () => {
+    const h = harness();
+    await h.auth.login();
+    const lostKey = new ChatGPTAuth(h.authBrowser, h.fetcher, new DeviceKey(new MemoryDeviceKeyStore()));
+    expect(await lostKey.status()).toEqual({ connected: false, email: null });
+    expect(await getChatGPTCredential()).toBeNull();
+    expect(await lostKey.models()).toBeNull();
+    await expect(lostKey.getAuth(new AbortController().signal)).rejects.toMatchObject({ code: "AUTHENTICATION", message: expect.stringContaining("Sign in with ChatGPT") });
   });
 
   it("serializes rotating refresh tokens and saves a new IV with the replacement tokens", async () => {
     const h = harness();
-    await h.auth.login("12345678");
+    await h.auth.login();
     const saved = await getChatGPTCredential();
     vi.spyOn(Date, "now").mockReturnValue(Date.now() + 3_600_000);
     const [first, second] = await Promise.all([h.auth.getAuth(new AbortController().signal), h.auth.getAuth(new AbortController().signal)]);
@@ -110,9 +117,7 @@ describe("ChatGPT subscription OAuth and encrypted storage", () => {
     expect(h.tokenRequests[1]!.get("refresh_token")).toBe("test-refresh");
     const replacement = await getChatGPTCredential();
     expect(replacement?.iv).not.toBe(saved?.iv);
-    expect(replacement?.salt).toBe(saved?.salt);
     const restarted = new ChatGPTAuth(h.authBrowser, h.fetcher);
-    await restarted.unlock("12345678");
     expect((await restarted.getAuth(new AbortController().signal)).secret).toBe("test-access-rotated");
   });
 
@@ -126,22 +131,20 @@ describe("ChatGPT subscription OAuth and encrypted storage", () => {
     { scopes: "openid email" },
   ])("rejects invalid callbacks, identity, or missing plan consent before saving credentials", async (options) => {
     const h = harness(options);
-    await expect(h.auth.login("12345678")).rejects.toMatchObject({ code: "AUTHENTICATION" });
+    await expect(h.auth.login()).rejects.toMatchObject({ code: "AUTHENTICATION" });
     expect(await getChatGPTCredential()).toBeNull();
   });
 
-  it("reuses the registration and host ID when reconnecting, and supports changing a forgotten PIN", async () => {
+  it("reuses the registration and host ID when reconnecting", async () => {
     const h = harness();
-    await h.auth.login("12345678");
+    await h.auth.login();
     const registration = await getChatGPTRegistration();
-    await h.auth.lock();
-    await h.auth.login("87654321");
+    await h.auth.disconnect();
+    await h.auth.login();
     expect(h.authorization().searchParams.get("client_id")).toBe("oaiapp_test");
     expect(h.authorization().searchParams.has("agent_name_hint")).toBe(false);
     expect(await getChatGPTRegistration()).toEqual(registration);
-    await h.auth.lock();
-    await expect(h.auth.unlock("12345678")).rejects.toMatchObject({ code: "AUTHENTICATION" });
-    await h.auth.unlock("87654321");
+    expect(await h.auth.status()).toMatchObject({ connected: true });
   });
 
   it("adds an explicit port to a saved prototype registration without replacing its identity", async () => {
@@ -149,24 +152,24 @@ describe("ChatGPT subscription OAuth and encrypted storage", () => {
     const registration = { version: 1 as const, hostId: `urn:uuid:${crypto.randomUUID()}`, clientId: null, subject: null,
       redirectUri: "http://127.0.0.1/mozoauth2/test-addon" };
     await saveChatGPTRegistration(registration);
-    await h.auth.login("12345678");
+    await h.auth.login();
     expect(h.authorization().searchParams.get("ext_agent_host_id")).toBe(registration.hostId);
     expect(await getChatGPTRegistration()).toMatchObject({ hostId: registration.hostId, redirectUri: "http://127.0.0.1:1455/mozoauth2/test-addon" });
   });
 
   it("discards a registration and credential from a different add-on ID and registers fresh", async () => {
     const h = harness();
-    await h.auth.login("12345678");
+    await h.auth.login();
     const stale = { version: 1 as const, hostId: `urn:uuid:${crypto.randomUUID()}`, clientId: "oaiapp_old", subject: "old-user",
       redirectUri: "http://127.0.0.1:1455/mozoauth2/old-addon" };
     await saveChatGPTRegistration(stale);
     const failed = harness({ browserError: "cancelled" });
-    await expect(failed.auth.login("12345678")).rejects.toMatchObject({ code: "AUTHENTICATION" });
+    await expect(failed.auth.login()).rejects.toMatchObject({ code: "AUTHENTICATION" });
     expect(await getChatGPTCredential()).toBeNull();
     expect(await getChatGPTRegistration()).toMatchObject({ clientId: null, subject: null, redirectUri: "http://127.0.0.1:1455/mozoauth2/test-addon" });
 
     await saveChatGPTRegistration(stale);
-    await h.auth.login("12345678");
+    await h.auth.login();
     expect(h.authorization().searchParams.get("client_id")).toBe("dynamic_agent_client");
     expect(h.authorization().searchParams.get("ext_agent_host_id")).not.toBe(stale.hostId);
     expect(await getChatGPTRegistration()).toMatchObject({ clientId: "oaiapp_test", subject: "test-user", redirectUri: "http://127.0.0.1:1455/mozoauth2/test-addon" });
@@ -175,19 +178,30 @@ describe("ChatGPT subscription OAuth and encrypted storage", () => {
 
   it("retains saved credentials on refresh failure and sanitizes upstream error bodies", async () => {
     const h = harness({ refreshStatus: 500 });
-    await h.auth.login("12345678");
+    await h.auth.login();
     const saved = await getChatGPTCredential();
     vi.spyOn(Date, "now").mockReturnValue(Date.now() + 3_600_000);
     await expect(h.auth.getAuth(new AbortController().signal)).rejects.toMatchObject({ code: "PROVIDER_UNAVAILABLE", retryable: true, message: expect.not.stringContaining("private token error") });
     expect(await getChatGPTCredential()).toEqual(saved);
   });
 
+  it("revokes the saved refresh token remotely when disconnecting after a restart", async () => {
+    const h = harness();
+    await h.auth.login();
+    const restarted = new ChatGPTAuth(h.authBrowser, h.fetcher);
+    expect(await restarted.disconnect()).toBe(true);
+    const revoke = h.fetcher.mock.calls.find(([url]) => String(url).endsWith("/oauth/revoke"));
+    expect(new URLSearchParams(revoke?.[1]?.body as URLSearchParams).get("token")).toBe("test-refresh");
+    expect(await getChatGPTCredential()).toBeNull();
+    expect(await restarted.status()).toEqual({ connected: false, email: null });
+  });
+
   it("disconnects locally when revocation fails and leaves an existing API key intact", async () => {
     const h = harness({ revokeStatus: 503 });
     await saveOpenAICredential("sk-test-existing-key");
-    await h.auth.login("12345678");
+    await h.auth.login();
     expect(await h.auth.disconnect()).toBe(false);
-    expect(await h.auth.status()).toEqual({ connected: false, locked: false, email: null });
+    expect(await h.auth.status()).toEqual({ connected: false, email: null });
     expect(await getChatGPTCredential()).toBeNull();
     expect((await getOpenAICredential())?.apiKey).toBe("sk-test-existing-key");
   });

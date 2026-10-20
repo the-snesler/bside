@@ -394,12 +394,12 @@ describe("BackgroundRuntime: cancellation", () => {
 });
 
 describe("BackgroundRuntime: credential and settings changes from the options page", () => {
-  function subscription(locked = false) {
+  function subscription(failing = false) {
     const auth = new ChatGPTAuth();
-    vi.spyOn(auth, "status").mockResolvedValue({ connected: true, locked, email: locked ? null : "user@example.test" });
+    vi.spyOn(auth, "status").mockResolvedValue({ connected: true, email: "user@example.test" });
     vi.spyOn(auth, "models").mockResolvedValue([{ id: "account-model", name: "Account model", reasoningEfforts: ["none"], defaultReasoningEffort: "none" }]);
     vi.spyOn(auth, "getAuth").mockImplementation(async () => {
-      if (locked) throw new ProviderStreamError("Unlock ChatGPT in settings.", "AUTHENTICATION");
+      if (failing) throw new ProviderStreamError("ChatGPT token exchange failed. Reconnect in settings.", "AUTHENTICATION");
       return { providerId: "openai", method: "chatgpt", secret: "test-subscription-token" };
     });
     return auth;
@@ -418,7 +418,7 @@ describe("BackgroundRuntime: credential and settings changes from the options pa
     const snapshot = await runtime.getSnapshot();
     expect(snapshot.settings).toMatchObject({ modelId: "account-model", reasoningEffort: "none" });
     expect(snapshot.provider.models.map((model) => model.id)).toEqual(["account-model"]);
-    expect(snapshot.credential).toMatchObject({ configured: true, chatgpt: { connected: true, locked: false } });
+    expect(snapshot.credential).toMatchObject({ configured: true, chatgpt: { connected: true } });
     const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export" });
     for (const value of [JSON.stringify(snapshot), exported.markdown]) {
       expect(value).not.toContain("test-subscription-token");
@@ -426,16 +426,19 @@ describe("BackgroundRuntime: credential and settings changes from the options pa
     }
   });
 
-  it("blocks a locked subscription without falling back to the saved API key", async () => {
+  it("does not fall back to the saved API key when the subscription cannot authenticate", async () => {
     await saveOpenAICredential("sk-test-existing-key");
     const hub = new SidebarHub();
     const provider = new FakeProvider();
     const runtime = new BackgroundRuntime(hub, { provider, chatgpt: subscription(true), tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+    await port.send({ v: 1, id: "sub", type: "state.subscribe", lastSeq: null });
     await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Hello" });
     expect(provider.requests).toEqual([]);
     expect((await getConversation()).items).toEqual([]);
-    expect((await runtime.getSnapshot()).credential.configured).toBe(false);
+    expect(port.received.some((event) => event.type === "state.snapshot" && event.payload.notice?.includes("Reconnect in settings"))).toBe(true);
   });
 
   it("runs the connection test without page tools or changing the conversation", async () => {
