@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import { DeviceKey } from "@/lib/background/device-key";
+import { MemoryDeviceKeyStore } from "@/tests/helpers/memory-key-store";
 import {
   appendConversationItem,
   deleteOpenAICredential,
@@ -98,6 +100,39 @@ describe("storage: credential non-exposure", () => {
     await saveOpenAICredential("sk-super-secret-value-0000");
     await deleteOpenAICredential();
     expect(await getCredentialStatus()).toEqual({ configured: false, maskedSuffix: null });
+  });
+});
+
+describe("storage: API key encryption at rest", () => {
+  it("round-trips the key through a sealed v2 record with no plaintext in storage.local", async () => {
+    await saveOpenAICredential("sk-super-secret-value-0000");
+    const stored = await browser.storage.local.get(null);
+    expect(stored.openaiCredential).toMatchObject({ version: 2, iv: expect.any(String), ciphertext: expect.any(String) });
+    expect(JSON.stringify(stored)).not.toContain("sk-super-secret");
+    expect((await getOpenAICredential())?.apiKey).toBe("sk-super-secret-value-0000");
+  });
+
+  it("deletes a record that a different (e.g. lost and regenerated) device key cannot open", async () => {
+    await saveOpenAICredential("sk-super-secret-value-0000");
+    expect(await getOpenAICredential(new DeviceKey(new MemoryDeviceKeyStore()))).toBeNull();
+    expect(await browser.storage.local.get("openaiCredential")).toEqual({});
+    expect(await getCredentialStatus()).toEqual({ configured: false, maskedSuffix: null });
+  });
+
+  it("deletes a tampered record", async () => {
+    await saveOpenAICredential("sk-super-secret-value-0000");
+    const { openaiCredential } = await browser.storage.local.get("openaiCredential") as { openaiCredential: { ciphertext: string } };
+    await browser.storage.local.set({ openaiCredential: { ...openaiCredential, ciphertext: btoa("tampered-ciphertext!") } });
+    expect(await getOpenAICredential()).toBeNull();
+    expect(await browser.storage.local.get("openaiCredential")).toEqual({});
+  });
+
+  it("keeps the record but reports it absent while the key store is unavailable", async () => {
+    await saveOpenAICredential("sk-super-secret-value-0000");
+    const store = new MemoryDeviceKeyStore();
+    store.load = async () => { throw new Error("IndexedDB unavailable"); };
+    expect(await getOpenAICredential(new DeviceKey(store))).toBeNull();
+    expect((await getOpenAICredential())?.apiKey).toBe("sk-super-secret-value-0000");
   });
 });
 

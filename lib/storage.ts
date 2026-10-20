@@ -1,7 +1,8 @@
 /**
  * Versioned `storage.local` records. Only background code should import
  * `getOpenAICredential`/`saveOpenAICredential`; every other surface reads
- * `getCredentialStatus()`, which never exposes the raw key.
+ * `getCredentialStatus()`, which never exposes the raw key. The API key and
+ * ChatGPT tokens are sealed with the background's device key at rest.
  *
  * Every getter defensively revalidates the stored shape and resets to the
  * documented default on malformed/corrupt data — WXT's `version`/`migrations`
@@ -13,11 +14,20 @@ import { storage } from "wxt/utils/storage";
 import type { AppSettingsV1, ModelDefinition, ReasoningEffort } from "@/lib/domain/provider";
 import type { ConversationItem, ConversationRecordV1 } from "@/lib/domain/conversation";
 import { DEFAULT_MODEL_ID, DEFAULT_REASONING_EFFORT } from "@/lib/providers/openai-models";
+import { deviceKey, type DeviceKey } from "@/lib/background/device-key";
 
 export type { AppSettingsV1 } from "@/lib/domain/provider";
 
-export interface OpenAICredentialV1 {
-  version: 1;
+/** The API key sealed with the device key; never stored in plaintext. */
+export interface OpenAICredentialV2 {
+  version: 2;
+  iv: string;
+  ciphertext: string;
+  updatedAt: number;
+}
+
+/** Background-only decrypted view of `OpenAICredentialV2`. */
+export interface OpenAICredential {
   apiKey: string;
   updatedAt: number;
 }
@@ -66,9 +76,11 @@ const appSettingsItem = storage.defineItem<AppSettingsV1>("local:appSettings", {
   fallback: DEFAULT_APP_SETTINGS,
 });
 
-const openaiCredentialItem = storage.defineItem<OpenAICredentialV1>("local:openaiCredential", {
-  version: 1,
+const openaiCredentialItem = storage.defineItem<OpenAICredentialV2>("local:openaiCredential", {
+  version: 2,
 });
+
+const OPENAI_CREDENTIAL_CONTEXT = "bside:openai-credential:v2";
 
 const chatgptCredentialItem = storage.defineItem<ChatGPTCredentialV1>("local:chatgptCredential", { version: 1 });
 const chatgptRegistrationItem = storage.defineItem<ChatGPTRegistrationV1>("local:chatgptRegistration", { version: 1 });
@@ -102,10 +114,11 @@ function isValidAppSettings(value: unknown): value is AppSettingsV1 {
   );
 }
 
-function isValidCredential(value: unknown): value is OpenAICredentialV1 {
+function isValidCredential(value: unknown): value is OpenAICredentialV2 {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
-  return v.version === 1 && typeof v.apiKey === "string" && v.apiKey.length > 0 && typeof v.updatedAt === "number";
+  return v.version === 2 && typeof v.iv === "string" && v.iv.length === 16 && typeof v.ciphertext === "string" &&
+    v.ciphertext.length > 0 && v.ciphertext.length < 20_000 && typeof v.updatedAt === "number";
 }
 
 function isValidConversationItem(value: unknown): value is ConversationItem {
@@ -160,16 +173,29 @@ export async function saveAppSettings(settings: AppSettingsV1): Promise<void> {
 // Credential — background-only; every other surface must use getCredentialStatus.
 // ---------------------------------------------------------------------------
 
-/** Background-only. Never expose the return value of this function outside the background context. */
-export async function getOpenAICredential(): Promise<OpenAICredentialV1 | null> {
+/**
+ * Background-only. Never expose the return value of this function outside the
+ * background context. A record the device key cannot open (lost key,
+ * tampering) is deleted and reported absent; if the key store itself is
+ * unavailable the record is kept and also reported absent.
+ */
+export async function getOpenAICredential(key: DeviceKey = deviceKey): Promise<OpenAICredential | null> {
   const raw = await openaiCredentialItem.getValue();
-  if (isValidCredential(raw)) return raw;
-  if (raw !== null) await openaiCredentialItem.removeValue();
+  if (!isValidCredential(raw)) {
+    if (raw !== null) await openaiCredentialItem.removeValue();
+    return null;
+  }
+  let apiKey: string | null;
+  try { apiKey = await key.open(raw, OPENAI_CREDENTIAL_CONTEXT); }
+  catch { return null; }
+  if (apiKey) return { apiKey, updatedAt: raw.updatedAt };
+  await openaiCredentialItem.removeValue();
   return null;
 }
 
-export async function saveOpenAICredential(apiKey: string): Promise<void> {
-  await openaiCredentialItem.setValue({ version: 1, apiKey, updatedAt: Date.now() });
+export async function saveOpenAICredential(apiKey: string, key: DeviceKey = deviceKey): Promise<void> {
+  const sealed = await key.seal(apiKey, OPENAI_CREDENTIAL_CONTEXT);
+  await openaiCredentialItem.setValue({ version: 2, ...sealed, updatedAt: Date.now() });
 }
 
 export async function deleteOpenAICredential(): Promise<void> {
