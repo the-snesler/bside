@@ -27,6 +27,8 @@ import {
   resetConversation,
   getCredentialStatus,
   getOpenAICredential,
+  migrateCredentials,
+  clearChatGPTSignInNotice,
   recoverInterruptedRun,
   saveAppSettings,
   saveOpenAICredential,
@@ -145,9 +147,11 @@ export class BackgroundRuntime {
   async initialize(): Promise<void> {
     // An interrupted run can no longer be awaiting approval.
     this.#approvalBadge?.set(false);
-    // Each step fails safe on its own: a failed recovery offers no retry, and a
-    // failed restore leaves no agent tabs owned. Neither may cut the other short.
+    // Each step fails safe on its own: a failed migration retries next startup,
+    // a failed recovery offers no retry, and a failed restore leaves no agent
+    // tabs owned. None may cut another short.
     this.#ready = Promise.allSettled([
+      migrateCredentials(),
       recoverInterruptedRun().then(async (recovered) => {
         if (!recovered) return;
         this.#lastTurnHadPageEffect = lastTurnRanProgram((await getConversation()).items);
@@ -397,7 +401,8 @@ export class BackgroundRuntime {
   async handleCredentialRequest(request: CredentialRequest): Promise<CredentialResponse> {
     try {
       let notice: string | null = null;
-      if (request.type !== "credentials.openai.status") {
+      if (request.type === "credentials.chatgpt.notice.dismiss") await clearChatGPTSignInNotice();
+      else if (request.type !== "credentials.openai.status") {
         if (this.#activeRun) throw new ProviderStreamError("Wait for the active run to finish before changing or testing credentials.", "INVALID_REQUEST");
         if (request.type === "credentials.openai.save") {
           await this.#provider.validateAuth({ providerId: "openai", method: "api-key", secret: request.apiKey }, new AbortController().signal);

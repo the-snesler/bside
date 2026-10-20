@@ -40,6 +40,12 @@ export interface ChatGPTCredentialV2 {
   models: ModelDefinition[];
 }
 
+/** Set when an upgrade removed a PIN-wrapped ChatGPT credential; cleared on dismissal or sign-in. */
+export interface ChatGPTSignInNoticeV1 {
+  version: 1;
+  createdAt: number;
+}
+
 export interface ChatGPTRegistrationV1 {
   version: 1;
   hostId: string;
@@ -84,6 +90,7 @@ const OPENAI_CREDENTIAL_CONTEXT = "bside:openai-credential:v2";
 
 const chatgptCredentialItem = storage.defineItem<ChatGPTCredentialV2>("local:chatgptCredential", { version: 2 });
 const chatgptRegistrationItem = storage.defineItem<ChatGPTRegistrationV1>("local:chatgptRegistration", { version: 1 });
+const chatgptSignInNoticeItem = storage.defineItem<ChatGPTSignInNoticeV1>("local:chatgptSignInNotice", { version: 1 });
 
 const conversationItem = storage.defineItem<ConversationRecordV1>("local:conversation", {
   version: 1,
@@ -180,7 +187,9 @@ export async function saveAppSettings(settings: AppSettingsV1): Promise<void> {
  * unavailable the record is kept and also reported absent.
  */
 export async function getOpenAICredential(key: DeviceKey = deviceKey): Promise<OpenAICredential | null> {
-  const raw = await openaiCredentialItem.getValue();
+  let raw: unknown;
+  try { raw = await sealLegacyOpenAICredential(key); }
+  catch { return null; }
   if (!isValidCredential(raw)) {
     if (raw !== null) await openaiCredentialItem.removeValue();
     return null;
@@ -215,7 +224,7 @@ export async function getCredentialStatus(): Promise<CredentialStatus> {
 
 /** Background-only. OAuth tokens are encrypted; catalog metadata contains no credentials. */
 export async function getChatGPTCredential(): Promise<ChatGPTCredentialV2 | null> {
-  const raw = await chatgptCredentialItem.getValue();
+  const raw = await deleteLegacyChatGPTCredential();
   if (raw?.version === 2 && typeof raw.iv === "string" && raw.iv.length === 16 && typeof raw.ciphertext === "string" &&
     raw.ciphertext.length > 0 && raw.ciphertext.length < 200_000 && Array.isArray(raw.models) &&
     raw.models.length > 0 && raw.models.length <= 200 && raw.models.every((model) =>
@@ -252,6 +261,55 @@ export async function saveChatGPTRegistration(registration: ChatGPTRegistrationV
 
 export async function deleteChatGPTRegistration(): Promise<void> {
   await chatgptRegistrationItem.removeValue();
+}
+
+export async function hasChatGPTSignInNotice(): Promise<boolean> {
+  const raw = await chatgptSignInNoticeItem.getValue();
+  if (raw?.version === 1 && typeof raw.createdAt === "number") return true;
+  if (raw !== null) await chatgptSignInNoticeItem.removeValue();
+  return false;
+}
+
+export async function clearChatGPTSignInNotice(): Promise<void> {
+  await chatgptSignInNoticeItem.removeValue();
+}
+
+// ---------------------------------------------------------------------------
+// Credential migration — PIN removal and device-key encryption.
+// ---------------------------------------------------------------------------
+
+/** Re-encrypts a v1 plaintext API key in place; returns the current raw record. Rejects if the device key is unavailable. */
+async function sealLegacyOpenAICredential(key: DeviceKey): Promise<unknown> {
+  const raw: unknown = await openaiCredentialItem.getValue();
+  const legacy = raw as { version?: unknown; apiKey?: unknown; updatedAt?: unknown } | null;
+  if (legacy?.version !== 1 || typeof legacy.apiKey !== "string" || !legacy.apiKey) return raw;
+  const sealed = await key.seal(legacy.apiKey, OPENAI_CREDENTIAL_CONTEXT);
+  const record: OpenAICredentialV2 = { version: 2, ...sealed, updatedAt: typeof legacy.updatedAt === "number" ? legacy.updatedAt : Date.now() };
+  await openaiCredentialItem.setValue(record);
+  return record;
+}
+
+/**
+ * Deletes a v1 PIN-wrapped ChatGPT credential without migrating it and flags
+ * the one-time sign-in notice; returns the current raw record otherwise.
+ */
+async function deleteLegacyChatGPTCredential(): Promise<ChatGPTCredentialV2 | null> {
+  const raw = await chatgptCredentialItem.getValue();
+  if ((raw as { version?: unknown } | null)?.version !== 1) return raw;
+  await chatgptCredentialItem.removeValue();
+  await chatgptSignInNoticeItem.setValue({ version: 1, createdAt: Date.now() });
+  return null;
+}
+
+/**
+ * Idempotent startup migration. The getters apply the same upgrades lazily,
+ * so a credential read racing startup never discards a legacy record. If the
+ * device key is unavailable, a plaintext key stays put until the next start.
+ */
+export async function migrateCredentials(key: DeviceKey = deviceKey): Promise<void> {
+  try { await sealLegacyOpenAICredential(key); }
+  catch { console.warn("[bside] Could not encrypt the saved API key; will retry at next startup."); }
+  await deleteLegacyChatGPTCredential();
 }
 
 // ---------------------------------------------------------------------------

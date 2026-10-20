@@ -15,6 +15,8 @@ export type ProviderAuth = { providerId: "openai"; method: "api-key" | "chatgpt"
 export interface ChatGPTStatus {
   connected: boolean;
   email: string | null;
+  /** One-time "Sign in with ChatGPT again" notice after the PIN-wrapped connection was removed. */
+  signInAgain: boolean;
 }
 
 /** Persisted + wire-transmittable selection of provider/model/reasoning effort. */
