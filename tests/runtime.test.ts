@@ -498,6 +498,34 @@ describe("BackgroundRuntime: credential and settings changes from the options pa
     expect(dismissed).toMatchObject({ ok: true, chatgpt: { signInAgain: false } });
   });
 
+  it("applies an options-page credential change only after the startup migration finishes", async () => {
+    await browser.storage.local.set({ openaiCredential: { version: 1, apiKey: "sk-test-legacy-plaintext", updatedAt: 1 } });
+    const sealing = Promise.withResolvers<void>();
+    let sealWriteStarted = false;
+    const set = browser.storage.local.set.bind(browser.storage.local);
+    const spy = vi.spyOn(browser.storage.local, "set").mockImplementation(async (items) => {
+      if ((items as { openaiCredential?: { version?: number } }).openaiCredential?.version === 2) {
+        sealWriteStarted = true;
+        await sealing.promise;
+      }
+      return set(items);
+    });
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const started = runtime.initialize();
+    await vi.waitFor(() => expect(sealWriteStarted).toBe(true));
+    const deleted = runtime.handleCredentialRequest({ v: 1, id: "delete", type: "credentials.openai.delete" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    sealing.resolve();
+    await started;
+    expect(await deleted).toMatchObject({ ok: true, configured: false });
+    spy.mockRestore();
+    // The migration's sealed copy must not resurrect a key deleted while it ran.
+    expect(await getOpenAICredential()).toBeNull();
+    expect(await browser.storage.local.get("openaiCredential")).toEqual({});
+  });
+
   it("does not broadcast when key validation fails", async () => {
     const hub = new SidebarHub();
     const provider = new FakeProvider();
