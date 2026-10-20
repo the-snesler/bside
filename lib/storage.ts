@@ -296,8 +296,10 @@ async function sealLegacyOpenAICredential(key: DeviceKey): Promise<unknown> {
 async function deleteLegacyChatGPTCredential(): Promise<ChatGPTCredentialV2 | null> {
   const raw = await chatgptCredentialItem.getValue();
   if ((raw as { version?: unknown } | null)?.version !== 1) return raw;
-  await chatgptCredentialItem.removeValue();
+  // Notice first: an interruption between the writes must not drop the
+  // connection silently; the next read deletes the record again.
   await chatgptSignInNoticeItem.setValue({ version: 1, createdAt: Date.now() });
+  await chatgptCredentialItem.removeValue();
   return null;
 }
 
