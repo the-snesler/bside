@@ -23,8 +23,10 @@ import {
   appendConversationItem,
   clearRunCheckpoint,
   getAppSettings,
+  getAgentTabs,
   getConversation,
   resetConversation,
+  saveAgentTabs,
   getCredentialStatus,
   getOpenAICredential,
   recoverInterruptedRun,
@@ -33,7 +35,7 @@ import {
   saveRunCheckpoint,
   deleteOpenAICredential as deleteStoredCredential,
 } from "@/lib/storage";
-import type { RunStatus } from "@/lib/storage";
+import type { AgentTabsV1, RunStatus } from "@/lib/storage";
 import { validatePromptText } from "@/lib/validation";
 import type { ContextArtifact } from "@/lib/domain/tools";
 import type { ConversationItem, ConversationRecordV1 } from "@/lib/domain/conversation";
@@ -98,6 +100,10 @@ export class BackgroundRuntime {
   #debugOutputChars = 0;
   #debugOutputTruncated = false;
   #runRecord: RunRecord | null = null;
+  /** Settles once startup recovery/restoration finishes; every sidebar command waits on it. */
+  #ready: Promise<void> = Promise.resolve();
+  #agentTabSync: Promise<void> = Promise.resolve();
+  #agentTabSyncQueued = false;
 
   constructor(
     sidebarHub: SidebarHub,
@@ -111,16 +117,64 @@ export class BackgroundRuntime {
     );
     this.#tabControllerFactory = options.tabControllerFactory ?? (() => new TabController(browser as unknown as TabControllerBrowserApi));
     this.#approvalBadge = options.approvalBadge ?? null;
+    this.#workspace.onOwnershipChange = () => void this.#queueAgentTabSync();
   }
 
   /** Runs once at background startup, before any Port connects. */
   async initialize(): Promise<void> {
     // An interrupted run can no longer be awaiting approval.
     this.#approvalBadge?.set(false);
-    this.#lastTurnRetryable = await recoverInterruptedRun();
+    const startup = Promise.all([recoverInterruptedRun(), this.#restoreAgentTabs()]);
+    // A failed restore leaves no agent tabs owned, which is safe to proceed with.
+    this.#ready = startup.then(() => {}, () => {});
+    const [recovered] = await startup;
+    this.#lastTurnRetryable = recovered;
+  }
+
+  /**
+   * Restores persisted agent-tab ownership. A tab is kept only if it still
+   * exists, is hidden, and shows the persisted URL: Firefox reassigns tab IDs
+   * after a browser restart, and adopting a user's tab would let bside close it.
+   */
+  async #restoreAgentTabs(): Promise<void> {
+    const stored = await getAgentTabs();
+    const tabs = new Map((await this.#tabControllerFactory().allTabs()).map((tab) => [tab.id!, tab]));
+    for (const [key, entry] of Object.entries(stored.tabs)) {
+      const tab = tabs.get(Number(key));
+      if (tab?.hidden && tab.url === entry.url) this.#workspace.agentTabs.set(Number(key), entry.lastUsedAt);
+    }
+    if (stored.searchTabId !== null && this.#workspace.agentTabs.has(stored.searchTabId)) this.#workspace.searchTabId = stored.searchTabId;
+    await this.#queueAgentTabSync();
+  }
+
+  /** Serializes agent-tab writes; changes made while a write is queued share it. */
+  #queueAgentTabSync(): Promise<void> {
+    if (this.#agentTabSyncQueued) return this.#agentTabSync;
+    this.#agentTabSyncQueued = true;
+    this.#agentTabSync = this.#agentTabSync
+      .then(() => { this.#agentTabSyncQueued = false; return this.#syncAgentTabs(); })
+      // A failed write is retried by the next ownership change.
+      .catch(() => {});
+    return this.#agentTabSync;
+  }
+
+  /** Persists agent-tab ownership, dropping tabs that were closed outside bside. */
+  async #syncAgentTabs(): Promise<void> {
+    const tabs = new Map((await this.#tabControllerFactory().allTabs()).map((tab) => [tab.id!, tab]));
+    const record: AgentTabsV1 = { version: 1, tabs: {}, searchTabId: null };
+    for (const [id, lastUsedAt] of this.#workspace.agentTabs) {
+      const tab = tabs.get(id);
+      if (!tab) this.#workspace.agentTabs.delete(id);
+      // Without a URL (non-HTTP pages) the tab cannot be safely re-identified after a restart.
+      else if (tab.url) record.tabs[id] = { url: tab.url, lastUsedAt };
+    }
+    if (this.#workspace.searchTabId !== null && !this.#workspace.agentTabs.has(this.#workspace.searchTabId)) this.#workspace.searchTabId = null;
+    if (this.#workspace.searchTabId !== null && record.tabs[this.#workspace.searchTabId]) record.searchTabId = this.#workspace.searchTabId;
+    await saveAgentTabs(record);
   }
 
   async getSnapshot(): Promise<RuntimeSnapshot> {
+    await this.#ready;
     const [conversation, credential, settings, provider] = await Promise.all([
       getConversation(),
       this.#getCredentialStatus(),
@@ -151,6 +205,7 @@ export class BackgroundRuntime {
   handleCommand(command: { v: 1; id: string; type: "context.export" }): Promise<{ markdown: string; filename: string }>;
   handleCommand(command: SidebarCommand): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]>;
   async handleCommand(command: SidebarCommand): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]> {
+    await this.#ready;
     if (command.type === "tabs.list") {
       const tabs = await this.#tabControllerFactory().listTabs();
       return { tabs: tabs.map((tab) => ({ id: tab.id!, title: tab.title ?? "", url: tab.url!, path: `/${this.#workspace.agentTabs.has(tab.id!) ? "agent-tabs" : "tabs"}/${tab.id}/page.md` })) };

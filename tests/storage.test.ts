@@ -2,12 +2,14 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   appendConversationItem,
   deleteOpenAICredential,
+  getAgentTabs,
   getAppSettings,
   getConversation,
   getCredentialStatus,
   getOpenAICredential,
   getRunCheckpoint,
   recoverInterruptedRun,
+  saveAgentTabs,
   saveAppSettings,
   saveOpenAICredential,
   saveRunCheckpoint,
@@ -120,6 +122,35 @@ describe("storage: one-thread restore", () => {
     // Simulate a reload: fetch again from the same underlying storage.
     const restored = await getConversation();
     expect(restored.items).toEqual(conversation.items);
+  });
+});
+
+describe("storage: agent-tab ownership", () => {
+  it("defaults to no owned tabs", async () => {
+    expect(await getAgentTabs()).toEqual({ version: 1, tabs: {}, searchTabId: null });
+  });
+
+  it("round-trips ownership keyed by tab ID", async () => {
+    const record = {
+      version: 1 as const,
+      tabs: { "12": { url: "https://example.com/a", lastUsedAt: 1_000 }, "40": { url: "https://duckduckgo.com/", lastUsedAt: 2_000 } },
+      searchTabId: 40,
+    };
+    await saveAgentTabs(record);
+    expect(await getAgentTabs()).toEqual(record);
+  });
+
+  it.each([
+    ["an unknown version", { version: 2, tabs: {}, searchTabId: null }],
+    ["a non-numeric tab key", { version: 1, tabs: { abc: { url: "https://example.com/", lastUsedAt: 1 } }, searchTabId: null }],
+    ["an empty URL", { version: 1, tabs: { "3": { url: "", lastUsedAt: 1 } }, searchTabId: null }],
+    ["a non-numeric timestamp", { version: 1, tabs: { "3": { url: "https://example.com/", lastUsedAt: "1" } }, searchTabId: null }],
+    ["a search tab it does not own", { version: 1, tabs: { "3": { url: "https://example.com/", lastUsedAt: 1 } }, searchTabId: 4 }],
+    ["an array of tabs", { version: 1, tabs: [], searchTabId: null }],
+  ])("discards a record with %s", async (_label, record) => {
+    await browser.storage.local.set({ agentTabs: record });
+    expect(await getAgentTabs()).toEqual({ version: 1, tabs: {}, searchTabId: null });
+    expect((await browser.storage.local.get("agentTabs")).agentTabs).toBeUndefined();
   });
 });
 

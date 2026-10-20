@@ -64,7 +64,12 @@ export class TabController {
   }
 
   async listTabs(): Promise<TabSnapshot[]> {
-    return (await this.#browserApi.tabs.query({})).filter((tab) => tab.id !== undefined && isSupportedUrl(tab.url));
+    return (await this.allTabs()).filter((tab) => isSupportedUrl(tab.url));
+  }
+
+  /** Every tab, including unsupported pages, so an agent tab on such a page is not mistaken for a closed one. */
+  async allTabs(): Promise<TabSnapshot[]> {
+    return (await this.#browserApi.tabs.query({})).filter((tab) => tab.id !== undefined);
   }
 
   async forTab(tabId: number): Promise<TabController> {
