@@ -19,6 +19,8 @@
     "zip": "wxt zip",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "lint:ext": "web-ext lint --source-dir .output/firefox-mv2",
+    "check:manifest": "node scripts/check-manifest.mjs",
     "postinstall": "wxt prepare"
   },
   "dependencies": {
@@ -44,6 +46,7 @@
     "typescript": "7.0.2",
     "unplugin-icons": "^23.0.1",
     "vitest": "4.1.11",
+    "web-ext": "10.8.0",
     "wxt": "0.21.4"
   }
 }
