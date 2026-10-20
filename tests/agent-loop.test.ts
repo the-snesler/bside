@@ -527,3 +527,91 @@ describe("AgentLoop: page-effect tracking for retry gating", () => {
     if (result.status === "failed") expect(result.hadPageEffect).toBe(false);
   });
 });
+
+describe("AgentLoop: run budgets", () => {
+  /** Never finishes on its own: every round returns another tool call. */
+  class EndlessProvider extends ScriptedProvider {
+    constructor(onRound: (round: number) => { name: ToolCall["name"]; args: Record<string, unknown> }, outputPerRound = 0) {
+      let round = 0;
+      const next = () => {
+        round += 1;
+        const { name, args } = onRound(round);
+        return [toolCallEvent(`call_${round}`, name, args), { type: "turn.completed", replayState: null, usage: { output: outputPerRound } } as ScriptedProviderEvent];
+      };
+      super(Array.from({ length: 1000 }, () => next));
+    }
+  }
+
+  const click = { name: "browser_program" as const, args: { source: 'await browser.tab("/tabs/1/page.md").ref("e1").click();' } };
+  const read = { name: "browser_program" as const, args: { source: "return 1;" } };
+
+  async function runWith(provider: ScriptedProvider, limits: ConstructorParameters<typeof AgentLoop>[4], onApprovalPending: (request: ApprovalRequest | null, loop: AgentLoop) => void = () => {}) {
+    const { tabController, sendMessageMock } = await createTabController();
+    const loop = new AgentLoop(provider, tabController, new SidebarHub(), undefined, limits);
+    const result = await loop.run({
+      runId: "run1", conversationId: "default", modelId: "gpt-5.6-terra", reasoningEffort: "medium", transcript: baseTranscript, contextArtifact: artifact,
+      auth: AUTH, signal: new AbortController().signal, onDelta: () => {}, onItem: async () => {}, onApprovalPending: (request) => onApprovalPending(request, loop),
+    });
+    const executed = sendMessageMock.mock.calls.filter((call) => (call[1] as { type?: string }).type === "page.execute").length;
+    return { result, executed };
+  }
+
+  it("stops after the step cap as a non-retryable LIMIT_EXCEEDED failure, keeping committed effects", async () => {
+    const provider = new EndlessProvider(() => click);
+    const { result, executed } = await runWith(provider, { maxRounds: 3 });
+
+    expect(result).toEqual({
+      status: "failed",
+      error: { code: "LIMIT_EXCEEDED", message: "Stopped after 3 steps; ask me to continue.", retryable: false, phase: "provider" },
+      hadPageEffect: true,
+    });
+    expect(provider.requests).toHaveLength(3);
+    expect(executed).toBe(3);
+  });
+
+  it("defaults to 40 steps", async () => {
+    const provider = new EndlessProvider(() => read);
+    const { result } = await runWith(provider, {});
+    expect(result.status === "failed" ? result.error.message : null).toBe("Stopped after 40 steps; ask me to continue.");
+    expect(provider.requests).toHaveLength(40);
+  });
+
+  it("stops once total output tokens reach the cap", async () => {
+    const provider = new EndlessProvider(() => read, 300);
+    const { result } = await runWith(provider, { maxOutputTokens: 1000 });
+    expect(result).toMatchObject({ status: "failed", error: { code: "LIMIT_EXCEEDED", message: "Stopped after 1,000 output tokens; ask me to continue.", retryable: false }, hadPageEffect: false });
+    expect(provider.requests).toHaveLength(4);
+  });
+
+  it("stops once active wall-clock time reaches the cap", async () => {
+    let clock = 0;
+    const provider = new EndlessProvider(() => { clock += 60_000; return read; });
+    const { result } = await runWith(provider, { maxActiveMs: 5 * 60_000, now: () => clock });
+    expect(result).toMatchObject({ status: "failed", error: { code: "LIMIT_EXCEEDED", message: "Stopped after 5 minutes of work; ask me to continue.", retryable: false } });
+    expect(provider.requests).toHaveLength(5);
+  });
+
+  it("excludes time spent awaiting an explicit confirmation decision", async () => {
+    let clock = 0;
+    const provider = new EndlessProvider((round) => {
+      clock += 60_000;
+      return round === 1 ? { name: "request_action_confirmation", args: { title: "Submit", message: "Submit this draft?", artifact: "" } } : read;
+    });
+    const { result } = await runWith(provider, { maxActiveMs: 5 * 60_000, now: () => clock }, (request, loop) => {
+      if (!request) return;
+      clock += 60 * 60_000; // The user takes an hour to decide.
+      loop.approve(request.call.id);
+    });
+    expect(result).toMatchObject({ status: "failed", error: { code: "LIMIT_EXCEEDED", message: "Stopped after 5 minutes of work; ask me to continue." } });
+    expect(provider.requests).toHaveLength(5);
+  });
+
+  it("lets a run that finishes on its own complete even past a cap", async () => {
+    const provider = new ScriptedProvider([
+      () => [toolCallEvent("call_1", "browser_program", read.args as never), { type: "turn.completed", replayState: null, usage: { output: 500 } }],
+      () => [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null, usage: { output: 500 } }],
+    ]);
+    const { result } = await runWith(provider, { maxRounds: 2, maxOutputTokens: 600 });
+    expect(result.status).toBe("completed");
+  });
+});

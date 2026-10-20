@@ -44,6 +44,21 @@ export type AgentLoopResult =
   | { status: "cancelled"; partialText: string }
   | { status: "failed"; error: NormalizedError; hadPageEffect: boolean };
 
+/**
+ * Per-run budgets, checked between provider rounds so effects already
+ * committed are kept. Time spent awaiting an explicit confirmation decision
+ * does not count toward the wall-clock budget.
+ */
+export interface RunLimits {
+  maxRounds: number;
+  maxActiveMs: number;
+  /** Total output (including reasoning) tokens across all rounds. 40 rounds at the provider's 8192-token response cap is ~328k. */
+  maxOutputTokens: number;
+  now: () => number;
+}
+
+export const DEFAULT_RUN_LIMITS: RunLimits = { maxRounds: 40, maxActiveMs: 15 * 60_000, maxOutputTokens: 200_000, now: () => Date.now() };
+
 const AGENT_TOOLS = [
   { name: "browser_program" as const, description: PROGRAM_HELP, parameters: {
     type: "object", properties: { source: { type: "string", minLength: 1, maxLength: 16000 } }, required: ["source"], additionalProperties: false,
@@ -62,9 +77,12 @@ export class AgentLoop {
   #startedAt = new Map<string, number>();
   #hadPageEffect = false;
   #pendingApprovals = new Map<string, (approved: boolean) => void>();
+  #limits: RunLimits;
+  #approvalWaitMs = 0;
 
-  constructor(provider: ProviderAdapter, tabController: TabController, sidebarHub: SidebarHub, workspace = new WorkspaceState()) {
+  constructor(provider: ProviderAdapter, tabController: TabController, sidebarHub: SidebarHub, workspace = new WorkspaceState(), limits: Partial<RunLimits> = {}) {
     this.#provider = provider;
+    this.#limits = { ...DEFAULT_RUN_LIMITS, ...limits };
     this.#program = new BrowserProgram(tabController, workspace, () => { this.#hadPageEffect = true; });
     this.#sidebarHub = sidebarHub;
   }
@@ -96,6 +114,11 @@ export class AgentLoop {
 
     let currentRoundText = "";
     let lastMessageId: string | null = null;
+    const limits = this.#limits;
+    const startedAt = limits.now();
+    let rounds = 0;
+    let outputTokens = 0;
+    let limitError: NormalizedError | null = null;
     if (params.contextArtifact) this.#program.observe(params.contextArtifact.snapshot.tabId, params.contextArtifact.snapshot.documentId);
     const agent = new Agent({
       initialState: {
@@ -106,6 +129,7 @@ export class AgentLoop {
         tools: this.#createTools(params),
       },
       streamFn: (_model, context, options) => {
+        rounds += 1;
         params.onContext?.(JSON.stringify(context, null, 2));
         return this.#provider.streamTurn(
         { model: _model, reasoningEffort: params.reasoningEffort, context, sessionId: params.conversationId },
@@ -118,6 +142,16 @@ export class AgentLoop {
         const toolResult = readToolResult(result);
         return toolResult ? { isError: !toolResult.ok } : undefined;
       },
+      // Only a turn with tool results would start another provider round.
+      shouldStopAfterTurn: ({ toolResults }) => {
+        if (!toolResults.length) return false;
+        const message = rounds >= limits.maxRounds ? `Stopped after ${limits.maxRounds} steps; ask me to continue.`
+          : limits.now() - startedAt - this.#approvalWaitMs >= limits.maxActiveMs ? `Stopped after ${Math.round(limits.maxActiveMs / 60_000)} minutes of work; ask me to continue.`
+          : outputTokens >= limits.maxOutputTokens ? `Stopped after ${limits.maxOutputTokens.toLocaleString("en-US")} output tokens; ask me to continue.`
+          : null;
+        if (message) limitError = { code: "LIMIT_EXCEEDED", message, retryable: false, phase: "provider" };
+        return limitError !== null;
+      },
     });
 
     agent.subscribe(async (event) => {
@@ -127,6 +161,7 @@ export class AgentLoop {
         return;
       }
       if (event.type === "message_end" && event.message.role === "assistant") {
+        outputTokens += event.message.usage.output;
         params.onUsage?.(event.message.usage);
         if (event.message.stopReason === "error" || event.message.stopReason === "aborted") return;
         const text = assistantText(event.message);
@@ -149,6 +184,7 @@ export class AgentLoop {
     }
 
     if (params.signal.aborted) return { status: "cancelled", partialText: currentRoundText };
+    if (limitError) return { status: "failed", error: limitError, hadPageEffect: this.#hadPageEffect };
     if (agent.state.errorMessage) {
       return { status: "failed", error: toNormalizedError(decodeProviderError(agent.state.errorMessage)), hadPageEffect: this.#hadPageEffect };
     }
@@ -214,11 +250,13 @@ export class AgentLoop {
     if (call.name === "request_action_confirmation" && typeof args.title === "string" && args.title.trim().length > 0 && args.title.length <= 160 &&
         typeof args.message === "string" && args.message.trim().length > 0 && args.message.length <= 4000 && typeof args.artifact === "string" && args.artifact.length <= 32000 && Object.keys(args).length === 3) {
       const request: ApprovalRequest = { call, origin: "", display: args.title, target: {} };
+      const waitStartedAt = this.#limits.now();
       // Register before publishing so an immediate UI response cannot be lost.
       const decision = this.#waitForApproval(call.id, signal);
       this.#sidebarHub.publishRunEvent(params.runId, "action.approval-required", request);
       params.onApprovalPending(request);
       const approved = await decision;
+      this.#approvalWaitMs += this.#limits.now() - waitStartedAt;
       params.onApprovalPending(null);
       result = approved && !signal.aborted && !params.signal.aborted
         ? { ok: true, summary: "approved:true. The user confirmed the described action only." }
