@@ -399,6 +399,9 @@ export class BackgroundRuntime {
   }
 
   async handleCredentialRequest(request: CredentialRequest): Promise<CredentialResponse> {
+    // The options page can message during startup; a change racing the
+    // credential migration could be overwritten by its sealed legacy copy.
+    await this.#ready;
     try {
       let notice: string | null = null;
       if (request.type === "credentials.chatgpt.notice.dismiss") await clearChatGPTSignInNotice();
@@ -445,6 +448,7 @@ export class BackgroundRuntime {
   }
 
   async handleSettingsRequest(request: SettingsRequest): Promise<SettingsResponse> {
+    await this.#ready;
     if (request.type === "settings.get") {
       const settings = await this.#getValidatedSettings();
       const notice = this.#notice;
