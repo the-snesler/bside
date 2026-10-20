@@ -784,3 +784,140 @@ describe("BackgroundRuntime: approval badge", () => {
     expect((await getConversation()).items.at(-1)).toMatchObject({ id: "interrupted-r1", role: "assistant" });
   });
 });
+
+describe("BackgroundRuntime: run.retry", () => {
+  const userTexts = async () => (await getConversation()).items.flatMap((item) => item.kind === "message" && item.role === "user" ? [item.text] : []);
+  const answer = (text: string): ScriptedProviderEvent[] => [{ type: "text.delta", delta: text }, { type: "turn.completed", replayState: null }];
+
+  function scriptedRounds(provider: FakeProvider, rounds: Array<ScriptedProviderEvent[] | Error>): void {
+    let round = 0;
+    provider.script = (signal) => {
+      const next = rounds[round++] ?? answer("Extra.");
+      return { [Symbol.asyncIterator]: async function* () {
+        if (next instanceof Error) throw next;
+        yield* next;
+        if (next.at(-1)?.type === "turn.completed") return;
+        const { promise, reject } = Promise.withResolvers<never>();
+        signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+        await promise;
+      } };
+    };
+  }
+
+  function setup(provider: FakeProvider) {
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+    return { runtime, port };
+  }
+
+  it("re-runs a failed turn without a second user message; the model sees history through the original prompt, not the failed attempt's interim text", async () => {
+    await saveOpenAICredential("sk-test");
+    await appendConversationItem({ id: "u0", kind: "message", role: "user", text: "Earlier", context: null, at: 1 });
+    await appendConversationItem({ id: "a0", kind: "message", role: "assistant", text: "Earlier answer.", at: 2 });
+    const provider = new FakeProvider();
+    scriptedRounds(provider, [
+      [{ type: "text.delta", delta: "Let me look." }, { type: "tool.call", call: { id: "call_1", name: "browser_program", arguments: { source: 'return await fs.read("/tabs/1/page.md");' } } }, { type: "turn.completed", replayState: null }],
+      new ProviderStreamError("Rate limited.", "RATE_LIMIT"),
+      answer("Found it."),
+    ]);
+    const { runtime, port } = setup(provider);
+
+    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Find it" });
+    expect(port.received.find((event) => event.type === "run.failed")?.payload).toMatchObject({ code: "RATE_LIMIT", retryable: true });
+
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    const started = port.received.filter((event) => event.type === "run.started").at(-1);
+    expect(started?.payload).toMatchObject({ prompt: "Find it", retry: true });
+    expect(port.received.at(-1)?.type).toBe("run.completed");
+    expect(await userTexts()).toEqual(["Earlier", "Find it"]);
+    expect(provider.requests[2]?.context.messages.map((message) => [message.role, JSON.stringify(message.content)])).toEqual([
+      ["user", JSON.stringify("Earlier")],
+      ["assistant", JSON.stringify([{ type: "text", text: "Earlier answer." }])],
+      ["user", JSON.stringify("Find it")],
+    ]);
+    // The failed attempt stays visible in the same turn, followed by the retried answer.
+    const items = (await getConversation()).items;
+    expect(items.some((item) => item.kind === "message" && item.text === "Let me look.")).toBe(true);
+    expect(items.at(-1)).toMatchObject({ role: "assistant", text: "Found it." });
+  });
+
+  it("re-runs a cancelled turn, keeping its stopped partial text visible but out of the retried request", async () => {
+    await saveOpenAICredential("sk-test");
+    const provider = new FakeProvider();
+    scriptedRounds(provider, [[{ type: "text.delta", delta: "The page says" }], answer("Done.")]);
+    const { runtime } = setup(provider);
+
+    const run = runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Read it" });
+    await tick();
+    await runtime.handleCommand({ v: 1, id: "cancel", type: "run.cancel", runId: (await runtime.getSnapshot()).activeRun!.runId });
+    await run;
+
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    expect(await userTexts()).toEqual(["Read it"]);
+    expect(provider.requests[1]?.context.messages.map((message) => message.role)).toEqual(["user"]);
+    const texts = (await getConversation()).items.flatMap((item) => item.kind === "message" && item.role === "assistant" ? [item.text] : []);
+    expect(texts).toEqual([expect.stringContaining("Stopped"), "Done."]);
+  });
+
+  it("re-runs a turn interrupted by a background restart", async () => {
+    await saveOpenAICredential("sk-test");
+    await appendConversationItem({ id: "u1", kind: "message", role: "user", text: "Before restart", context: null, at: 1 });
+    await saveRunCheckpoint({ version: 1, runId: "r1", status: "running", partialAssistantText: "Half", lastSeq: 2, updatedAt: 1 });
+    const provider = new FakeProvider();
+    scriptedRounds(provider, [answer("After restart.")]);
+    const { runtime } = setup(provider);
+    await runtime.initialize();
+
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    expect(await userTexts()).toEqual(["Before restart"]);
+    expect(provider.requests[0]?.context.messages.map((message) => message.role)).toEqual(["user"]);
+    expect((await getConversation()).items.at(-1)).toMatchObject({ role: "assistant", text: "After restart." });
+  });
+
+  it("drops a retry after a completed turn, a successful retry, a context reset, or with no history", async () => {
+    await saveOpenAICredential("sk-test");
+    const provider = new FakeProvider();
+    scriptedRounds(provider, [answer("One."), new ProviderStreamError("Rate limited.", "RATE_LIMIT"), answer("Two.")]);
+    const { runtime, port } = setup(provider);
+
+    await runtime.handleCommand({ v: 1, id: "none", type: "run.retry" });
+    expect(provider.requests).toHaveLength(0);
+    expect(port.received.at(-1)?.type).toBe("state.snapshot");
+
+    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "First" });
+    await runtime.handleCommand({ v: 1, id: "after-complete", type: "run.retry" });
+    expect(provider.requests).toHaveLength(1);
+
+    await runtime.handleCommand({ v: 1, id: "start2", type: "run.start", prompt: "Second" });
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "retry-again", type: "run.retry" });
+    expect(provider.requests).toHaveLength(3);
+    expect(await userTexts()).toEqual(["First", "Second"]);
+
+    scriptedRounds(provider, [new ProviderStreamError("Rate limited.", "RATE_LIMIT")]);
+    await runtime.handleCommand({ v: 1, id: "start3", type: "run.start", prompt: "Third" });
+    await runtime.handleCommand({ v: 1, id: "reset", type: "context.reset" });
+    await runtime.handleCommand({ v: 1, id: "after-reset", type: "run.retry" });
+    expect(provider.requests).toHaveLength(4);
+    expect((await getConversation()).items).toEqual([]);
+  });
+
+  it("drops a retry while a run is active", async () => {
+    await saveOpenAICredential("sk-test");
+    const provider = new FakeProvider();
+    scriptedRounds(provider, [new ProviderStreamError("Rate limited.", "RATE_LIMIT"), [{ type: "text.delta", delta: "Working" }]]);
+    const { runtime } = setup(provider);
+    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Go" });
+
+    const retry = runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    await tick();
+    await runtime.handleCommand({ v: 1, id: "retry-again", type: "run.retry" });
+    expect(provider.requests).toHaveLength(2);
+    await runtime.handleCommand({ v: 1, id: "cancel", type: "run.cancel", runId: (await runtime.getSnapshot()).activeRun!.runId });
+    await retry;
+    expect(await userTexts()).toEqual(["Go"]);
+  });
+});

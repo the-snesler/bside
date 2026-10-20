@@ -36,7 +36,7 @@ import {
 import type { RunStatus } from "@/lib/storage";
 import { validatePromptText } from "@/lib/validation";
 import type { ContextArtifact } from "@/lib/domain/tools";
-import type { ConversationItem } from "@/lib/domain/conversation";
+import type { ConversationItem, ConversationRecordV1 } from "@/lib/domain/conversation";
 import type { AppSettingsV1, ModelDefinition, ProviderAdapter, ProviderAuth, ProviderDefinition } from "@/lib/domain/provider";
 import type {
   ApprovalRequest,
@@ -92,6 +92,8 @@ export class BackgroundRuntime {
   #workspace = new WorkspaceState();
   #latestContext: string | null = null;
   #resetting = false;
+  /** Whether the last turn ended failed, cancelled, or interrupted, so `run.retry` may re-run it. */
+  #lastTurnRetryable = false;
   #debugOutputs: string[] = [];
   #debugOutputChars = 0;
   #debugOutputTruncated = false;
@@ -115,7 +117,7 @@ export class BackgroundRuntime {
   async initialize(): Promise<void> {
     // An interrupted run can no longer be awaiting approval.
     this.#approvalBadge?.set(false);
-    await recoverInterruptedRun();
+    this.#lastTurnRetryable = await recoverInterruptedRun();
   }
 
   async getSnapshot(): Promise<RuntimeSnapshot> {
@@ -194,6 +196,7 @@ export class BackgroundRuntime {
         this.#debugOutputChars = 0;
         this.#debugOutputTruncated = false;
         this.#workspace.files.clear();
+        this.#lastTurnRetryable = false;
         this.#sidebarHub.startRun();
         this.#notice = "Context reset. Conversation history and scratch files cleared; tabs and settings kept.";
         await this.#sidebarHub.broadcastSnapshot();
@@ -202,6 +205,10 @@ export class BackgroundRuntime {
     }
     if (command.type === "run.start") {
       await this.#startRun(command.prompt);
+      return;
+    }
+    if (command.type === "run.retry") {
+      await this.#startRun(null);
       return;
     }
     if (command.type === "run.cancel") {
@@ -300,14 +307,16 @@ export class BackgroundRuntime {
     return fallback;
   }
 
-  async #startRun(rawPrompt: string): Promise<void> {
-    if (this.#activeRun || this.#resetting) {
+  /** A `null` prompt is a retry: it re-runs the last turn's existing user message instead of appending a new one. */
+  async #startRun(rawPrompt: string | null): Promise<void> {
+    const retry = rawPrompt === null;
+    if (this.#activeRun || this.#resetting || (retry && !this.#lastTurnRetryable)) {
       await this.#sidebarHub.broadcastSnapshot();
       return;
     }
 
-    const prompt = validatePromptText(rawPrompt);
-    if (!prompt) {
+    const prompt = retry ? null : validatePromptText(rawPrompt);
+    if (!retry && !prompt) {
       this.#notice = "Message is empty or too long.";
       await this.#sidebarHub.broadcastSnapshot();
       return;
@@ -331,11 +340,16 @@ export class BackgroundRuntime {
     };
 
     let auth: ProviderAuth;
+    let retryConversation: ConversationRecordV1 | null = null;
     try {
       const chatgpt = await this.#chatgpt.status();
       const credential = chatgpt.connected ? null : await getOpenAICredential();
       if (!chatgpt.connected && !credential) throw new ProviderStreamError("Sign in with ChatGPT or add an OpenAI API key in settings before starting a conversation.", "AUTHENTICATION");
       auth = chatgpt.connected ? await this.#chatgpt.getAuth(controller.signal) : { providerId: "openai", method: "api-key", secret: credential!.apiKey };
+      if (retry) {
+        retryConversation = await getConversation();
+        if (!retryConversation.items.some(isUserMessage)) throw new ProviderStreamError("There is no turn to retry.", "INVALID_REQUEST");
+      }
     } catch (error) {
       this.#activeRun = null;
       this.#notice = toNormalizedError(error, "setup").message;
@@ -355,22 +369,28 @@ export class BackgroundRuntime {
       ? { ...captureOutcome.value.artifact, target: { kind: "tab", tabId: captureOutcome.value.snapshot.tabId }, snapshot: captureOutcome.value.snapshot }
       : null;
 
-    const userItem: ConversationItem = {
+    const conversation = retryConversation ?? await appendConversationItem({
       id: crypto.randomUUID(),
       kind: "message",
       role: "user",
-      text: prompt,
+      text: prompt!,
       context: artifact ? { artifactId: artifact.artifactId, kind: "page", title: artifact.title, url: artifact.url, capturedAt: artifact.capturedAt } : null,
       at: Date.now(),
-    };
-    const conversation = await appendConversationItem(userItem);
+    });
+    const userIndex = conversation.items.findLastIndex(isUserMessage);
+    const userItem = conversation.items[userIndex] as UserMessage;
+    this.#lastTurnRetryable = false;
 
-    this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt, page: userItem.kind === "message" ? userItem.context : null });
+    this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt: userItem.text, page: userItem.context, retry });
     await this.#writeCheckpoint(runId, "running", "");
 
     // Pi owns assistant/tool replay during this run. Persisted tool items are
     // display/audit records only, so a new run starts from message history.
-    const transcript = conversation.items.filter((item) => item.kind === "message");
+    // History ends at this turn's user message: on a retry, the failed
+    // attempt's interim/partial assistant text stays visible but is not sent,
+    // so the model answers the original prompt afresh against a new page
+    // capture. Its page effects are never replayed.
+    const transcript = conversation.items.slice(0, userIndex + 1).filter((item) => item.kind === "message");
     await this.#runAgentLoop(runId, transcript, artifact, auth);
   }
 
@@ -466,6 +486,7 @@ export class BackgroundRuntime {
       const messageId = result.partialText ? await this.#persistCancelledMessage(result.partialText) : null;
       this.#sidebarHub.publishRunEvent(runId, "run.cancelled", { partialText: result.partialText, messageId });
       await clearRunCheckpoint();
+      this.#lastTurnRetryable = true;
       this.#activeRun = null;
       return;
     }
@@ -476,6 +497,7 @@ export class BackgroundRuntime {
     const error: NormalizedError = result.hadPageEffect ? { ...result.error, retryable: false } : result.error;
     this.#sidebarHub.publishRunEvent(runId, "run.failed", error);
     await clearRunCheckpoint();
+    this.#lastTurnRetryable = true;
     this.#activeRun = null;
   }
 
@@ -524,6 +546,12 @@ export class BackgroundRuntime {
     if (approved) this.#activeRun.agentLoop.approve(callId);
     else this.#activeRun.agentLoop.deny(callId);
   }
+}
+
+type UserMessage = Extract<ConversationItem, { kind: "message"; role: "user" }>;
+
+function isUserMessage(item: ConversationItem): item is UserMessage {
+  return item.kind === "message" && item.role === "user";
 }
 
 function extensionVersion(): string {

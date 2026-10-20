@@ -25,6 +25,7 @@ export interface BackgroundActions {
   focusTab(tabId: number): void;
   saveSettings(settings: AppSettingsV1): void;
   sendPrompt(prompt: string): void;
+  retryRun(): void;
   cancelRun(): void;
   approveAction(callId: string): void;
   denyAction(callId: string): void;
@@ -91,6 +92,10 @@ export function useBackground(): BackgroundState & BackgroundActions {
     portRef.current?.postMessage(command);
   }, []);
 
+  const retryRun = useCallback(() => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "run.retry" } satisfies SidebarCommand);
+  }, []);
+
   const cancelRun = useCallback(() => {
     const runId = activeRunIdRef.current;
     if (!runId) return;
@@ -132,7 +137,7 @@ export function useBackground(): BackgroundState & BackgroundActions {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "settings.save", settings } satisfies SidebarCommand);
   }, []);
 
-  return { ...state, sendPrompt, cancelRun, approveAction, denyAction, resetContext, downloadContext, listTabs, focusTab, saveSettings };
+  return { ...state, sendPrompt, retryRun, cancelRun, approveAction, denyAction, resetContext, downloadContext, listTabs, focusTab, saveSettings };
 }
 
 function commitPendingText(prev: BackgroundState): BackgroundState {
@@ -180,10 +185,13 @@ function applyEvent(
         context: event.payload.page,
         at: event.at,
       };
+      // A retry re-runs the turn's existing user message rather than adding one.
+      const items = event.payload.retry ? prev.conversation.items : [...prev.conversation.items, userItem];
       return {
         ...prev,
+        lastError: null,
         activeRun: { runId: event.runId as string, status: "running", partialAssistantText: "", pendingApproval: null },
-        conversation: { ...prev.conversation, items: [...prev.conversation.items, userItem], updatedAt: event.at },
+        conversation: { ...prev.conversation, items, updatedAt: event.at },
       };
     });
     return;

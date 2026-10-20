@@ -5,10 +5,12 @@ import { act } from "preact/test-utils";
 import { Markdown } from "@/lib/ui/Markdown";
 import { parsePromptMentions, serializeDraft } from "@/lib/ui/Composer";
 import { useBottomScroll } from "@/lib/ui/use-bottom-scroll";
+import { useBackground } from "@/lib/ui/use-background";
 import { isSidebarCommand } from "@/lib/protocol";
 import { buildTurns, formatDuration } from "@/lib/ui/turns";
 import { TurnTrace } from "@/lib/ui/TurnTrace";
 import type { ConversationItem } from "@/lib/domain/conversation";
+import type { SidebarEvent } from "@/lib/protocol";
 
 const turnItems: ConversationItem[] = [
   { id: "u1", kind: "message", role: "user", text: "Fill the form", context: null, at: 0 },
@@ -23,6 +25,7 @@ const turnItems: ConversationItem[] = [
 afterEach(() => {
   document.body.innerHTML = "";
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe("sidebar UI contracts", () => {
@@ -159,6 +162,40 @@ describe("sidebar UI contracts", () => {
     expect(
       isSidebarCommand({ v: 1, id: "c", type: "credentials.openai.status" }),
     ).toBe(false);
+  });
+
+  it("retries a failed turn in place without duplicating its user message", async () => {
+    const posted: unknown[] = [];
+    const listeners: Array<(message: unknown) => void> = [];
+    vi.spyOn(browser.runtime, "connect").mockReturnValue({
+      postMessage: (message: unknown) => posted.push(message),
+      onMessage: { addListener: (listener: (message: unknown) => void) => listeners.push(listener), removeListener: () => {} },
+      disconnect: () => {},
+    } as never);
+    let background: ReturnType<typeof useBackground>;
+    function Harness() {
+      background = useBackground();
+      return null;
+    }
+    const root = document.createElement("div");
+    document.body.append(root);
+    await act(() => render(h(Harness, {}), root));
+    const emit = (event: Omit<SidebarEvent, "v" | "conversationId" | "seq" | "at">) =>
+      act(() => listeners.forEach((listener) => listener({ v: 1, conversationId: "default", seq: 1, at: 1, ...event })));
+
+    await emit({ runId: "r1", type: "run.started", payload: { prompt: "Find it", page: null, retry: false } });
+    await emit({ runId: "r1", type: "run.failed", payload: { code: "RATE_LIMIT", message: "Rate limited.", retryable: true, phase: "provider" } });
+    expect(background!.lastError?.retryable).toBe(true);
+
+    await act(() => background!.retryRun());
+    expect(posted.at(-1)).toMatchObject({ v: 1, type: "run.retry" });
+    expect(isSidebarCommand(posted.at(-1))).toBe(true);
+
+    await emit({ runId: "r2", type: "run.started", payload: { prompt: "Find it", page: null, retry: true } });
+    expect(background!.conversation.items.filter((item) => item.kind === "message" && item.role === "user")).toHaveLength(1);
+    expect(background!.activeRun?.runId).toBe("r2");
+    expect(background!.lastError).toBeNull();
+    await act(() => render(null, root));
   });
 
   it("follows content growth only while pinned, and resumes after jumping to latest", async () => {
