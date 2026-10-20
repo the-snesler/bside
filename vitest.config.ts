@@ -9,5 +9,6 @@ export default defineConfig({
     server: { deps: { inline: ["react-markdown", "slate-react", "slate-dom"] } },
     environment: "node",
     include: ["tests/**/*.test.ts"],
+    setupFiles: ["tests/setup.ts"],
   },
 });

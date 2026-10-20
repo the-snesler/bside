@@ -148,7 +148,7 @@ export function App() {
 
       <section class="options__section">
         <h2 class="options__heading">OpenAI API key</h2>
-        <p class="options__disclosure">Stored unencrypted in this Firefox profile. Never shared with page scripts.</p>
+        <p class="options__disclosure">Encrypted in this Firefox profile with a key that never leaves it. Never shared with page scripts.</p>
         {credential?.configured ? (
           <p class="options__status">
             Configured (ending in {credential.maskedSuffix}).{" "}
