@@ -23,7 +23,7 @@ export interface SidebarHubDelegate {
   handleCommand(command: SidebarCommand): Promise<{ markdown: string; filename: string } | { tabs: TabMention[] } | void>;
 }
 
-type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" | "context.exported" | "tabs.listed" }>;
+type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" | "agent-tabs.changed" | "context.exported" | "tabs.listed" }>;
 
 export class SidebarHub {
   delegate: SidebarHubDelegate | null = null;
@@ -62,6 +62,20 @@ export class SidebarHub {
     for (const port of this.#ports) {
       this.#sendAttachment(port, next);
     }
+  }
+
+  /** Broadcasts the hidden agent-tab count. Not run-sequenced, so it is safe mid-run and never clears sidebar error state. */
+  publishAgentTabs(count: number): void {
+    const event: SidebarEvent = {
+      v: 1,
+      runId: null,
+      conversationId: "default",
+      seq: this.#lastSeq,
+      type: "agent-tabs.changed",
+      at: Date.now(),
+      payload: { count },
+    };
+    for (const port of this.#ports) port.postMessage(event);
   }
 
   /** Called by BackgroundRuntime when a new run begins: resets the run-local seq/replay buffer. */

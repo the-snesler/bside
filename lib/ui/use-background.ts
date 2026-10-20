@@ -23,6 +23,7 @@ export interface BackgroundState extends RuntimeSnapshot {
 export interface BackgroundActions {
   listTabs(): void;
   focusTab(tabId: number): void;
+  closeAgentTabs(): void;
   saveSettings(settings: AppSettingsV1): void;
   sendPrompt(prompt: string): void;
   retryRun(): void;
@@ -40,6 +41,7 @@ const INITIAL_STATE: BackgroundState = {
   provider: OPENAI_PROVIDER,
   settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
   page: null,
+  agentTabs: 0,
   activeRun: null,
   lastSeq: 0,
   notice: null,
@@ -133,11 +135,14 @@ export function useBackground(): BackgroundState & BackgroundActions {
   const focusTab = useCallback((tabId: number) => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "tabs.focus", tabId } satisfies SidebarCommand);
   }, []);
+  const closeAgentTabs = useCallback(() => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "tabs.closeAgentTabs" } satisfies SidebarCommand);
+  }, []);
   const saveSettings = useCallback((settings: AppSettingsV1) => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "settings.save", settings } satisfies SidebarCommand);
   }, []);
 
-  return { ...state, sendPrompt, retryRun, cancelRun, approveAction, denyAction, resetContext, downloadContext, listTabs, focusTab, saveSettings };
+  return { ...state, sendPrompt, retryRun, cancelRun, approveAction, denyAction, resetContext, downloadContext, listTabs, focusTab, closeAgentTabs, saveSettings };
 }
 
 function commitPendingText(prev: BackgroundState): BackgroundState {
@@ -172,6 +177,10 @@ function applyEvent(
   }
   if (event.type === "page.attached") {
     setState((prev) => ({ ...prev, page: event.payload }));
+    return;
+  }
+  if (event.type === "agent-tabs.changed") {
+    setState((prev) => ({ ...prev, agentTabs: event.payload.count }));
     return;
   }
   if (event.type === "run.started") {
