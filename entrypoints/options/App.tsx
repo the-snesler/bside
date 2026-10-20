@@ -109,6 +109,12 @@ export function App() {
         <p class="options__status" role="status">
           {chatgpt?.connected ? `Connected${chatgpt.email ? ` as ${chatgpt.email}` : ""}.` : "Not connected."}
         </p>
+        {chatgpt?.signInAgain && (
+          <p class="options__notice" role="status">
+            Sign in with ChatGPT again. bside no longer uses a PIN, so your earlier connection was removed.{" "}
+            <button type="button" disabled={saving} onClick={() => void performCredentialAction({ type: "credentials.chatgpt.notice.dismiss" })}>Dismiss</button>
+          </p>
+        )}
         <div class="options__form options__form--wrap">
           {chatgpt?.connected ? <>
             <button type="button" disabled={saving} onClick={() => void performCredentialAction({ type: "credentials.chatgpt.test" })}>Test connection</button>

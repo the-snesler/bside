@@ -103,7 +103,7 @@ describe("isCredentialRequest: accepts every valid variant, rejects malformed in
   });
 
   it("accepts ChatGPT account actions only from the options channel and has no PIN commands", () => {
-    for (const action of ["login", "disconnect", "test"]) {
+    for (const action of ["login", "disconnect", "test", "notice.dismiss"]) {
       const request = { v: 1, id: "1", type: `credentials.chatgpt.${action}` };
       expect(isCredentialRequest(request)).toBe(true);
       expect(isSidebarCommand(request)).toBe(false);

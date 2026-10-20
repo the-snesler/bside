@@ -396,7 +396,7 @@ describe("BackgroundRuntime: cancellation", () => {
 describe("BackgroundRuntime: credential and settings changes from the options page", () => {
   function subscription(failing = false) {
     const auth = new ChatGPTAuth();
-    vi.spyOn(auth, "status").mockResolvedValue({ connected: true, email: "user@example.test" });
+    vi.spyOn(auth, "status").mockResolvedValue({ connected: true, email: "user@example.test", signInAgain: false });
     vi.spyOn(auth, "models").mockResolvedValue([{ id: "account-model", name: "Account model", reasoningEfforts: ["none"], defaultReasoningEffort: "none" }]);
     vi.spyOn(auth, "getAuth").mockImplementation(async () => {
       if (failing) throw new ProviderStreamError("ChatGPT token exchange failed. Reconnect in settings.", "AUTHENTICATION");
@@ -480,6 +480,22 @@ describe("BackgroundRuntime: credential and settings changes from the options pa
 
     await runtime.handleCredentialRequest({ v: 1, id: "delete", type: "credentials.openai.delete" });
     expect(credentialStates()).toEqual([false, true, false]);
+  });
+
+  it("migrates legacy credentials at startup and dismisses the sign-in notice even during a run", async () => {
+    await browser.storage.local.set({
+      openaiCredential: { version: 1, apiKey: "sk-test-legacy-plaintext", updatedAt: 1 },
+      chatgptCredential: { version: 1, salt: "A".repeat(24), iv: "B".repeat(16), ciphertext: "C".repeat(64), models: [] },
+    });
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    await runtime.initialize();
+    expect(JSON.stringify(await browser.storage.local.get(null))).not.toContain("sk-test-legacy-plaintext");
+    const status = await runtime.handleCredentialRequest({ v: 1, id: "status", type: "credentials.openai.status" });
+    expect(status).toMatchObject({ ok: true, configured: true, maskedSuffix: "text", chatgpt: { connected: false, signInAgain: true } });
+    const dismissed = await runtime.handleCredentialRequest({ v: 1, id: "dismiss", type: "credentials.chatgpt.notice.dismiss" });
+    expect(dismissed).toMatchObject({ ok: true, chatgpt: { signInAgain: false } });
   });
 
   it("does not broadcast when key validation fails", async () => {

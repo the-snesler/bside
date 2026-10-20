@@ -6,8 +6,8 @@ import { ProviderStreamError } from "@/lib/providers/openai";
 import { FirefoxChatGPTAuthBrowser, type ChatGPTAuthBrowser } from "@/lib/background/chatgpt-browser-auth";
 import { deviceKey, type DeviceKey } from "@/lib/background/device-key";
 import {
-  deleteChatGPTCredential, deleteChatGPTRegistration, getChatGPTCredential, getChatGPTRegistration,
-  saveChatGPTCredential, saveChatGPTRegistration, type ChatGPTRegistrationV1,
+  clearChatGPTSignInNotice, deleteChatGPTCredential, deleteChatGPTRegistration, getChatGPTCredential, getChatGPTRegistration,
+  hasChatGPTSignInNotice, saveChatGPTCredential, saveChatGPTRegistration, type ChatGPTRegistrationV1,
 } from "@/lib/storage";
 
 const ISSUER = "https://auth.openai.com";
@@ -62,7 +62,7 @@ export class ChatGPTAuth {
 
   async status(): Promise<ChatGPTStatus> {
     const credential = await this.#load();
-    return { connected: credential !== null, email: credential?.email ?? null };
+    return { connected: credential !== null, email: credential?.email ?? null, signInAgain: await hasChatGPTSignInNotice() };
   }
 
   async models(): Promise<ModelDefinition[] | null> {
@@ -123,6 +123,7 @@ export class ChatGPTAuth {
       const models = await this.#loadModels(credential.accessToken);
       await this.#save(credential, models);
       await saveChatGPTRegistration({ ...registration, clientId, subject: identity.subject });
+      await clearChatGPTSignInNotice();
       this.#credential = credential;
     });
   }

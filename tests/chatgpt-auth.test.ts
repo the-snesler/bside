@@ -80,17 +80,25 @@ describe("ChatGPT subscription OAuth and encrypted storage", () => {
     for (const secret of ["test-access", "test-refresh", "user@example.test", "id_token", "salt"]) expect(stored).not.toContain(secret);
     expect(await getChatGPTCredential()).toMatchObject({ version: 2 });
     const status = await h.auth.status();
-    expect(status).toEqual({ connected: true, email: "user@example.test" });
+    expect(status).toEqual({ connected: true, email: "user@example.test", signInAgain: false });
     expect(JSON.stringify(status)).not.toContain("test-access");
     expect((await h.auth.models())?.map((model) => model.id)).toEqual(["gpt-5.6-terra", "gpt-6.1-sol"]);
     expect(await h.auth.getAuth(new AbortController().signal)).toMatchObject({ method: "chatgpt", secret: "test-access" });
+  });
+
+  it("clears the sign-in-again notice after a successful sign-in", async () => {
+    await browser.storage.local.set({ chatgptCredential: { version: 1, salt: "A".repeat(24), iv: "B".repeat(16), ciphertext: "C".repeat(64), models: [] } });
+    const h = harness();
+    expect(await h.auth.status()).toEqual({ connected: false, email: null, signInAgain: true });
+    await h.auth.login();
+    expect(await h.auth.status()).toEqual({ connected: true, email: "user@example.test", signInAgain: false });
   });
 
   it("reconnects silently after restart with the device key", async () => {
     const h = harness();
     await h.auth.login();
     const restarted = new ChatGPTAuth(h.authBrowser, h.fetcher);
-    expect(await restarted.status()).toEqual({ connected: true, email: "user@example.test" });
+    expect(await restarted.status()).toEqual({ connected: true, email: "user@example.test", signInAgain: false });
     expect(await restarted.getAuth(new AbortController().signal)).toMatchObject({ secret: "test-access" });
     expect(h.authBrowser.authorize).toHaveBeenCalledTimes(1);
   });
@@ -99,7 +107,7 @@ describe("ChatGPT subscription OAuth and encrypted storage", () => {
     const h = harness();
     await h.auth.login();
     const lostKey = new ChatGPTAuth(h.authBrowser, h.fetcher, new DeviceKey(new MemoryDeviceKeyStore()));
-    expect(await lostKey.status()).toEqual({ connected: false, email: null });
+    expect(await lostKey.status()).toEqual({ connected: false, email: null, signInAgain: false });
     expect(await getChatGPTCredential()).toBeNull();
     expect(await lostKey.models()).toBeNull();
     await expect(lostKey.getAuth(new AbortController().signal)).rejects.toMatchObject({ code: "AUTHENTICATION", message: expect.stringContaining("Sign in with ChatGPT") });
@@ -193,7 +201,7 @@ describe("ChatGPT subscription OAuth and encrypted storage", () => {
     const revoke = h.fetcher.mock.calls.find(([url]) => String(url).endsWith("/oauth/revoke"));
     expect(new URLSearchParams(revoke?.[1]?.body as URLSearchParams).get("token")).toBe("test-refresh");
     expect(await getChatGPTCredential()).toBeNull();
-    expect(await restarted.status()).toEqual({ connected: false, email: null });
+    expect(await restarted.status()).toEqual({ connected: false, email: null, signInAgain: false });
   });
 
   it("disconnects locally when revocation fails and leaves an existing API key intact", async () => {
@@ -201,7 +209,7 @@ describe("ChatGPT subscription OAuth and encrypted storage", () => {
     await saveOpenAICredential("sk-test-existing-key");
     await h.auth.login();
     expect(await h.auth.disconnect()).toBe(false);
-    expect(await h.auth.status()).toEqual({ connected: false, email: null });
+    expect(await h.auth.status()).toEqual({ connected: false, email: null, signInAgain: false });
     expect(await getChatGPTCredential()).toBeNull();
     expect((await getOpenAICredential())?.apiKey).toBe("sk-test-existing-key");
   });

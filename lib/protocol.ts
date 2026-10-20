@@ -302,7 +302,7 @@ export type CredentialRequest =
   | { v: 1; id: string; type: "credentials.openai.status" }
   | { v: 1; id: string; type: "credentials.openai.save"; apiKey: string }
   | { v: 1; id: string; type: "credentials.openai.delete" }
-  | { v: 1; id: string; type: "credentials.chatgpt.login" | "credentials.chatgpt.disconnect" | "credentials.chatgpt.test" };
+  | { v: 1; id: string; type: "credentials.chatgpt.login" | "credentials.chatgpt.disconnect" | "credentials.chatgpt.test" | "credentials.chatgpt.notice.dismiss" };
 
 export type CredentialResponse =
   | { v: 1; id: string; ok: true; configured: boolean; maskedSuffix: string | null; chatgpt: ChatGPTStatus; notice: string | null }
@@ -322,7 +322,8 @@ export function isCredentialRequest(value: unknown): value is CredentialRequest 
   if (candidate.type === "credentials.openai.status") return true;
   if (candidate.type === "credentials.openai.save") return typeof candidate.apiKey === "string";
   if (candidate.type === "credentials.openai.delete") return true;
-  if (candidate.type === "credentials.chatgpt.login" || candidate.type === "credentials.chatgpt.disconnect" || candidate.type === "credentials.chatgpt.test") return true;
+  if (candidate.type === "credentials.chatgpt.login" || candidate.type === "credentials.chatgpt.disconnect" || candidate.type === "credentials.chatgpt.test" ||
+    candidate.type === "credentials.chatgpt.notice.dismiss") return true;
   return false;
 }
 

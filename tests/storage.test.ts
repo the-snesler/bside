@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DeviceKey } from "@/lib/background/device-key";
 import { MemoryDeviceKeyStore } from "@/tests/helpers/memory-key-store";
 import {
@@ -8,7 +8,10 @@ import {
   getConversation,
   getCredentialStatus,
   getOpenAICredential,
+  getChatGPTCredential,
   getRunCheckpoint,
+  hasChatGPTSignInNotice,
+  migrateCredentials,
   recoverInterruptedRun,
   saveAppSettings,
   saveOpenAICredential,
@@ -133,6 +136,66 @@ describe("storage: API key encryption at rest", () => {
     store.load = async () => { throw new Error("IndexedDB unavailable"); };
     expect(await getOpenAICredential(new DeviceKey(store))).toBeNull();
     expect((await getOpenAICredential())?.apiKey).toBe("sk-super-secret-value-0000");
+  });
+});
+
+describe("storage: credential migration", () => {
+  const legacyApiKey = { version: 1, apiKey: "sk-test-legacy-plaintext", updatedAt: 5 };
+  const legacyChatGPT = { version: 1, salt: "A".repeat(24), iv: "B".repeat(16), ciphertext: "C".repeat(64),
+    models: [{ id: "gpt-5.6-terra", name: "GPT-5.6 Terra", reasoningEfforts: ["none"], defaultReasoningEffort: "none" }] };
+
+  it("deletes a legacy PIN-wrapped ChatGPT credential and flags the sign-in notice", async () => {
+    const registration = { version: 1, hostId: `urn:uuid:${crypto.randomUUID()}`, clientId: "oaiapp_test", subject: "test-user",
+      redirectUri: "http://127.0.0.1:1455/mozoauth2/test-addon" };
+    await browser.storage.local.set({ chatgptCredential: legacyChatGPT, chatgptRegistration: registration });
+    await migrateCredentials();
+    const stored = await browser.storage.local.get(null);
+    expect(stored.chatgptCredential).toBeUndefined();
+    // The registration holds no PIN-wrapped secret; login discards it if its callback is stale.
+    expect(stored.chatgptRegistration).toEqual(registration);
+    expect(await hasChatGPTSignInNotice()).toBe(true);
+  });
+
+  it("re-encrypts a plaintext API key and removes the plaintext copy", async () => {
+    await browser.storage.local.set({ openaiCredential: legacyApiKey });
+    await migrateCredentials();
+    const stored = await browser.storage.local.get(null);
+    expect(stored.openaiCredential).toMatchObject({ version: 2, iv: expect.any(String), ciphertext: expect.any(String), updatedAt: 5 });
+    expect(stored.openaiCredential).not.toHaveProperty("apiKey");
+    expect(JSON.stringify(stored)).not.toContain("sk-test-legacy-plaintext");
+    expect(await getOpenAICredential()).toEqual({ apiKey: "sk-test-legacy-plaintext", updatedAt: 5 });
+    expect(await hasChatGPTSignInNotice()).toBe(false);
+  });
+
+  it("is a no-op when run again", async () => {
+    await browser.storage.local.set({ openaiCredential: legacyApiKey, chatgptCredential: legacyChatGPT });
+    await migrateCredentials();
+    const first = await browser.storage.local.get(null);
+    await migrateCredentials();
+    expect(await browser.storage.local.get(null)).toEqual(first);
+    await browser.storage.local.remove("chatgptSignInNotice");
+    await migrateCredentials();
+    expect(await hasChatGPTSignInNotice()).toBe(false);
+  });
+
+  it("applies the same upgrade when a getter runs before the startup migration", async () => {
+    await browser.storage.local.set({ openaiCredential: legacyApiKey, chatgptCredential: legacyChatGPT });
+    expect((await getOpenAICredential())?.apiKey).toBe("sk-test-legacy-plaintext");
+    expect(await getChatGPTCredential()).toBeNull();
+    expect(JSON.stringify(await browser.storage.local.get(null))).not.toContain("sk-test-legacy-plaintext");
+    expect(await hasChatGPTSignInNotice()).toBe(true);
+  });
+
+  it("keeps the plaintext key for a later retry when the device key is unavailable", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await browser.storage.local.set({ openaiCredential: legacyApiKey });
+    const store = new MemoryDeviceKeyStore();
+    store.load = async () => { throw new Error("IndexedDB unavailable"); };
+    await migrateCredentials(new DeviceKey(store));
+    expect((await browser.storage.local.get("openaiCredential")).openaiCredential).toEqual(legacyApiKey);
+    expect(JSON.stringify(vi.mocked(console.warn).mock.calls)).not.toContain("sk-test");
+    await migrateCredentials();
+    expect((await getOpenAICredential())?.apiKey).toBe("sk-test-legacy-plaintext");
   });
 });
 

@@ -34,7 +34,9 @@ lib/
     tab-controller.ts  Bound-tab capture, page RPC, navigation settlement, tab hide/close, agent-tab session tags.
     sidebar-hub.ts     Sidebar Port transport, snapshots, sequencing, replay buffer.
     approval-badge.ts  Toolbar "!" badge while a run awaits confirmation.
-    chatgpt-auth.ts    Sign in with ChatGPT: OAuth, token refresh, PIN-encrypted credential.
+    chatgpt-auth.ts    Sign in with ChatGPT: OAuth, token refresh, device-key-sealed credential.
+    device-key.ts      Non-extractable AES-GCM device key; seals and opens stored credentials.
+    device-key-store.ts  Thin IndexedDB adapter holding the device CryptoKey.
     chatgpt-browser-auth.ts  Sign-in popup; captures the loopback OAuth callback with blocking webRequest.
   domain/              Framework-independent conversation, provider, and tool contracts.
   providers/
@@ -81,7 +83,8 @@ wxt.config.ts          Firefox MV2 manifest, permissions, CSP, and Preact Vite s
 
 ## Security and privacy boundaries
 
-- The API key lives only in background memory / `storage.local` and the options password field. ChatGPT tokens are stored in `storage.local` encrypted under a key derived from the user's PIN, and are decrypted only into background memory. Never put either in sidebar events, content-script messages, page DOM, fixtures, logs, tests, or source.
+- The API key and ChatGPT tokens live only in background memory and in `storage.local`, sealed with the device key; the API key is also entered in the options password field. Never put them in sidebar events, content-script messages, page DOM, fixtures, logs, tests, or source.
+- The device key (`lib/background/device-key.ts`) is a non-extractable AES-GCM `CryptoKey` kept in the extension's IndexedDB and loaded silently. Never store a credential in plaintext or reintroduce a PIN. A record the key cannot decrypt is deleted and reads as not connected.
 - Page content, tool output, and model output are untrusted text. Render them as Preact text nodes (model Markdown only through `lib/ui/Markdown.tsx`); do not inject HTML.
 - Do not widen CSP or permissions casually. CI fails on drift; for an intentional change, run `pnpm check:manifest --update` and commit the snapshot. Production `connect-src` permits only `https://api.openai.com` (Responses, models) and `https://auth.openai.com` (ChatGPT OAuth).
 - Permissions: `storage`; `identity` for the redirect-URL subdomain in the ChatGPT callback path; `webRequest` + `webRequestBlocking` to cancel that `http://127.0.0.1` callback, filtered to the sign-in popup tab; `tabHide` for the agent-tab workspace; `sessions` to tag agent tabs so ownership survives a browser restart; host access to `api.openai.com` and `auth.openai.com`; and `http://*/*` + `https://*/*` for the declarative page content script, tab URLs, and the callback filter, not for background fetching.
