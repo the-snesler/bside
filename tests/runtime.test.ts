@@ -5,10 +5,11 @@ import { ApprovalBadge } from "@/lib/background/approval-badge";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController } from "@/lib/background/tab-controller";
+import { AGENT_TAB_TAG_KEY } from "@/lib/background/tab-controller";
 import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import type { RuntimeClock } from "@/lib/background/runtime";
 import { ProviderStreamError } from "@/lib/providers/openai";
-import { saveOpenAICredential, appendConversationItem, getAgentTabs, getConversation, getOpenAICredential, saveAgentTabs, saveRunCheckpoint } from "@/lib/storage";
+import { saveOpenAICredential, appendConversationItem, getConversation, getOpenAICredential, saveRunCheckpoint } from "@/lib/storage";
 import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
 import type { PageSnapshot } from "@/lib/domain/tools";
 import type { SidebarEvent } from "@/lib/protocol";
@@ -1023,10 +1024,18 @@ describe("BackgroundRuntime: run.retry", () => {
 });
 
 type FakeTab = { id: number; url: string; title: string; hidden: boolean };
+type TagRole = "agent" | "search";
 
-/** A tabs API over a mutable tab list: enough for agent-tab bookkeeping and browser.open(). */
-function fakeTabsApi(tabs: FakeTab[]) {
+const tag = (lastUsedAt: number, role: TagRole = "agent") => ({ v: 1, role, lastUsedAt });
+
+/**
+ * A tabs + sessions API over a mutable tab list: enough for agent-tab
+ * bookkeeping and browser.open(). `tags` holds each tab's agent session value,
+ * which Firefox keeps with the tab whatever ID it has.
+ */
+function fakeTabsApi(tabs: FakeTab[], tags = new Map<number, unknown>()) {
   let nextId = 100;
+  const open = (tabId: number) => { if (!tabs.some((tab) => tab.id === tabId)) throw new Error("Invalid tab ID"); };
   const api = {
     tabs: {
       query: vi.fn(async () => tabs.map((tab) => ({ ...tab }))),
@@ -1041,6 +1050,7 @@ function fakeTabsApi(tabs: FakeTab[]) {
         const index = tabs.findIndex((tab) => tab.id === tabId);
         if (index < 0) throw new Error("Invalid tab ID");
         tabs.splice(index, 1);
+        tags.delete(tabId);
       }),
       update: vi.fn(async () => {}),
       goBack: vi.fn(async () => {}),
@@ -1051,8 +1061,13 @@ function fakeTabsApi(tabs: FakeTab[]) {
       }),
       onUpdated: { addListener: vi.fn(), removeListener: vi.fn() },
     },
+    sessions: {
+      getTabValue: vi.fn(async (tabId: number, key: string): Promise<unknown> => { open(tabId); return key === AGENT_TAB_TAG_KEY ? structuredClone(tags.get(tabId)) : undefined; }),
+      setTabValue: vi.fn(async (tabId: number, key: string, value: unknown) => { open(tabId); if (key === AGENT_TAB_TAG_KEY) tags.set(tabId, structuredClone(value)); }),
+      removeTabValue: vi.fn(async (tabId: number, key: string) => { open(tabId); if (key === AGENT_TAB_TAG_KEY) tags.delete(tabId); }),
+    },
   } satisfies TabControllerBrowserApi;
-  return { api, factory: () => new TabController(api) };
+  return { api, tags, factory: () => new TabController(api) };
 }
 
 function programRound(source: string): ScriptedProviderEvent[][] {
@@ -1075,61 +1090,147 @@ function modelInput(provider: FakeProvider): string {
   return JSON.stringify(provider.requests.at(-1)?.context.messages);
 }
 
+/** The mount path the sidebar's tab list reports for each tab. */
+async function tabPaths(runtime: BackgroundRuntime): Promise<Record<number, string>> {
+  const listed = await runtime.handleCommand({ v: 1, id: "tabs", type: "tabs.list" });
+  return Object.fromEntries((listed && "tabs" in listed ? listed.tabs : []).map((tab) => [tab.id, tab.path]));
+}
+
 describe("BackgroundRuntime: agent-tab ownership across restarts", () => {
   const userTab = { id: 1, url: "https://user.test/", title: "User", hidden: false };
 
-  it("restores /agent-tabs at startup, dropping closed tabs and reused tab IDs", async () => {
-    await saveAgentTabs({ version: 1, searchTabId: 6, tabs: {
-      "5": { url: "https://kept.test/", lastUsedAt: 100 },
-      "6": { url: "https://closed.test/", lastUsedAt: 100 },
-      "7": { url: "https://agent.test/", lastUsedAt: 100 },
-      "8": { url: "https://shown.test/", lastUsedAt: 100 },
-    } });
-    const { factory } = fakeTabsApi([
-      userTab,
-      { id: 5, url: "https://kept.test/", title: "Kept", hidden: true },
-      // After a browser restart Firefox may hand an old ID to an unrelated tab.
-      { id: 7, url: "https://other-extension.test/", title: "Grouped", hidden: true },
-      { id: 8, url: "https://shown.test/", title: "Shown", hidden: false },
-    ]);
+  it("tags a tab a program opens and untags it when the program closes it", async () => {
+    const { clock } = manualClock();
+    const tabs = [userTab];
+    const { api, tags, factory } = fakeTabsApi(tabs);
     await saveOpenAICredential("sk-test");
     const hub = new SidebarHub();
     const provider = new FakeProvider();
-    scripted(provider, programRound('return fs.list("/agent-tabs");'));
-    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory });
+    scripted(provider, programRound('const page = await browser.open("https://example.test/"); return page.path();'));
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory, clock });
     hub.delegate = runtime;
     await runtime.initialize();
 
-    expect(await getAgentTabs()).toEqual({ version: 1, searchTabId: null, tabs: { "5": { url: "https://kept.test/", lastUsedAt: 100 } } });
-    await runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "List agent tabs" });
-    const listed = modelInput(provider);
-    expect(listed).toContain("/agent-tabs/5/page.md");
-    expect(listed).not.toMatch(/\/agent-tabs\/[678]\//);
+    await runtime.handleCommand({ v: 1, id: "open", type: "run.start", prompt: "Open example" });
+    await vi.waitFor(() => expect([...tags]).toEqual([[100, tag(clock.now())]]));
+
+    scripted(provider, programRound('return fs.remove("/agent-tabs/100/page.md");'));
+    await runtime.handleCommand({ v: 1, id: "close", type: "run.start", prompt: "Close it" });
+    expect(tabs.map((tab) => tab.id)).toEqual([1]);
+    expect(api.sessions.removeTabValue).toHaveBeenCalledWith(100, AGENT_TAB_TAG_KEY);
+    expect(api.sessions.removeTabValue.mock.invocationCallOrder[0]).toBeLessThan(api.tabs.remove.mock.invocationCallOrder[0]!);
+    expect(tags.size).toBe(0);
   });
 
-  it("holds sidebar commands until startup restoration finishes", async () => {
-    await saveAgentTabs({ version: 1, searchTabId: null, tabs: { "5": { url: "https://kept.test/", lastUsedAt: 100 } } });
-    const { factory } = fakeTabsApi([userTab, { id: 5, url: "https://kept.test/", title: "Kept", hidden: true }]);
-    // Stall startup's storage reads; tabs.list itself never reads storage.
-    const gate = Promise.withResolvers<void>();
-    const get = browser.storage.local.get.bind(browser.storage.local);
-    const stalled = vi.spyOn(browser.storage.local, "get").mockImplementation((async (keys: never) => { await gate.promise; return get(keys); }) as never);
+  it("untags a tab moved to /tabs and tags a tab moved to /agent-tabs", async () => {
+    const { clock } = manualClock();
+    const tabs = [userTab, { id: 5, url: "https://agent-5.test/", title: "", hidden: true }];
+    const { tags, factory } = fakeTabsApi(tabs, new Map([[5, tag(clock.now() - 1)]]));
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    scripted(provider, programRound('await fs.move("/agent-tabs/5/page.md", "/tabs/5/page.md"); return fs.move("/tabs/1/page.md", "/agent-tabs/1/page.md");'));
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory, clock });
+    hub.delegate = runtime;
+    await runtime.initialize();
+
+    await runtime.handleCommand({ v: 1, id: "move", type: "run.start", prompt: "Swap tabs" });
+    await vi.waitFor(() => expect([...tags]).toEqual([[1, tag(clock.now())]]));
+    expect(tabs.map((tab) => [tab.id, tab.hidden])).toEqual([[1, true], [5, false]]);
+    expect(await tabPaths(runtime)).toEqual({ 1: "/agent-tabs/1/page.md", 5: "/tabs/5/page.md" });
+  });
+
+  it("restores ownership after a browser restart reassigns tab IDs, from session tags alone", async () => {
+    const { clock } = manualClock();
+    const before = [userTab];
+    const first = fakeTabsApi(before);
+    await saveOpenAICredential("sk-test");
+    const provider = new FakeProvider();
+    scripted(provider, programRound('const a = await browser.open("https://a.test/"); const b = await browser.open("https://b.test/"); return [a.path(), b.path()];'));
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: first.factory, clock });
+    hub.delegate = runtime;
+    await runtime.initialize();
+    await runtime.handleCommand({ v: 1, id: "open", type: "run.start", prompt: "Open two tabs" });
+    await vi.waitFor(() => expect([...first.tags.keys()]).toEqual([100, 101]));
+
+    // Firefox restarts: the session values follow the tabs to new IDs, and the
+    // old IDs now name a user tab and an untagged hidden tab showing an agent tab's URL.
+    const after = [
+      { id: 100, url: "https://user-2.test/", title: "User 2", hidden: false },
+      { id: 101, url: "https://b.test/", title: "", hidden: true },
+      { id: 7, url: "https://a.test/navigated", title: "", hidden: true },
+      { id: 8, url: "https://b.test/", title: "", hidden: true },
+    ];
+    const second = fakeTabsApi(after, new Map([[7, first.tags.get(100)], [8, first.tags.get(101)]]));
+    const restarted = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: second.factory, clock });
+    await restarted.initialize();
+
+    expect((await restarted.getSnapshot()).agentTabs).toBe(2);
+    expect(await tabPaths(restarted)).toEqual({ 100: "/tabs/100/page.md", 101: "/tabs/101/page.md", 7: "/agent-tabs/7/page.md", 8: "/agent-tabs/8/page.md" });
+    // Restored tags are current, so they are not rewritten, and untagged tabs stay untagged.
+    expect(second.api.sessions.setTabValue).not.toHaveBeenCalled();
+    expect([...second.tags.keys()]).toEqual([7, 8]);
+  });
+
+  it("restores the search tab's role", async () => {
+    const { clock } = manualClock();
+    const tabs = [userTab, { id: 5, url: "https://search.test/", title: "", hidden: true }, { id: 6, url: "https://agent-6.test/", title: "", hidden: true }];
+    const { api, tags, factory } = fakeTabsApi(tabs, new Map([[5, tag(1, "search")], [6, tag(1)]]));
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    scripted(provider, programRound('return fs.remove("/agent-tabs/6/page.md");'));
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory, clock });
+    hub.delegate = runtime;
+    await runtime.initialize();
+
+    // Releasing tab 6 resyncs ownership; a lost search role would rewrite tab 5's tag.
+    await runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Close tab 6" });
+    await vi.waitFor(() => expect([...tags]).toEqual([[5, tag(1, "search")]]));
+    expect(api.sessions.setTabValue).not.toHaveBeenCalled();
+  });
+
+  it("releases and untags a tagged tab Firefox restored as visible, without hiding it", async () => {
+    const tabs = [userTab, { id: 5, url: "https://agent-5.test/", title: "", hidden: false }];
+    const { api, tags, factory } = fakeTabsApi(tabs, new Map([[5, tag(1)]]));
     const runtime = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: factory });
+    await runtime.initialize();
 
-    const startup = runtime.initialize();
-    let path: string | undefined;
-    const listed = runtime.handleCommand({ v: 1, id: "tabs", type: "tabs.list" }).then((result) => { path = result && "tabs" in result ? result.tabs.find((tab) => tab.id === 5)?.path : undefined; });
-    await tick();
-    expect(path).toBeUndefined();
-    gate.resolve();
-    await Promise.all([startup, listed]);
-    stalled.mockRestore();
-    expect(path).toBe("/agent-tabs/5/page.md");
+    expect((await runtime.getSnapshot()).agentTabs).toBe(0);
+    expect(await tabPaths(runtime)).toEqual({ 1: "/tabs/1/page.md", 5: "/tabs/5/page.md" });
+    expect(tags.size).toBe(0);
+    expect(api.tabs.hide).not.toHaveBeenCalled();
+    expect(tabs.map((tab) => tab.id)).toEqual([1, 5]);
   });
 
-  it("persists a tab opened by a program and releases it when the program closes it", async () => {
+  it("adopts a tagged hidden tab that session restore creates after startup, and only that one", async () => {
+    const tabs: FakeTab[] = [userTab];
+    const { tags, factory } = fakeTabsApi(tabs);
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: factory });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+    await runtime.initialize();
+
+    tabs.push(
+      { id: 20, url: "https://agent-20.test/", title: "", hidden: true },
+      { id: 21, url: "https://agent-21.test/", title: "", hidden: true },
+      { id: 22, url: "https://agent-22.test/", title: "", hidden: false },
+    );
+    tags.set(20, tag(1)).set(22, tag(1));
+    await Promise.all([20, 21, 22].map((id) => runtime.handleTabCreated(id)));
+
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).agentTabs).toBe(1));
+    expect(await tabPaths(runtime)).toMatchObject({ 20: "/agent-tabs/20/page.md", 21: "/tabs/21/page.md", 22: "/tabs/22/page.md" });
+    expect([...tags.keys()]).toEqual([20]);
+    expect(port.received.flatMap((event) => event.type === "agent-tabs.changed" ? [event.payload.count] : [])).toEqual([1]);
+  });
+
+  it("keeps a tab it is opening when tabs.onCreated reports it before it is hidden", async () => {
     const tabs = [userTab];
-    const { factory } = fakeTabsApi(tabs);
+    const { api, tags, factory } = fakeTabsApi(tabs);
     await saveOpenAICredential("sk-test");
     const hub = new SidebarHub();
     const provider = new FakeProvider();
@@ -1137,15 +1238,36 @@ describe("BackgroundRuntime: agent-tab ownership across restarts", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory });
     hub.delegate = runtime;
     await runtime.initialize();
+    const create = api.tabs.create.getMockImplementation()!;
+    const created: Promise<void>[] = [];
+    api.tabs.create.mockImplementation(async (properties) => {
+      const tab = await create(properties);
+      created.push(runtime.handleTabCreated(tab.id));
+      return tab;
+    });
 
     await runtime.handleCommand({ v: 1, id: "open", type: "run.start", prompt: "Open example" });
-    await vi.waitFor(async () => expect(Object.keys((await getAgentTabs()).tabs)).toEqual(["100"]));
-    expect((await getAgentTabs()).tabs["100"]?.url).toBe("https://example.test/");
+    await Promise.all(created);
+    await vi.waitFor(() => expect([...tags.keys()]).toEqual([100]));
+    expect(await tabPaths(runtime)).toMatchObject({ 100: "/agent-tabs/100/page.md" });
+    expect(tabs.find((tab) => tab.id === 100)?.hidden).toBe(true);
+  });
 
-    scripted(provider, programRound('return fs.remove("/agent-tabs/100/page.md");'));
-    await runtime.handleCommand({ v: 1, id: "close", type: "run.start", prompt: "Close it" });
-    await vi.waitFor(async () => expect((await getAgentTabs()).tabs).toEqual({}));
-    expect(tabs.map((tab) => tab.id)).toEqual([1]);
+  it("holds sidebar commands until startup restoration finishes", async () => {
+    const { api, factory } = fakeTabsApi([userTab, { id: 5, url: "https://kept.test/", title: "Kept", hidden: true }], new Map([[5, tag(100)]]));
+    const gate = Promise.withResolvers<void>();
+    const getTabValue = api.sessions.getTabValue.getMockImplementation()!;
+    api.sessions.getTabValue.mockImplementation(async (tabId, key) => { await gate.promise; return getTabValue(tabId, key); });
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: factory });
+
+    const startup = runtime.initialize();
+    let paths: Record<number, string> | undefined;
+    const listed = tabPaths(runtime).then((result) => { paths = result; });
+    await tick();
+    expect(paths).toBeUndefined();
+    gate.resolve();
+    await Promise.all([startup, listed]);
+    expect(paths?.[5]).toBe("/agent-tabs/5/page.md");
   });
 });
 
@@ -1176,14 +1298,14 @@ describe("BackgroundRuntime: closing agent tabs", () => {
   const minute = 60_000;
   const userTab = { id: 1, url: "https://user.test/", title: "User", hidden: false };
   const agentTab = (id: number) => ({ id, url: `https://agent-${id}.test/`, title: "", hidden: true });
-  const owned = (now: number, ...entries: [number, number][]) => saveAgentTabs({ version: 1, searchTabId: entries[0]?.[0] ?? null,
-    tabs: Object.fromEntries(entries.map(([id, idleMs]) => [String(id), { url: `https://agent-${id}.test/`, lastUsedAt: now - idleMs }])) });
+  /** Session tags of agent tabs restored at startup, each idle for the given time; the first is the search tab. */
+  const owned = (now: number, ...entries: [number, number][]) =>
+    new Map<number, unknown>(entries.map(([id, idleMs], index) => [id, tag(now - idleMs, index === 0 ? "search" : "agent")]));
 
   it("closes every agent tab, including the search tab, on request and leaves user tabs alone", async () => {
     const { clock } = manualClock();
-    await owned(clock.now(), [5, 0], [6, 0]);
     const tabs = [userTab, agentTab(5), agentTab(6)];
-    const { factory } = fakeTabsApi(tabs);
+    const { tags, factory } = fakeTabsApi(tabs, owned(clock.now(), [5, 0], [6, 0]));
     const hub = new SidebarHub();
     const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: factory, clock });
     hub.delegate = runtime;
@@ -1194,17 +1316,16 @@ describe("BackgroundRuntime: closing agent tabs", () => {
 
     await port.send({ v: 1, id: "close", type: "tabs.closeAgentTabs" });
     expect(tabs.map((tab) => tab.id)).toEqual([1]);
-    expect(await getAgentTabs()).toEqual({ version: 1, tabs: {}, searchTabId: null });
+    expect(tags.size).toBe(0);
     expect((await runtime.getSnapshot()).agentTabs).toBe(0);
     const counts = port.received.flatMap((event) => event.type === "agent-tabs.changed" ? [event.payload.count] : []);
-    expect(counts).toEqual([2, 0]);
+    expect([counts[0], counts.at(-1)]).toEqual([2, 0]);
   });
 
   it("refuses to close agent tabs while a run is active", async () => {
     const { clock } = manualClock();
-    await owned(clock.now(), [5, 0]);
     const tabs = [userTab, agentTab(5)];
-    const { factory } = fakeTabsApi(tabs);
+    const { factory } = fakeTabsApi(tabs, owned(clock.now(), [5, 0]));
     await saveOpenAICredential("sk-test");
     const hub = new SidebarHub();
     const { provider, release } = blockingProvider();
@@ -1223,17 +1344,16 @@ describe("BackgroundRuntime: closing agent tabs", () => {
     expect(tabs.map((tab) => tab.id)).toEqual([1]);
   });
 
-  it("auto-closes agent tabs once no run has used them for the idle period", async () => {
+  it("auto-closes restored agent tabs once their tagged last use is older than the idle period", async () => {
     const { clock, advance, sweep } = manualClock();
-    await owned(clock.now(), [5, AGENT_TAB_IDLE_MS + minute], [6, 5 * minute]);
     const tabs = [userTab, agentTab(5), agentTab(6)];
-    const { factory } = fakeTabsApi(tabs);
+    const { tags, factory } = fakeTabsApi(tabs, owned(clock.now(), [5, AGENT_TAB_IDLE_MS + minute], [6, 5 * minute]));
     const runtime = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: factory, clock });
     await runtime.initialize();
 
     await sweep();
     expect(tabs.map((tab) => tab.id)).toEqual([1, 6]);
-    expect(await getAgentTabs()).toEqual({ version: 1, searchTabId: null, tabs: { "6": { url: "https://agent-6.test/", lastUsedAt: clock.now() - 5 * minute } } });
+    expect([...tags]).toEqual([[6, tag(clock.now() - 5 * minute)]]);
 
     advance(AGENT_TAB_IDLE_MS - 6 * minute);
     await sweep();
@@ -1246,8 +1366,7 @@ describe("BackgroundRuntime: closing agent tabs", () => {
   it("never auto-closes while a run is active, and restarts the idle period of tabs the run used", async () => {
     const { clock, advance, sweep } = manualClock();
     const tabs = [userTab, agentTab(5)];
-    await owned(clock.now(), [5, minute]);
-    const { factory } = fakeTabsApi(tabs);
+    const { tags, factory } = fakeTabsApi(tabs, owned(clock.now(), [5, minute]));
     await saveOpenAICredential("sk-test");
     const hub = new SidebarHub();
     const provider = new FakeProvider();
@@ -1274,6 +1393,8 @@ describe("BackgroundRuntime: closing agent tabs", () => {
     await run;
     await sweep();
     expect(tabs.map((tab) => tab.id)).toEqual([1, 100]);
+    // The restarted idle period is written to the tag, so it survives a restart too.
+    expect([...tags]).toEqual([[100, tag(clock.now())]]);
     advance(AGENT_TAB_IDLE_MS + minute);
     await sweep();
     expect(tabs.map((tab) => tab.id)).toEqual([1]);
@@ -1304,9 +1425,8 @@ describe("BackgroundRuntime: Phase 0 integration (regression)", () => {
   });
 
   it("keeps a tab adopted while an earlier ownership write is still reading the tab list", async () => {
-    await saveAgentTabs({ version: 1, searchTabId: null, tabs: { "5": { url: "https://agent-5.test/", lastUsedAt: 1 } } });
     const tabs = [userTab, { id: 5, url: "https://agent-5.test/", title: "", hidden: true }];
-    const { api, factory } = fakeTabsApi(tabs);
+    const { api, tags, factory } = fakeTabsApi(tabs, new Map([[5, tag(1)]]));
     // Hold the tab-list read that releasing tab 5 starts until the next tab is created and hidden.
     const query = api.tabs.query.getMockImplementation()!;
     const remove = api.tabs.remove.getMockImplementation()!;
@@ -1330,25 +1450,28 @@ describe("BackgroundRuntime: Phase 0 integration (regression)", () => {
 
     await runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Swap tabs" });
     expect(modelInput(provider)).toContain("/agent-tabs/100/page.md");
-    await vi.waitFor(async () => expect(Object.keys((await getAgentTabs()).tabs)).toEqual(["100"]));
+    await vi.waitFor(() => expect([...tags.keys()]).toEqual([100]));
     expect((await runtime.getSnapshot()).agentTabs).toBe(1);
   });
 
-  it("re-persists an agent tab's URL after it navigates, so a restart still restores it", async () => {
-    await saveAgentTabs({ version: 1, searchTabId: null, tabs: { "5": { url: "https://agent-5.test/", lastUsedAt: 1 } } });
-    const tabs = [userTab, { id: 5, url: "https://agent-5.test/", title: "", hidden: true }];
-    const { factory } = fakeTabsApi(tabs);
-    const runtime = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: factory });
+  it("retries an untag that failed on the next ownership change", async () => {
+    const tabs = [userTab, { id: 5, url: "https://agent-5.test/", title: "", hidden: true }, { id: 6, url: "https://agent-6.test/", title: "", hidden: true }];
+    const { api, tags, factory } = fakeTabsApi(tabs, new Map([[5, tag(1)], [6, tag(1)]]));
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    scripted(provider, programRound('return fs.move("/agent-tabs/5/page.md", "/tabs/5/page.md");'));
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory });
+    hub.delegate = runtime;
     await runtime.initialize();
+    api.sessions.removeTabValue.mockRejectedValueOnce(new Error("Session store busy."));
 
-    tabs[1]!.url = "https://agent-5.test/next";
-    runtime.handleTabUrlChanged(5);
-    await vi.waitFor(async () => expect((await getAgentTabs()).tabs["5"]?.url).toBe("https://agent-5.test/next"));
-    // A user-tab navigation is not an ownership change.
-    runtime.handleTabUrlChanged(1);
-
-    const restarted = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: factory });
-    await restarted.initialize();
-    expect((await restarted.getSnapshot()).agentTabs).toBe(1);
+    await runtime.handleCommand({ v: 1, id: "move", type: "run.start", prompt: "Show tab 5" });
+    await tick();
+    expect([...tags.keys()]).toEqual([5, 6]);
+    scripted(provider, programRound('return fs.remove("/agent-tabs/6/page.md");'));
+    await runtime.handleCommand({ v: 1, id: "close", type: "run.start", prompt: "Close tab 6" });
+    await vi.waitFor(() => expect(tags.size).toBe(0));
+    expect(tabs.map((tab) => [tab.id, tab.hidden])).toEqual([[1, false], [5, false]]);
   });
 });

@@ -20,6 +20,7 @@ export default defineConfig({
       "webRequest",
       "webRequestBlocking",
       "tabHide",
+      "sessions",
       "https://api.openai.com/*",
       "https://auth.openai.com/*",
       "http://*/*",
