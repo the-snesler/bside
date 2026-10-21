@@ -19,7 +19,7 @@ import type {
   ProviderTurnRequest,
   ModelDefinition,
 } from "@/lib/domain/provider";
-import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
+import { BUNDLED_CONTEXT_WINDOWS, DEFAULT_CONTEXT_WINDOW, OPENAI_PROVIDER } from "@/lib/providers/openai-models";
 
 const REQUEST_TIMEOUT_MS = 120_000;
 const MAX_OUTPUT_TOKENS = 8192;
@@ -79,10 +79,12 @@ export class OpenAIProvider implements ProviderAdapter {
     if (known) return known;
     const accountModel = this.#findModel(modelId);
     // A server-listed model can be newer than Pi's bundled catalog. Omit
-    // reasoning controls and pricing/limit assumptions for unknown models.
+    // reasoning controls and pricing assumptions for unknown models; the
+    // context window (which only decides when history is summarized) comes
+    // from the bundled catalog or a conservative default.
     return accountModel ? {
       id: modelId, name: accountModel.name, api: "openai-responses", provider: "openai", baseUrl: API_BASE_URL,
-      reasoning: false, input: ["text", "image"], contextWindow: 0, maxTokens: MAX_OUTPUT_TOKENS,
+      reasoning: false, input: ["text", "image"], contextWindow: BUNDLED_CONTEXT_WINDOWS[modelId] ?? DEFAULT_CONTEXT_WINDOW, maxTokens: MAX_OUTPUT_TOKENS,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, compat: { supportsStrictMode: true },
     } : null;
   }

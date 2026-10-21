@@ -109,7 +109,7 @@ describe("context controls", () => {
     expect((await runtime.getSnapshot()).settings).toEqual(settings);
   });
 
-  it("exports complete tool output for debugging without persisting page content", async () => {
+  it("exports complete tool output for debugging, persisting page content only as a bounded digest excerpt", async () => {
     await saveOpenAICredential("sk-test");
     const hub = new SidebarHub();
     const provider = new FakeProvider();
@@ -131,7 +131,10 @@ describe("context controls", () => {
     expect(latestRun).toContain('"status": "completed"');
     expect(latestRun).toContain('"providerResponses": 2');
     expect(latestRun).toContain('"name": "browser_program"');
-    expect(JSON.stringify(await openConversation())).not.toContain("Orchid launch moved to Friday.");
+    const persisted = (await openConversation()).items;
+    expect(JSON.stringify(persisted.filter((item) => item.kind !== "run-digest"))).not.toContain("Orchid launch moved to Friday.");
+    const digest = persisted.find((item) => item.kind === "run-digest");
+    expect(digest?.kind === "run-digest" && digest.digest.entries[0]?.type === "program" && digest.digest.entries[0].excerpt).toContain("Orchid launch moved to Friday.");
     await runtime.handleCommand({ v: 1, id: "reset", type: "session.create" });
     expect((await runtime.handleCommand({ v: 1, id: "export2", type: "context.export", sessionId: (await getOpenSessionId())! }))?.markdown).not.toContain("Orchid launch moved to Friday.");
   });
@@ -1925,3 +1928,126 @@ async function createSessionWith(...items: ConversationItem[]): Promise<string> 
 async function listSessionIds(): Promise<string[]> {
   return (await listSessions()).map((session) => session.id);
 }
+
+describe("BackgroundRuntime: run digests and context continuity", () => {
+  const programCall = (id: string, source = "return 1;"): ScriptedProviderEvent => ({ type: "tool.call", call: { id, name: "browser_program", arguments: { source } } });
+  const done: ScriptedProviderEvent = { type: "turn.completed", replayState: null };
+
+  function setup(rounds: Array<ScriptedProviderEvent[] | Error | "hang" | "loop">, tabControllerFactory = unsupportedPageTabControllerFactory) {
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    let round = 0;
+    provider.script = (signal) => {
+      const next = rounds[Math.min(round++, rounds.length - 1)]!;
+      return { [Symbol.asyncIterator]: async function* () {
+        if (next instanceof Error) throw next;
+        if (next === "loop") { yield programCall(`loop-${round}`); yield done; return; }
+        if (next === "hang") {
+          const { promise, reject } = Promise.withResolvers<never>();
+          signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+          await promise;
+        }
+        yield* next as ScriptedProviderEvent[];
+      } };
+    };
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+    return { runtime, provider, port };
+  }
+  const digests = async () => (await openConversation()).items.flatMap((item) => item.kind === "run-digest" ? [item.digest] : []);
+
+  it("persists a digest after a completed run's answer and replays it as a note on the next run", async () => {
+    await saveOpenAICredential("sk-test");
+    const { runtime, provider } = setup([
+      [programCall("read", 'return fs.read("/tabs/1/page.md");'), done],
+      [{ type: "text.delta", delta: "It moved to Friday." }, done],
+      [{ type: "text.delta", delta: "Friday." }, done],
+    ], supportedPageTabControllerFactory);
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "When is the launch?" });
+    const items = (await openConversation()).items;
+    expect(items.map((item) => item.kind)).toEqual(["message", "tool-call", "tool-result", "message", "run-digest"]);
+    expect(await digests()).toEqual([{ version: 1, status: "completed", error: null, omittedEntries: 0, entries: [
+      { type: "program", source: 'return fs.read("/tabs/1/page.md");', ok: true, code: null, urls: ["http://127.0.0.1:4173/agent-page.html"], excerpt: expect.stringContaining("Orchid launch moved to Friday.") },
+    ] }]);
+
+    await runtime.handleCommand({ v: 1, id: "2", type: "run.start", prompt: "Which day again?" });
+    const messages = provider.requests[2]!.context.messages;
+    expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "user", "user"]);
+    expect(messages[2]!.content).toEqual(expect.stringContaining("Orchid launch moved to Friday."));
+    expect(messages[2]!.content).toMatch(/^\[bside run notes\]/);
+    // Exports carry digests with the rest of the chat.
+    const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export", sessionId: (await getOpenSessionId())! });
+    expect(exported?.markdown.split("## Conversation log")[1]).toContain('"kind": "run-digest"');
+  });
+
+  it("persists a digest for a failed run with its safe error, and leaves it out of the retried request", async () => {
+    await saveOpenAICredential("sk-test");
+    const { runtime, provider } = setup([[programCall("p1"), done], new ProviderStreamError("Rate limited.", "RATE_LIMIT"), [{ type: "text.delta", delta: "Ok." }, done]]);
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Try" });
+    expect(await digests()).toEqual([expect.objectContaining({ status: "failed", error: "Rate limited.", entries: [expect.objectContaining({ source: "return 1;", ok: true })] })]);
+    await runtime.handleCommand({ v: 1, id: "2", type: "run.retry" });
+    expect(provider.requests[2]!.context.messages.map((message) => message.role)).toEqual(["user"]);
+  });
+
+  it("persists a digest for a run stopped by a budget (LIMIT_EXCEEDED), bounded to the newest calls", async () => {
+    await saveOpenAICredential("sk-test");
+    const { runtime, port } = setup(["loop"]);
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Loop" });
+    expect(port.received.find((event) => event.type === "run.failed")?.payload).toMatchObject({ code: "LIMIT_EXCEEDED" });
+    const [digest] = await digests();
+    expect(digest).toMatchObject({ status: "failed", error: expect.stringContaining("Stopped after 40 steps"), omittedEntries: 24 });
+    expect(digest!.entries).toHaveLength(16);
+  });
+
+  it("persists a digest for a cancelled run", async () => {
+    await saveOpenAICredential("sk-test");
+    const { runtime } = setup([[programCall("p1"), done], "hang"]);
+    const run = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Go" });
+    await tick();
+    await runtime.handleCommand({ v: 1, id: "2", type: "run.cancel", runId: (await runtime.getSnapshot()).activeRun!.runId });
+    await run;
+    expect(await digests()).toEqual([expect.objectContaining({ status: "cancelled", entries: [expect.objectContaining({ ok: true })] })]);
+  });
+
+  it("writes no digest for a run that used no tools", async () => {
+    await saveOpenAICredential("sk-test");
+    const { runtime } = setup([[{ type: "text.delta", delta: "Hi." }, done]]);
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hello" });
+    expect(await digests()).toEqual([]);
+  });
+
+  it("rebuilds a digest from the persisted calls of a run interrupted by a restart", async () => {
+    await seed({ id: "u1", kind: "message", role: "user", text: "Before restart", context: null, at: 1 });
+    await seed({ id: "t1", kind: "tool-call", call: { id: "call_1", name: "browser_program", arguments: { source: 'return await web.search("orchids");' } }, at: 2 });
+    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", lastSeq: 2, updatedAt: 1 });
+    const { runtime } = setup([[{ type: "text.delta", delta: "Ok." }, done]]);
+    await runtime.initialize();
+    const items = (await openConversation()).items;
+    expect(items.at(-2)).toMatchObject({ id: "interrupted-r1" });
+    expect(items.at(-1)).toMatchObject({ id: "digest-r1", kind: "run-digest", digest: { status: "interrupted", entries: [{ type: "program", source: 'return await web.search("orchids");', ok: null }] } });
+  });
+
+  it("publishes a snapshot with the compaction marker as soon as older turns are summarized", async () => {
+    await saveOpenAICredential("sk-test");
+    for (let i = 0; i < 6; i++) {
+      await seed({ id: `u${i}`, kind: "message", role: "user", text: `Question ${i} ${"q".repeat(16_000)}`, context: null, at: i });
+      await seed({ id: `a${i}`, kind: "message", role: "assistant", text: `Answer ${i}`, at: i });
+    }
+    const { runtime, provider, port } = setup([[{ type: "text.delta", delta: "Summary of orchids." }, done], [{ type: "text.delta", delta: "Answered." }, done]]);
+    provider.getModel = () => ({ ...TEST_MODEL, contextWindow: 30_000 });
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Latest?" });
+    const items = (await openConversation()).items;
+    const compaction = items.find((item) => item.kind === "compaction");
+    expect(compaction).toMatchObject({ summary: "Summary of orchids.", firstKeptItemId: expect.any(String) });
+    // Every item stays stored; only the model's view is summarized.
+    expect(items.filter((item) => item.kind === "message")).toHaveLength(14);
+    await tick();
+    const snapshots = port.received.filter((event) => event.type === "state.snapshot");
+    expect(snapshots.some((event) => event.type === "state.snapshot" && event.payload.conversation.items.some((item) => item.kind === "compaction"))).toBe(true);
+    expect(provider.requests[1]!.context.messages[0]!.content).toContain("Summary of orchids.");
+    const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export", sessionId: (await getOpenSessionId())! });
+    expect(exported?.markdown).toContain("Summary of orchids.");
+  });
+});

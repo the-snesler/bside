@@ -219,6 +219,8 @@ export class BrowserProgram {
   #variables = new Map<string, Value>([["fs", { kind: "fs" }], ["browser", { kind: "browser" }], ["JSON", { kind: "json" }], ["web", { kind: "web" }]]);
   // Handles are capabilities minted here, never objects supplied by the program.
   #handles = new WeakSet<object>();
+  /** Page URLs the current program read, opened, or navigated to; returned as `data.visited` for the run digest. */
+  #visited: string[] = [];
   constructor(private tabs: TabController, private state: WorkspaceState, private onEffect: () => void) {
     for (const value of this.#variables.values()) this.#handles.add(value as object);
   }
@@ -232,6 +234,7 @@ export class BrowserProgram {
     const output = new Output();
     let completed = 0;
     let parsed = false;
+    this.#visited = [];
     try {
       const statements = parseProgram(source);
       parsed = true;
@@ -273,12 +276,12 @@ export class BrowserProgram {
           output.add(printed > 1 ? `[${completed}] ${rendered}` : rendered);
         }
       }
-      return { ok: true, summary: output.render() || `Program completed (${completed} statements, nothing returned).` };
+      return { ok: true, summary: output.render() || `Program completed (${completed} statements, nothing returned).`, data: { visited: this.#visited } };
     } catch (error) {
       const diagnostic = `${parsed ? `${completed} statements completed. Stopped in statement ${completed + 1}; earlier effects may have committed. Do not replay completed steps.` : "Program rejected before execution; no statements ran."} ${error instanceof Error ? error.message.slice(0, 2400) : "Browser operation failed."}`;
       const printed = output.render();
       return { ok: false, code: signal.aborted ? "ACTION_DENIED" : error instanceof ProgramError ? error.code : "INVALID_TOOL_ARGUMENTS",
-        summary: printed ? `${diagnostic}\nOutput before the failure:\n${printed}` : diagnostic, data: { diagnostic } };
+        summary: printed ? `${diagnostic}\nOutput before the failure:\n${printed}` : diagnostic, data: { diagnostic, visited: this.#visited } };
     }
   }
 
@@ -380,6 +383,7 @@ export class BrowserProgram {
       if (!query.trim() || query.length > 200) throw new Error("find() expects 1–200 characters.");
       const found = await controller.find(query);
       if (!found.ok) throw this.#pageError(found.error, tabId);
+      this.#visited.push(found.value.url);
       this.state.observed.set(tabId, found.value.documentId);
       return this.#renderFind(found.value, tabId);
     }
@@ -424,6 +428,7 @@ export class BrowserProgram {
     }
     if (method === "navigate" || method === "goBack") {
       if (method === "navigate") count(1); else count(0);
+      if (method === "navigate") this.#visited.push(text(0, "an absolute URL"));
       this.onEffect();
       const result = method === "navigate" ? await controller.navigate(text(0, "an absolute URL")) : await controller.goBack();
       this.state.observed.delete(tabId);
@@ -463,6 +468,7 @@ export class BrowserProgram {
     }
     const snapshot = await controller.snapshot({ offset, maxChars });
     if (!snapshot.ok) throw this.#pageError(snapshot.error, tabId);
+    this.#visited.push(snapshot.value.url);
     this.state.observed.set(tabId, snapshot.value.documentId);
     return renderSnapshot(snapshot.value, this.#path(tabId));
   }
@@ -498,6 +504,7 @@ export class BrowserProgram {
   }
 
   async #openTab(url: string, signal: AbortSignal): Promise<number> {
+    this.#visited.push(url);
     this.onEffect();
     const tabId = await this.tabs.createTab(url);
     this.state.adoptTab(tabId);

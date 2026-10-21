@@ -53,6 +53,7 @@ import { validatePromptText, validateSessionTitle } from "@/lib/validation";
 import type { ContextArtifact } from "@/lib/domain/tools";
 import type { Conversation, ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
 import { retentionCutoff } from "@/lib/domain/conversation";
+import { buildRunDigest } from "@/lib/domain/run-digest";
 import type { AppSettingsV1, ModelDefinition, ProviderAdapter, ProviderAuth, ProviderDefinition } from "@/lib/domain/provider";
 import type {
   ApprovalRequest,
@@ -780,12 +781,14 @@ export class BackgroundRuntime {
     await this.#writeCheckpoint(run, "running", "");
 
     // Pi owns assistant/tool replay during this run. Persisted tool items are
-    // display/audit records only, so a new run starts from message history.
+    // display/audit records only; earlier runs reach the model as message
+    // text, run digests, and the latest compaction summary (see AgentLoop).
     // History ends at this turn's user message: on a retry, the failed
-    // attempt's interim/partial assistant text stays visible but is not sent,
-    // so the model answers the original prompt afresh against a new page
-    // capture. Its page effects are never replayed.
-    const transcript = items.slice(0, userIndex + 1).filter((item) => item.kind === "message");
+    // attempt's interim/partial assistant text and digest stay stored but are
+    // not sent, so the model answers the original prompt afresh against a new
+    // page capture. Its page effects are never replayed. A compaction the
+    // failed attempt made is kept, so it is not summarized again.
+    const transcript = [...items.slice(0, userIndex + 1), ...items.slice(userIndex + 1).filter((item) => item.kind === "compaction")];
     await this.#runAgentLoop(runId, transcript, artifact, auth);
   }
 
@@ -858,6 +861,8 @@ export class BackgroundRuntime {
         await appendConversationItem(run.sessionId, item);
         if (item.kind === "message" && item.role === "assistant") run.partialAssistantText = "";
         await this.#writeCheckpoint(run, run.status, run.partialAssistantText);
+        // No run event carries a compaction; a snapshot shows its marker at once.
+        if (item.kind === "compaction") void this.#sidebarHub.broadcastSnapshot();
       },
       onApprovalPending: (request) => {
         if (this.#activeRun?.runId !== runId) return;
@@ -877,6 +882,13 @@ export class BackgroundRuntime {
     flushDelta();
     this.#approvalBadge?.set(false);
 
+    // Written after the run's last message, so a replayed digest follows the
+    // answer it describes, and before the terminal event, so a run started
+    // right after it sees the digest. A failed write only loses the digest.
+    const persistDigest = async () => {
+      const digest = buildRunDigest(run.agentLoop.digestSteps(), result.status, result.status === "failed" ? result.error.message : null);
+      if (digest) await appendConversationItem(run.sessionId, { id: crypto.randomUUID(), kind: "run-digest", digest, at: Date.now() }).catch(() => {});
+    };
     const finish = async () => {
       await clearRunCheckpoint();
       await touchSession(run.sessionId).catch(() => {});
@@ -885,12 +897,14 @@ export class BackgroundRuntime {
     };
     if (result.status === "completed") {
       const messageId = result.finalMessageId ?? (await this.#persistEmptyFinalMessage(run.sessionId));
+      await persistDigest();
       this.#sidebarHub.publishRunEvent(runId, "run.completed", { messageId });
       await finish();
       return;
     }
     if (result.status === "cancelled") {
       const messageId = result.partialText ? await this.#persistCancelledMessage(run.sessionId, result.partialText) : null;
+      await persistDigest();
       this.#sidebarHub.publishRunEvent(runId, "run.cancelled", { partialText: result.partialText, messageId });
       this.#retryable = { sessionId: run.sessionId, hadPageEffect: result.hadPageEffect };
       await finish();
@@ -901,6 +915,7 @@ export class BackgroundRuntime {
     // imply retry-safety once a consequential tool call has already
     // committed a real effect on the page.
     const error: NormalizedError = result.hadPageEffect ? { ...result.error, retryable: false } : result.error;
+    await persistDigest();
     this.#sidebarHub.publishRunEvent(runId, "run.failed", error);
     this.#retryable = { sessionId: run.sessionId, hadPageEffect: result.hadPageEffect };
     await finish();

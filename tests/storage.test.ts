@@ -296,6 +296,25 @@ describe("storage: sessions", () => {
     expect(items.at(-1)?.id).toBe("after");
   });
 
+  it("stores run digests and compactions, and revalidates them on read", async () => {
+    const id = (await createSession()).id;
+    const digest = { version: 1 as const, status: "completed" as const, error: null, omittedEntries: 0,
+      entries: [{ type: "program" as const, source: "return 1;", ok: true, code: null, urls: ["https://example.com/"], excerpt: "1" }] };
+    await appendConversationItem(id, message("m0"));
+    await appendConversationItem(id, { id: "d0", kind: "run-digest", digest, at: 1 });
+    await appendConversationItem(id, { id: "k0", kind: "compaction", summary: "Summary", firstKeptItemId: "m0", tokensBefore: 10, at: 2 });
+    expect((await getConversation(id))?.items.map((item) => item.kind)).toEqual(["message", "run-digest", "compaction"]);
+    for (const bad of [
+      { id: "d1", kind: "run-digest", digest: { ...digest, entries: [{ type: "program", source: 1 }] }, at: 1 },
+      { id: "k1", kind: "compaction", summary: "x".repeat(60_001), firstKeptItemId: "m0", tokensBefore: 10, at: 2 },
+      { id: "k2", kind: "compaction", summary: "Summary", tokensBefore: 10, at: 2 },
+    ]) {
+      await browser.storage.local.set({ [`conversation:${id}:items:0`]: { version: 1, items: [message("m0"), bad, message("m2")] } });
+      expect((await getConversation(id))?.items).toEqual([]);
+      await browser.storage.local.set({ [`conversation:${id}`]: { version: 2, id, createdAt: 0, updatedAt: 0, itemCount: 3 } });
+    }
+  });
+
   it("ignores items a chunk holds past the committed count", async () => {
     const id = await sessionWith(2);
     await browser.storage.local.set({ [`conversation:${id}:items:0`]: { version: 1, items: [message("m0"), message("m1"), message("uncommitted")] } });

@@ -37,4 +37,13 @@ export const OPENAI_PROVIDER = {
 } as const satisfies ProviderDefinition;
 
 export const DEFAULT_MODEL_ID = "gpt-5.6-terra";
+
+/** Context windows of the bundled models, for account-catalog models Pi's catalog does not list. */
+export const BUNDLED_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
+  "gpt-5.6-sol": 272_000,
+  "gpt-5.6-terra": 272_000,
+  "gpt-5.6-luna": 272_000,
+};
+/** Conservative window for a model of unknown size; it only decides when history is summarized. */
+export const DEFAULT_CONTEXT_WINDOW = 128_000;
 export const DEFAULT_REASONING_EFFORT = "medium";

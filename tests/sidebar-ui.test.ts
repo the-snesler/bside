@@ -117,6 +117,55 @@ describe("sidebar UI contracts", () => {
     expect(buildTurns(turnItems, true)[0]!.answer).toBeNull();
   });
 
+  it("hides run digests and marks the turn where the latest compaction's summary ends", () => {
+    const digest = { version: 1 as const, status: "completed" as const, error: null, entries: [], omittedEntries: 0 };
+    const items: ConversationItem[] = [
+      ...turnItems,
+      { id: "d1", kind: "run-digest", digest, at: 64_001 },
+      { id: "u2", kind: "message", role: "user", text: "And then?", context: null, at: 70_000 },
+      { id: "a3", kind: "message", role: "assistant", text: "Done.", at: 71_000 },
+      { id: "u3", kind: "message", role: "user", text: "Last one", context: null, at: 80_000 },
+      { id: "k1", kind: "compaction", summary: "Old summary", firstKeptItemId: "u2", tokensBefore: 1, at: 80_001 },
+      { id: "k2", kind: "compaction", summary: "Newer summary", firstKeptItemId: "u3", tokensBefore: 1, at: 80_002 },
+      { id: "a4", kind: "message", role: "assistant", text: "Final.", at: 81_000 },
+    ];
+    const turns = buildTurns(items, false);
+    expect(turns.map((turn) => turn.prompt?.text)).toEqual(["Fill the form", "And then?", "Last one"]);
+    expect(turns[0]!.answer).toEqual({ id: "a2", text: "Okay, not submitted." });
+    expect(turns.map((turn) => turn.summary)).toEqual([null, null, "Newer summary"]);
+    expect(turns[2]!.answer?.text).toBe("Final.");
+  });
+
+  it("shows an \"Earlier conversation summarized\" marker while keeping earlier turns visible", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    const listeners: Array<(message: unknown) => void> = [];
+    vi.spyOn(browser.runtime, "connect").mockReturnValue({
+      postMessage: () => {},
+      onMessage: { addListener: (listener: (message: unknown) => void) => listeners.push(listener), removeListener: () => {} },
+      disconnect: () => {},
+    } as never);
+    const root = document.createElement("div");
+    document.body.append(root);
+    await act(() => render(h(App, {}), root));
+    const snapshot = snapshotFor("a");
+    snapshot.conversation.items = [
+      { id: "u1", kind: "message", role: "user", text: "First question", context: null, at: 1 },
+      { id: "a1", kind: "message", role: "assistant", text: "First answer", at: 2 },
+      { id: "u2", kind: "message", role: "user", text: "Second question", context: null, at: 3 },
+      { id: "k1", kind: "compaction", summary: "**Goal** <img src=x onerror=alert(1)>", firstKeptItemId: "u2", tokensBefore: 1, at: 4 },
+      { id: "a2", kind: "message", role: "assistant", text: "Second answer", at: 5 },
+    ];
+    await act(() => listeners.forEach((listener) => listener({ v: 1, seq: 0, at: 1, runId: null, conversationId: "a", type: "state.snapshot", payload: snapshot })));
+    const marker = root.querySelector(".summary-marker summary");
+    expect(marker?.textContent).toBe("Earlier conversation summarized");
+    const text = root.querySelector(".timeline")!.textContent!;
+    expect(text.indexOf("First answer")).toBeLessThan(text.indexOf("Earlier conversation summarized"));
+    expect(text.indexOf("Earlier conversation summarized")).toBeLessThan(text.indexOf("Second question"));
+    expect(root.querySelector(".summary-marker strong")?.textContent).toBe("Goal");
+    expect(root.querySelector(".summary-marker img")).toBeNull();
+    render(null, root);
+  });
+
   it("renders a completed turn collapsed with status in words and untrusted text as text", () => {
     const root = document.createElement("div");
     document.body.append(root);

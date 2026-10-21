@@ -23,7 +23,35 @@ export type ConversationItem =
       callId: string;
       result: Omit<ToolResult, "data">;
       at: number;
-    };
+    }
+  /** What a run did, appended when it ends; replayed to later runs as notes (see `lib/domain/run-digest.ts`). Not shown in the transcript. */
+  | { id: string; kind: "run-digest"; digest: RunDigestV1; at: number }
+  /**
+   * Model-written summary of every item before `firstKeptItemId` (a user
+   * message), replacing them in later requests. The items themselves stay
+   * stored and visible. Untrusted model text derived from page content.
+   */
+  | { id: string; kind: "compaction"; summary: string; firstKeptItemId: string; tokensBefore: number; at: number };
+
+/** Longer summaries are clipped before they are stored. */
+export const COMPACTION_SUMMARY_MAX_CHARS = 60_000;
+
+export type RunDigestStatus = "completed" | "failed" | "cancelled" | "interrupted";
+
+/** One tool call of a run. `ok`/`approved` are `null` when an interruption left no result. */
+export type RunDigestEntry =
+  | { type: "program"; source: string; ok: boolean | null; code: string | null; urls: string[]; excerpt: string }
+  | { type: "confirmation"; title: string; approved: boolean | null };
+
+export interface RunDigestV1 {
+  version: 1;
+  status: RunDigestStatus;
+  /** Safe run-level error message (e.g. a run budget), never a raw provider body. */
+  error: string | null;
+  /** Most recent tool calls, oldest first; earlier ones beyond the bound are counted in `omittedEntries`. */
+  entries: RunDigestEntry[];
+  omittedEntries: number;
+}
 
 /** One session's entry in `ConversationIndexV1`. A session id is its conversation id. */
 export interface ConversationSummary {

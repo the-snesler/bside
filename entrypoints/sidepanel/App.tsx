@@ -168,6 +168,17 @@ export function App() {
                 <ul class="timeline">
                   {turns.map((turn, index) => (
                     <Fragment key={turn.id}>
+                      {turn.summary !== null && (
+                        <li class="timeline__item timeline__item--summary">
+                          <details class="summary-marker">
+                            <summary class="summary-marker__line">Earlier conversation summarized</summary>
+                            <p class="summary-marker__note">
+                              bside now sees this summary instead of the turns above. They stay here and in exports.
+                            </p>
+                            <Markdown text={turn.summary} />
+                          </details>
+                        </li>
+                      )}
                       {turn.prompt && (
                         <li class="timeline__item timeline__item--user">
                           <p class="timeline__text">

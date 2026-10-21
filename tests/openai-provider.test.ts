@@ -77,6 +77,14 @@ describe("OpenAIProvider Pi adapter", () => {
     expect(provider.getModel("missing")).toBeNull();
   });
 
+  it("gives account-catalog models outside Pi's catalog a bundled or conservative context window", async () => {
+    const { OpenAIProvider } = await import("@/lib/providers/openai");
+    const account = (id: string) => ({ id, name: id, reasoningEfforts: ["medium" as const], defaultReasoningEffort: "medium" as const });
+    const provider = new OpenAIProvider(undefined, account);
+    expect(provider.getModel("gpt-5.6-sol")?.contextWindow).toBe(272_000);
+    expect(provider.getModel("gpt-future-1")?.contextWindow).toBe(128_000);
+  });
+
   it("preserves request privacy, retry, cache, token, and sequential-call policy", async () => {
     let options: SimpleStreamOptions | undefined;
     streamSimpleMock.mockImplementation((_model, _context, received: SimpleStreamOptions) => {

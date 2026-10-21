@@ -13,7 +13,8 @@
 import { storage } from "wxt/utils/storage";
 import type { AppSettingsV1, ModelDefinition, ReasoningEffort } from "@/lib/domain/provider";
 import type { Conversation, ConversationIndexV1, ConversationItem, ConversationSummary, HistorySettingsV1 } from "@/lib/domain/conversation";
-import { HISTORY_RETENTIONS, titleFromPrompt } from "@/lib/domain/conversation";
+import { COMPACTION_SUMMARY_MAX_CHARS, HISTORY_RETENTIONS, titleFromPrompt } from "@/lib/domain/conversation";
+import { digestFromItems, isValidRunDigest } from "@/lib/domain/run-digest";
 import { DEFAULT_MODEL_ID, DEFAULT_REASONING_EFFORT } from "@/lib/providers/openai-models";
 import { deviceKey, type DeviceKey } from "@/lib/background/device-key";
 import { isSessionId } from "@/lib/validation";
@@ -136,6 +137,11 @@ function isValidConversationItem(value: unknown): value is ConversationItem {
   }
   if (v.kind === "tool-call") return typeof v.call === "object" && v.call !== null;
   if (v.kind === "tool-result") return typeof v.callId === "string" && typeof v.result === "object" && v.result !== null;
+  if (v.kind === "run-digest") return isValidRunDigest(v.digest);
+  if (v.kind === "compaction") {
+    return typeof v.summary === "string" && v.summary.length <= COMPACTION_SUMMARY_MAX_CHARS && typeof v.firstKeptItemId === "string" &&
+      Number.isSafeInteger(v.tokensBefore) && (v.tokensBefore as number) >= 0;
+  }
   return false;
 }
 
@@ -747,7 +753,8 @@ const INTERRUPTED_SUFFIX ="\n\n[Interrupted: the extension restarted before this
  * Startup recovery: a checkpoint left "running"/"awaiting-approval" means the
  * background died mid-run. Convert it into a visible interrupted assistant
  * message in the run's session rather than silently dropping it or claiming
- * stream resumption. Returns the session a run was interrupted in, if any.
+ * stream resumption, followed by a digest of the calls it had started.
+ * Returns the session a run was interrupted in, if any.
  */
 export async function recoverInterruptedRun(): Promise<string | null> {
   const checkpoint = await getRunCheckpoint();
@@ -772,6 +779,9 @@ export async function recoverInterruptedRun(): Promise<string | null> {
     text,
     at: Date.now(),
   });
+  // The tool ledger died with the background; the persisted calls still say what the run did.
+  const digest = digestFromItems((await getConversation(checkpoint.sessionId))?.items ?? []);
+  if (digest) await appendConversationItem(checkpoint.sessionId, { id: `digest-${checkpoint.runId}`, kind: "run-digest", digest, at: Date.now() });
   await touchSession(checkpoint.sessionId);
   await clearRunCheckpoint();
   return checkpoint.sessionId;

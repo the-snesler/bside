@@ -18,6 +18,8 @@ export type Turn = {
   prompt: Extract<ConversationItem, { kind: "message"; role: "user" }> | null;
   steps: TurnStep[];
   answer: { id: string; text: string } | null;
+  /** Set on the first turn the model still sees verbatim after the latest compaction: the summary of everything before it. */
+  summary: string | null;
   startedAt: number;
   endedAt: number;
 };
@@ -26,12 +28,15 @@ export type Turn = {
  * Groups conversation items into turns. A completed turn's trailing assistant
  * message is its answer; earlier assistant text is interim work. The active
  * turn has no answer yet because any committed text may still be followed by
- * more tool calls.
+ * more tool calls. Run digests are not shown; the latest compaction marks the
+ * turn it starts at, and every item stays visible.
  */
 export function buildTurns(items: ConversationItem[], running: boolean): Turn[] {
   const turns: Turn[] = [];
   const activities = new Map<string, Activity>();
+  const compaction = items.findLast((item) => item.kind === "compaction");
   for (const item of items) {
+    if (item.kind === "run-digest" || item.kind === "compaction") continue;
     let turn = turns.at(-1);
     if ((item.kind === "message" && item.role === "user") || !turn) {
       turn = {
@@ -39,6 +44,7 @@ export function buildTurns(items: ConversationItem[], running: boolean): Turn[] 
         prompt: item.kind === "message" && item.role === "user" ? item : null,
         steps: [],
         answer: null,
+        summary: compaction?.kind === "compaction" && compaction.firstKeptItemId === item.id ? compaction.summary : null,
         startedAt: item.at,
         endedAt: item.at,
       };

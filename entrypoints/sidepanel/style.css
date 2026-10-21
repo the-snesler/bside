@@ -127,6 +127,36 @@ select:disabled {
 .timeline__item--work + .timeline__item--assistant {
   margin-top: -8px;
 }
+.summary-marker {
+  color: var(--muted);
+  font-size: 13px;
+}
+.summary-marker__line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+}
+.summary-marker__line::-webkit-details-marker {
+  display: none;
+}
+.summary-marker__line::before,
+.summary-marker__line::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid var(--surface);
+}
+.summary-marker__line:hover {
+  color: var(--ink);
+}
+.summary-marker__note {
+  margin: 8px 0;
+}
+.summary-marker[open] .markdown {
+  color: var(--ink);
+  font-size: 14px;
+}
 .trace {
   list-style: none;
   margin: 0;
