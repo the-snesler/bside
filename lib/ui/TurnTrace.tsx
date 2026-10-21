@@ -38,7 +38,8 @@ const PROGRAM_ACTIONS: [RegExp, Icon, string, string, string][] = [
   [/fs\.write\(/, FilePencil, "Writing a scratch file", "Wrote a scratch file", "Couldn't write a scratch file"],
   [/\.scroll\(/, ArrowsVertical, "Scrolling the page", "Scrolled the page", "Couldn't scroll the page"],
   [/\.find\(|\.waitFor\(/, Search, "Searching page content", "Searched page content", "Page search failed"],
-  [/fs\.read\(|\.snapshot\(/, FileText, "Reading page content", "Read page content", "Couldn't read page content"],
+  [/fs\s*\.\s*read\s*\(/, FileText, "Reading file content", "Read file content", "Couldn't read file content"],
+  [/\.snapshot\(/, FileText, "Reading page content", "Read page content", "Couldn't read page content"],
   [/fs\.list\(/, List, "Listing tabs and files", "Listed tabs and files", "Couldn't list tabs and files"],
 ];
 
