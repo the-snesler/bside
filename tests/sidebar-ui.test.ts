@@ -25,7 +25,7 @@ function snapshotFor(id: string): RuntimeSnapshot {
     credential: { configured: true, maskedSuffix: null, chatgpt: { connected: false, email: null, signInAgain: false } },
     provider: OPENAI_PROVIDER,
     settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
-    page: null, agentTabs: 0, activeRun: null, lastSeq: 0, notice: null,
+    page: null, agentTabs: {}, activeRun: null, lastSeq: 0, notice: null,
   };
 }
 
@@ -354,6 +354,7 @@ describe("history drawer", () => {
       sessions: [summary("p", "Pinned trip", { pinned: true }), summary("a", "Alpha <b>bold</b>"), summary("b", "Beta", { updatedAt: now - 3 * 86_400_000 }), summary("e", "")],
       openId: "a",
       run: { conversationId: "b", awaitingApproval: false },
+      agentTabs: {},
       now,
       onOpen: vi.fn(), onRename: vi.fn(), onPin: vi.fn(), onExport: vi.fn(), onDelete: vi.fn(), onClose: vi.fn(),
       ...overrides,
@@ -440,9 +441,28 @@ describe("history drawer", () => {
     expect(document.activeElement).toBe(labelled("Delete Alpha <b>bold</b>"));
 
     await act(() => labelled("Delete Alpha <b>bold</b>").click());
+    expect(root.querySelector(".history__danger")?.textContent).toBe("Delete");
     await act(() => (root.querySelector(".history__danger") as HTMLButtonElement).click());
-    expect(props.onDelete).toHaveBeenCalledWith("a");
+    expect(props.onDelete).toHaveBeenCalledWith("a", true);
     expect(document.activeElement).toBe(labelled("Search chats by title"));
+  });
+
+  it("shows a chat's hidden agent tabs and offers to close or keep them when deleting it", async () => {
+    const props = await mount({ agentTabs: { a: 2, p: 1 } });
+    expect(row("Alpha <b>bold</b>").querySelector(".history__meta")?.textContent).toBe("5m ago · Current · 2 hidden tabs");
+    expect(row("Pinned trip").querySelector(".history__meta")?.textContent).toContain("· 1 hidden tab");
+    expect(row("Beta").querySelector(".history__meta")?.textContent).not.toContain("tab");
+
+    await act(() => labelled("Delete Alpha <b>bold</b>").click());
+    const confirm = labelled("Delete Alpha <b>bold</b>?");
+    expect(confirm.textContent).toContain("Delete? It has 2 hidden tabs.");
+    expect([...confirm.querySelectorAll("button")].map((button) => button.textContent)).toEqual(["Cancel", "Delete, keep tabs", "Delete and close tabs"]);
+    await act(() => [...confirm.querySelectorAll("button")].find((button) => button.textContent === "Delete, keep tabs")!.click());
+    expect(props.onDelete).toHaveBeenLastCalledWith("a", false);
+
+    await act(() => labelled("Delete Pinned trip").click());
+    await act(() => (root.querySelector(".history__danger") as HTMLButtonElement).click());
+    expect(props.onDelete).toHaveBeenLastCalledWith("p", true);
   });
 
   it("closes on Escape", async () => {
@@ -497,5 +517,29 @@ describe("history drawer", () => {
     await act(() => (row("Gamma").querySelector(".history__open") as HTMLButtonElement).click());
     expect(posted.at(-1)).toMatchObject({ type: "session.open", sessionId: "c" });
     expect(root.querySelector(".history")).toBeNull();
+  });
+
+  it("counts and closes only the open chat's agent tabs from the header", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    const posted: Array<{ type: string; sessionId?: string }> = [];
+    const listeners: Array<(message: unknown) => void> = [];
+    vi.spyOn(browser.runtime, "connect").mockReturnValue({
+      postMessage: (message: { type: string }) => posted.push(message),
+      onMessage: { addListener: (listener: (message: unknown) => void) => listeners.push(listener), removeListener: () => {} },
+      disconnect: () => {},
+    } as never);
+    root = document.createElement("div");
+    document.body.append(root);
+    await act(() => render(h(App, {}), root));
+    const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) => act(() => listeners.forEach((listener) => listener({ v: 1, seq: 0, at: 1, ...event })));
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), agentTabs: { b: 3 } } });
+    expect(root.querySelector(".agent-tabs-button")).toBeNull();
+
+    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession: { a: 2, b: 3 } } });
+    const button = labelled("Close this chat's 2 agent tabs") as HTMLButtonElement;
+    expect(button.textContent).toBe("2");
+    await act(() => button.click());
+    expect(posted.at(-1)).toMatchObject({ type: "tabs.closeAgentTabs", sessionId: "a" });
+    expect(isSidebarCommand(posted.at(-1))).toBe(true);
   });
 });

@@ -67,8 +67,8 @@ export class SidebarHub {
     }
   }
 
-  /** Broadcasts the hidden agent-tab count. Not run-sequenced, so it is safe mid-run and never clears sidebar error state. */
-  publishAgentTabs(count: number): void {
+  /** Broadcasts hidden agent-tab counts per session. Not run-sequenced, so it is safe mid-run and never clears sidebar error state. */
+  publishAgentTabs(bySession: Record<string, number>): void {
     const event: SidebarEvent = {
       v: 1,
       runId: null,
@@ -76,7 +76,7 @@ export class SidebarHub {
       seq: this.#lastSeq,
       type: "agent-tabs.changed",
       at: Date.now(),
-      payload: { count },
+      payload: { bySession },
     };
     for (const port of this.#ports) port.postMessage(event);
   }

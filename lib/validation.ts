@@ -156,3 +156,13 @@ export function validateSessionTitle(raw: string): string | null {
   if (title.length === 0 || title.length > MAX_SESSION_TITLE_LEN) return null;
   return title;
 }
+
+/** `/workspace` scratch-file limits, per session. */
+export const WORKSPACE_MAX_FILES = 64;
+export const WORKSPACE_MAX_FILE_CHARS = 32_000;
+
+/** A `/workspace/…` file path: segments of letters, digits, '.', '_' and '-', no traversal, at most 256 characters. */
+export function isWorkspacePath(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 256 &&
+    /^\/workspace\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(value);
+}

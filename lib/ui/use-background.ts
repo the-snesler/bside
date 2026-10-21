@@ -28,7 +28,8 @@ export interface BackgroundState extends RuntimeSnapshot {
 export interface BackgroundActions {
   listTabs(): void;
   focusTab(tabId: number): void;
-  closeAgentTabs(): void;
+  /** Closes one session's hidden agent tabs. */
+  closeAgentTabs(sessionId: string): void;
   saveSettings(settings: AppSettingsV1): void;
   sendPrompt(prompt: string): void;
   retryRun(): void;
@@ -40,7 +41,8 @@ export interface BackgroundActions {
   openSession(sessionId: string): void;
   renameSession(sessionId: string, title: string): void;
   pinSession(sessionId: string, pinned: boolean): void;
-  deleteSession(sessionId: string): void;
+  /** Deletes a session; its agent tabs are closed, or with `closeAgentTabs` false shown and handed to the user. */
+  deleteSession(sessionId: string, closeAgentTabs: boolean): void;
   /** Downloads one session's context export. */
   downloadContext(sessionId: string): void;
 }
@@ -57,7 +59,7 @@ const INITIAL_STATE: BackgroundState = {
   provider: OPENAI_PROVIDER,
   settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
   page: null,
-  agentTabs: 0,
+  agentTabs: {},
   activeRun: null,
   lastSeq: 0,
   notice: null,
@@ -151,8 +153,8 @@ export function useBackground(): BackgroundState & BackgroundActions {
   const pinSession = useCallback((sessionId: string, pinned: boolean) => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.pin", sessionId, pinned } satisfies SidebarCommand);
   }, []);
-  const deleteSession = useCallback((sessionId: string) => {
-    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.delete", sessionId } satisfies SidebarCommand);
+  const deleteSession = useCallback((sessionId: string, closeAgentTabs: boolean) => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.delete", sessionId, closeAgentTabs } satisfies SidebarCommand);
   }, []);
 
   const downloadContext = useCallback((sessionId: string) => {
@@ -167,8 +169,8 @@ export function useBackground(): BackgroundState & BackgroundActions {
   const focusTab = useCallback((tabId: number) => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "tabs.focus", tabId } satisfies SidebarCommand);
   }, []);
-  const closeAgentTabs = useCallback(() => {
-    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "tabs.closeAgentTabs" } satisfies SidebarCommand);
+  const closeAgentTabs = useCallback((sessionId: string) => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "tabs.closeAgentTabs", sessionId } satisfies SidebarCommand);
   }, []);
   const saveSettings = useCallback((settings: AppSettingsV1) => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "settings.save", settings } satisfies SidebarCommand);
@@ -225,7 +227,7 @@ function applyEvent(
     return;
   }
   if (event.type === "agent-tabs.changed") {
-    setState((prev) => ({ ...prev, agentTabs: event.payload.count }));
+    setState((prev) => ({ ...prev, agentTabs: event.payload.bySession }));
     return;
   }
   if (event.type === "run.started") {

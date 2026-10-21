@@ -1,55 +1,147 @@
 import type { DomAction, ElementTarget, JsonValue, PageFindResult, PageSnapshot, PressKey, ToolResult, UploadFile } from "@/lib/domain/tools";
 import { MAX_SNAPSHOT_CHARS } from "@/lib/protocol";
-import { MAX_UPLOAD_FILE_CHARS, MAX_UPLOAD_FILES, PRESS_KEYS } from "@/lib/validation";
-import { DEFAULT_SNAPSHOT_CHARS, TabController } from "./tab-controller";
+import { isWorkspacePath, MAX_UPLOAD_FILE_CHARS, MAX_UPLOAD_FILES, PRESS_KEYS, WORKSPACE_MAX_FILE_CHARS, WORKSPACE_MAX_FILES } from "@/lib/validation";
+import { AGENT_TAB_ROLES, DEFAULT_SNAPSHOT_CHARS, TabController } from "./tab-controller";
 
 export const PROGRAM_HELP = `Run a small browser/filesystem program. It is interpreted, not JavaScript: only const/let, await, return, double-quoted strings, numbers, booleans, arrays, objects, variables, and the capability calls below. No loops, functions, property access, selectors, or globals. End statements with semicolons. Variables persist across programs in this run.
 
 Output: the value of \`return\` and of bare expression statements (e.g. \`await x.click();\`) is printed; assignments are silent. Output over 40000 characters is cut with an explicit notice.
 
-Tabs: fs.list("/tabs") (user tabs), fs.list("/agent-tabs") (hidden tabs you opened). const page = browser.tab("/tabs/12/page.md"); const res = await browser.open("https://…") opens a hidden agent tab.
+Tabs: fs.list("/tabs") (user tabs), fs.list("/agent-tabs") (hidden tabs this chat opened). const page = browser.tab("/tabs/12/page.md"); const res = await browser.open("https://…") opens a hidden agent tab.
 Reading: await page.snapshot() returns the page outline: text in document order with interactive elements inlined as [e5 button "Save"], [e7 textbox "Email" type=email required value="…"], [e9 link "Docs" → /docs], [e3 combobox "Country" selected="…" options: …]. Includes open/closed shadow DOM and same-origin iframes; a cross-origin frame appears as [frame cross-origin → url] — open that URL with browser.open() to read or operate it. Long pages are paged: snapshot({offset: 16000, maxChars: 16000}) continues where the notice says (maxChars ≤ 40000). fs.read(tabPath) equals snapshot().
 Searching: await page.find("text") lists matching outline lines (with refs) and their offsets — use it on long pages instead of reading everything. await page.waitFor("text", 8000) waits up to 15000 ms for text to appear. await web.search("query") returns web results (title, URL, snippet) from a hidden search tab; open results with browser.open(url).
 Targeting: page.ref("e5") targets the element with that ref from your latest snapshot/find/diff of that page; refs stay valid until the page navigates or reloads. page.getByRole("button", {name: "Save"}) matches a unique element by role and case-insensitive name substring ({exact: true} for exact). page.getByText("Save") matches any interactive element by name. Ambiguous or missing matches fail and list candidate refs.
 Actions (on a locator): click(), fill(text) (inputs, textareas, rich-text editors; dates as YYYY-MM-DD), selectOption("label or value" | [...]), setChecked(bool), check(), uncheck(), press("Enter"|"Tab"|"Escape"|"Space"|"Backspace"|"ArrowDown"|…), setInputFiles("/workspace/file.txt" | [...]) attaches scratch files to a file input. Each action reports the effect, native validation problems, and the page outline lines that appeared (+) or disappeared (−). Use that diff to verify outcomes.
 Page methods: navigate(url), goBack(), scroll("down"|"up", "page"|"line"), path().
-Scratch files: fs.write("/workspace/notes.md", "text"), fs.read, fs.list("/workspace"), fs.move, fs.remove (64 files, 32000 characters each; session only).
+Scratch files: fs.write("/workspace/notes.md", "text"), fs.read, fs.list("/workspace"), fs.move, fs.remove (64 files, 32000 characters each; kept with this chat).
 Tab management: fs.move("/tabs/12/page.md", "/agent-tabs/12/page.md") hides a tab, the reverse shows it; fs.remove(tabPath) closes it.
 Limits: 32 statements, 64 calls, 16000 source characters. The program stops at the first failure; earlier effects stay committed, so never replay completed steps.
 Call request_action_confirmation BEFORE externally visible, destructive, or paid actions (submitting, sending, purchasing, deleting) in a separate program.`;
 
+export type AgentTabRole = (typeof AGENT_TAB_ROLES)[number];
+
+/** A hidden tab bside owns, and the session whose runs may use it. */
+export interface AgentTab {
+  sessionId: string;
+  role: AgentTabRole;
+  /** When a program last used the tab; idle auto-close counts from this. */
+  lastUsedAt: number;
+}
+
+/** Agent-tab ownership and observed documents, shared by every session; the runtime keeps one for the background's lifetime. */
 export class WorkspaceState {
-  files = new Map<string, string>();
-  /** Hidden tabs the agent owns, mapped to when a program last used each one. */
-  agentTabs = new Map<number, number>();
+  agentTabs = new Map<number, AgentTab>();
   /** Document id of the latest outline shown to the model per tab; refs resolve against it. */
   observed = new Map<number, string>();
-  searchTabId: number | null = null;
-  /** Called after agentTabs/searchTabId ownership changes so the runtime can persist it. */
+  /** Called after agentTabs ownership changes so the runtime can persist it. */
   onOwnershipChange: () => void = () => {};
 
   constructor(readonly now: () => number = Date.now) {}
 
-  adoptTab(tabId: number): void {
-    this.agentTabs.set(tabId, this.now());
+  adoptTab(tabId: number, sessionId: string, role: AgentTabRole = "agent"): void {
+    this.agentTabs.set(tabId, { sessionId, role, lastUsedAt: this.now() });
     this.onOwnershipChange();
   }
 
   releaseTab(tabId: number): void {
     this.agentTabs.delete(tabId);
-    if (this.searchTabId === tabId) this.searchTabId = null;
     this.onOwnershipChange();
   }
 
-  setSearchTab(tabId: number): void {
-    this.searchTabId = tabId;
-    this.onOwnershipChange();
+  /** The session's search tab, if it has one. */
+  searchTab(sessionId: string): number | null {
+    for (const [id, tab] of this.agentTabs) if (tab.sessionId === sessionId && tab.role === "search") return id;
+    return null;
   }
 
   /** Marks an owned tab as used now; idle auto-close counts from this. */
   touchTab(tabId: number): void {
-    if (this.agentTabs.has(tabId)) this.agentTabs.set(tabId, this.now());
+    const tab = this.agentTabs.get(tabId);
+    if (tab) tab.lastUsedAt = this.now();
   }
+}
+
+/** One `/workspace` file as persisted: `slot` (0–63) is its storage key within the session. */
+export interface ScratchFileEntry { slot: number; path: string; content: string }
+
+/** Persistence for one session's scratch files; every write and removal touches exactly one slot. */
+export interface ScratchStore {
+  load(): Promise<ScratchFileEntry[]>;
+  write(entry: ScratchFileEntry): Promise<void>;
+  remove(slot: number): Promise<void>;
+}
+
+const MEMORY_SCRATCH_STORE: ScratchStore = { load: async () => [], write: async () => {}, remove: async () => {} };
+
+/**
+ * One session's `/workspace` files, loaded from its store on first use. Each
+ * change is written through before it applies in memory, so a change a
+ * program reports has been persisted; a failed write changes nothing.
+ */
+export class ScratchFiles {
+  #files: Promise<Map<string, { slot: number; content: string }>> | null = null;
+
+  constructor(private store: ScratchStore = MEMORY_SCRATCH_STORE) {}
+
+  #load(): Promise<Map<string, { slot: number; content: string }>> {
+    if (!this.#files) {
+      const files = this.store.load().then((entries) => new Map(entries.map(({ slot, path, content }) => [path, { slot, content }])));
+      // A failed load is retried by the next call rather than cached.
+      files.catch(() => { if (this.#files === files) this.#files = null; });
+      this.#files = files;
+    }
+    return this.#files;
+  }
+
+  async paths(): Promise<string[]> {
+    return [...(await this.#load()).keys()];
+  }
+
+  async read(path: string): Promise<string | undefined> {
+    return (await this.#load()).get(path)?.content;
+  }
+
+  async write(path: string, content: string): Promise<void> {
+    const files = await this.#load();
+    const existing = files.get(path);
+    if (content.length > WORKSPACE_MAX_FILE_CHARS || (!existing && files.size >= WORKSPACE_MAX_FILES)) {
+      throw new Error(`Workspace limit: ${WORKSPACE_MAX_FILES} files, ${WORKSPACE_MAX_FILE_CHARS} characters per file.`);
+    }
+    const used = new Set([...files.values()].map((file) => file.slot));
+    const slot = existing?.slot ?? Array.from({ length: WORKSPACE_MAX_FILES }, (_, n) => n).find((n) => !used.has(n))!;
+    await this.#persist(() => this.store.write({ slot, path, content }));
+    files.set(path, { slot, content });
+  }
+
+  async remove(path: string): Promise<void> {
+    const files = await this.#load();
+    const file = files.get(path);
+    if (!file) return;
+    await this.#persist(() => this.store.remove(file.slot));
+    files.delete(path);
+  }
+
+  /** Renames in place: the file keeps its slot, so a move is one write. */
+  async move(from: string, to: string): Promise<void> {
+    const files = await this.#load();
+    const file = files.get(from);
+    if (!file || files.has(to)) throw new Error("Destination must be a new workspace path.");
+    await this.#persist(() => this.store.write({ slot: file.slot, path: to, content: file.content }));
+    files.delete(from);
+    files.set(to, file);
+  }
+
+  async #persist(write: () => Promise<void>): Promise<void> {
+    try { await write(); }
+    catch { throw new Error("Could not save the workspace change; nothing was changed. Retry once."); }
+  }
+}
+
+/** What one run's programs operate on: shared agent-tab state, the run's session, and that session's scratch files. */
+export interface ProgramScope {
+  state: WorkspaceState;
+  sessionId: string;
+  files: ScratchFiles;
 }
 
 type Expr = { type: "literal"; value: JsonValue } | { type: "variable"; name: string } |
@@ -221,8 +313,13 @@ export class BrowserProgram {
   #handles = new WeakSet<object>();
   /** Page URLs the current program read, opened, or navigated to; returned as `data.visited` for the run digest. */
   #visited: string[] = [];
-  constructor(private tabs: TabController, private state: WorkspaceState, private onEffect: () => void) {
+  private readonly state: WorkspaceState;
+  /** The run's session: its agent tabs are this program's `/agent-tabs`, and `files` is its `/workspace`. */
+  private readonly sessionId: string;
+  private readonly files: ScratchFiles;
+  constructor(private tabs: TabController, scope: ProgramScope, private onEffect: () => void) {
     for (const value of this.#variables.values()) this.#handles.add(value as object);
+    ({ state: this.state, sessionId: this.sessionId, files: this.files } = scope);
   }
 
   /** Records that the model has seen refs from this document (e.g. the initial page artifact). */
@@ -350,7 +447,7 @@ export class BrowserProgram {
       action = { kind: "press", target, key: key as PressKey };
     } else if (method === "setInputFiles") {
       count(1);
-      action = { kind: "upload", target, files: this.#uploadFiles(args[0]!) };
+      action = { kind: "upload", target, files: await this.#uploadFiles(args[0]!) };
     } else throw new Error("Locators support click, fill, selectOption, setChecked, check, uncheck, press, setInputFiles.");
     signal.throwIfAborted();
     // A lost response can follow a committed effect; disable automatic retry before dispatch.
@@ -488,26 +585,28 @@ export class BrowserProgram {
     return { kind: "ref", ref: locator.target.ref, documentId };
   }
 
-  #uploadFiles(raw: Value): UploadFile[] {
+  async #uploadFiles(raw: Value): Promise<UploadFile[]> {
     const paths = typeof raw === "string" ? [raw] : raw;
     if (!Array.isArray(paths) || !paths.length || paths.length > MAX_UPLOAD_FILES || !paths.every((path) => typeof path === "string")) {
       throw new Error(`setInputFiles() expects a /workspace path or an array of up to ${MAX_UPLOAD_FILES}.`);
     }
-    return (paths as string[]).map((path) => {
+    const files: UploadFile[] = [];
+    for (const path of paths as string[]) {
       if (!path.startsWith("/workspace/")) throw new Error("Only /workspace scratch files can be uploaded; write one with fs.write first.");
-      const content = this.state.files.get(path);
+      const content = await this.files.read(path);
       if (content === undefined) throw new Error(`File ${path} does not exist; create it with fs.write first.`);
       if (content.length > MAX_UPLOAD_FILE_CHARS) throw new Error(`Upload files are limited to ${MAX_UPLOAD_FILE_CHARS} characters.`);
       const name = path.slice(path.lastIndexOf("/") + 1);
-      return { name, mimeType: mimeTypeFor(name), text: content };
-    });
+      files.push({ name, mimeType: mimeTypeFor(name), text: content });
+    }
+    return files;
   }
 
-  async #openTab(url: string, signal: AbortSignal): Promise<number> {
+  async #openTab(url: string, signal: AbortSignal, role: AgentTabRole = "agent"): Promise<number> {
     this.#visited.push(url);
     this.onEffect();
     const tabId = await this.tabs.createTab(url);
-    this.state.adoptTab(tabId);
+    this.state.adoptTab(tabId, this.sessionId, role);
     // Finish hiding a newly created tab even if cancelled during creation.
     try { await this.tabs.hideTab(tabId); }
     catch { throw new Error(`Created /agent-tabs/${tabId}/page.md but Firefox could not hide it. The tab remains visible.`); }
@@ -518,14 +617,13 @@ export class BrowserProgram {
 
   async #search(query: string, signal: AbortSignal): Promise<string> {
     if (!query.trim() || query.length > 400) throw new Error("web.search() expects a 1–400 character query.");
-    let tabId = this.state.searchTabId;
-    const reusable = tabId !== null && this.state.agentTabs.has(tabId) && (await this.tabs.listTabs()).some((tab) => tab.id === tabId);
+    let tabId = this.state.searchTab(this.sessionId);
+    const reusable = tabId !== null && (await this.tabs.listTabs()).some((tab) => tab.id === tabId);
     for (const [index, engine] of SEARCH_ENGINES.entries()) {
       signal.throwIfAborted();
       const url = engine.url(query);
       if (index === 0 && !reusable) {
-        tabId = await this.#openTab(url, signal);
-        this.state.setSearchTab(tabId);
+        tabId = await this.#openTab(url, signal, "search");
       } else {
         const navigated = await (await this.#controller(tabId!)).navigate(url);
         if (!navigated.ok) throw this.#pageError({ code: navigated.code ?? "NAVIGATION_INTERRUPTED", message: navigated.summary }, tabId!);
@@ -558,7 +656,12 @@ export class BrowserProgram {
     }
   }
 
-  #path(tabId: number): string { return `/${this.state.agentTabs.has(tabId) ? "agent-tabs" : "tabs"}/${tabId}/page.md`; }
+  #path(tabId: number): string { return `/${this.#ownsTab(tabId) ? "agent-tabs" : "tabs"}/${tabId}/page.md`; }
+
+  #ownsTab(tabId: number): boolean { return this.state.agentTabs.get(tabId)?.sessionId === this.sessionId; }
+
+  /** Another session's agent tab: invisible to this run, as if it did not exist. */
+  #foreignTab(tabId: number): boolean { return this.state.agentTabs.has(tabId) && !this.#ownsTab(tabId); }
 
   #pageError(error: { code: string; message: string }, tabId: number): ProgramError {
     const codes: readonly NonNullable<ToolResult["code"]>[] = ["UNSUPPORTED_PAGE", "TAB_CHANGED", "STALE_SNAPSHOT", "TARGET_MISSING", "NOT_INTERACTABLE", "NAVIGATION_INTERRUPTED", "INVALID_TOOL_ARGUMENTS", "LIMIT_EXCEEDED", "ACTION_DENIED"];
@@ -571,7 +674,7 @@ export class BrowserProgram {
     const match = /^\/(tabs|agent-tabs)\/([1-9]\d*)\/page\.md$/.exec(path);
     if (!match) throw new Error("Expected /tabs/<id>/page.md or /agent-tabs/<id>/page.md.");
     const id = Number(match[2]);
-    if (!Number.isSafeInteger(id) || !(await this.tabs.listTabs()).some((tab) => tab.id === id)) throw new ProgramError("Tab path is closed or unsupported; list tabs again.", "TARGET_MISSING");
+    if (!Number.isSafeInteger(id) || this.#foreignTab(id) || !(await this.tabs.listTabs()).some((tab) => tab.id === id)) throw new ProgramError("Tab path is closed or unsupported; list tabs again.", "TARGET_MISSING");
     if (path !== this.#path(id)) throw new ProgramError(`Tab moved; use ${this.#path(id)}.`, "TARGET_MISSING");
     return id;
   }
@@ -583,28 +686,26 @@ export class BrowserProgram {
       if (args.length !== 1) throw new Error("fs.list(path) takes one argument.");
       if (path === "/") return ["/tabs", "/agent-tabs", "/workspace"];
       if (path === "/tabs" || path === "/agent-tabs") {
-        const tabs = (await this.tabs.listTabs()).filter((tab) => this.state.agentTabs.has(tab.id!) === (path === "/agent-tabs"));
+        const tabs = (await this.tabs.listTabs()).filter((tab) => !this.#foreignTab(tab.id!) && this.#ownsTab(tab.id!) === (path === "/agent-tabs"));
         return { entries: tabs.slice(0, 200).map((tab) => ({ path: this.#path(tab.id!), url: tab.url!, title: tab.title ?? "", hidden: tab.hidden ?? false })), truncated: tabs.length > 200 };
       }
-      if (path === "/workspace" || path.startsWith("/workspace/")) return [...this.state.files.keys()].filter((key) => key.startsWith(`${path.replace(/\/$/, "")}/`));
+      if (path === "/workspace" || path.startsWith("/workspace/")) return (await this.files.paths()).filter((key) => key.startsWith(`${path.replace(/\/$/, "")}/`));
       throw new Error("Unknown directory. Mounts: /tabs, /agent-tabs, /workspace.");
     }
     if (path.startsWith("/workspace/")) {
       if (args.length !== (["write", "move"].includes(method) ? 2 : 1) || (args.length === 2 && typeof second !== "string")) throw new Error(`Invalid arguments for fs.${method}.`);
       const destination = second as string | undefined;
-      const valid = (p: string) => p.length <= 256 && /^\/workspace\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(p);
-      if (!valid(path)) throw new Error("Invalid workspace path; use letters, digits, '.', '_' and '-'.");
+      if (!isWorkspacePath(path)) throw new Error("Invalid workspace path; use letters, digits, '.', '_' and '-'.");
       if (method === "write") {
-        if (destination!.length > 32_000 || (!this.state.files.has(path) && this.state.files.size >= 64)) throw new Error("Workspace limit: 64 files, 32000 characters per file.");
-        this.state.files.set(path, destination!); return `Wrote ${path} (${destination!.length} characters).`;
+        await this.files.write(path, destination!); return `Wrote ${path} (${destination!.length} characters).`;
       }
-      const content = this.state.files.get(path);
+      const content = await this.files.read(path);
       if (content === undefined) throw new Error("File does not exist.");
       if (method === "read") return content;
-      if (method === "remove") { this.state.files.delete(path); return `Removed ${path}.`; }
+      if (method === "remove") { await this.files.remove(path); return `Removed ${path}.`; }
       if (method === "move") {
-        if (!valid(destination!) || this.state.files.has(destination!)) throw new Error("Destination must be a new workspace path.");
-        this.state.files.set(destination!, content); this.state.files.delete(path); return `Moved to ${destination}.`;
+        if (!isWorkspacePath(destination)) throw new Error("Destination must be a new workspace path.");
+        await this.files.move(path, destination); return `Moved to ${destination}.`;
       }
     } else {
       const id = await this.#tabPath(path);
@@ -619,10 +720,10 @@ export class BrowserProgram {
         return `Closed ${path}.`;
       }
       if (method === "move") {
-        const toAgent = !this.state.agentTabs.has(id);
+        const toAgent = !this.#ownsTab(id);
         if (second !== `/${toAgent ? "agent-tabs" : "tabs"}/${id}/page.md`) throw new Error("Tab moves must preserve the ID and switch /tabs and /agent-tabs.");
         this.onEffect();
-        if (toAgent) { await this.tabs.hideTab(id); this.state.adoptTab(id); }
+        if (toAgent) { await this.tabs.hideTab(id); this.state.adoptTab(id, this.sessionId); }
         else { await this.tabs.showTab(id); this.state.releaseTab(id); }
         return `Moved to ${second}.`;
       }

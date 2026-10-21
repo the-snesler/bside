@@ -13,7 +13,8 @@ import type { Api, AssistantMessage, Message, Model, Models, TSchema } from "@ea
 import type { SidebarHub } from "@/lib/background/sidebar-hub";
 import type { TabController } from "@/lib/background/tab-controller";
 import type { ContextArtifact, JsonValue, ToolCall, ToolResult } from "@/lib/domain/tools";
-import { BrowserProgram, PROGRAM_HELP, WorkspaceState, renderSnapshot } from "./browser-program";
+import { BrowserProgram, PROGRAM_HELP, ScratchFiles, WorkspaceState, renderSnapshot } from "./browser-program";
+import type { ProgramScope } from "./browser-program";
 import { COMPACTION_SUMMARY_MAX_CHARS, type ConversationItem } from "@/lib/domain/conversation";
 import { renderDigestNote, renderSummaryNote, type DigestStep } from "@/lib/domain/run-digest";
 import type { ProviderAdapter, ProviderAuth, ReasoningEffort } from "@/lib/domain/provider";
@@ -100,10 +101,17 @@ export class AgentLoop {
   /** Every executed call in order, for the run digest. */
   #steps: DigestStep[] = [];
 
-  constructor(provider: ProviderAdapter, tabController: TabController, sidebarHub: SidebarHub, workspace = new WorkspaceState(), limits: Partial<RunLimits> = {}) {
+  /** `scope` defaults to fresh in-memory state for a standalone loop; the runtime passes the run's session scope. */
+  constructor(
+    provider: ProviderAdapter,
+    tabController: TabController,
+    sidebarHub: SidebarHub,
+    scope: ProgramScope = { state: new WorkspaceState(), sessionId: "default", files: new ScratchFiles() },
+    limits: Partial<RunLimits> = {},
+  ) {
     this.#provider = provider;
     this.#limits = { ...DEFAULT_RUN_LIMITS, ...limits };
-    this.#program = new BrowserProgram(tabController, workspace, () => { this.#hadPageEffect = true; });
+    this.#program = new BrowserProgram(tabController, scope, () => { this.#hadPageEffect = true; });
     this.#sidebarHub = sidebarHub;
   }
 

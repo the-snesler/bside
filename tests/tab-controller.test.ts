@@ -247,13 +247,20 @@ describe("TabController: agent-tab session tags", () => {
     const { api } = sessionsApi(undefined);
     const controller = new TabController(api);
     expect(await controller.agentTabTag(1)).toBeNull();
-    await controller.tagAgentTab(1, { v: 1, role: "search", lastUsedAt: 5 });
-    expect(api.sessions!.setTabValue).toHaveBeenCalledWith(1, AGENT_TAB_TAG_KEY, { v: 1, role: "search", lastUsedAt: 5 });
-    expect(await controller.agentTabTag(1)).toEqual({ v: 1, role: "search", lastUsedAt: 5 });
+    const tag = { v: 2 as const, role: "search" as const, sessionId: "session-1", lastUsedAt: 5 };
+    await controller.tagAgentTab(1, tag);
+    expect(api.sessions!.setTabValue).toHaveBeenCalledWith(1, AGENT_TAB_TAG_KEY, tag);
+    expect(await controller.agentTabTag(1)).toEqual(tag);
+  });
+
+  it("reads a pre-session v1 tag as legacy, so startup can hand its tab back", async () => {
+    expect(await new TabController(sessionsApi({ v: 1, role: "agent", lastUsedAt: 1 }).api).agentTabTag(1)).toEqual({ v: 1, role: "agent", lastUsedAt: 1 });
   });
 
   it.each([
-    ["an unknown version", { v: 2, role: "agent", lastUsedAt: 1 }],
+    ["an unknown version", { v: 3, role: "agent", sessionId: "s1", lastUsedAt: 1 }],
+    ["a v2 tag without an owning session", { v: 2, role: "agent", lastUsedAt: 1 }],
+    ["a v2 tag with a malformed session id", { v: 2, role: "agent", sessionId: "../x", lastUsedAt: 1 }],
     ["an unknown role", { v: 1, role: "user", lastUsedAt: 1 }],
     ["a non-numeric timestamp", { v: 1, role: "agent", lastUsedAt: "1" }],
     ["a non-finite timestamp", { v: 1, role: "agent", lastUsedAt: Number.POSITIVE_INFINITY }],

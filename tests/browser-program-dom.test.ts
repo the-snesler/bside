@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { readFileSync } from "node:fs";
 import { expect, it, vi } from "vitest";
-import { BrowserProgram, WorkspaceState } from "@/lib/background/browser-program";
+import { BrowserProgram, ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
 import { TabController } from "@/lib/background/tab-controller";
 import { createElementRefRegistry, executeDomAction, extractSnapshot, findInPage } from "@/lib/tools/page-executor";
 import type { PageRequest } from "@/lib/protocol";
@@ -27,7 +27,7 @@ it("fills the real fixture by ref and role in one program and verifies a later s
       return { ok: true, type: "page.execute", result, documentId: registry.documentId };
     },
   } });
-  const program = new BrowserProgram(controller, new WorkspaceState(), () => {});
+  const program = new BrowserProgram(controller, { state: new WorkspaceState(), sessionId: "s1", files: new ScratchFiles() }, () => {});
   const signal = new AbortController().signal;
 
   const read = await program.execute('const page = browser.tab("/tabs/1/page.md"); return await page.snapshot();', signal);

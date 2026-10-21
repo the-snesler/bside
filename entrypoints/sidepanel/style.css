@@ -642,6 +642,19 @@ summary.trace__line:focus-visible .trace__chevron,
   font-size: 12px;
   cursor: pointer;
 }
+.history__row[data-wrap] {
+  flex-wrap: wrap;
+}
+.history__confirm[data-tabs] {
+  flex-basis: 100%;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  padding: 0 var(--space-1) var(--space-1);
+}
+.history__confirm[data-tabs] span {
+  flex-basis: 100%;
+  padding-left: 8px;
+}
 .history__confirm .history__danger {
   border-color: var(--error);
   background: var(--error);

@@ -207,22 +207,23 @@ export const SIDEBAR_PORT_NAME = "agent-sidebar:v1";
 export type SidebarCommand =
   | { v: 1; id: string; type: "tabs.list" }
   | { v: 1; id: string; type: "tabs.focus"; tabId: number }
-  | { v: 1; id: string; type: "tabs.closeAgentTabs" }
+  /** Closes one session's hidden agent tabs (the sidebar sends the open session's); refused while a run is active. */
+  | { v: 1; id: string; type: "tabs.closeAgentTabs"; sessionId: string }
   | { v: 1; id: string; type: "settings.save"; settings: AppSettingsV1 }
-  /** Exports one session; run diagnostics, model input, tool output, and scratch files are included only for the latest run's session. Answered with `context.exported` to the requesting sidebar only. */
+  /** Exports one session with its scratch files; run diagnostics, model input, and tool output are included only for the latest run's session. Answered with `context.exported` to the requesting sidebar only. */
   | { v: 1; id: string; type: "context.export"; sessionId: string }
   | { v: 1; id: string; type: "state.subscribe"; lastSeq: number | null }
-  /**
-   * "New chat": opens an empty session (reusing the open one if it is an untouched new chat).
-   * With no run active it also clears scratch files and the debug buffers.
-   */
+  /** "New chat": opens an empty session (reusing the open one if it is an untouched new chat), which starts with an empty /workspace. */
   | { v: 1; id: string; type: "session.create" }
   /** Answered with `session.listed` to the requesting sidebar; every sidebar also gets `session.listed` whenever the index changes. */
   | { v: 1; id: string; type: "session.list" }
   /** Allowed while a run is active elsewhere; the run keeps its own session. Leaving an untouched new chat (no items, pin, or user title) deletes it. */
   | { v: 1; id: string; type: "session.open"; sessionId: string }
-  /** Refused for the active run's session. Deleting the open session opens the most recent remaining one, or a new empty one. */
-  | { v: 1; id: string; type: "session.delete"; sessionId: string }
+  /**
+   * Refused for the active run's session. Deleting the open session opens the most recent remaining one, or a new empty one.
+   * The session's scratch files are deleted with it; its agent tabs are closed, or with `closeAgentTabs: false` shown and handed to the user.
+   */
+  | { v: 1; id: string; type: "session.delete"; sessionId: string; closeAgentTabs: boolean }
   /** Sets a user title, which is never auto-overwritten. */
   | { v: 1; id: string; type: "session.rename"; sessionId: string; title: string }
   | { v: 1; id: string; type: "session.pin"; sessionId: string; pinned: boolean }
@@ -248,8 +249,8 @@ export interface RuntimeSnapshot {
   provider: ProviderDefinition;
   settings: AppSettingsV1;
   page: PageArtifactSummary | null;
-  /** Number of hidden agent-owned tabs, including the search tab. */
-  agentTabs: number;
+  /** Hidden agent tabs (search tabs included) per owning session id; sessions with none are omitted. */
+  agentTabs: Record<string, number>;
   /** The single active run, which may belong to a session other than the open one. */
   activeRun: {
     runId: string;
@@ -282,7 +283,7 @@ export type SidebarEvent =
   | EventBase<"state.snapshot", RuntimeSnapshot>
   | EventBase<"session.listed", { sessions: ConversationSummary[] }>
   | EventBase<"page.attached", PageArtifactSummary | null>
-  | EventBase<"agent-tabs.changed", { count: number }>
+  | EventBase<"agent-tabs.changed", { bySession: Record<string, number> }>
   | EventBase<"run.started", { prompt: string; page: PageArtifactSummary | null; retry: boolean }>
   | EventBase<"assistant.delta", { delta: string }>
   | EventBase<"tool.requested", { call: ToolCall; display: string }>
@@ -297,11 +298,12 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
   const candidate = value as Record<string, unknown>;
   if (candidate.type === "tabs.list") return true;
   if (candidate.type === "tabs.focus") return Number.isSafeInteger(candidate.tabId);
-  if (candidate.type === "tabs.closeAgentTabs") return true;
+  if (candidate.type === "tabs.closeAgentTabs") return isSessionId(candidate.sessionId);
   if (candidate.type === "settings.save") return isAppSettings(candidate.settings);
   if (candidate.type === "context.export") return isSessionId(candidate.sessionId);
   if (candidate.type === "session.create" || candidate.type === "session.list") return true;
-  if (candidate.type === "session.open" || candidate.type === "session.delete") return isSessionId(candidate.sessionId);
+  if (candidate.type === "session.open") return isSessionId(candidate.sessionId);
+  if (candidate.type === "session.delete") return isSessionId(candidate.sessionId) && typeof candidate.closeAgentTabs === "boolean";
   if (candidate.type === "session.rename") {
     return isSessionId(candidate.sessionId) && typeof candidate.title === "string" && candidate.title.length <= MAX_SESSION_TITLE_LEN * 4;
   }

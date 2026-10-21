@@ -37,16 +37,19 @@ describe("isSidebarCommand: accepts every valid variant", () => {
     expect(isSidebarCommand({ v: 1, id: "1", type: "action.deny", runId: "r1", callId: "c1" })).toBe(true);
   });
 
-  it("accepts tabs.closeAgentTabs only in a v1 envelope", () => {
-    expect(isSidebarCommand({ v: 1, id: "1", type: "tabs.closeAgentTabs" })).toBe(true);
-    expect(isSidebarCommand({ v: 2, id: "1", type: "tabs.closeAgentTabs" })).toBe(false);
-    expect(isSidebarCommand({ v: 1, type: "tabs.closeAgentTabs" })).toBe(false);
+  it("accepts tabs.closeAgentTabs only in a v1 envelope naming a session", () => {
+    expect(isSidebarCommand({ v: 1, id: "1", type: "tabs.closeAgentTabs", sessionId: "s1" })).toBe(true);
+    expect(isSidebarCommand({ v: 1, id: "1", type: "tabs.closeAgentTabs" })).toBe(false);
+    expect(isSidebarCommand({ v: 1, id: "1", type: "tabs.closeAgentTabs", sessionId: "../x" })).toBe(false);
+    expect(isSidebarCommand({ v: 2, id: "1", type: "tabs.closeAgentTabs", sessionId: "s1" })).toBe(false);
+    expect(isSidebarCommand({ v: 1, type: "tabs.closeAgentTabs", sessionId: "s1" })).toBe(false);
   });
 
   it("accepts every session command", () => {
     const sessionId = crypto.randomUUID();
     for (const command of [
-      { type: "session.create" }, { type: "session.list" }, { type: "session.open", sessionId }, { type: "session.delete", sessionId: "default" },
+      { type: "session.create" }, { type: "session.list" }, { type: "session.open", sessionId }, { type: "session.delete", sessionId: "default", closeAgentTabs: true },
+      { type: "session.delete", sessionId, closeAgentTabs: false },
       { type: "session.rename", sessionId, title: "Trip plans" }, { type: "session.pin", sessionId, pinned: false },
     ]) expect(isSidebarCommand({ v: 1, id: "1", ...command })).toBe(true);
   });
@@ -115,7 +118,10 @@ describe("isSidebarCommand: rejects malformed input", () => {
   it("rejects session commands with a malformed session id, title, or pinned flag", () => {
     for (const sessionId of [undefined, 7, "", "../x", "a b", "x".repeat(65)]) {
       expect(isSidebarCommand({ v: 1, id: "1", type: "session.open", sessionId })).toBe(false);
-      expect(isSidebarCommand({ v: 1, id: "1", type: "session.delete", sessionId })).toBe(false);
+      expect(isSidebarCommand({ v: 1, id: "1", type: "session.delete", sessionId, closeAgentTabs: true })).toBe(false);
+    }
+    for (const closeAgentTabs of [undefined, "yes", 1, null]) {
+      expect(isSidebarCommand({ v: 1, id: "1", type: "session.delete", sessionId: "s1", closeAgentTabs })).toBe(false);
     }
     expect(isSidebarCommand({ v: 1, id: "1", type: "session.rename", sessionId: "s1" })).toBe(false);
     expect(isSidebarCommand({ v: 1, id: "1", type: "session.rename", sessionId: "s1", title: 5 })).toBe(false);

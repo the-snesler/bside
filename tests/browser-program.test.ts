@@ -1,7 +1,21 @@
 import { describe, expect, it, vi } from "vitest";
-import { BrowserProgram, parseProgram, WorkspaceState } from "@/lib/background/browser-program";
+import { BrowserProgram, parseProgram, ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
+import type { ScratchFileEntry, ScratchStore } from "@/lib/background/browser-program";
 import { TabController, type TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import type { DomAction, PageSnapshot, SearchResult } from "@/lib/domain/tools";
+
+/** A scratch store over a slot map, standing in for the session's storage.local records. */
+function memoryStore(initial: ScratchFileEntry[] = []) {
+  const slots = new Map(initial.map((entry) => [entry.slot, entry]));
+  const store: ScratchStore = {
+    load: vi.fn(async () => [...slots.values()].map((entry) => ({ ...entry }))),
+    write: vi.fn(async (entry: ScratchFileEntry) => { slots.set(entry.slot, { ...entry }); }),
+    remove: vi.fn(async (slot: number) => { slots.delete(slot); }),
+  };
+  /** Persisted contents by path. */
+  const files = () => Object.fromEntries([...slots.values()].map((entry) => [entry.path, entry.content]));
+  return { store, slots, files };
+}
 
 function setup(options: { outline?: string; searchResults?: (url: string) => SearchResult[] } = {}) {
   const tabs = new Map([[1, { id: 1, url: "https://example.com", title: "Example", hidden: false }]]);
@@ -42,10 +56,12 @@ function setup(options: { outline?: string; searchResults?: (url: string) => Sea
   } };
   const effect = vi.fn();
   const state = new WorkspaceState();
+  const scratch = memoryStore();
+  const files = new ScratchFiles(scratch.store);
   const controller = new TabController(api);
-  const program = new BrowserProgram(controller, state, effect);
+  const program = new BrowserProgram(controller, { state, sessionId: "s1", files }, effect);
   const run = (source: string) => program.execute(source, abort.signal);
-  return { run, tabs, actions, api, effect, state, controller, abort, sendMessage, program, documents };
+  return { run, tabs, actions, api, effect, state, scratch, files, controller, abort, sendMessage, program, documents };
 }
 
 describe("browser program boundary", () => {
@@ -72,11 +88,10 @@ describe("browser program boundary", () => {
   });
 
   it("preserves nested call ordering and stops after a failed filesystem read", async () => {
-    const { run, state } = setup();
+    const { run, scratch } = setup();
     const result = await run('return [fs.write("/workspace/before", "yes"), fs.read("/workspace/missing"), fs.write("/workspace/after", "no")];');
     expect(result.ok).toBe(false);
-    expect(state.files.get("/workspace/before")).toBe("yes");
-    expect(state.files.has("/workspace/after")).toBe(false);
+    expect(scratch.files()).toEqual({ "/workspace/before": "yes" });
     expect(result.summary).toContain("Stopped in statement 1");
     expect(result.data).toMatchObject({ diagnostic: expect.stringContaining("File does not exist") });
   });
@@ -102,10 +117,10 @@ describe("browser program boundary", () => {
     "return fs.read('/workspace/x');",
     'await fs.list("/");'.repeat(33),
   ])("rejects unsupported source before executing anything: %s", async (source) => {
-    const { run, state, effect } = setup();
+    const { run, scratch, effect } = setup();
     expect(() => parseProgram(source)).toThrow();
     expect((await run(source)).ok).toBe(false);
-    expect(state.files.size).toBe(0);
+    expect(scratch.slots.size).toBe(0);
     expect(effect).not.toHaveBeenCalled();
   });
 
@@ -228,15 +243,77 @@ describe("browser program targeting", () => {
 
 describe("browser program tabs, files, and search", () => {
   it("keeps scratch files across runs, bounds them, and rejects host paths and traversal", async () => {
-    const { run, state, controller } = setup();
+    const { run, state, files, controller } = setup();
     expect((await run('await fs.write("/workspace/notes.md", "hello"); await fs.move("/workspace/notes.md", "/workspace/saved.md");')).ok).toBe(true);
-    const nextRun = new BrowserProgram(controller, state, () => {});
+    const nextRun = new BrowserProgram(controller, { state, sessionId: "s1", files }, () => {});
     expect((await nextRun.execute('return fs.read("/workspace/saved.md");', new AbortController().signal)).summary).toContain("hello");
     for (const path of ["/etc/passwd", "/workspace/../secret", "/workspace/./secret", "/workspace//secret"]) {
       expect((await run(`return fs.read(${JSON.stringify(path)});`)).ok).toBe(false);
     }
     expect((await run('await fs.remove("/workspace/saved.md");')).ok).toBe(true);
-    expect(state.files.size).toBe(0);
+    expect(await files.paths()).toEqual([]);
+  });
+
+  it("persists each scratch-file change to one slot before reporting it, loading the session's files on first use", async () => {
+    const scratch = memoryStore([{ slot: 3, path: "/workspace/kept.md", content: "from last week" }]);
+    const files = new ScratchFiles(scratch.store);
+    const { controller } = setup();
+    const program = new BrowserProgram(controller, { state: new WorkspaceState(), sessionId: "s1", files }, () => {});
+    const run = (source: string) => program.execute(source, new AbortController().signal);
+    expect(scratch.store.load).not.toHaveBeenCalled();
+
+    expect((await run('return fs.read("/workspace/kept.md");')).summary).toBe("from last week");
+    expect((await run('await fs.write("/workspace/a.md", "A"); await fs.write("/workspace/a.md", "A2"); await fs.move("/workspace/kept.md", "/workspace/old.md");')).ok).toBe(true);
+    expect([...scratch.slots.entries()].map(([slot, entry]) => [slot, entry.path, entry.content])).toEqual([
+      [3, "/workspace/old.md", "from last week"], [0, "/workspace/a.md", "A2"],
+    ]);
+    expect(scratch.store.load).toHaveBeenCalledTimes(1);
+
+    // A failed write reports no change and leaves the file as it was.
+    vi.mocked(scratch.store.write).mockRejectedValueOnce(new Error("Quota exceeded"));
+    const failed = await run('await fs.write("/workspace/a.md", "lost");');
+    expect(failed.ok).toBe(false);
+    expect(failed.summary).toContain("Could not save the workspace change");
+    expect((await run('return fs.read("/workspace/a.md");')).summary).toBe("A2");
+
+    await expect(files.write("/workspace/big.txt", "x".repeat(32_001))).rejects.toThrow("Workspace limit");
+    for (let n = 2; n < 64; n++) await files.write(`/workspace/f${n}.txt`, "");
+    expect((await run('return fs.write("/workspace/one-too-many.txt", "x");')).summary).toContain("64 files");
+    expect(scratch.slots.size).toBe(64);
+  });
+
+  it("uploads from the run's own session workspace", async () => {
+    const { controller, actions } = setup();
+    const state = new WorkspaceState();
+    const mine = new BrowserProgram(controller, { state, sessionId: "a", files: new ScratchFiles(memoryStore([{ slot: 0, path: "/workspace/cv.txt", content: "Mine" }]).store) }, () => {});
+    const other = new BrowserProgram(controller, { state, sessionId: "b", files: new ScratchFiles() }, () => {});
+    const upload = 'await browser.tab("/tabs/1/page.md").getByRole("file").setInputFiles("/workspace/cv.txt");';
+    expect((await other.execute(upload, new AbortController().signal)).summary).toContain("does not exist");
+    expect((await mine.execute(upload, new AbortController().signal)).ok).toBe(true);
+    expect(actions).toMatchObject([{ kind: "upload", files: [{ name: "cv.txt", text: "Mine" }] }]);
+  });
+
+  it("shows a run only its own session's agent tabs, and adopts moved tabs into its session", async () => {
+    const { controller, tabs, state } = setup();
+    const signal = new AbortController().signal;
+    const programFor = (sessionId: string) => new BrowserProgram(controller, { state, sessionId, files: new ScratchFiles() }, () => {});
+    const a = programFor("a");
+    const b = programFor("b");
+    expect((await a.execute('const page = await browser.open("https://example.com/a"); return page.path();', signal)).summary).toBe("/agent-tabs/2/page.md");
+    expect(state.agentTabs.get(2)).toMatchObject({ sessionId: "a", role: "agent" });
+
+    const listed = (await b.execute('return [fs.list("/tabs"), fs.list("/agent-tabs")];', signal)).summary;
+    expect(listed).toContain("/tabs/1/page.md");
+    expect(listed).not.toContain("/2/page.md");
+    for (const source of ['return fs.read("/agent-tabs/2/page.md");', 'return fs.read("/tabs/2/page.md");', 'return fs.remove("/tabs/2/page.md");', 'return fs.move("/tabs/2/page.md", "/agent-tabs/2/page.md");']) {
+      const result = await b.execute(source, signal);
+      expect(result.code, source).toBe("TARGET_MISSING");
+    }
+    expect(tabs.has(2)).toBe(true);
+
+    expect((await b.execute('return fs.move("/tabs/1/page.md", "/agent-tabs/1/page.md");', signal)).ok).toBe(true);
+    expect(state.agentTabs.get(1)).toMatchObject({ sessionId: "b", role: "agent" });
+    expect((await a.execute('return fs.list("/agent-tabs");', signal)).summary).not.toContain("/1/page.md");
   });
 
   it("opens hidden agent tabs, moves them into user tabs and closes exact targets", async () => {
@@ -273,9 +350,14 @@ describe("browser program tabs, files, and search", () => {
     expect(first.summary).toContain("via DuckDuckGo");
     expect(first.summary).toContain("1. 2020 Worldwide Box Office\n   https://www.boxofficemojo.com/year/world/2020/\n   Top grossing");
     expect(api.tabs.create).toHaveBeenCalledTimes(1);
-    expect(state.agentTabs.has(state.searchTabId!)).toBe(true);
+    expect(state.agentTabs.get(state.searchTab("s1")!)).toMatchObject({ sessionId: "s1", role: "search" });
     const second = await run('return web.search("obscure query");');
     expect(api.tabs.create).toHaveBeenCalledTimes(1);
     expect(second.summary).toContain("via Bing");
+    // Another session gets its own search tab rather than seeing this one.
+    const other = new BrowserProgram(new TabController(api), { state, sessionId: "s2", files: new ScratchFiles() }, () => {});
+    expect((await other.execute('return web.search("box office 2020");', new AbortController().signal)).ok).toBe(true);
+    expect(api.tabs.create).toHaveBeenCalledTimes(2);
+    expect(state.searchTab("s2")).not.toBe(state.searchTab("s1"));
   });
 });

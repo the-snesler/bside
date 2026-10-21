@@ -18,7 +18,7 @@ import type {
   PageSnapshotRequest,
 } from "@/lib/protocol";
 import type { DomAction, PageArtifactSummary, PageErrorCode, PageFindResult, PageSnapshot, SearchResult, ToolResult } from "@/lib/domain/tools";
-import { validateHttpUrl } from "@/lib/validation";
+import { isSessionId, validateHttpUrl } from "@/lib/validation";
 
 const NAVIGATION_TIMEOUT_MS = 10_000;
 const PROBE_DELAYS_MS = [100, 200, 400, 800, 1_600, 3_200];
@@ -27,16 +27,25 @@ export const DEFAULT_SNAPSHOT_CHARS = 16_000;
 export const ARTIFACT_SNAPSHOT_CHARS = 8_000;
 
 export const AGENT_TAB_TAG_KEY = "bside.agentTab";
-const AGENT_TAB_ROLES = ["agent", "search"] as const;
+export const AGENT_TAB_ROLES = ["agent", "search"] as const;
 
 /**
  * Session value marking a tab bside owns. Firefox keeps it with the tab across
  * browser restarts, session restore, and undo-close, whatever ID the tab gets.
  */
+export interface AgentTabTagV2 {
+  v: 2;
+  role: (typeof AGENT_TAB_ROLES)[number];
+  /** The chat session whose runs may use the tab; each session has its own search tab. */
+  sessionId: string;
+  /** When a program last used the tab; idle auto-close counts from this. */
+  lastUsedAt: number;
+}
+
+/** A tag from before agent tabs had an owning session. It names no session, so it is never adopted. */
 export interface AgentTabTagV1 {
   v: 1;
   role: (typeof AGENT_TAB_ROLES)[number];
-  /** When a program last used the tab; idle auto-close counts from this. */
   lastUsedAt: number;
 }
 
@@ -134,13 +143,13 @@ export class TabController {
     await this.#browserApi.tabs.remove(tabId);
   }
 
-  /** The tab's agent tag, or null when it has none or holds anything malformed. */
-  async agentTabTag(tabId: number): Promise<AgentTabTagV1 | null> {
+  /** The tab's agent tag (current or legacy), or null when it has none or holds anything malformed. */
+  async agentTabTag(tabId: number): Promise<AgentTabTagV2 | AgentTabTagV1 | null> {
     const value = await this.#browserApi.sessions?.getTabValue(tabId, AGENT_TAB_TAG_KEY);
     return isAgentTabTag(value) ? value : null;
   }
 
-  async tagAgentTab(tabId: number, tag: AgentTabTagV1): Promise<void> {
+  async tagAgentTab(tabId: number, tag: AgentTabTagV2): Promise<void> {
     if (!this.#browserApi.sessions) throw new Error("Session tab values are unavailable.");
     await this.#browserApi.sessions.setTabValue(tabId, AGENT_TAB_TAG_KEY, tag);
   }
@@ -339,10 +348,10 @@ export class TabController {
   }
 }
 
-function isAgentTabTag(value: unknown): value is AgentTabTagV1 {
+function isAgentTabTag(value: unknown): value is AgentTabTagV2 | AgentTabTagV1 {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
-  return v.v === 1 && (AGENT_TAB_ROLES as readonly unknown[]).includes(v.role) &&
+  return (v.v === 1 || (v.v === 2 && isSessionId(v.sessionId))) && (AGENT_TAB_ROLES as readonly unknown[]).includes(v.role) &&
     typeof v.lastUsedAt === "number" && Number.isFinite(v.lastUsedAt);
 }
 

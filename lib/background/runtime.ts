@@ -14,10 +14,11 @@
 import { AgentLoop } from "@/lib/background/agent-loop";
 import type { ApprovalBadge } from "@/lib/background/approval-badge";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
-import { WorkspaceState } from "@/lib/background/browser-program";
+import { ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
+import type { AgentTab } from "@/lib/background/browser-program";
 import type { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController } from "@/lib/background/tab-controller";
-import type { AgentTabTagV1, TabControllerBrowserApi } from "@/lib/background/tab-controller";
+import type { AgentTabTagV1, AgentTabTagV2, TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import { decodeProviderError, OpenAIProvider, ProviderStreamError } from "@/lib/providers/openai";
 import { OPENAI_PROVIDER, DEFAULT_MODEL_ID } from "@/lib/providers/openai-models";
 import {
@@ -31,6 +32,8 @@ import {
   getConversation,
   getHistorySettings,
   isSessionUntouched,
+  loadWorkspaceFiles,
+  workspaceStore,
   listSessions,
   migrateConversation,
   pruneSessions,
@@ -150,7 +153,8 @@ export class BackgroundRuntime {
   #agentTabSyncQueued = false;
   /** Serialized tag last read from or written to each owned tab, so unchanged tags are not rewritten. */
   #agentTabTags = new Map<number, string>();
-  #publishedAgentTabs = 0;
+  /** Serialized per-session counts last published. */
+  #publishedAgentTabs = "{}";
 
   constructor(
     sidebarHub: SidebarHub,
@@ -177,6 +181,9 @@ export class BackgroundRuntime {
     // a failed recovery offers no retry, and a failed restore leaves no agent
     // tabs owned. None may cut another short. Recovery runs after the
     // conversation migration, since a pre-sessions checkpoint recovers into it.
+    // Retention runs after agent-tab restoration, since it closes the tabs of
+    // the sessions it deletes.
+    const restored = this.#restoreAgentTabs();
     this.#ready = Promise.allSettled([
       migrateCredentials(),
       migrateConversation()
@@ -187,8 +194,9 @@ export class BackgroundRuntime {
           this.#retryable = { sessionId, hadPageEffect: lastTurnRanProgram((await getConversation(sessionId))?.items ?? []) };
         })
         .finally(() => this.#openSession())
+        .finally(() => restored.catch(() => {}))
         .then(() => this.#applyRetention()),
-      this.#restoreAgentTabs(),
+      restored,
     ]).then(() => {});
     await this.#ready;
     this.#clock.setInterval(() => {
@@ -216,17 +224,21 @@ export class BackgroundRuntime {
   async #closeIdleAgentTabs(): Promise<void> {
     if (this.#activeRun) return;
     const cutoff = this.#clock.now() - AGENT_TAB_IDLE_MS;
-    await this.#closeAgentTabs((lastUsedAt) => lastUsedAt <= cutoff);
+    await this.#closeAgentTabs((tab) => tab.lastUsedAt <= cutoff);
   }
 
-  /** Closes owned agent tabs matching `shouldClose`, stopping as soon as a run starts. */
-  async #closeAgentTabs(shouldClose: (lastUsedAt: number) => boolean): Promise<void> {
+  /**
+   * Closes owned agent tabs matching `shouldClose`. With `stopForRun`, stops
+   * as soon as a run starts; without it, the caller guarantees `shouldClose`
+   * never matches the active run's session.
+   */
+  async #closeAgentTabs(shouldClose: (tab: AgentTab) => boolean, stopForRun = true): Promise<void> {
     const tabController = this.#tabControllerFactory();
     for (const id of [...this.#workspace.agentTabs.keys()]) {
       // Re-read after every await: a run may have started or used the tab meanwhile.
-      const lastUsedAt = this.#workspace.agentTabs.get(id);
-      if (this.#activeRun) break;
-      if (lastUsedAt === undefined || !shouldClose(lastUsedAt)) continue;
+      const tab = this.#workspace.agentTabs.get(id);
+      if (stopForRun && this.#activeRun) break;
+      if (tab === undefined || !shouldClose(tab)) continue;
       try {
         await tabController.closeTab(id);
       } catch {
@@ -261,17 +273,21 @@ export class BackgroundRuntime {
    * (they selected it from the tab list, or Firefox showed it while bside was
    * disabled). Firefox applies a restored tab's hidden state and session values
    * in the same restore step, so a visible tag is not a tab still being restored.
+   *
+   * A legacy v1 tag names no owning session, so its tab is never adopted:
+   * a hidden one is shown and untagged, handing it to the user like a visible
+   * one. If Firefox cannot show it, the tag stays and the next startup retries.
    * Returns whether the tab was adopted.
    */
-  async #claimTaggedTab(tabController: TabController, tabId: number, tag: AgentTabTagV1, hidden: boolean): Promise<boolean> {
+  async #claimTaggedTab(tabController: TabController, tabId: number, tag: AgentTabTagV2 | AgentTabTagV1, hidden: boolean): Promise<boolean> {
     if (this.#workspace.agentTabs.has(tabId)) return false;
-    if (!hidden) {
+    if (!hidden || tag.v === 1) {
+      if (hidden && !(await tabController.showTab(tabId).then(() => true, () => false))) return false;
       await tabController.untagAgentTab(tabId).catch(() => {});
       return false;
     }
-    this.#workspace.agentTabs.set(tabId, tag.lastUsedAt);
+    this.#workspace.agentTabs.set(tabId, { sessionId: tag.sessionId, role: tag.role, lastUsedAt: tag.lastUsedAt });
     this.#agentTabTags.set(tabId, JSON.stringify(tag));
-    if (tag.role === "search" && this.#workspace.searchTabId === null) this.#workspace.searchTabId = tabId;
     return true;
   }
 
@@ -294,7 +310,6 @@ export class BackgroundRuntime {
     const tabController = this.#tabControllerFactory();
     const open = new Set((await tabController.allTabs()).map((tab) => tab.id!));
     for (const id of listed) if (!open.has(id)) this.#workspace.agentTabs.delete(id);
-    if (this.#workspace.searchTabId !== null && !this.#workspace.agentTabs.has(this.#workspace.searchTabId)) this.#workspace.searchTabId = null;
     const writes: Promise<void>[] = [];
     for (const id of this.#agentTabTags.keys()) {
       if (this.#workspace.agentTabs.has(id)) continue;
@@ -302,19 +317,28 @@ export class BackgroundRuntime {
       if (!open.has(id)) this.#agentTabTags.delete(id);
       else writes.push(tabController.untagAgentTab(id).then(() => { this.#agentTabTags.delete(id); }));
     }
-    for (const [id, lastUsedAt] of this.#workspace.agentTabs) {
+    for (const [id, { sessionId, role, lastUsedAt }] of this.#workspace.agentTabs) {
       if (!open.has(id)) continue;
-      const tag: AgentTabTagV1 = { v: 1, role: id === this.#workspace.searchTabId ? "search" : "agent", lastUsedAt };
+      const tag: AgentTabTagV2 = { v: 2, role, sessionId, lastUsedAt };
       const serialized = JSON.stringify(tag);
       if (this.#agentTabTags.get(id) === serialized) continue;
       writes.push(tabController.tagAgentTab(id, tag).then(() => { this.#agentTabTags.set(id, serialized); }));
     }
     // A failed write leaves its cached tag stale, so the next sync retries it.
     await Promise.allSettled(writes);
-    if (this.#workspace.agentTabs.size !== this.#publishedAgentTabs) {
-      this.#publishedAgentTabs = this.#workspace.agentTabs.size;
-      this.#sidebarHub.publishAgentTabs(this.#publishedAgentTabs);
+    const counts = this.#agentTabCounts();
+    const serialized = JSON.stringify(counts);
+    if (serialized !== this.#publishedAgentTabs) {
+      this.#publishedAgentTabs = serialized;
+      this.#sidebarHub.publishAgentTabs(counts);
     }
+  }
+
+  /** Owned agent tabs per session, for the sidebar header and the history drawer. */
+  #agentTabCounts(): Record<string, number> {
+    const counts: Record<string, number> = {};
+    for (const { sessionId } of this.#workspace.agentTabs.values()) counts[sessionId] = (counts[sessionId] ?? 0) + 1;
+    return counts;
   }
 
   /** The open session's id, resolved once and kept in step with `local:openConversation`. */
@@ -347,7 +371,7 @@ export class BackgroundRuntime {
       provider,
       settings,
       page: this.#sidebarHub.currentAttachment(),
-      agentTabs: this.#workspace.agentTabs.size,
+      agentTabs: this.#agentTabCounts(),
       activeRun: this.#activeRun
         ? {
             runId: this.#activeRun.runId,
@@ -368,8 +392,11 @@ export class BackgroundRuntime {
   async handleCommand(command: SidebarCommand): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]> {
     await this.#ready;
     if (command.type === "tabs.list") {
-      const tabs = await this.#tabControllerFactory().listTabs();
-      return { tabs: tabs.map((tab) => ({ id: tab.id!, title: tab.title ?? "", url: tab.url!, path: `/${this.#workspace.agentTabs.has(tab.id!) ? "agent-tabs" : "tabs"}/${tab.id}/page.md` })) };
+      // As the open session's runs see them: other sessions' agent tabs are left out.
+      const openId = await this.#openSession();
+      const owner = (id: number) => this.#workspace.agentTabs.get(id)?.sessionId;
+      const tabs = (await this.#tabControllerFactory().listTabs()).filter((tab) => owner(tab.id!) === undefined || owner(tab.id!) === openId);
+      return { tabs: tabs.map((tab) => ({ id: tab.id!, title: tab.title ?? "", url: tab.url!, path: `/${owner(tab.id!) ? "agent-tabs" : "tabs"}/${tab.id}/page.md` })) };
     }
     if (command.type === "tabs.focus") {
       // Agent tabs are hidden workspace tabs; activating one would unhide it.
@@ -380,7 +407,7 @@ export class BackgroundRuntime {
       // Refused rather than deferred while a run is active: the run may be using
       // these tabs, and a deferred close would fire after the user moved on.
       if (this.#activeRun) return;
-      await this.#closeAgentTabs(() => true);
+      await this.#closeAgentTabs((tab) => tab.sessionId === command.sessionId);
       return;
     }
     if (command.type === "settings.save") {
@@ -417,9 +444,9 @@ export class BackgroundRuntime {
   }
 
   /**
-   * One session as Markdown. The latest run's diagnostics, model input, tool
-   * output, and scratch files describe one session, so they are included only
-   * when exporting that session.
+   * One session as Markdown, with its scratch files. The latest run's
+   * diagnostics, model input, and tool output describe one session, so they
+   * are included only when exporting that session.
    */
   async #exportSession(sessionId: string): Promise<{ markdown: string; filename: string } | undefined> {
     const conversation = await getConversation(sessionId);
@@ -429,6 +456,7 @@ export class BackgroundRuntime {
       return undefined;
     }
     const latestRun = this.#debugSessionId === sessionId;
+    const files = await loadWorkspaceFiles(sessionId).catch(() => null);
     const fence = (text: string) => {
       const delimiter = "`".repeat(Math.max(3, ...[...text.matchAll(/`+/g)].map((match) => match[0].length + 1)));
       return `${delimiter}\n${text}\n${delimiter}`;
@@ -439,12 +467,13 @@ export class BackgroundRuntime {
       latestRun && this.#runRecord ? fence(JSON.stringify(this.#runRecord, null, 2)) : "No run recorded for this chat in this background session.",
       "## Latest model input", "This is the most recent request, not an exact live token count. It is held in memory only; after an extension restart only the saved conversation remains. It may include private page content. Credentials are not included.",
       latestRun && this.#latestContext ? fence(this.#latestContext) : "No model input captured for this chat in this background session.",
-      "## Full tool output — latest run", "Exact tool results, including bounded page snapshots and errors. Retained only until the next run, New chat, deleting that run's chat, or extension restart. These are the snapshots exposed to the agent, not the entire page DOM.",
+      "## Full tool output — latest run", "Exact tool results, including bounded page snapshots and errors. Retained only until the next run, deleting that run's chat, or extension restart. These are the snapshots exposed to the agent, not the entire page DOM.",
       latestRun && this.#debugOutputTruncated ? "Earlier results were dropped to keep the debug buffer below 2 million characters." : "No tool results dropped from this run.",
       latestRun && this.#debugOutputs.length ? fence(`[\n${this.#debugOutputs.join(",\n")}\n]`) : "No tool output captured for this chat in this background session.",
       "## Conversation log", fence(JSON.stringify(conversation, null, 2)),
       "## Partial response", fence(this.#activeRun?.sessionId === sessionId ? this.#activeRun.partialAssistantText : ""),
-      "## Scratch files", latestRun ? fence(JSON.stringify(Object.fromEntries(this.#workspace.files), null, 2)) : "Scratch files are exported with the latest run's chat.",
+      "## Scratch files", "This chat's /workspace files, kept until the chat is deleted.",
+      files ? fence(JSON.stringify(Object.fromEntries(files.map((file) => [file.path, file.content])), null, 2)) : "The scratch files could not be read.",
     ].join("\n\n") };
   }
 
@@ -476,18 +505,22 @@ export class BackgroundRuntime {
 
   /**
    * Deletes unpinned sessions not updated within the retention period. The
-   * open session and the active run's session are never pruned. Returns the
-   * number deleted.
+   * open session and the active run's session are never pruned. Also closes
+   * agent tabs whose session no longer exists (one deleted while its tabs
+   * could not be closed, or restored from an older profile). Returns the
+   * number of sessions deleted.
    */
   async #applyRetention(): Promise<number> {
     this.#lastRetentionAt = this.#clock.now();
     // Never blocks runs: a run only starts in the open session, which is kept.
     const deleted = await this.#queueSessionOp(async () => {
       const cutoff = retentionCutoff((await getHistorySettings()).retention, this.#clock.now());
-      if (cutoff === null) return [];
       const keep = [await this.#openSession(), ...(this.#activeRun ? [this.#activeRun.sessionId] : [])];
-      const ids = await pruneSessions(cutoff, keep);
-      this.#forgetSessions(ids);
+      const ids = cutoff === null ? [] : await pruneSessions(cutoff, keep);
+      await this.#forgetSessions(ids, true);
+      const live = new Set((await listSessions()).map((session) => session.id));
+      const orphaned = (tab: AgentTab) => !live.has(tab.sessionId);
+      if ([...this.#workspace.agentTabs.values()].some(orphaned)) await this.#closeAgentTabs(orphaned, false);
       return ids;
     }, false);
     if (deleted.length > 0) await this.#publishSessions();
@@ -496,24 +529,20 @@ export class BackgroundRuntime {
 
   /**
    * "Delete all history": every session except the active run's, pinned ones
-   * included. A deleted open session is replaced by a new empty one. With no
-   * run active, scratch files and the debug buffers are cleared too.
+   * included, with their scratch files and agent tabs. A deleted open session
+   * is replaced by a new empty one.
    */
   async #deleteAllHistory(): Promise<string> {
     const { deleted, kept } = await this.#queueSessionOp(async () => {
       const kept = this.#activeRun?.sessionId ?? null;
       const openId = await this.#openSession();
       const deleted = await deleteAllSessions(kept ? [kept] : []);
-      this.#forgetSessions(deleted);
       if (deleted.includes(openId)) {
         const { id } = await createSession();
         await setOpenSessionId(id);
         this.#openSessionId = id;
       }
-      if (!this.#activeRun) {
-        this.#workspace.files.clear();
-        this.#clearDebugBuffers();
-      }
+      await this.#forgetSessions(deleted, true);
       return { deleted, kept };
     });
     await this.#sidebarHub.broadcastSnapshot();
@@ -522,10 +551,26 @@ export class BackgroundRuntime {
     return kept ? `${count} The chat with the active run was kept.` : count;
   }
 
-  /** Drops retry and debug state that described deleted sessions. */
-  #forgetSessions(ids: readonly string[]): void {
+  /**
+   * Drops retry and debug state that described deleted sessions, and closes
+   * their agent tabs, or with `closeTabs` false shows them and hands them to
+   * the user (a tab Firefox cannot show is closed). Never a running session:
+   * deletion and pruning both spare the active run's.
+   */
+  async #forgetSessions(ids: readonly string[], closeTabs: boolean): Promise<void> {
     if (this.#retryable && ids.includes(this.#retryable.sessionId)) this.#retryable = null;
     if (this.#debugSessionId !== null && ids.includes(this.#debugSessionId)) this.#clearDebugBuffers();
+    const owned = (tab: AgentTab) => ids.includes(tab.sessionId);
+    if (![...this.#workspace.agentTabs.values()].some(owned)) return;
+    if (!closeTabs) {
+      const tabController = this.#tabControllerFactory();
+      for (const [id, tab] of [...this.#workspace.agentTabs]) {
+        if (!owned(tab) || !(await tabController.showTab(id).then(() => true, () => false))) continue;
+        this.#workspace.observed.delete(id);
+        this.#workspace.releaseTab(id);
+      }
+    }
+    await this.#closeAgentTabs(owned, false);
   }
 
   async #applySessionCommand(command: SessionCommand): Promise<void> {
@@ -534,11 +579,6 @@ export class BackgroundRuntime {
       // An untouched open session already is a new chat. The active run's
       // session counts as touched even before its user message is written.
       if (this.#activeRun?.sessionId === openId || !(await isSessionUntouched(openId))) await this.#switchSession((await createSession()).id);
-      // Scratch files and debug buffers belong to the active run while there is one.
-      if (!this.#activeRun) {
-        this.#workspace.files.clear();
-        this.#clearDebugBuffers();
-      }
       return;
     }
     if (command.type === "session.open") {
@@ -563,7 +603,7 @@ export class BackgroundRuntime {
       return;
     }
     await deleteSession(command.sessionId);
-    this.#forgetSessions([command.sessionId]);
+    await this.#forgetSessions([command.sessionId], command.closeAgentTabs);
     if (command.sessionId === openId) {
       // Opens the most recently updated remaining session, or a new empty one.
       this.#openSessionId = null;
@@ -719,7 +759,9 @@ export class BackgroundRuntime {
     const runId = crypto.randomUUID();
     const controller = new AbortController();
     const tabController = this.#tabControllerFactory();
-    const agentLoop = new AgentLoop(this.#provider, tabController, this.#sidebarHub, this.#workspace);
+    // The session's scratch files load on the first program that uses them.
+    const scope = { state: this.#workspace, sessionId, files: new ScratchFiles(workspaceStore(sessionId)) };
+    const agentLoop = new AgentLoop(this.#provider, tabController, this.#sidebarHub, scope);
     const run: ActiveRun = this.#activeRun = {
       runId,
       sessionId,
@@ -925,9 +967,9 @@ export class BackgroundRuntime {
   #keepRunTabsAlive(since: number): void {
     const now = this.#clock.now();
     let touched = false;
-    for (const [id, lastUsedAt] of this.#workspace.agentTabs) {
-      if (lastUsedAt < since) continue;
-      this.#workspace.agentTabs.set(id, now);
+    for (const tab of this.#workspace.agentTabs.values()) {
+      if (tab.lastUsedAt < since) continue;
+      tab.lastUsedAt = now;
       touched = true;
     }
     if (touched) void this.#queueAgentTabSync();

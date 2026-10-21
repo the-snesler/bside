@@ -19,6 +19,7 @@ import {
   getRunCheckpoint,
   hasChatGPTSignInNotice,
   listSessions,
+  loadWorkspaceFiles,
   migrateConversation,
   migrateCredentials,
   pruneSessions,
@@ -29,15 +30,18 @@ import {
   saveRunCheckpoint,
   touchSession,
   updateSession,
+  workspaceStore,
 } from "@/lib/storage";
 import { titleFromPrompt, type ConversationItem } from "@/lib/domain/conversation";
 
 const message = (id: string, text = id): ConversationItem => ({ id, kind: "message", role: "assistant", text, at: 1 });
 const prompt = (id: string, text: string): ConversationItem => ({ id, kind: "message", role: "user", text, context: null, at: 1 });
 
+/** A session with `count` items and one scratch file in its last workspace slot. */
 async function sessionWith(count: number): Promise<string> {
   const { id } = await createSession();
   for (let i = 0; i < count; i += 1) await appendConversationItem(id, message(`m${i}`));
+  await workspaceStore(id).write({ slot: 63, path: "/workspace/notes.md", content: "Scratch" });
   return id;
 }
 
@@ -388,6 +392,34 @@ describe("storage: sessions", () => {
     expect(await getOpenSessionId()).toBeNull();
     expect((await listSessions()).map((session) => session.id)).toEqual([keep]);
     expect(await ensureOpenSession()).toBe(keep);
+  });
+});
+
+describe("storage: session workspace", () => {
+  it("stores each file in its own slot record and reads back only the session's files", async () => {
+    const a = workspaceStore("a");
+    await a.write({ slot: 0, path: "/workspace/x.md", content: "X" });
+    await a.write({ slot: 5, path: "/workspace/dir/y.csv", content: "1,2" });
+    await workspaceStore("b").write({ slot: 0, path: "/workspace/x.md", content: "Other chat" });
+    expect((await browser.storage.local.get("workspace:a:5"))["workspace:a:5"]).toEqual({ version: 1, path: "/workspace/dir/y.csv", content: "1,2" });
+    expect(await loadWorkspaceFiles("a")).toEqual([{ slot: 0, path: "/workspace/x.md", content: "X" }, { slot: 5, path: "/workspace/dir/y.csv", content: "1,2" }]);
+    await a.remove(0);
+    expect(await loadWorkspaceFiles("a")).toEqual([{ slot: 5, path: "/workspace/dir/y.csv", content: "1,2" }]);
+  });
+
+  it("revalidates files on read, deleting malformed, oversized, traversing, and duplicate ones", async () => {
+    await browser.storage.local.set({
+      "workspace:a:0": { version: 1, path: "/workspace/ok.md", content: "fine" },
+      "workspace:a:1": { version: 2, path: "/workspace/v2.md", content: "unknown version" },
+      "workspace:a:2": { version: 1, path: "/workspace/big.md", content: "x".repeat(32_001) },
+      "workspace:a:3": { version: 1, path: "/workspace/../etc/passwd", content: "no" },
+      "workspace:a:4": { version: 1, path: "/workspace/ok.md", content: "duplicate" },
+      "workspace:a:5": "corrupt",
+      "workspace:a:6": { version: 1, path: "/workspace/max.md", content: "y".repeat(32_000) },
+      "workspace:a:64": { version: 1, path: "/workspace/out-of-range.md", content: "never read" },
+    });
+    expect((await loadWorkspaceFiles("a")).map((file) => [file.slot, file.path])).toEqual([[0, "/workspace/ok.md"], [6, "/workspace/max.md"]]);
+    expect(Object.keys(await browser.storage.local.get(null)).sort()).toEqual(["workspace:a:0", "workspace:a:6", "workspace:a:64"]);
   });
 });
 

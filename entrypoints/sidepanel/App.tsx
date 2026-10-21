@@ -73,6 +73,7 @@ export function App() {
     provider.models[0];
   const turns = buildTurns(conversation.items, runHere);
   const pendingApproval = runHere ? activeRun.pendingApproval : null;
+  const chatAgentTabs = agentTabs[conversation.id] ?? 0;
 
   return (
     <div class="sidebar">
@@ -97,17 +98,17 @@ export function App() {
           <h1 class="sidebar__title" title={conversation.title || undefined}>bside</h1>
         </div>
         <div class="sidebar__header-actions">
-          {agentTabs > 0 && (
+          {chatAgentTabs > 0 && (
             <button
               type="button"
               class="icon-button agent-tabs-button"
               disabled={activeRun !== null}
-              onClick={closeAgentTabs}
-              aria-label={`Close ${agentTabs} agent ${agentTabs === 1 ? "tab" : "tabs"}`}
-              title={`Close ${agentTabs} hidden agent ${agentTabs === 1 ? "tab" : "tabs"} (unused ones close after 30 minutes)`}
+              onClick={() => closeAgentTabs(conversation.id)}
+              aria-label={`Close this chat's ${chatAgentTabs} agent ${chatAgentTabs === 1 ? "tab" : "tabs"}`}
+              title={`Close this chat's ${chatAgentTabs} hidden agent ${chatAgentTabs === 1 ? "tab" : "tabs"} (unused ones close after 30 minutes)`}
             >
               <BrowserX />
-              <span>{agentTabs}</span>
+              <span>{chatAgentTabs}</span>
             </button>
           )}
           <button
@@ -337,6 +338,7 @@ export function App() {
             sessions={sessions}
             openId={conversation.id}
             run={activeRun && { conversationId: activeRun.conversationId, awaitingApproval: activeRun.pendingApproval !== null }}
+            agentTabs={agentTabs}
             now={Date.now()}
             onOpen={(sessionId) => {
               closeHistory();

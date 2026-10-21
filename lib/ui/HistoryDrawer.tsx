@@ -1,7 +1,9 @@
 /**
  * Sidebar history drawer: the background's session index (pinned first, then
  * most recent), filtered by title, with per-row open, rename, pin, export, and
- * delete. Every action is a background command; titles are untrusted text.
+ * delete. Deleting a chat that owns hidden agent tabs asks whether to close
+ * them or keep them as ordinary tabs. Every action is a background command;
+ * titles are untrusted text.
  */
 
 import { useEffect, useRef, useState } from "preact/hooks";
@@ -20,12 +22,15 @@ export interface HistoryDrawerProps {
   openId: string;
   /** The single active run, if any. */
   run: { conversationId: string; awaitingApproval: boolean } | null;
+  /** Hidden agent tabs per session id. */
+  agentTabs: Readonly<Record<string, number>>;
   now: number;
   onOpen(sessionId: string): void;
   onRename(sessionId: string, title: string): void;
   onPin(sessionId: string, pinned: boolean): void;
   onExport(sessionId: string): void;
-  onDelete(sessionId: string): void;
+  /** `closeAgentTabs` false keeps the chat's agent tabs, shown as ordinary tabs. */
+  onDelete(sessionId: string, closeAgentTabs: boolean): void;
   onClose(): void;
 }
 
@@ -111,7 +116,7 @@ function Group({ label, sessions, ...props }: RowProps & { label: string | null 
 
 type RowMode = "idle" | "renaming" | "confirming";
 
-function Row({ session, openId, run, now, onOpen, onRename, onPin, onExport, onDelete, focusSearch }: Omit<RowProps, "sessions" | "onClose"> & { session: ConversationSummary }) {
+function Row({ session, openId, run, agentTabs, now, onOpen, onRename, onPin, onExport, onDelete, focusSearch }: Omit<RowProps, "sessions" | "onClose"> & { session: ConversationSummary }) {
   const [mode, setMode] = useState<RowMode>("idle");
   const previousMode = useRef<RowMode>("idle");
   /** Set once a rename finished, so the blur that follows Enter or Escape does not finish it again. */
@@ -138,6 +143,14 @@ function Row({ session, openId, run, now, onOpen, onRename, onPin, onExport, onD
   const isOpen = session.id === openId;
   const runHere = run?.conversationId === session.id;
   const updated = new Date(session.updatedAt);
+  const tabs = agentTabs[session.id] ?? 0;
+  const tabsLabel = `${tabs} hidden ${tabs === 1 ? "tab" : "tabs"}`;
+  const confirmDelete = (closeAgentTabs: boolean) => {
+    onDelete(session.id, closeAgentTabs);
+    // The row goes away once the background confirms; keep focus inside the drawer.
+    focusSearch();
+    setMode("idle");
+  };
 
   const finishRename = (value: string | null) => {
     if (renameDone.current) return;
@@ -148,7 +161,7 @@ function Row({ session, openId, run, now, onOpen, onRename, onPin, onExport, onD
   };
 
   return (
-    <li class="history__row" data-open={isOpen || undefined} aria-current={isOpen ? "true" : undefined}>
+    <li class="history__row" data-open={isOpen || undefined} data-wrap={(mode === "confirming" && tabs > 0) || undefined} aria-current={isOpen ? "true" : undefined}>
       {mode === "renaming" ? (
         <input
           ref={renameInput}
@@ -174,6 +187,7 @@ function Row({ session, openId, run, now, onOpen, onRename, onPin, onExport, onD
           <span class="history__meta">
             <time dateTime={updated.toISOString()} title={updated.toLocaleString()}>{formatRelativeTime(session.updatedAt, now)}</time>
             {isOpen && " · Current"}
+            {tabs > 0 && ` · ${tabsLabel}`}
             {runHere && <span class="history__status">{run!.awaitingApproval ? " · Needs confirmation" : " · Working"}</span>}
           </span>
         </button>
@@ -182,6 +196,7 @@ function Row({ session, openId, run, now, onOpen, onRename, onPin, onExport, onD
         <div
           key="confirm"
           class="history__confirm"
+          data-tabs={tabs > 0 || undefined}
           role="group"
           aria-label={`Delete ${label}?`}
           onKeyDown={(event) => {
@@ -191,19 +206,12 @@ function Row({ session, openId, run, now, onOpen, onRename, onPin, onExport, onD
             setMode("idle");
           }}
         >
-          <span>Delete?</span>
+          <span>{tabs > 0 ? `Delete? It has ${tabsLabel}.` : "Delete?"}</span>
           <button type="button" ref={cancelButton} onClick={() => setMode("idle")}>Cancel</button>
-          <button
-            type="button"
-            class="history__danger"
-            onClick={() => {
-              onDelete(session.id);
-              // The row goes away once the background confirms; keep focus inside the drawer.
-              focusSearch();
-              setMode("idle");
-            }}
-          >
-            Delete
+          {/* Plain Delete passes closeAgentTabs: tabs the chat gained after this row rendered are closed, not suddenly shown. */}
+          {tabs > 0 && <button type="button" onClick={() => confirmDelete(false)}>Delete, keep tabs</button>}
+          <button type="button" class="history__danger" onClick={() => confirmDelete(true)}>
+            {tabs > 0 ? "Delete and close tabs" : "Delete"}
           </button>
         </div>
       ) : mode === "idle" && (

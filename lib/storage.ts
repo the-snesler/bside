@@ -17,7 +17,8 @@ import { COMPACTION_SUMMARY_MAX_CHARS, HISTORY_RETENTIONS, titleFromPrompt } fro
 import { digestFromItems, isValidRunDigest } from "@/lib/domain/run-digest";
 import { DEFAULT_MODEL_ID, DEFAULT_REASONING_EFFORT } from "@/lib/providers/openai-models";
 import { deviceKey, type DeviceKey } from "@/lib/background/device-key";
-import { isSessionId } from "@/lib/validation";
+import { isSessionId, isWorkspacePath, WORKSPACE_MAX_FILE_CHARS, WORKSPACE_MAX_FILES } from "@/lib/validation";
+import type { ScratchFileEntry, ScratchStore } from "@/lib/background/browser-program";
 
 export type { AppSettingsV1 } from "@/lib/domain/provider";
 
@@ -336,6 +337,7 @@ export async function migrateCredentials(key: DeviceKey = deviceKey): Promise<vo
 //   local:conversation:<id>            ConversationRecordV2 (item count; the commit point for appends)
 //   local:conversation:<id>:items:<n>  ConversationChunkV1 (items n*CHUNK .. n*CHUNK+CHUNK-1)
 //   local:openConversation             OpenConversationV1 (the session the sidebar shows)
+//   local:workspace:<id>:<slot>        WorkspaceFileV1 (one /workspace file of the session; see below)
 //
 // An append writes only the tail chunk and the session record, in one
 // `storage.local.set`, so its cost does not grow with history. The index is
@@ -611,24 +613,24 @@ export function updateSession(id: string, patch: { title?: string; pinned?: bool
   });
 }
 
-/** Deletes a session's items, record, and index entry, in that order, and clears the open pointer if it pointed there. */
+/** Deletes a session's items, record, and scratch files, then its index entry, and clears the open pointer if it pointed there. */
 export function deleteSession(id: string): Promise<void> {
   return withConversationLock(async () => {
     const sessions = await readIndex();
     const entry = sessions.find((session) => session.id === id);
     const record = await readRecord(id);
-    await storage.removeItems([recordKey(id), ...chunkKeys(id, Math.max(record?.itemCount ?? 0, entry?.itemCount ?? 0))]);
+    await storage.removeItems([recordKey(id), ...chunkKeys(id, Math.max(record?.itemCount ?? 0, entry?.itemCount ?? 0)), ...workspaceKeys(id)]);
     if (entry) await writeIndex(sessions.filter((session) => session !== entry));
     if ((await openConversationItem.getValue())?.id === id) await openConversationItem.removeValue();
   });
 }
 
-/** Deletes several sessions' items and records, then their index entries in one write. Clears the open pointer if it pointed at one. */
+/** Deletes several sessions' items, records, and scratch files, then their index entries in one write. Clears the open pointer if it pointed at one. */
 async function removeSessions(sessions: ConversationSummary[], doomed: readonly ConversationSummary[]): Promise<void> {
   if (doomed.length === 0) return;
   const records = await Promise.all(doomed.map((session) => readRecord(session.id)));
   await storage.removeItems(doomed.flatMap((session, i) =>
-    [recordKey(session.id), ...chunkKeys(session.id, Math.max(records[i]?.itemCount ?? 0, session.itemCount))]));
+    [recordKey(session.id), ...chunkKeys(session.id, Math.max(records[i]?.itemCount ?? 0, session.itemCount)), ...workspaceKeys(session.id)]));
   const ids = new Set(doomed.map((session) => session.id));
   await writeIndex(sessions.filter((session) => !ids.has(session.id)));
   const open = await openConversationItem.getValue();
@@ -723,6 +725,54 @@ export async function migrateConversation(): Promise<void> {
     }
   });
   await legacyConversationItem.removeValue();
+}
+
+// ---------------------------------------------------------------------------
+// Workspace — each session's /workspace scratch files, one key per file slot.
+//
+// A session has WORKSPACE_MAX_FILES fixed slots, so writing, removing, or
+// renaming a file touches one key of at most WORKSPACE_MAX_FILE_CHARS, never
+// the whole workspace, and deleting a session removes a known key set without
+// listing storage. The slot record carries its path; there is no separate
+// manifest that could disagree with the files.
+// ---------------------------------------------------------------------------
+
+export interface WorkspaceFileV1 {
+  version: 1;
+  path: string;
+  content: string;
+}
+
+const workspaceKey = (id: string, slot: number) => `local:workspace:${id}:${slot}` as const;
+const workspaceKeys = (id: string) => Array.from({ length: WORKSPACE_MAX_FILES }, (_, slot) => workspaceKey(id, slot));
+
+function isValidWorkspaceFile(value: unknown): value is WorkspaceFileV1 {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return v.version === 1 && isWorkspacePath(v.path) && typeof v.content === "string" && v.content.length <= WORKSPACE_MAX_FILE_CHARS;
+}
+
+/** A session's scratch files by slot. Malformed slots and later duplicates of a path are deleted. */
+export async function loadWorkspaceFiles(sessionId: string): Promise<ScratchFileEntry[]> {
+  const slots = await storage.getItems(workspaceKeys(sessionId));
+  const files: ScratchFileEntry[] = [];
+  const invalid: (typeof slots)[number]["key"][] = [];
+  for (const [slot, { key, value }] of slots.entries()) {
+    if (value === null || value === undefined) continue;
+    if (isValidWorkspaceFile(value) && !files.some((file) => file.path === value.path)) files.push({ slot, path: value.path, content: value.content });
+    else invalid.push(key);
+  }
+  if (invalid.length > 0) await storage.removeItems(invalid);
+  return files;
+}
+
+/** Persistence for one session's `/workspace`, used by its runs' programs. */
+export function workspaceStore(sessionId: string): ScratchStore {
+  return {
+    load: () => loadWorkspaceFiles(sessionId),
+    write: ({ slot, path, content }) => storage.setItem(workspaceKey(sessionId, slot), { version: 1, path, content } satisfies WorkspaceFileV1),
+    remove: (slot) => storage.removeItem(workspaceKey(sessionId, slot)),
+  };
 }
 
 // ---------------------------------------------------------------------------
