@@ -14,7 +14,7 @@
 import type { Browser } from "wxt/browser";
 import { isSidebarCommand, SIDEBAR_PORT_NAME } from "@/lib/protocol";
 import type { RuntimeSnapshot, SidebarCommand, SidebarEvent, TabMention } from "@/lib/protocol";
-import type { ConversationSummary } from "@/lib/domain/conversation";
+import type { ConversationSummary, QueuedMessage } from "@/lib/domain/conversation";
 import type { PageArtifactSummary } from "@/lib/domain/tools";
 
 const MAX_REPLAY_EVENTS = 512;
@@ -25,7 +25,7 @@ export interface SidebarHubDelegate {
   handleCommand(command: SidebarCommand): Promise<{ markdown: string; filename: string } | { tabs: TabMention[] } | { sessions: ConversationSummary[] } | void>;
 }
 
-type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" | "agent-tabs.changed" | "context.exported" | "tabs.listed" | "session.listed" }>;
+type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" | "agent-tabs.changed" | "queue.changed" | "context.exported" | "tabs.listed" | "session.listed" }>;
 
 export class SidebarHub {
   delegate: SidebarHubDelegate | null = null;
@@ -91,6 +91,20 @@ export class SidebarHub {
       type: "session.listed",
       at: Date.now(),
       payload: { sessions },
+    };
+    for (const port of this.#ports) port.postMessage(event);
+  }
+
+  /** Broadcasts one session's message queue after it changes. Not run-sequenced, like `agent-tabs.changed`. */
+  publishQueue(sessionId: string, messages: QueuedMessage[]): void {
+    const event: SidebarEvent = {
+      v: 1,
+      runId: null,
+      conversationId: sessionId,
+      seq: this.#lastSeq,
+      type: "queue.changed",
+      at: Date.now(),
+      payload: { messages },
     };
     for (const port of this.#ports) port.postMessage(event);
   }

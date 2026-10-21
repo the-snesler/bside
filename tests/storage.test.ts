@@ -17,6 +17,8 @@ import {
   getChatGPTCredential,
   getHistorySettings,
   getRunCheckpoint,
+  loadMessageQueue,
+  saveMessageQueue,
   hasChatGPTSignInNotice,
   listSessions,
   loadWorkspaceFiles,
@@ -392,6 +394,36 @@ describe("storage: sessions", () => {
     expect(await getOpenSessionId()).toBeNull();
     expect((await listSessions()).map((session) => session.id)).toEqual([keep]);
     expect(await ensureOpenSession()).toBe(keep);
+  });
+});
+
+describe("storage: message queue", () => {
+  it("round-trips a session's queue, deletes it with the session, and drops malformed records", async () => {
+    const id = (await createSession()).id;
+    const queue = [{ id: "q1", mode: "follow-up" as const, text: "Then summarize", at: 1 }, { id: "q2", mode: "steer" as const, text: "Use tab 2", at: 2 }];
+    await saveMessageQueue(id, queue);
+    expect(await loadMessageQueue(id)).toEqual(queue);
+    for (const bad of [
+      { version: 2, messages: queue },
+      { version: 1, messages: [{ ...queue[0], mode: "later" }] },
+      { version: 1, messages: [{ ...queue[0], text: "   " }] },
+      { version: 1, messages: Array.from({ length: 21 }, (_, i) => ({ ...queue[0], id: `q${i}` })) },
+    ]) {
+      await browser.storage.local.set({ [`queue:${id}`]: bad });
+      expect(await loadMessageQueue(id)).toEqual([]);
+      expect(await browser.storage.local.get(`queue:${id}`)).toEqual({});
+    }
+    await saveMessageQueue(id, queue);
+    await deleteSession(id);
+    expect(await browser.storage.local.get(`queue:${id}`)).toEqual({});
+  });
+
+  it("stores delivered steers as user items and revalidates their marker on read", async () => {
+    const id = (await createSession()).id;
+    await appendConversationItem(id, { id: "s0", kind: "message", role: "user", text: "Use tab 2", context: null, delivery: "steer", at: 1 });
+    expect((await getConversation(id))?.items[0]).toMatchObject({ delivery: "steer" });
+    await browser.storage.local.set({ [`conversation:${id}:items:0`]: { version: 1, items: [{ id: "s0", kind: "message", role: "user", text: "x", context: null, delivery: "later", at: 1 }] } });
+    expect((await getConversation(id))?.items).toEqual([]);
   });
 });
 

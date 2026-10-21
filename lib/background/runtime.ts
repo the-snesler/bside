@@ -32,7 +32,9 @@ import {
   getConversation,
   getHistorySettings,
   isSessionUntouched,
+  loadMessageQueue,
   loadWorkspaceFiles,
+  saveMessageQueue,
   workspaceStore,
   listSessions,
   migrateConversation,
@@ -54,8 +56,8 @@ import {
 import type { RunStatus } from "@/lib/storage";
 import { validatePromptText, validateSessionTitle } from "@/lib/validation";
 import type { ContextArtifact } from "@/lib/domain/tools";
-import type { Conversation, ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
-import { retentionCutoff } from "@/lib/domain/conversation";
+import type { Conversation, ConversationItem, ConversationSummary, QueuedMessage, UserMessageItem } from "@/lib/domain/conversation";
+import { isTurnStart, MAX_QUEUED_MESSAGES, retentionCutoff } from "@/lib/domain/conversation";
 import { buildRunDigest } from "@/lib/domain/run-digest";
 import type { AppSettingsV1, ModelDefinition, ProviderAdapter, ProviderAuth, ProviderDefinition } from "@/lib/domain/provider";
 import type {
@@ -155,6 +157,8 @@ export class BackgroundRuntime {
   #agentTabTags = new Map<number, string>();
   /** Serialized per-session counts last published. */
   #publishedAgentTabs = "{}";
+  /** Each session's message queue once loaded; this cache is authoritative and written through to storage. */
+  #queues = new Map<string, QueuedMessage[]>();
 
   constructor(
     sidebarHub: SidebarHub,
@@ -372,6 +376,7 @@ export class BackgroundRuntime {
       settings,
       page: this.#sidebarHub.currentAttachment(),
       agentTabs: this.#agentTabCounts(),
+      queue: [...await this.#queue(conversation.id)],
       activeRun: this.#activeRun
         ? {
             runId: this.#activeRun.runId,
@@ -423,11 +428,27 @@ export class BackgroundRuntime {
     }
     if (command.type === "context.export") return this.#exportSession(command.sessionId);
     if (command.type === "run.start") {
-      await this.#startRun(command.prompt);
+      await this.#submitPrompt(command.prompt);
+      return;
+    }
+    if (command.type === "run.steer") {
+      await this.#steer(command.runId, command.text);
+      return;
+    }
+    if (command.type === "queue.remove") {
+      const queue = await this.#queue(command.sessionId);
+      // A pending steer is already on its way to the model, so only follow-ups can be withdrawn.
+      if (queue.some((message) => message.id === command.messageId && message.mode === "follow-up")) {
+        await this.#setQueue(command.sessionId, queue.filter((message) => message.id !== command.messageId));
+      }
+      return;
+    }
+    if (command.type === "queue.send") {
+      await this.#sendQueued(command.sessionId, command.messageId);
       return;
     }
     if (command.type === "run.retry") {
-      await this.#startRun(null);
+      await this.#startRun(await this.#openSession(), null);
       return;
     }
     if (command.type === "run.cancel") {
@@ -512,7 +533,8 @@ export class BackgroundRuntime {
    */
   async #applyRetention(): Promise<number> {
     this.#lastRetentionAt = this.#clock.now();
-    // Never blocks runs: a run only starts in the open session, which is kept.
+    // Never blocks runs: a run only starts in the open session, which is kept,
+    // or as a follow-up in the session whose run just completed, which was just updated.
     const deleted = await this.#queueSessionOp(async () => {
       const cutoff = retentionCutoff((await getHistorySettings()).retention, this.#clock.now());
       const keep = [await this.#openSession(), ...(this.#activeRun ? [this.#activeRun.sessionId] : [])];
@@ -559,6 +581,7 @@ export class BackgroundRuntime {
    */
   async #forgetSessions(ids: readonly string[], closeTabs: boolean): Promise<void> {
     if (this.#retryable && ids.includes(this.#retryable.sessionId)) this.#retryable = null;
+    for (const id of ids) this.#queues.delete(id);
     if (this.#debugSessionId !== null && ids.includes(this.#debugSessionId)) this.#clearDebugBuffers();
     const owned = (tab: AgentTab) => ids.includes(tab.sessionId);
     if (![...this.#workspace.agentTabs.values()].some(owned)) return;
@@ -732,10 +755,104 @@ export class BackgroundRuntime {
     return fallback;
   }
 
-  /** Starts a run in the open session. A `null` prompt is a retry: it re-runs the last turn's existing user message instead of appending a new one. */
-  async #startRun(rawPrompt: string | null): Promise<void> {
-    const retry = rawPrompt === null;
+  /**
+   * A session's message queue, loaded once per background lifetime. Steers
+   * found in storage then belong to a run a restart interrupted, so they load
+   * as follow-ups. A delivered steer or dispatched follow-up keeps its queued
+   * id as its item id, so one the restart caught between writing its item and
+   * leaving the queue is dropped here rather than sent twice.
+   */
+  async #queue(sessionId: string): Promise<QueuedMessage[]> {
+    const cached = this.#queues.get(sessionId);
+    if (cached) return cached;
+    let stored = await loadMessageQueue(sessionId).catch(() => []);
+    if (stored.length > 0) {
+      const delivered = new Set((await getConversation(sessionId).catch(() => null))?.items.map((item) => item.id));
+      stored = stored.filter((message) => !delivered.has(message.id));
+    }
+    // A concurrent caller may have loaded and changed it meanwhile.
+    const queue = this.#queues.get(sessionId) ?? stored.map((message) => ({ ...message, mode: "follow-up" as const }));
+    this.#queues.set(sessionId, queue);
+    return queue;
+  }
+
+  /** Replaces a session's queue (synchronously in memory), pushes it to every sidebar, and persists it. */
+  async #setQueue(sessionId: string, messages: QueuedMessage[]): Promise<void> {
+    this.#queues.set(sessionId, messages);
+    this.#sidebarHub.publishQueue(sessionId, messages);
+    await saveMessageQueue(sessionId, messages).catch(() => console.warn("[bside] Could not save queued messages."));
+  }
+
+  /** Refuses a queue at capacity with a notice. */
+  async #queueFull(queue: readonly QueuedMessage[]): Promise<boolean> {
+    if (queue.length < MAX_QUEUED_MESSAGES) return false;
+    this.#notice = `Up to ${MAX_QUEUED_MESSAGES} messages can wait at once.`;
+    await this.#sidebarHub.broadcastSnapshot();
+    return true;
+  }
+
+  /** `run.start`: while the open session's run is active, the prompt waits as a follow-up; otherwise a run starts with it. */
+  async #submitPrompt(rawPrompt: string): Promise<void> {
     const sessionId = await this.#openSession();
+    const queue = await this.#queue(sessionId);
+    const prompt = validatePromptText(rawPrompt);
+    if (!prompt || this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, rawPrompt);
+    if (await this.#queueFull(queue)) return;
+    await this.#setQueue(sessionId, [...queue, { id: crypto.randomUUID(), mode: "follow-up", text: prompt, at: Date.now() }]);
+  }
+
+  /** `run.steer`: hands guidance to the active run's agent loop and shows it as pending until delivered. */
+  async #steer(runId: string, rawText: string): Promise<void> {
+    const run = this.#activeRun;
+    if (!run || run.runId !== runId) return this.#submitPrompt(rawText);
+    const queue = await this.#queue(run.sessionId);
+    const text = validatePromptText(rawText);
+    // Re-checked after loading: once a run ends or is cancelling, a steer could never be delivered.
+    if (!text || this.#activeRun !== run || run.status === "cancelling") return this.#submitPrompt(rawText);
+    if (await this.#queueFull(queue)) return;
+    const message: QueuedMessage = { id: crypto.randomUUID(), mode: "steer", text, at: Date.now() };
+    run.agentLoop.steer(message);
+    await this.#setQueue(run.sessionId, [...queue, message]);
+  }
+
+  /** Steers the run never delivered become follow-ups: kept visible, and sent next only if the run completed. */
+  async #settleSteers(sessionId: string): Promise<void> {
+    const queue = await this.#queue(sessionId);
+    if (queue.some((message) => message.mode === "steer")) {
+      await this.#setQueue(sessionId, queue.map((message) => ({ ...message, mode: "follow-up" })));
+    }
+  }
+
+  /** `queue.send`: starts a run with a queued follow-up of the open session now. */
+  async #sendQueued(sessionId: string, messageId: string): Promise<void> {
+    const message = (await this.#queue(sessionId)).find((candidate) => candidate.id === messageId && candidate.mode === "follow-up");
+    if (!message || sessionId !== await this.#openSession()) {
+      await this.#sidebarHub.broadcastSnapshot();
+      return;
+    }
+    await this.#startRun(sessionId, message.text, message.id);
+  }
+
+  /**
+   * After a completed run, starts the next turn with the oldest queued
+   * follow-up of its session, open or not. Follow-ups wait after a failed,
+   * cancelled, or interrupted run until the user sends them.
+   */
+  async #dispatchFollowUp(sessionId: string): Promise<void> {
+    if (this.#activeRun || this.#sessionOpsPending > 0) return;
+    const next = (await this.#queue(sessionId)).find((message) => message.mode === "follow-up");
+    if (next) await this.#startRun(sessionId, next.text, next.id);
+  }
+
+  /**
+   * Starts a run in `sessionId` (the open session, or a completed run's
+   * session for a follow-up). A `null` prompt is a retry: it re-runs the last
+   * turn's existing user message instead of appending a new one. `queuedId`
+   * names the queued follow-up the prompt came from; its user message keeps
+   * that id, and it leaves the queue once that message is written.
+   */
+  async #startRun(sessionId: string, rawPrompt: string | null, queuedId?: string): Promise<void> {
+    const retry = rawPrompt === null;
     if (this.#activeRun || this.#sessionOpsPending > 0 || (retry && this.#retryable?.sessionId !== sessionId)) {
       await this.#sidebarHub.broadcastSnapshot();
       return;
@@ -782,9 +899,10 @@ export class BackgroundRuntime {
       auth = chatgpt.connected ? await this.#chatgpt.getAuth(controller.signal) : { providerId: "openai", method: "api-key", secret: credential!.apiKey };
       conversation = await getConversation(sessionId);
       if (!conversation) throw new ProviderStreamError("This chat no longer exists.", "INVALID_REQUEST");
-      if (retry && !conversation.items.some(isUserMessage)) throw new ProviderStreamError("There is no turn to retry.", "INVALID_REQUEST");
+      if (retry && !conversation.items.some(isTurnStart)) throw new ProviderStreamError("There is no turn to retry.", "INVALID_REQUEST");
     } catch (error) {
       this.#activeRun = null;
+      await this.#settleSteers(sessionId);
       this.#notice = toNormalizedError(error, "setup").message;
       await this.#sidebarHub.broadcastSnapshot();
       return;
@@ -804,8 +922,8 @@ export class BackgroundRuntime {
 
     let items = conversation.items;
     if (!retry) {
-      const item: UserMessage = {
-        id: crypto.randomUUID(),
+      const item: UserMessageItem = {
+        id: queuedId ?? crypto.randomUUID(),
         kind: "message",
         role: "user",
         text: prompt!,
@@ -814,9 +932,10 @@ export class BackgroundRuntime {
       };
       await appendConversationItem(sessionId, item);
       items = [...items, item];
+      if (queuedId) await this.#setQueue(sessionId, (await this.#queue(sessionId)).filter((message) => message.id !== queuedId));
     }
-    const userIndex = items.findLastIndex(isUserMessage);
-    const userItem = items[userIndex] as UserMessage;
+    const userIndex = items.findLastIndex(isTurnStart);
+    const userItem = items[userIndex] as UserMessageItem;
     this.#retryable = null;
 
     this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt: userItem.text, page: userItem.context, retry });
@@ -829,8 +948,10 @@ export class BackgroundRuntime {
     // attempt's interim/partial assistant text and digest stay stored but are
     // not sent, so the model answers the original prompt afresh against a new
     // page capture. Its page effects are never replayed. A compaction the
-    // failed attempt made is kept, so it is not summarized again.
-    const transcript = [...items.slice(0, userIndex + 1), ...items.slice(userIndex + 1).filter((item) => item.kind === "compaction")];
+    // failed attempt made is kept, so it is not summarized again, and so are
+    // its delivered steers, which are the user's guidance for this turn.
+    const transcript = [...items.slice(0, userIndex + 1), ...items.slice(userIndex + 1).filter((item) =>
+      item.kind === "compaction" || (item.kind === "message" && item.role === "user"))];
     await this.#runAgentLoop(runId, transcript, artifact, auth);
   }
 
@@ -841,7 +962,7 @@ export class BackgroundRuntime {
     const settings = await this.#getValidatedSettings();
     // Titles a new session from its first prompt and records the model for the history list.
     // The index only lags on failure, so a failed write never stops the run.
-    await touchSession(run.sessionId, { prompt: transcript.findLast(isUserMessage)?.text, modelId: settings.modelId }).catch(() => {});
+    await touchSession(run.sessionId, { prompt: transcript.findLast(isTurnStart)?.text, modelId: settings.modelId }).catch(() => {});
     await this.#publishSessions();
     const record: RunRecord = {
       runId, modelId: settings.modelId, reasoningEffort: settings.reasoningEffort, startedAt: Date.now(), endedAt: null, status: "running", error: null,
@@ -902,6 +1023,12 @@ export class BackgroundRuntime {
       onItem: async (item) => {
         await appendConversationItem(run.sessionId, item);
         if (item.kind === "message" && item.role === "assistant") run.partialAssistantText = "";
+        if (item.kind === "message" && item.role === "user") {
+          // A delivered steer: shown inline in the turn and no longer pending.
+          flushDelta();
+          this.#sidebarHub.publishRunEvent(runId, "steer.delivered", { item });
+          await this.#setQueue(run.sessionId, (await this.#queue(run.sessionId)).filter((message) => message.id !== item.id));
+        }
         await this.#writeCheckpoint(run, run.status, run.partialAssistantText);
         // No run event carries a compaction; a snapshot shows its marker at once.
         if (item.kind === "compaction") void this.#sidebarHub.broadcastSnapshot();
@@ -935,6 +1062,8 @@ export class BackgroundRuntime {
       await clearRunCheckpoint();
       await touchSession(run.sessionId).catch(() => {});
       this.#activeRun = null;
+      // After the run slot is released, so no steer can be accepted for this run any more.
+      await this.#settleSteers(run.sessionId);
       await this.#publishSessions();
     };
     if (result.status === "completed") {
@@ -942,6 +1071,7 @@ export class BackgroundRuntime {
       await persistDigest();
       this.#sidebarHub.publishRunEvent(runId, "run.completed", { messageId });
       await finish();
+      await this.#dispatchFollowUp(run.sessionId);
       return;
     }
     if (result.status === "cancelled") {
@@ -1023,19 +1153,14 @@ export class BackgroundRuntime {
   }
 }
 
-type UserMessage = Extract<ConversationItem, { kind: "message"; role: "user" }>;
 type SessionCommand = Extract<SidebarCommand, { type: "session.create" | "session.open" | "session.delete" | "session.rename" | "session.pin" }>;
-
-function isUserMessage(item: ConversationItem): item is UserMessage {
-  return item.kind === "message" && item.role === "user";
-}
 
 /**
  * Whether the last turn started a browser program. Run checkpoints record no
  * effects, so after an interruption any started program may have committed one.
  */
 function lastTurnRanProgram(items: readonly ConversationItem[]): boolean {
-  return items.slice(items.findLastIndex(isUserMessage) + 1).some((item) => item.kind === "tool-call" && item.call.name === "browser_program");
+  return items.slice(items.findLastIndex(isTurnStart) + 1).some((item) => item.kind === "tool-call" && item.call.name === "browser_program");
 }
 
 function extensionVersion(): string {

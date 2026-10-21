@@ -7,6 +7,8 @@ import MessagePlus from "~icons/tabler/message-plus";
 import Globe from "~icons/tabler/world";
 import ArrowDown from "~icons/tabler/arrow-down";
 import BrowserX from "~icons/tabler/browser-x";
+import ArrowUp from "~icons/tabler/arrow-up";
+import X from "~icons/tabler/x";
 import { Markdown } from "@/lib/ui/Markdown";
 import { Composer, parsePromptMentions } from "@/lib/ui/Composer";
 import { useBottomScroll } from "@/lib/ui/use-bottom-scroll";
@@ -16,6 +18,7 @@ import type { PageArtifactSummary } from "@/lib/domain/tools";
 import { TurnTrace } from "@/lib/ui/TurnTrace";
 import { buildTurns } from "@/lib/ui/turns";
 import { HistoryDrawer } from "@/lib/ui/HistoryDrawer";
+import { PROMPT_MENTION_PATTERN } from "@/lib/domain/conversation";
 
 function describeAttachment(page: PageArtifactSummary): string {
   let origin = page.url;
@@ -44,6 +47,10 @@ export function App() {
     closeAgentTabs,
     saveSettings,
     sendPrompt,
+    steer,
+    queue,
+    removeQueued,
+    sendQueued,
     retryRun,
     cancelRun,
     approveAction,
@@ -66,8 +73,9 @@ export function App() {
   };
 
   // One run at a time across all chats; it may belong to a chat other than the one on screen.
-  const composerDisabled = activeRun !== null || !credential.configured;
+  // While it works in this chat, the composer queues follow-ups and steers it.
   const runHere = activeRun !== null && activeRun.conversationId === conversation.id;
+  const composerDisabled = !credential.configured || (activeRun !== null && !runHere);
   const model =
     provider.models.find((model) => model.id === settings.modelId) ??
     provider.models[0];
@@ -262,6 +270,36 @@ export function App() {
             </div>
           )}
           <footer class="sidebar__composer">
+            {queue.length > 0 && (
+              <ul class="queue" aria-label="Waiting messages">
+                {queue.map((message) => {
+                  const text = message.text.replace(PROMPT_MENTION_PATTERN, "@$1");
+                  return (
+                    <li key={message.id} class="queue__item">
+                      <span
+                        class="queue__label"
+                        title={message.mode === "steer"
+                          ? "Reaches bside at its next step"
+                          : runHere ? "Sent when this task completes" : "Waiting: send it or remove it"}
+                      >
+                        {message.mode === "steer" ? "Steer" : "Queued"}
+                      </span>
+                      <span class="queue__text" title={text}>{text}</span>
+                      {message.mode === "follow-up" && activeRun === null && (
+                        <button type="button" class="icon-button" aria-label="Send now" title="Send now" onClick={() => sendQueued(message.id)}>
+                          <ArrowUp />
+                        </button>
+                      )}
+                      {message.mode === "follow-up" && (
+                        <button type="button" class="icon-button" aria-label="Remove from queue" title="Remove from queue" onClick={() => removeQueued(message.id)}>
+                          <X />
+                        </button>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
             <div class="composer">
               {page && (
                 <div class="context-chip" title={describeAttachment(page)}>
@@ -275,6 +313,8 @@ export function App() {
               <Composer
                 disabled={composerDisabled}
                 running={!!activeRun}
+                working={runHere}
+                canSteer={runHere && activeRun.status !== "cancelling"}
                 configured={credential.configured}
                 tabs={tabs}
                 onListTabs={listTabs}
@@ -282,6 +322,7 @@ export function App() {
                   scroll.scrollToBottom();
                   sendPrompt(text);
                 }}
+                onSteer={steer}
                 onStop={cancelRun}
               />
             </div>

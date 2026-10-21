@@ -31,7 +31,12 @@ export interface BackgroundActions {
   /** Closes one session's hidden agent tabs. */
   closeAgentTabs(sessionId: string): void;
   saveSettings(settings: AppSettingsV1): void;
+  /** Starts a run, or queues a follow-up while this chat's run is working. */
   sendPrompt(prompt: string): void;
+  /** Guidance for the running turn, delivered at its next tool boundary. */
+  steer(text: string): void;
+  removeQueued(messageId: string): void;
+  sendQueued(messageId: string): void;
   retryRun(): void;
   cancelRun(): void;
   approveAction(callId: string): void;
@@ -60,6 +65,7 @@ const INITIAL_STATE: BackgroundState = {
   settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
   page: null,
   agentTabs: {},
+  queue: [],
   activeRun: null,
   lastSeq: 0,
   notice: null,
@@ -73,6 +79,8 @@ export function useBackground(): BackgroundState & BackgroundActions {
   const portRef = useRef<Port | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
   const exportRequestRef = useRef<string | null>(null);
+  const conversationIdRef = useRef("");
+  conversationIdRef.current = state.conversation.id;
 
   useEffect(() => {
     const port = browser.runtime.connect({ name: SIDEBAR_PORT_NAME });
@@ -111,6 +119,20 @@ export function useBackground(): BackgroundState & BackgroundActions {
   const sendPrompt = useCallback((prompt: string) => {
     const command: SidebarCommand = { v: 1, id: crypto.randomUUID(), type: "run.start", prompt };
     portRef.current?.postMessage(command);
+  }, []);
+
+  const steer = useCallback((text: string) => {
+    const runId = activeRunIdRef.current;
+    // With no run to steer, the background treats the text as a normal prompt.
+    portRef.current?.postMessage(runId
+      ? { v: 1, id: crypto.randomUUID(), type: "run.steer", runId, text } satisfies SidebarCommand
+      : { v: 1, id: crypto.randomUUID(), type: "run.start", prompt: text } satisfies SidebarCommand);
+  }, []);
+  const removeQueued = useCallback((messageId: string) => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "queue.remove", sessionId: conversationIdRef.current, messageId } satisfies SidebarCommand);
+  }, []);
+  const sendQueued = useCallback((messageId: string) => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "queue.send", sessionId: conversationIdRef.current, messageId } satisfies SidebarCommand);
   }, []);
 
   const retryRun = useCallback(() => {
@@ -177,7 +199,7 @@ export function useBackground(): BackgroundState & BackgroundActions {
   }, []);
 
   return {
-    ...state, sendPrompt, retryRun, cancelRun, approveAction, denyAction, newChat, listSessions, openSession, renameSession, pinSession,
+    ...state, sendPrompt, steer, removeQueued, sendQueued, retryRun, cancelRun, approveAction, denyAction, newChat, listSessions, openSession, renameSession, pinSession,
     deleteSession, downloadContext, listTabs, focusTab, closeAgentTabs, saveSettings,
   };
 }
@@ -228,6 +250,23 @@ function applyEvent(
   }
   if (event.type === "agent-tabs.changed") {
     setState((prev) => ({ ...prev, agentTabs: event.payload.bySession }));
+    return;
+  }
+  if (event.type === "queue.changed") {
+    setState((prev) => event.conversationId === prev.conversation.id ? { ...prev, queue: event.payload.messages } : prev);
+    return;
+  }
+  if (event.type === "steer.delivered") {
+    setState((prev) => {
+      const committed = commitPendingText(prev, event.conversationId);
+      const delivered = event.payload.item;
+      if (event.conversationId !== prev.conversation.id) return committed;
+      return {
+        ...committed,
+        queue: committed.queue.filter((message) => message.id !== delivered.id),
+        conversation: appendItem(committed, event.conversationId, delivered),
+      };
+    });
     return;
   }
   if (event.type === "run.started") {

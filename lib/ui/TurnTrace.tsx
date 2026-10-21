@@ -16,10 +16,11 @@ import Shield from "~icons/tabler/shield-check";
 import Terminal from "~icons/tabler/terminal-2";
 import Trash from "~icons/tabler/trash";
 import WorldSearch from "~icons/tabler/world-search";
+import { PROMPT_MENTION_PATTERN } from "@/lib/domain/conversation";
 import type { ApprovalRequest } from "@/lib/protocol";
 import { Markdown } from "@/lib/ui/Markdown";
 import { Trace, TraceLine, type TraceStatus } from "@/lib/ui/Trace";
-import { formatDuration, type Activity, type Turn } from "@/lib/ui/turns";
+import { formatDuration, type Activity, type Turn, type TurnStep } from "@/lib/ui/turns";
 
 type Icon = typeof Pointer;
 
@@ -126,7 +127,8 @@ function useNow(ticking: boolean): number {
 
 /**
  * The work for one turn behind a single "Worked for …" disclosure: tool rows
- * grouped into Trace lists, with interim assistant text between them. It stays
+ * grouped into Trace lists, with interim assistant text and the user's steers
+ * between them. It stays
  * open while the turn is active and collapses when the turn completes.
  */
 export function TurnTrace(props: {
@@ -154,10 +156,10 @@ export function TurnTrace(props: {
     ? `${activities.length} ${activities.length === 1 ? "step" : "steps"}`
     : undefined;
 
-  const groups: (Activity[] | { id: string; text: string })[] = [];
+  const groups: (Activity[] | Exclude<TurnStep, Activity>)[] = [];
   for (const step of turn.steps) {
     const last = groups.at(-1);
-    if (step.kind === "text") groups.push(step);
+    if (step.kind !== "activity") groups.push(step);
     else if (Array.isArray(last)) last.push(step);
     else groups.push([step]);
   }
@@ -185,6 +187,11 @@ export function TurnTrace(props: {
                   />
                 ))}
               </Trace>
+            ) : group.kind === "steer" ? (
+              <p key={group.id} class="trace__steer">
+                <span class="trace__steer-label">You</span>
+                {group.text.replace(PROMPT_MENTION_PATTERN, "@$1")}
+              </p>
             ) : (
               <div key={group.id} class="trace__message">
                 <Markdown text={group.text} />

@@ -7,6 +7,7 @@
  */
 
 import type { ConversationItem, RunDigestEntry, RunDigestStatus, RunDigestV1 } from "@/lib/domain/conversation";
+import { isTurnStart } from "@/lib/domain/conversation";
 import type { ToolCall, ToolResult } from "@/lib/domain/tools";
 
 export const DIGEST_SOURCE_CHARS = 600;
@@ -75,7 +76,7 @@ export function buildRunDigest(steps: readonly DigestStep[], status: RunDigestSt
  * only as its short status, so the excerpt is that status.
  */
 export function digestFromItems(items: readonly ConversationItem[]): RunDigestV1 | null {
-  const turn = items.slice(items.findLastIndex((item) => item.kind === "message" && item.role === "user") + 1);
+  const turn = items.slice(items.findLastIndex(isTurnStart) + 1);
   const results = new Map(turn.flatMap((item) => item.kind === "tool-result" ? [[item.callId, item.result] as const] : []));
   return buildRunDigest(turn.flatMap((item) => item.kind === "tool-call" ? [{ call: item.call, result: results.get(item.call.id) ?? null }] : []), "interrupted");
 }

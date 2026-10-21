@@ -15,6 +15,7 @@ import type { TabMention } from "@/lib/protocol";
 import { PROMPT_MENTION_PATTERN } from "@/lib/domain/conversation";
 import ArrowUp from "~icons/tabler/arrow-up";
 import PlayerStop from "~icons/tabler/player-stop";
+import SteeringWheel from "~icons/tabler/steering-wheel";
 
 type Mention = {
   type: "mention";
@@ -60,13 +61,32 @@ export function parsePromptMentions(prompt: string): PromptSegment[] {
   return segments;
 }
 
+/**
+ * What a key press in the editor does. Enter sends (while this chat's run is
+ * working, that queues a follow-up); Ctrl/Cmd+Enter steers when steering is
+ * available. Shift+Enter is a newline.
+ */
+export function composerKeyAction(
+  event: { key: string; shiftKey: boolean; ctrlKey: boolean; metaKey: boolean },
+  canSteer: boolean,
+): "send" | "steer" | null {
+  if (event.key !== "Enter" || event.shiftKey) return null;
+  return canSteer && (event.ctrlKey || event.metaKey) ? "steer" : "send";
+}
+
 export function Composer(props: {
   disabled: boolean;
+  /** Any run is active: Stop is shown. */
   running: boolean;
+  /** This chat's run is working: sending queues a follow-up. */
+  working: boolean;
+  /** This chat's run can take a steer (it is not stopping). */
+  canSteer: boolean;
   configured: boolean;
   tabs: TabMention[];
   onListTabs: () => void;
   onSend: (text: string) => void;
+  onSteer: (text: string) => void;
   onStop: () => void;
 }) {
   const editor = useMemo(() => {
@@ -87,10 +107,11 @@ export function Composer(props: {
       `${tab.title} ${tab.url}`.toLowerCase().includes(search.toLowerCase()),
     )
     .slice(0, 8);
-  const send = () => {
+  const send = (steer = false) => {
     const value = serializeDraft(editor.children);
     if (!value || value.length > 16000 || props.disabled) return;
-    props.onSend(value);
+    if (steer) props.onSteer(value);
+    else props.onSend(value);
     Transforms.select(editor, Editor.range(editor, []));
     Transforms.delete(editor);
     setTarget(null);
@@ -153,9 +174,11 @@ export function Composer(props: {
               : undefined
           }
           placeholder={
-            props.configured
-              ? "Ask a task, @ for tabs…"
-              : "Connect OpenAI in settings to start."
+            !props.configured
+              ? "Connect OpenAI in settings to start."
+              : props.working
+                ? "Enter queues, Ctrl/⌘+Enter steers…"
+                : "Ask a task, @ for tabs…"
           }
           renderElement={({ attributes, children, element }) =>
             element.type === "mention" ? (
@@ -192,12 +215,39 @@ export function Composer(props: {
                 return;
               }
             }
-            if (event.key === "Enter" && !event.shiftKey) {
+            const action = composerKeyAction(event, props.working && props.canSteer);
+            if (action) {
               event.preventDefault();
-              send();
+              send(action === "steer");
             }
           }}
         />
+        {props.working && text && text.length <= 16000 && (
+          <>
+            {props.canSteer && (
+              <button
+                class="composer__send composer__send--secondary"
+                type="button"
+                aria-label="Steer"
+                title="Steer: send now as guidance at the next step (Ctrl/⌘+Enter)"
+                disabled={props.disabled}
+                onClick={() => send(true)}
+              >
+                <SteeringWheel />
+              </button>
+            )}
+            <button
+              class="composer__send composer__send--secondary"
+              type="button"
+              aria-label="Queue message"
+              title="Queue: send after this task finishes (Enter)"
+              disabled={props.disabled}
+              onClick={() => send()}
+            >
+              <ArrowUp />
+            </button>
+          </>
+        )}
         {props.running ? (
           <button
             class="composer__send"
@@ -215,7 +265,7 @@ export function Composer(props: {
             aria-label="Send message"
             title="Send message"
             disabled={props.disabled || !text || text.length > 16000}
-            onClick={send}
+            onClick={() => send()}
           >
             <ArrowUp />
           </button>

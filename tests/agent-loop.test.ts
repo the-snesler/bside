@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Browser } from "wxt/browser";
 import { AgentLoop, DIGEST_REPLAY_CHARS } from "@/lib/background/agent-loop";
 import { buildRunDigest, renderDigestNote } from "@/lib/domain/run-digest";
-import type { ConversationItem } from "@/lib/domain/conversation";
+import type { ConversationItem, QueuedMessage } from "@/lib/domain/conversation";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController } from "@/lib/background/tab-controller";
 import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
@@ -682,6 +682,36 @@ describe("AgentLoop: history replay", () => {
     expect(later.map((message) => message.role)).toEqual(["user", "assistant", "user", "user", "assistant", "user", "user"]);
   });
 
+  it("replays a delivered steer as a user message inside its turn, where it was received, without making it a turn start", async () => {
+    const steerItem: ConversationItem = { id: "s0", kind: "message", role: "user", text: "Only red ones", context: null, delivery: "steer", at: 0 };
+    const transcript: ConversationItem[] = [
+      user("u0", "Search orchids"), assistant("a0", "Searching."), steerItem, assistant("a0b", "Two red orchids."), digestItem("d0", "red"),
+      user("u1", "Which is cheaper?"),
+    ];
+    const provider = new ScriptedProvider([() => [{ type: "text.delta", delta: "Ok." }, { type: "turn.completed", replayState: null }]]);
+    const { tabController } = await createTabController();
+    await new AgentLoop(provider, tabController, new SidebarHub()).run({
+      runId: "run1", conversationId: "default", modelId: "gpt-5.6-terra", reasoningEffort: "medium", transcript, contextArtifact: artifact,
+      auth: AUTH, signal: new AbortController().signal, onDelta: () => {}, onItem: async () => {}, onApprovalPending: () => {},
+    });
+    const messages = provider.requests[0]!.context.messages;
+    expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "user", "assistant", "user", "user"]);
+    expect(messages[2]).toMatchObject({ role: "user", content: "Only red ones" });
+    expect(JSON.stringify(messages.slice(0, 5))).not.toContain("Orchid launch");
+    // The page outline rides on the turn's prompt, never on a steer, even when a retried turn ends with one.
+    expect(JSON.stringify(messages[5]!.content)).toContain("Orchid launch moved to Friday.");
+    const retried = new ScriptedProvider([() => [{ type: "turn.completed", replayState: null }]]);
+    await new AgentLoop(retried, tabController, new SidebarHub()).run({
+      runId: "run2", conversationId: "default", modelId: "gpt-5.6-terra", reasoningEffort: "medium", contextArtifact: artifact,
+      transcript: [...transcript, { ...steerItem, id: "s1", text: "Under $10" }],
+      auth: AUTH, signal: new AbortController().signal, onDelta: () => {}, onItem: async () => {}, onApprovalPending: () => {},
+    });
+    const resent = retried.requests[0]!.context.messages;
+    expect(JSON.stringify(resent.slice(0, 5))).toBe(JSON.stringify(messages.slice(0, 5)));
+    expect(JSON.stringify(resent[5]!.content)).toContain("Orchid launch moved to Friday.");
+    expect(resent[6]).toMatchObject({ role: "user", content: "Under $10" });
+  });
+
   it("keeps the newest digests within the replay budget, dropping old ones in steps rather than every run", async () => {
     const turns = (count: number) => Array.from({ length: count }, (_, i) => [
       user(`u${i}`, `Question ${i}`), assistant(`a${i}`, `Answer ${i}`), digestItem(`d${i}`, `result ${i} `.repeat(150)),
@@ -776,6 +806,20 @@ describe("AgentLoop: compaction", () => {
     expect(JSON.stringify(next.requests[0]!.context.messages)).not.toContain("Question 6");
   });
 
+  it("never cuts the summarized history at a steer", async () => {
+    const provider = new WindowProvider([
+      () => [{ type: "text.delta", delta: "## Goal\nOrchid research." }, { type: "turn.completed", replayState: null }],
+      answer,
+    ], WINDOW);
+    const items = history(8);
+    // A large steer late in turn 7: were it a turn start, the kept tail could begin there, mid-turn.
+    items.splice(items.length - 1, 0, { id: "s7", kind: "message", role: "user", text: `Steer ${"s".repeat(12_000)}`, context: null, delivery: "steer", at: 99 });
+    const { items: created } = await run(provider, items);
+    const compaction = created.find((item) => item.kind === "compaction");
+    expect(compaction).toMatchObject({ firstKeptItemId: "now" });
+    expect(JSON.stringify(provider.requests[0]!.context.messages)).toContain("Steer sss");
+  });
+
   it("keeps going without losing data when summarizing fails, leaving the oldest turns out only if the request would not fit", async () => {
     const failing = () => new WindowProvider([() => { throw new ProviderStreamError("Rate limited.", "RATE_LIMIT"); }, answer], WINDOW);
     const near = failing();
@@ -804,5 +848,110 @@ describe("AgentLoop: compaction", () => {
     expect(result).toEqual({ status: "cancelled", partialText: "", hadPageEffect: false });
     expect(items).toEqual([]);
     expect(provider.requests).toHaveLength(1);
+  });
+});
+
+describe("AgentLoop: steering", () => {
+  const steer = (id: string, text: string): QueuedMessage => ({ id, mode: "steer", text, at: 1 });
+  const read = () => toolCallEvent("call_1", "browser_program", { source: "return 1;" });
+  const done = (text: string): ScriptedProviderEvent[] => [{ type: "text.delta", delta: text }, { type: "turn.completed", replayState: null }];
+  const lastMessage = (request: ProviderTurnRequest | undefined) => request?.context.messages.at(-1);
+  const loopRef: { current: AgentLoop | null } = { current: null };
+
+  async function steered(rounds: ConstructorParameters<typeof ScriptedProvider>[0], options: {
+    before?: (loop: AgentLoop) => void;
+    limits?: ConstructorParameters<typeof AgentLoop>[4];
+    onApprovalPending?: (request: ApprovalRequest | null, loop: AgentLoop) => void;
+  } = {}) {
+    const provider = new ScriptedProvider(rounds);
+    const { tabController } = await createTabController();
+    const loop = new AgentLoop(provider, tabController, new SidebarHub(), undefined, options.limits);
+    loopRef.current = loop;
+    options.before?.(loop);
+    const items: ConversationItem[] = [];
+    const result = await loop.run({
+      runId: "run1", conversationId: "default", modelId: "gpt-5.6-terra", reasoningEffort: "medium", transcript: baseTranscript, contextArtifact: null,
+      auth: AUTH, signal: new AbortController().signal, onDelta: () => {}, onItem: async (item) => { items.push(item); },
+      onApprovalPending: (request) => options.onApprovalPending?.(request, loop),
+    });
+    return { result, items, provider };
+  }
+
+  it("delivers a steer sent mid-round after that round's tool result, before the next request, and persists it there", async () => {
+    const { result, items, provider } = await steered([
+      () => {
+        loopRef.current!.steer(steer("s1", "Use the second tab instead"));
+        return [read(), { type: "turn.completed", replayState: null }];
+      },
+      () => done("Used the second tab."),
+    ]);
+    expect(result.status).toBe("completed");
+    expect(JSON.stringify(provider.requests[0]!.context.messages)).not.toContain("second tab");
+    expect(provider.requests[1]!.context.messages.slice(-2).map((message) => message.role)).toEqual(["toolResult", "user"]);
+    expect(lastMessage(provider.requests[1])).toMatchObject({ role: "user", content: "Use the second tab instead" });
+    expect(items.map((item) => item.kind === "message" ? `${item.role}:${item.text}` : item.kind)).toEqual([
+      "tool-call", "tool-result", "user:Use the second tab instead", "assistant:Used the second tab.",
+    ]);
+    expect(items[2]).toMatchObject({ id: "s1", kind: "message", role: "user", delivery: "steer", context: null });
+  });
+
+  it("delivers a steer sent while awaiting confirmation after the decision's result", async () => {
+    const { items, provider } = await steered([
+      () => [toolCallEvent("call_1", "request_action_confirmation", { title: "Submit", message: "Submit it?", artifact: "" }), { type: "turn.completed", replayState: null }],
+      () => done("Submitted."),
+    ], {
+      onApprovalPending: (request, loop) => {
+        if (!request) return;
+        loop.steer(steer("s1", "Also cc Dana"));
+        loop.approve(request.call.id);
+      },
+    });
+    const sent = provider.requests[1]!.context.messages;
+    expect(sent.at(-2)).toMatchObject({ role: "toolResult" });
+    expect(JSON.stringify(sent.at(-2)!.content)).toContain("approved:true");
+    expect(sent.at(-1)).toMatchObject({ role: "user", content: "Also cc Dana" });
+    expect(items.filter((item) => item.kind === "message" && item.role === "user")).toHaveLength(1);
+  });
+
+  it("answers a steer that arrives during the final round with one more round instead of losing it", async () => {
+    const { result, items, provider } = await steered([
+      () => {
+        loopRef.current!.steer(steer("s1", "And the price?"));
+        return done("It is blue.");
+      },
+      () => done("It costs $5."),
+    ]);
+    expect(result).toMatchObject({ status: "completed" });
+    expect(provider.requests).toHaveLength(2);
+    expect(items.map((item) => item.kind === "message" ? item.text : item.kind)).toEqual(["It is blue.", "And the price?", "It costs $5."]);
+  });
+
+  it("delivers a steer accepted before the first round right after the prompt", async () => {
+    const { provider } = await steered([() => done("Ok.")], { before: (loop) => loop.steer(steer("s1", "Be brief")) });
+    expect(provider.requests[0]!.context.messages.map((message) => message.content)).toEqual(["Do it", "Be brief"]);
+  });
+
+  it("leaves a steer undelivered when a run budget stops the run at that boundary", async () => {
+    const { result, items, provider } = await steered([
+      () => {
+        loopRef.current!.steer(steer("s1", "Keep going"));
+        return [read(), { type: "turn.completed", replayState: null }];
+      },
+    ], { limits: { maxRounds: 1 } });
+    expect(result).toMatchObject({ status: "failed", error: { code: "LIMIT_EXCEEDED" } });
+    expect(provider.requests).toHaveLength(1);
+    expect(items.some((item) => item.kind === "message" && item.role === "user")).toBe(false);
+  });
+
+  it("completes with its answer, leaving the steer undelivered, when a steer at the final answer would exceed a budget", async () => {
+    const { result, items, provider } = await steered([
+      () => {
+        loopRef.current!.steer(steer("s1", "And the price?"));
+        return done("It is blue.");
+      },
+    ], { limits: { maxRounds: 1 } });
+    expect(result).toMatchObject({ status: "completed" });
+    expect(provider.requests).toHaveLength(1);
+    expect(items.map((item) => item.kind === "message" ? item.text : item.kind)).toEqual(["It is blue."]);
   });
 });

@@ -12,12 +12,12 @@
 
 import { storage } from "wxt/utils/storage";
 import type { AppSettingsV1, ModelDefinition, ReasoningEffort } from "@/lib/domain/provider";
-import type { Conversation, ConversationIndexV1, ConversationItem, ConversationSummary, HistorySettingsV1 } from "@/lib/domain/conversation";
-import { COMPACTION_SUMMARY_MAX_CHARS, HISTORY_RETENTIONS, titleFromPrompt } from "@/lib/domain/conversation";
+import type { Conversation, ConversationIndexV1, ConversationItem, ConversationSummary, HistorySettingsV1, MessageQueueV1, QueuedMessage } from "@/lib/domain/conversation";
+import { COMPACTION_SUMMARY_MAX_CHARS, HISTORY_RETENTIONS, isTurnStart, MAX_QUEUED_MESSAGES, titleFromPrompt } from "@/lib/domain/conversation";
 import { digestFromItems, isValidRunDigest } from "@/lib/domain/run-digest";
 import { DEFAULT_MODEL_ID, DEFAULT_REASONING_EFFORT } from "@/lib/providers/openai-models";
 import { deviceKey, type DeviceKey } from "@/lib/background/device-key";
-import { isSessionId, isWorkspacePath, WORKSPACE_MAX_FILE_CHARS, WORKSPACE_MAX_FILES } from "@/lib/validation";
+import { isSessionId, isWorkspacePath, validatePromptText, WORKSPACE_MAX_FILE_CHARS, WORKSPACE_MAX_FILES } from "@/lib/validation";
 import type { ScratchFileEntry, ScratchStore } from "@/lib/background/browser-program";
 
 export type { AppSettingsV1 } from "@/lib/domain/provider";
@@ -133,7 +133,7 @@ function isValidConversationItem(value: unknown): value is ConversationItem {
   if (typeof v.id !== "string" || typeof v.at !== "number") return false;
   if (v.kind === "message") {
     if (typeof v.text !== "string") return false;
-    if (v.role === "user") return v.context === null || typeof v.context === "object";
+    if (v.role === "user") return (v.context === null || typeof v.context === "object") && (v.delivery === undefined || v.delivery === "steer");
     return v.role === "assistant";
   }
   if (v.kind === "tool-call") return typeof v.call === "object" && v.call !== null;
@@ -338,6 +338,7 @@ export async function migrateCredentials(key: DeviceKey = deviceKey): Promise<vo
 //   local:conversation:<id>:items:<n>  ConversationChunkV1 (items n*CHUNK .. n*CHUNK+CHUNK-1)
 //   local:openConversation             OpenConversationV1 (the session the sidebar shows)
 //   local:workspace:<id>:<slot>        WorkspaceFileV1 (one /workspace file of the session; see below)
+//   local:queue:<id>                   MessageQueueV1 (messages typed while a run worked, until delivered)
 //
 // An append writes only the tail chunk and the session record, in one
 // `storage.local.set`, so its cost does not grow with history. The index is
@@ -424,7 +425,7 @@ function isValidLegacyConversation(value: unknown): value is LegacyConversationR
 }
 
 function firstPromptTitle(items: readonly ConversationItem[]): string {
-  const prompt = items.find((item) => item.kind === "message" && item.role === "user");
+  const prompt = items.find(isTurnStart);
   return prompt ? titleFromPrompt(prompt.text) : "";
 }
 
@@ -613,24 +614,24 @@ export function updateSession(id: string, patch: { title?: string; pinned?: bool
   });
 }
 
-/** Deletes a session's items, record, and scratch files, then its index entry, and clears the open pointer if it pointed there. */
+/** Deletes a session's items, record, scratch files, and message queue, then its index entry, and clears the open pointer if it pointed there. */
 export function deleteSession(id: string): Promise<void> {
   return withConversationLock(async () => {
     const sessions = await readIndex();
     const entry = sessions.find((session) => session.id === id);
     const record = await readRecord(id);
-    await storage.removeItems([recordKey(id), ...chunkKeys(id, Math.max(record?.itemCount ?? 0, entry?.itemCount ?? 0)), ...workspaceKeys(id)]);
+    await storage.removeItems([recordKey(id), ...chunkKeys(id, Math.max(record?.itemCount ?? 0, entry?.itemCount ?? 0)), ...workspaceKeys(id), queueKey(id)]);
     if (entry) await writeIndex(sessions.filter((session) => session !== entry));
     if ((await openConversationItem.getValue())?.id === id) await openConversationItem.removeValue();
   });
 }
 
-/** Deletes several sessions' items, records, and scratch files, then their index entries in one write. Clears the open pointer if it pointed at one. */
+/** Deletes several sessions' items, records, scratch files, and message queues, then their index entries in one write. Clears the open pointer if it pointed at one. */
 async function removeSessions(sessions: ConversationSummary[], doomed: readonly ConversationSummary[]): Promise<void> {
   if (doomed.length === 0) return;
   const records = await Promise.all(doomed.map((session) => readRecord(session.id)));
   await storage.removeItems(doomed.flatMap((session, i) =>
-    [recordKey(session.id), ...chunkKeys(session.id, Math.max(records[i]?.itemCount ?? 0, session.itemCount)), ...workspaceKeys(session.id)]));
+    [recordKey(session.id), ...chunkKeys(session.id, Math.max(records[i]?.itemCount ?? 0, session.itemCount)), ...workspaceKeys(session.id), queueKey(session.id)]));
   const ids = new Set(doomed.map((session) => session.id));
   await writeIndex(sessions.filter((session) => !ids.has(session.id)));
   const open = await openConversationItem.getValue();
@@ -773,6 +774,36 @@ export function workspaceStore(sessionId: string): ScratchStore {
     write: ({ slot, path, content }) => storage.setItem(workspaceKey(sessionId, slot), { version: 1, path, content } satisfies WorkspaceFileV1),
     remove: (slot) => storage.removeItem(workspaceKey(sessionId, slot)),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Message queue — each session's messages typed while a run was working.
+// ---------------------------------------------------------------------------
+
+const queueKey = (id: string) => `local:queue:${id}` as const;
+
+function isValidQueuedMessage(value: unknown): value is QueuedMessage {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return typeof v.id === "string" && v.id.length > 0 && v.id.length <= 64 && (v.mode === "follow-up" || v.mode === "steer") &&
+    typeof v.text === "string" && validatePromptText(v.text) === v.text && Number.isFinite(v.at);
+}
+
+/** A session's queued messages, oldest first. A malformed record is deleted and reads as empty. */
+export async function loadMessageQueue(sessionId: string): Promise<QueuedMessage[]> {
+  const raw = await storage.getItem<unknown>(queueKey(sessionId));
+  const queue = raw as { version?: unknown; messages?: unknown } | null;
+  if (queue?.version === 1 && Array.isArray(queue.messages) && queue.messages.length <= MAX_QUEUED_MESSAGES && queue.messages.every(isValidQueuedMessage)) {
+    return queue.messages;
+  }
+  if (raw !== null) await storage.removeItem(queueKey(sessionId));
+  return [];
+}
+
+/** Replaces a session's queue; an empty queue removes the record. */
+export async function saveMessageQueue(sessionId: string, messages: readonly QueuedMessage[]): Promise<void> {
+  if (messages.length === 0) await storage.removeItem(queueKey(sessionId));
+  else await storage.setItem(queueKey(sessionId), { version: 1, messages: [...messages] } satisfies MessageQueueV1);
 }
 
 // ---------------------------------------------------------------------------

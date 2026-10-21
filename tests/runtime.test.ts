@@ -11,7 +11,7 @@ import type { RuntimeClock } from "@/lib/background/runtime";
 import { ProviderStreamError } from "@/lib/providers/openai";
 import {
   saveOpenAICredential, appendConversationItem, createSession, ensureOpenSession, getConversation, getOpenAICredential, getOpenSessionId,
-  listSessions, saveHistorySettings, saveRunCheckpoint, setOpenSessionId, updateSession,
+  listSessions, loadMessageQueue, saveHistorySettings, saveMessageQueue, saveRunCheckpoint, setOpenSessionId, updateSession,
 } from "@/lib/storage";
 import type { ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
 import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
@@ -227,7 +227,7 @@ beforeEach(() => {
 });
 
 describe("BackgroundRuntime: single active run", () => {
-  it("drops a second run.start while a run is active and republishes a snapshot", async () => {
+  it("queues a second run.start as a follow-up while the run is active, without a second user message", async () => {
     await saveOpenAICredential("sk-test");
     const hub = new SidebarHub();
     const provider = new FakeProvider();
@@ -247,12 +247,12 @@ describe("BackgroundRuntime: single active run", () => {
     const snapshot = await runtime.getSnapshot();
     expect(snapshot.activeRun).not.toBeNull();
     expect(snapshot.conversation.items.filter((item) => item.kind === "message" && item.role === "user")).toHaveLength(1);
-
-    const snapshotEvents = port.received.filter((e) => e.type === "state.snapshot");
-    expect(snapshotEvents.length).toBeGreaterThanOrEqual(1);
+    expect(snapshot.queue).toEqual([{ id: expect.any(String), mode: "follow-up", text: "Second", at: expect.any(Number) }]);
+    expect(port.received.find((e) => e.type === "queue.changed")).toMatchObject({ conversationId: snapshot.conversation.id, payload: { messages: snapshot.queue } });
+    expect(provider.requests).toHaveLength(1);
   });
 
-  it("never starts two runs even when run.start arrives twice before credential lookup resolves", async () => {
+  it("never starts two runs at once even when run.start arrives twice before credential lookup resolves; the second follows the first", async () => {
     await saveOpenAICredential("sk-test");
     const hub = new SidebarHub();
     const provider = new FakeProvider();
@@ -272,7 +272,9 @@ describe("BackgroundRuntime: single active run", () => {
 
     const snapshot = await runtime.getSnapshot();
     const userMessages = snapshot.conversation.items.filter((item) => item.kind === "message" && item.role === "user");
-    expect(userMessages).toHaveLength(1);
+    expect(userMessages.map((item) => item.text)).toEqual(["A", "B"]);
+    expect(provider.requests[1]?.context.messages.map((message) => message.role)).toEqual(["user", "assistant", "user"]);
+    expect(snapshot.queue).toEqual([]);
   });
 });
 
@@ -2185,5 +2187,197 @@ describe("BackgroundRuntime: run digests and context continuity", () => {
     expect(provider.requests[1]!.context.messages[0]!.content).toContain("Summary of orchids.");
     const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export", sessionId: (await getOpenSessionId())! });
     expect(exported?.markdown).toContain("Summary of orchids.");
+  });
+});
+
+describe("BackgroundRuntime: talk while it works", () => {
+  type Round = { events?: ScriptedProviderEvent[]; gate?: Promise<void>; error?: Error };
+  const answer = (text: string): ScriptedProviderEvent[] => [{ type: "text.delta", delta: text }, { type: "turn.completed", replayState: null }];
+  const program: ScriptedProviderEvent[] = [
+    { type: "tool.call", call: { id: "call_1", name: "browser_program", arguments: { source: "return 1;" } } }, { type: "turn.completed", replayState: null },
+  ];
+  /** Rounds in order; a gated round waits for its gate (or cancellation) before streaming. */
+  function scripted(provider: FakeProvider, rounds: Round[]): void {
+    let round = 0;
+    provider.script = (signal) => {
+      const next = rounds[round++] ?? { events: answer("Extra.") };
+      return { [Symbol.asyncIterator]: async function* () {
+        if (next.gate) {
+          await new Promise<void>((resolve, reject) => {
+            void next.gate!.then(resolve);
+            signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+          });
+        }
+        if (next.error) throw next.error;
+        yield* next.events ?? [];
+      } };
+    };
+  }
+  function setup(provider = new FakeProvider()) {
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+    return { runtime, port, provider };
+  }
+  const send = (runtime: BackgroundRuntime, command: Record<string, unknown>) =>
+    runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+  const userTexts = (items: ConversationItem[]) => items.flatMap((item) => item.kind === "message" && item.role === "user" ? [item.text] : []);
+  const queueOf = async (runtime: BackgroundRuntime) => (await runtime.getSnapshot()).queue.map((message) => `${message.mode}:${message.text}`);
+
+  beforeEach(async () => {
+    await saveOpenAICredential("sk-test");
+  });
+
+  it("steers the running turn at its next tool boundary, showing the steer as pending until it is delivered", async () => {
+    const { runtime, port, provider } = setup();
+    const gate = Promise.withResolvers<void>();
+    scripted(provider, [{ events: program, gate: gate.promise }, { events: answer("Used tab 2.") }]);
+    const run = send(runtime, { type: "run.start", prompt: "Compare prices" });
+    await tick();
+    const { activeRun, conversation } = await runtime.getSnapshot();
+    await send(runtime, { type: "run.steer", runId: activeRun!.runId, text: "  Use tab 2  " });
+    const [pending] = (await runtime.getSnapshot()).queue;
+    expect(pending).toEqual({ id: expect.any(String), mode: "steer", text: "Use tab 2", at: expect.any(Number) });
+    // A pending steer is already on its way to the model.
+    await send(runtime, { type: "queue.remove", sessionId: conversation.id, messageId: pending!.id });
+    expect(await queueOf(runtime)).toEqual(["steer:Use tab 2"]);
+
+    gate.resolve();
+    await run;
+    expect(JSON.stringify(provider.requests[0]!.context.messages)).not.toContain("Use tab 2");
+    expect(provider.requests[1]!.context.messages.at(-1)).toMatchObject({ role: "user", content: "Use tab 2" });
+    const items = (await openConversation()).items;
+    expect(items.map((item) => item.kind === "message" ? item.role : item.kind)).toEqual(["user", "tool-call", "tool-result", "user", "assistant", "run-digest"]);
+    expect(items[3]).toMatchObject({ id: pending!.id, delivery: "steer", text: "Use tab 2" });
+    expect(port.received.find((event) => event.type === "steer.delivered")?.payload).toEqual({ item: items[3] });
+    expect(await queueOf(runtime)).toEqual([]);
+    expect(port.received.filter((event) => event.type === "run.started")).toHaveLength(1);
+  });
+
+  it("starts a queued follow-up as the next turn once the run completes, in the run's chat even after switching chats", async () => {
+    const { runtime, port, provider } = setup();
+    const gate = Promise.withResolvers<void>();
+    scripted(provider, [{ events: answer("A done."), gate: gate.promise }, { events: answer("B done.") }]);
+    const run = send(runtime, { type: "run.start", prompt: "A" });
+    await tick();
+    const first = (await runtime.getSnapshot()).conversation.id;
+    await send(runtime, { type: "run.start", prompt: "B" });
+    expect(await queueOf(runtime)).toEqual(["follow-up:B"]);
+    await send(runtime, { type: "session.create" });
+    // Another chat cannot queue for, or start beside, the run.
+    await send(runtime, { type: "run.start", prompt: "C" });
+    expect(await queueOf(runtime)).toEqual([]);
+
+    gate.resolve();
+    await run;
+    const chat = await getConversation(first);
+    expect(userTexts(chat!.items)).toEqual(["A", "B"]);
+    expect(chat!.items.at(-1)).toMatchObject({ role: "assistant", text: "B done." });
+    expect((await openConversation()).items).toEqual([]);
+    expect(provider.requests).toHaveLength(2);
+    expect(provider.requests[1]!.sessionId).toBe(first);
+    expect(provider.requests[1]!.context.messages.map((message) => message.role)).toEqual(["user", "assistant", "user"]);
+    expect(port.received.filter((event) => event.type === "run.started").map((event) => event.conversationId)).toEqual([first, first]);
+    expect(await loadMessageQueue(first)).toEqual([]);
+  });
+
+  it("keeps follow-ups waiting after a failed run until the user sends or removes them", async () => {
+    const { runtime, provider } = setup();
+    const gate = Promise.withResolvers<void>();
+    scripted(provider, [{ gate: gate.promise, error: new ProviderStreamError("Rate limited.", "RATE_LIMIT") }, { events: answer("B done.") }]);
+    const run = send(runtime, { type: "run.start", prompt: "A" });
+    await tick();
+    await send(runtime, { type: "run.start", prompt: "B" });
+    await send(runtime, { type: "run.start", prompt: "C" });
+    gate.resolve();
+    await run;
+    expect(provider.requests).toHaveLength(1);
+    expect(await queueOf(runtime)).toEqual(["follow-up:B", "follow-up:C"]);
+
+    const { conversation, queue } = await runtime.getSnapshot();
+    await send(runtime, { type: "queue.remove", sessionId: conversation.id, messageId: queue[1]!.id });
+    await send(runtime, { type: "queue.send", sessionId: conversation.id, messageId: queue[0]!.id });
+    expect(userTexts((await openConversation()).items)).toEqual(["A", "B"]);
+    expect(provider.requests).toHaveLength(2);
+    expect(await queueOf(runtime)).toEqual([]);
+  });
+
+  it("turns steers still pending at cancellation into waiting follow-ups and sends nothing", async () => {
+    const { runtime, provider } = setup();
+    scripted(provider, [{ events: answer("Never."), gate: new Promise(() => {}) }]);
+    const run = send(runtime, { type: "run.start", prompt: "A" });
+    await tick();
+    const runId = (await runtime.getSnapshot()).activeRun!.runId;
+    await send(runtime, { type: "run.steer", runId, text: "S" });
+    await send(runtime, { type: "run.start", prompt: "F" });
+    await send(runtime, { type: "run.cancel", runId });
+    await run;
+    expect(await queueOf(runtime)).toEqual(["follow-up:S", "follow-up:F"]);
+    expect(provider.requests).toHaveLength(1);
+    expect(userTexts((await openConversation()).items)).toEqual(["A"]);
+  });
+
+  it("treats a steer for a run that already ended as a new prompt", async () => {
+    const { runtime, provider } = setup();
+    scripted(provider, [{ events: answer("One.") }, { events: answer("Two.") }]);
+    await send(runtime, { type: "run.start", prompt: "A" });
+    await send(runtime, { type: "run.steer", runId: "finished-run", text: "More" });
+    expect(userTexts((await openConversation()).items)).toEqual(["A", "More"]);
+    expect((await openConversation()).items.some((item) => item.kind === "message" && item.role === "user" && item.delivery === "steer")).toBe(false);
+    expect(provider.requests).toHaveLength(2);
+  });
+
+  it("keeps queued messages across a background restart; the interrupted run's steers come back as follow-ups, unsent", async () => {
+    const before = setup();
+    scripted(before.provider, [{ events: answer("Never."), gate: new Promise(() => {}) }]);
+    void send(before.runtime, { type: "run.start", prompt: "A" });
+    await tick();
+    await send(before.runtime, { type: "run.steer", runId: (await before.runtime.getSnapshot()).activeRun!.runId, text: "S" });
+    await send(before.runtime, { type: "run.start", prompt: "F" });
+
+    const after = setup();
+    await after.runtime.initialize();
+    expect(await queueOf(after.runtime)).toEqual(["follow-up:S", "follow-up:F"]);
+    expect(after.provider.requests).toHaveLength(0);
+    expect((await openConversation()).items.at(-1)).toMatchObject({ role: "assistant", text: expect.stringContaining("Interrupted") });
+  });
+
+  it("drops a queued message whose item a restart caught already written, so it is never sent twice", async () => {
+    const id = await ensureOpenSession();
+    await saveMessageQueue(id, [{ id: "q1", mode: "steer", text: "S", at: 1 }, { id: "q2", mode: "follow-up", text: "F", at: 2 }]);
+    await appendConversationItem(id, { id: "q1", kind: "message", role: "user", text: "S", context: null, delivery: "steer", at: 3 });
+    const { runtime } = setup();
+    await runtime.initialize();
+    expect(await queueOf(runtime)).toEqual(["follow-up:F"]);
+  });
+
+  it("gives a dispatched follow-up's user message its queued id", async () => {
+    const { runtime, provider } = setup();
+    const gate = Promise.withResolvers<void>();
+    scripted(provider, [{ events: answer("A done."), gate: gate.promise }, { events: answer("B done.") }]);
+    const run = send(runtime, { type: "run.start", prompt: "A" });
+    await tick();
+    await send(runtime, { type: "run.start", prompt: "B" });
+    const [queued] = (await runtime.getSnapshot()).queue;
+    gate.resolve();
+    await run;
+    expect((await openConversation()).items.find((item) => item.kind === "message" && item.text === "B")?.id).toBe(queued!.id);
+  });
+
+  it("retries a failed turn with the steers it received, without adding user items", async () => {
+    const { runtime, provider } = setup();
+    const gate = Promise.withResolvers<void>();
+    scripted(provider, [{ events: program, gate: gate.promise }, { error: new ProviderStreamError("Rate limited.", "RATE_LIMIT") }, { events: answer("Done.") }]);
+    const run = send(runtime, { type: "run.start", prompt: "A" });
+    await tick();
+    await send(runtime, { type: "run.steer", runId: (await runtime.getSnapshot()).activeRun!.runId, text: "S" });
+    gate.resolve();
+    await run;
+    await send(runtime, { type: "run.retry" });
+    expect(provider.requests[2]!.context.messages.map((message) => message.content)).toEqual(["A", "S"]);
+    expect(userTexts((await openConversation()).items)).toEqual(["A", "S"]);
+    expect((await openConversation()).items.at(-1)).toMatchObject({ role: "assistant", text: "Done." });
   });
 });

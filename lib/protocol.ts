@@ -19,7 +19,7 @@ import type {
   ToolCall,
   ToolResult,
 } from "@/lib/domain/tools";
-import type { Conversation, ConversationSummary, HistoryRetention, HistorySettingsV1 } from "@/lib/domain/conversation";
+import type { Conversation, ConversationItem, ConversationSummary, HistoryRetention, HistorySettingsV1, QueuedMessage } from "@/lib/domain/conversation";
 import { HISTORY_RETENTIONS } from "@/lib/domain/conversation";
 import type { AppSettingsV1, ChatGPTStatus, ProviderDefinition } from "@/lib/domain/provider";
 import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction } from "@/lib/validation";
@@ -227,8 +227,22 @@ export type SidebarCommand =
   /** Sets a user title, which is never auto-overwritten. */
   | { v: 1; id: string; type: "session.rename"; sessionId: string; title: string }
   | { v: 1; id: string; type: "session.pin"; sessionId: string; pinned: boolean }
-  /** Starts a run in the open session. */
+  /**
+   * Starts a run in the open session. While the active run is in the open
+   * session, queues the prompt as a follow-up instead: it starts the next
+   * turn once that run completes (not after a failure or cancellation).
+   */
   | { v: 1; id: string; type: "run.start"; prompt: string }
+  /**
+   * Guidance for the active run, delivered as a user message at its next tool
+   * boundary, within the same turn and budgets. If `runId` is no longer
+   * running (finished or cancelling), handled exactly like `run.start`.
+   */
+  | { v: 1; id: string; type: "run.steer"; runId: string; text: string }
+  /** Discards a queued follow-up, or a steer not yet delivered, from a session's queue. */
+  | { v: 1; id: string; type: "queue.remove"; sessionId: string; messageId: string }
+  /** Starts a run with a queued follow-up of the open session now; refused while any run is active. */
+  | { v: 1; id: string; type: "queue.send"; sessionId: string; messageId: string }
   /** Re-runs the open session's last turn's existing user message; accepted only when no run is active and that turn ended failed, cancelled, or interrupted without a committed page effect. */
   | { v: 1; id: string; type: "run.retry" }
   | { v: 1; id: string; type: "run.cancel"; runId: string }
@@ -251,6 +265,8 @@ export interface RuntimeSnapshot {
   page: PageArtifactSummary | null;
   /** Hidden agent tabs (search tabs included) per owning session id; sessions with none are omitted. */
   agentTabs: Record<string, number>;
+  /** The open session's queued follow-ups and undelivered steers, oldest first. */
+  queue: QueuedMessage[];
   /** The single active run, which may belong to a session other than the open one. */
   activeRun: {
     runId: string;
@@ -284,11 +300,15 @@ export type SidebarEvent =
   | EventBase<"session.listed", { sessions: ConversationSummary[] }>
   | EventBase<"page.attached", PageArtifactSummary | null>
   | EventBase<"agent-tabs.changed", { bySession: Record<string, number> }>
+  /** A session's queue after it changed; `conversationId` is that session. Not run-sequenced. */
+  | EventBase<"queue.changed", { messages: QueuedMessage[] }>
   | EventBase<"run.started", { prompt: string; page: PageArtifactSummary | null; retry: boolean }>
   | EventBase<"assistant.delta", { delta: string }>
   | EventBase<"tool.requested", { call: ToolCall; display: string }>
   | EventBase<"action.approval-required", ApprovalRequest>
   | EventBase<"tool.result", { callId: string; result: ToolResult }>
+  /** A steer reached the model; `item` is the persisted user message (`delivery: "steer"`), whose id is the queued message's. */
+  | EventBase<"steer.delivered", { item: ConversationItem }>
   | EventBase<"run.completed", { messageId: string }>
   | EventBase<"run.cancelled", { partialText: string; messageId: string | null }>
   | EventBase<"run.failed", NormalizedError>;
@@ -312,6 +332,10 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
     return candidate.lastSeq === null || typeof candidate.lastSeq === "number";
   }
   if (candidate.type === "run.start") return typeof candidate.prompt === "string";
+  if (candidate.type === "run.steer") return typeof candidate.runId === "string" && typeof candidate.text === "string";
+  if (candidate.type === "queue.remove" || candidate.type === "queue.send") {
+    return isSessionId(candidate.sessionId) && typeof candidate.messageId === "string";
+  }
   if (candidate.type === "run.retry") return true;
   if (candidate.type === "run.cancel") return typeof candidate.runId === "string";
   if (candidate.type === "action.approve" || candidate.type === "action.deny") {

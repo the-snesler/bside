@@ -24,6 +24,17 @@ describe("isSidebarCommand: accepts every valid variant", () => {
     expect(isSidebarCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi" })).toBe(true);
   });
 
+  it("accepts run.steer and the queue commands only with their fields", () => {
+    expect(isSidebarCommand({ v: 1, id: "1", type: "run.steer", runId: "r1", text: "Use tab 2" })).toBe(true);
+    expect(isSidebarCommand({ v: 1, id: "1", type: "run.steer", text: "Use tab 2" })).toBe(false);
+    expect(isSidebarCommand({ v: 1, id: "1", type: "run.steer", runId: "r1", text: 5 })).toBe(false);
+    for (const type of ["queue.remove", "queue.send"]) {
+      expect(isSidebarCommand({ v: 1, id: "1", type, sessionId: "s1", messageId: "m1" })).toBe(true);
+      expect(isSidebarCommand({ v: 1, id: "1", type, sessionId: "../s1", messageId: "m1" })).toBe(false);
+      expect(isSidebarCommand({ v: 1, id: "1", type, sessionId: "s1" })).toBe(false);
+    }
+  });
+
   it("accepts run.retry, which carries no prompt", () => {
     expect(isSidebarCommand({ v: 1, id: "1", type: "run.retry" })).toBe(true);
   });

@@ -13,6 +13,12 @@ export type ConversationItem =
       role: "user";
       text: string;
       context: PageArtifactSummary | null;
+      /**
+       * `"steer"`: guidance sent while the turn's run was working, persisted
+       * where the model received it (after a tool round). It belongs to the
+       * current turn: never a turn start, a compaction boundary, or a retry target.
+       */
+      delivery?: "steer";
       at: number;
     }
   | { id: string; kind: "message"; role: "assistant"; text: string; at: number }
@@ -32,6 +38,34 @@ export type ConversationItem =
    * stored and visible. Untrusted model text derived from page content.
    */
   | { id: string; kind: "compaction"; summary: string; firstKeptItemId: string; tokensBefore: number; at: number };
+
+export type UserMessageItem = Extract<ConversationItem, { kind: "message"; role: "user" }>;
+
+/** A user prompt that starts a turn; mid-turn steers do not. */
+export function isTurnStart(item: ConversationItem): item is UserMessageItem {
+  return item.kind === "message" && item.role === "user" && item.delivery !== "steer";
+}
+
+/**
+ * A message typed while a run was working in its session. A `"follow-up"`
+ * starts the next turn after the run completes; a `"steer"` waits for the
+ * active run's next tool boundary and becomes a follow-up if the run ends
+ * first. Persisted per session as `MessageQueueV1` until it is delivered.
+ */
+export interface QueuedMessage {
+  id: string;
+  mode: "follow-up" | "steer";
+  /** Validated prompt text, mentions encoded as the composer serializes them. */
+  text: string;
+  at: number;
+}
+
+export interface MessageQueueV1 {
+  version: 1;
+  messages: QueuedMessage[];
+}
+
+export const MAX_QUEUED_MESSAGES = 20;
 
 /** Longer summaries are clipped before they are stored. */
 export const COMPACTION_SUMMARY_MAX_CHARS = 60_000;

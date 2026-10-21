@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { h, render } from "preact";
 import { act } from "preact/test-utils";
 import { Markdown } from "@/lib/ui/Markdown";
-import { parsePromptMentions, serializeDraft } from "@/lib/ui/Composer";
+import { composerKeyAction, parsePromptMentions, serializeDraft } from "@/lib/ui/Composer";
 import { useBottomScroll } from "@/lib/ui/use-bottom-scroll";
 import { useBackground } from "@/lib/ui/use-background";
 import { isSidebarCommand } from "@/lib/protocol";
@@ -16,8 +16,15 @@ import type { ConversationItem, ConversationSummary } from "@/lib/domain/convers
 import type { RuntimeSnapshot, SidebarEvent } from "@/lib/protocol";
 import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
 
-// Slate resolves real React under Vitest, so App-level tests render without the editor.
-vi.mock("@/lib/ui/Composer", async (original) => ({ ...await original<typeof import("@/lib/ui/Composer")>(), Composer: () => null }));
+// Slate resolves real React under Vitest, so App-level tests render without the editor and read the props it would get.
+const composer = vi.hoisted(() => ({ props: null as null | Record<string, unknown> }));
+vi.mock("@/lib/ui/Composer", async (original) => ({
+  ...await original<typeof import("@/lib/ui/Composer")>(),
+  Composer: (props: Record<string, unknown>) => {
+    composer.props = props;
+    return null;
+  },
+}));
 
 function snapshotFor(id: string): RuntimeSnapshot {
   return {
@@ -25,7 +32,7 @@ function snapshotFor(id: string): RuntimeSnapshot {
     credential: { configured: true, maskedSuffix: null, chatgpt: { connected: false, email: null, signInAgain: false } },
     provider: OPENAI_PROVIDER,
     settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
-    page: null, agentTabs: {}, activeRun: null, lastSeq: 0, notice: null,
+    page: null, agentTabs: {}, queue: [], activeRun: null, lastSeq: 0, notice: null,
   };
 }
 
@@ -293,6 +300,86 @@ describe("sidebar UI contracts", () => {
     expect(background!.activeRun).toBeNull();
     expect(background!.lastError).toBeNull();
     await act(() => render(null, root));
+  });
+
+  it("keeps a steer inside the turn it was sent in and shows it in the trace as the user's guidance", () => {
+    const items: ConversationItem[] = [
+      ...turnItems.slice(0, 3),
+      { id: "s1", kind: "message", role: "user", text: "Use the @Shop (tab 2, /tabs/2/page.md, https://shop.example/) instead", context: null, delivery: "steer", at: 3_500 },
+      ...turnItems.slice(3),
+      { id: "u2", kind: "message", role: "user", text: "Next", context: null, at: 70_000 },
+    ];
+    const turns = buildTurns(items, false);
+    expect(turns.map((turn) => turn.prompt?.text)).toEqual(["Fill the form", "Next"]);
+    expect(turns[0]!.steps.map((step) => step.kind)).toEqual(["activity", "steer", "text", "activity"]);
+    expect(turns[0]!.answer).toEqual({ id: "a2", text: "Okay, not submitted." });
+    const root = document.createElement("div");
+    document.body.append(root);
+    render(h(TurnTrace, { turn: turns[0]!, active: true, pendingApproval: null, onApprove: () => {}, onDeny: () => {} }), root);
+    expect(root.querySelector(".trace__steer")?.textContent).toBe("YouUse the @Shop instead");
+    render(null, root);
+  });
+
+  it("maps Enter to send and Ctrl/Cmd+Enter to steer only while steering is available", () => {
+    const key = (overrides: Partial<{ key: string; shiftKey: boolean; ctrlKey: boolean; metaKey: boolean }>) =>
+      ({ key: "Enter", shiftKey: false, ctrlKey: false, metaKey: false, ...overrides });
+    expect(composerKeyAction(key({}), true)).toBe("send");
+    expect(composerKeyAction(key({ ctrlKey: true }), true)).toBe("steer");
+    expect(composerKeyAction(key({ metaKey: true }), true)).toBe("steer");
+    expect(composerKeyAction(key({ metaKey: true }), false)).toBe("send");
+    expect(composerKeyAction(key({ shiftKey: true }), true)).toBeNull();
+    expect(composerKeyAction(key({ key: "a" }), true)).toBeNull();
+  });
+
+  it("keeps the composer live during this chat's run: send queues, steer targets the run, and queued messages can be removed or sent", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    const posted: Record<string, unknown>[] = [];
+    const listeners: Array<(message: unknown) => void> = [];
+    vi.spyOn(browser.runtime, "connect").mockReturnValue({
+      postMessage: (message: Record<string, unknown>) => posted.push(message),
+      onMessage: { addListener: (listener: (message: unknown) => void) => listeners.push(listener), removeListener: () => {} },
+      disconnect: () => {},
+    } as never);
+    const root = document.createElement("div");
+    document.body.append(root);
+    await act(() => render(h(App, {}), root));
+    const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) =>
+      act(() => listeners.forEach((listener) => listener({ v: 1, seq: 1, at: 1, ...event })));
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: snapshotFor("a") });
+    await emit({ runId: "r1", conversationId: "a", type: "run.started", payload: { prompt: "Find it", page: null, retry: false } });
+    expect(composer.props).toMatchObject({ disabled: false, running: true, working: true, canSteer: true });
+
+    await act(() => (composer.props!.onSteer as (text: string) => void)("Use tab 2"));
+    expect(posted.at(-1)).toMatchObject({ type: "run.steer", runId: "r1", text: "Use tab 2" });
+    expect(isSidebarCommand(posted.at(-1))).toBe(true);
+    await act(() => (composer.props!.onSend as (text: string) => void)("Then summarize"));
+    expect(posted.at(-1)).toMatchObject({ type: "run.start", prompt: "Then summarize" });
+
+    await emit({ runId: null, conversationId: "a", type: "queue.changed", payload: { messages: [
+      { id: "q1", mode: "steer", text: "Use tab 2", at: 1 }, { id: "q2", mode: "follow-up", text: "Then summarize", at: 2 },
+    ] } });
+    const rows = [...root.querySelectorAll(".queue__item")];
+    expect(rows.map((row) => row.querySelector(".queue__label")?.textContent)).toEqual(["Steer", "Queued"]);
+    // A pending steer cannot be withdrawn; nothing can be sent now while the run works.
+    expect(rows[0]!.querySelector("button")).toBeNull();
+    expect(rows[1]!.querySelector('[aria-label="Send now"]')).toBeNull();
+    await act(() => (rows[1]!.querySelector('[aria-label="Remove from queue"]') as HTMLButtonElement).click());
+    expect(posted.at(-1)).toMatchObject({ type: "queue.remove", sessionId: "a", messageId: "q2" });
+    expect(isSidebarCommand(posted.at(-1))).toBe(true);
+
+    await emit({ runId: "r1", conversationId: "a", type: "steer.delivered", payload: { item: { id: "q1", kind: "message", role: "user", text: "Use tab 2", context: null, delivery: "steer", at: 3 } } });
+    expect(root.querySelectorAll(".queue__item")).toHaveLength(1);
+    expect(root.querySelector(".trace__steer")?.textContent).toContain("Use tab 2");
+
+    await emit({ runId: "r1", conversationId: "a", type: "run.failed", payload: { code: "RATE_LIMIT", message: "Rate limited.", retryable: true, phase: "provider" } });
+    expect(composer.props).toMatchObject({ disabled: false, running: false, working: false });
+    await act(() => (root.querySelector('.queue__item [aria-label="Send now"]') as HTMLButtonElement).click());
+    expect(posted.at(-1)).toMatchObject({ type: "queue.send", sessionId: "a", messageId: "q2" });
+
+    // A run in another chat keeps this chat's composer disabled.
+    await emit({ runId: "r2", conversationId: "b", type: "run.started", payload: { prompt: "Elsewhere", page: null, retry: false } });
+    expect(composer.props).toMatchObject({ disabled: true, working: false, canSteer: false });
+    render(null, root);
   });
 
   it("follows content growth only while pinned, and resumes after jumping to latest", async () => {
