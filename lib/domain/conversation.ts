@@ -51,6 +51,25 @@ export interface Conversation extends ConversationSummary {
   items: ConversationItem[];
 }
 
+/** How long unpinned sessions are kept after their last activity. */
+export type HistoryRetention = "forever" | "30d" | "7d";
+
+export const HISTORY_RETENTIONS: readonly HistoryRetention[] = ["forever", "30d", "7d"];
+
+/** Persisted as `local:historySettings`. */
+export interface HistorySettingsV1 {
+  version: 1;
+  retention: HistoryRetention;
+}
+
+const RETENTION_DAYS: Record<HistoryRetention, number | null> = { forever: null, "30d": 30, "7d": 7 };
+
+/** Sessions last updated before the returned time are past retention; `null` keeps everything. */
+export function retentionCutoff(retention: HistoryRetention, now: number): number | null {
+  const days = RETENTION_DAYS[retention];
+  return days === null ? null : now - days * 24 * 60 * 60_000;
+}
+
 export const SESSION_TITLE_MAX_CHARS = 60;
 
 /** Matches a tab mention as `serializeDraft` encodes it; group 1 is the label. */

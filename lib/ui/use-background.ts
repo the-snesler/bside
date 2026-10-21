@@ -20,7 +20,7 @@ import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
 
 export interface BackgroundState extends RuntimeSnapshot {
   tabs: TabMention[];
-  /** The last `session.listed` reply; empty until `listSessions()` is called. */
+  /** The session index, pinned first, then most recent. Requested on connect and pushed by the background whenever it changes. */
   sessions: ConversationSummary[];
   lastError: NormalizedError | null;
 }
@@ -41,7 +41,8 @@ export interface BackgroundActions {
   renameSession(sessionId: string, title: string): void;
   pinSession(sessionId: string, pinned: boolean): void;
   deleteSession(sessionId: string): void;
-  downloadContext(): void;
+  /** Downloads one session's context export. */
+  downloadContext(sessionId: string): void;
 }
 
 const EMPTY_CONVERSATION: Conversation = {
@@ -96,6 +97,7 @@ export function useBackground(): BackgroundState & BackgroundActions {
 
     const subscribe: SidebarCommand = { v: 1, id: crypto.randomUUID(), type: "state.subscribe", lastSeq: null };
     port.postMessage(subscribe);
+    port.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.list" } satisfies SidebarCommand);
 
     return () => {
       port.onMessage.removeListener(onMessage);
@@ -153,10 +155,10 @@ export function useBackground(): BackgroundState & BackgroundActions {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.delete", sessionId } satisfies SidebarCommand);
   }, []);
 
-  const downloadContext = useCallback(() => {
+  const downloadContext = useCallback((sessionId: string) => {
     const id = crypto.randomUUID();
     exportRequestRef.current = id;
-    portRef.current?.postMessage({ v: 1, id, type: "context.export" } satisfies SidebarCommand);
+    portRef.current?.postMessage({ v: 1, id, type: "context.export", sessionId } satisfies SidebarCommand);
   }, []);
 
   const listTabs = useCallback(() => {

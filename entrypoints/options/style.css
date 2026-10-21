@@ -94,3 +94,21 @@
   border: 1px solid var(--muted);
   background: var(--bg);
 }
+
+.options__form .options__danger {
+  border-color: var(--error);
+  background: var(--error);
+  color: var(--on-primary);
+}
+
+.options__form .options__secondary {
+  border-color: var(--muted);
+  background: transparent;
+  color: var(--ink);
+}
+
+.options__confirm {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: 13px;
+}

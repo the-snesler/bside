@@ -24,13 +24,17 @@ import {
   appendConversationItem,
   clearRunCheckpoint,
   createSession,
+  deleteAllSessions,
   deleteSession,
   ensureOpenSession,
   getAppSettings,
   getConversation,
+  getHistorySettings,
   isSessionUntouched,
   listSessions,
   migrateConversation,
+  pruneSessions,
+  saveHistorySettings,
   setOpenSessionId,
   touchSession,
   updateSession,
@@ -48,11 +52,14 @@ import type { RunStatus } from "@/lib/storage";
 import { validatePromptText, validateSessionTitle } from "@/lib/validation";
 import type { ContextArtifact } from "@/lib/domain/tools";
 import type { Conversation, ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
+import { retentionCutoff } from "@/lib/domain/conversation";
 import type { AppSettingsV1, ModelDefinition, ProviderAdapter, ProviderAuth, ProviderDefinition } from "@/lib/domain/provider";
 import type {
   ApprovalRequest,
   CredentialRequest,
   CredentialResponse,
+  HistoryRequest,
+  HistoryResponse,
   NormalizedError,
   RuntimeSnapshot,
   SettingsRequest,
@@ -67,6 +74,8 @@ const DELTA_COALESCE_BYTES = 1024;
 /** Agent tabs no run has used for this long are closed. */
 export const AGENT_TAB_IDLE_MS = 30 * 60_000;
 const AGENT_TAB_SWEEP_MS = 60_000;
+/** History retention is enforced at startup, when it changes, and on the first sweep after this long. */
+const RETENTION_SWEEP_MS = 60 * 60_000;
 
 /** Time source for agent-tab idle tracking; background-page timers, since the MV2 page is persistent. */
 export interface RuntimeClock {
@@ -120,6 +129,7 @@ export class BackgroundRuntime {
   #openSessionId: string | null = null;
   #sessionOps: Promise<void> = Promise.resolve();
   #sessionOpsPending = 0;
+  #lastRetentionAt = -Infinity;
   /**
    * Set when the last run's turn ended failed, cancelled, or interrupted, so
    * `run.retry` may re-run it while its session is open. `hadPageEffect`:
@@ -175,11 +185,15 @@ export class BackgroundRuntime {
           if (!sessionId) return;
           this.#retryable = { sessionId, hadPageEffect: lastTurnRanProgram((await getConversation(sessionId))?.items ?? []) };
         })
-        .finally(() => this.#openSession()),
+        .finally(() => this.#openSession())
+        .then(() => this.#applyRetention()),
       this.#restoreAgentTabs(),
     ]).then(() => {});
     await this.#ready;
-    this.#clock.setInterval(() => void this.#closeIdleAgentTabs(), AGENT_TAB_SWEEP_MS);
+    this.#clock.setInterval(() => {
+      void this.#closeIdleAgentTabs();
+      if (this.#clock.now() - this.#lastRetentionAt >= RETENTION_SWEEP_MS) void this.#applyRetention().catch(() => {});
+    }, AGENT_TAB_SWEEP_MS);
   }
 
   /**
@@ -347,7 +361,7 @@ export class BackgroundRuntime {
     };
   }
 
-  handleCommand(command: { v: 1; id: string; type: "context.export" }): Promise<{ markdown: string; filename: string }>;
+  handleCommand(command: Extract<SidebarCommand, { type: "context.export" }>): Promise<{ markdown: string; filename: string } | undefined>;
   handleCommand(command: { v: 1; id: string; type: "session.list" }): Promise<{ sessions: ConversationSummary[] }>;
   handleCommand(command: SidebarCommand): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]>;
   async handleCommand(command: SidebarCommand): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]> {
@@ -379,26 +393,7 @@ export class BackgroundRuntime {
       await this.#runSessionCommand(command);
       return;
     }
-    if (command.type === "context.export") {
-      const conversation = await this.#openConversation();
-      const fence = (text: string) => {
-        const delimiter = "`".repeat(Math.max(3, ...[...text.matchAll(/`+/g)].map((match) => match[0].length + 1)));
-        return `${delimiter}\n${text}\n${delimiter}`;
-      };
-      return { filename: `bside-context-${new Date().toISOString().replace(/[:.]/g, "-")}.md`, markdown: [
-        "# bside context export", `Exported: ${new Date().toISOString()}`, `Extension version: ${extensionVersion()}`,
-        "## Latest run", "Model, timing, usage, and per-call results for the latest run in this background session, which may belong to another chat.",
-        this.#runRecord ? fence(JSON.stringify(this.#runRecord, null, 2)) : "No run recorded in this background session.",
-        "## Latest model input", "This is the most recent request, not an exact live token count. It is held in memory only; after an extension restart only the saved conversation remains. It may include private page content. Credentials are not included.",
-        this.#latestContext ? fence(this.#latestContext) : "No model input captured in this background session.",
-        "## Full tool output — latest run", "Exact tool results, including bounded page snapshots and errors. Retained only until the next run, New chat, deleting that run's chat, or extension restart. These are the snapshots exposed to the agent, not the entire page DOM.",
-        this.#debugOutputTruncated ? "Earlier results were dropped to keep the debug buffer below 2 million characters." : "No tool results dropped from this run.",
-        this.#debugOutputs.length ? fence(`[\n${this.#debugOutputs.join(",\n")}\n]`) : "No tool output captured in this run/session.",
-        "## Conversation log", "The open chat.", fence(JSON.stringify(conversation, null, 2)),
-        "## Partial response", fence(this.#activeRun?.partialAssistantText ?? ""),
-        "## Scratch files", fence(JSON.stringify(Object.fromEntries(this.#workspace.files), null, 2)),
-      ].join("\n\n") };
-    }
+    if (command.type === "context.export") return this.#exportSession(command.sessionId);
     if (command.type === "run.start") {
       await this.#startRun(command.prompt);
       return;
@@ -421,18 +416,115 @@ export class BackgroundRuntime {
   }
 
   /**
-   * Serializes session changes and republishes the snapshot. `run.start` and
-   * `run.retry` are refused while one is pending, so a run never starts in a
+   * One session as Markdown. The latest run's diagnostics, model input, tool
+   * output, and scratch files describe one session, so they are included only
+   * when exporting that session.
+   */
+  async #exportSession(sessionId: string): Promise<{ markdown: string; filename: string } | undefined> {
+    const conversation = await getConversation(sessionId);
+    if (!conversation) {
+      this.#notice = "That chat no longer exists.";
+      await this.#sidebarHub.broadcastSnapshot();
+      return undefined;
+    }
+    const latestRun = this.#debugSessionId === sessionId;
+    const fence = (text: string) => {
+      const delimiter = "`".repeat(Math.max(3, ...[...text.matchAll(/`+/g)].map((match) => match[0].length + 1)));
+      return `${delimiter}\n${text}\n${delimiter}`;
+    };
+    return { filename: `bside-context-${new Date().toISOString().replace(/[:.]/g, "-")}.md`, markdown: [
+      "# bside context export", `Exported: ${new Date().toISOString()}`, `Extension version: ${extensionVersion()}`,
+      "## Latest run", "Model, timing, usage, and per-call results for this chat's latest run in this background session.",
+      latestRun && this.#runRecord ? fence(JSON.stringify(this.#runRecord, null, 2)) : "No run recorded for this chat in this background session.",
+      "## Latest model input", "This is the most recent request, not an exact live token count. It is held in memory only; after an extension restart only the saved conversation remains. It may include private page content. Credentials are not included.",
+      latestRun && this.#latestContext ? fence(this.#latestContext) : "No model input captured for this chat in this background session.",
+      "## Full tool output — latest run", "Exact tool results, including bounded page snapshots and errors. Retained only until the next run, New chat, deleting that run's chat, or extension restart. These are the snapshots exposed to the agent, not the entire page DOM.",
+      latestRun && this.#debugOutputTruncated ? "Earlier results were dropped to keep the debug buffer below 2 million characters." : "No tool results dropped from this run.",
+      latestRun && this.#debugOutputs.length ? fence(`[\n${this.#debugOutputs.join(",\n")}\n]`) : "No tool output captured for this chat in this background session.",
+      "## Conversation log", fence(JSON.stringify(conversation, null, 2)),
+      "## Partial response", fence(this.#activeRun?.sessionId === sessionId ? this.#activeRun.partialAssistantText : ""),
+      "## Scratch files", latestRun ? fence(JSON.stringify(Object.fromEntries(this.#workspace.files), null, 2)) : "Scratch files are exported with the latest run's chat.",
+    ].join("\n\n") };
+  }
+
+  /**
+   * Serializes session changes. While one that `blocksRuns` is pending,
+   * `run.start` and `run.retry` are refused, so a run never starts in a
    * session that is being switched away from or deleted.
    */
+  #queueSessionOp<T>(task: () => Promise<T>, blocksRuns = true): Promise<T> {
+    if (blocksRuns) this.#sessionOpsPending += 1;
+    const op = this.#sessionOps.then(task);
+    this.#sessionOps = op.then(() => {}, () => {});
+    return op.finally(() => { if (blocksRuns) this.#sessionOpsPending -= 1; });
+  }
+
+  /** Applies a session command, then republishes the snapshot and the session list. */
   async #runSessionCommand(command: SessionCommand): Promise<void> {
-    this.#sessionOpsPending += 1;
-    const op = this.#sessionOps.then(() => this.#applySessionCommand(command));
-    this.#sessionOps = op.catch(() => {});
-    try { await op; }
+    try { await this.#queueSessionOp(() => this.#applySessionCommand(command)); }
     catch { this.#notice = "Could not update chats. Try again."; }
-    finally { this.#sessionOpsPending -= 1; }
     await this.#sidebarHub.broadcastSnapshot();
+    await this.#publishSessions();
+  }
+
+  /** Pushes the session index to every sidebar. A failed read is skipped; the next change republishes. */
+  async #publishSessions(): Promise<void> {
+    try { this.#sidebarHub.publishSessions(await listSessions()); }
+    catch { /* The lists stay as they were. */ }
+  }
+
+  /**
+   * Deletes unpinned sessions not updated within the retention period. The
+   * open session and the active run's session are never pruned. Returns the
+   * number deleted.
+   */
+  async #applyRetention(): Promise<number> {
+    this.#lastRetentionAt = this.#clock.now();
+    // Never blocks runs: a run only starts in the open session, which is kept.
+    const deleted = await this.#queueSessionOp(async () => {
+      const cutoff = retentionCutoff((await getHistorySettings()).retention, this.#clock.now());
+      if (cutoff === null) return [];
+      const keep = [await this.#openSession(), ...(this.#activeRun ? [this.#activeRun.sessionId] : [])];
+      const ids = await pruneSessions(cutoff, keep);
+      this.#forgetSessions(ids);
+      return ids;
+    }, false);
+    if (deleted.length > 0) await this.#publishSessions();
+    return deleted.length;
+  }
+
+  /**
+   * "Delete all history": every session except the active run's, pinned ones
+   * included. A deleted open session is replaced by a new empty one. With no
+   * run active, scratch files and the debug buffers are cleared too.
+   */
+  async #deleteAllHistory(): Promise<string> {
+    const { deleted, kept } = await this.#queueSessionOp(async () => {
+      const kept = this.#activeRun?.sessionId ?? null;
+      const openId = await this.#openSession();
+      const deleted = await deleteAllSessions(kept ? [kept] : []);
+      this.#forgetSessions(deleted);
+      if (deleted.includes(openId)) {
+        const { id } = await createSession();
+        await setOpenSessionId(id);
+        this.#openSessionId = id;
+      }
+      if (!this.#activeRun) {
+        this.#workspace.files.clear();
+        this.#clearDebugBuffers();
+      }
+      return { deleted, kept };
+    });
+    await this.#sidebarHub.broadcastSnapshot();
+    await this.#publishSessions();
+    const count = `Deleted ${deleted.length} ${deleted.length === 1 ? "chat" : "chats"}.`;
+    return kept ? `${count} The chat with the active run was kept.` : count;
+  }
+
+  /** Drops retry and debug state that described deleted sessions. */
+  #forgetSessions(ids: readonly string[]): void {
+    if (this.#retryable && ids.includes(this.#retryable.sessionId)) this.#retryable = null;
+    if (this.#debugSessionId !== null && ids.includes(this.#debugSessionId)) this.#clearDebugBuffers();
   }
 
   async #applySessionCommand(command: SessionCommand): Promise<void> {
@@ -470,8 +562,7 @@ export class BackgroundRuntime {
       return;
     }
     await deleteSession(command.sessionId);
-    if (this.#retryable?.sessionId === command.sessionId) this.#retryable = null;
-    if (this.#debugSessionId === command.sessionId) this.#clearDebugBuffers();
+    this.#forgetSessions([command.sessionId]);
     if (command.sessionId === openId) {
       // Opens the most recently updated remaining session, or a new empty one.
       this.#openSessionId = null;
@@ -532,6 +623,24 @@ export class BackgroundRuntime {
       return { v: 1, id: request.id, ok: true, ...await this.#getCredentialStatus(), notice };
     } catch (error) {
       return { v: 1, id: request.id, ok: false, error: toNormalizedError(error, "setup") };
+    }
+  }
+
+  /** Options page: history retention and "Delete all history". */
+  async handleHistoryRequest(request: HistoryRequest): Promise<HistoryResponse> {
+    await this.#ready;
+    try {
+      let notice: string | null = null;
+      if (request.type === "history.retention.save") {
+        await saveHistorySettings({ version: 1, retention: request.retention });
+        const deleted = await this.#applyRetention();
+        if (deleted > 0) notice = `Deleted ${deleted} ${deleted === 1 ? "chat" : "chats"} older than the new limit.`;
+      } else if (request.type === "history.deleteAll") {
+        notice = await this.#deleteAllHistory();
+      }
+      return { v: 1, id: request.id, ok: true, settings: await getHistorySettings(), sessionCount: (await listSessions()).length, notice };
+    } catch (error) {
+      return { v: 1, id: request.id, ok: false, error: toNormalizedError(error, "persistence") };
     }
   }
 
@@ -688,6 +797,7 @@ export class BackgroundRuntime {
     // Titles a new session from its first prompt and records the model for the history list.
     // The index only lags on failure, so a failed write never stops the run.
     await touchSession(run.sessionId, { prompt: transcript.findLast(isUserMessage)?.text, modelId: settings.modelId }).catch(() => {});
+    await this.#publishSessions();
     const record: RunRecord = {
       runId, modelId: settings.modelId, reasoningEffort: settings.reasoningEffort, startedAt: Date.now(), endedAt: null, status: "running", error: null,
       providerResponses: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0 }, toolCalls: [],
@@ -771,6 +881,7 @@ export class BackgroundRuntime {
       await clearRunCheckpoint();
       await touchSession(run.sessionId).catch(() => {});
       this.#activeRun = null;
+      await this.#publishSessions();
     };
     if (result.status === "completed") {
       const messageId = result.finalMessageId ?? (await this.#persistEmptyFinalMessage(run.sessionId));

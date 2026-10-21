@@ -9,9 +9,15 @@ import { useBackground } from "@/lib/ui/use-background";
 import { isSidebarCommand } from "@/lib/protocol";
 import { buildTurns, formatDuration } from "@/lib/ui/turns";
 import { TurnTrace } from "@/lib/ui/TurnTrace";
-import type { ConversationItem } from "@/lib/domain/conversation";
+import { formatRelativeTime, HistoryDrawer } from "@/lib/ui/HistoryDrawer";
+import type { HistoryDrawerProps } from "@/lib/ui/HistoryDrawer";
+import { App } from "@/entrypoints/sidepanel/App";
+import type { ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
 import type { RuntimeSnapshot, SidebarEvent } from "@/lib/protocol";
 import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
+
+// Slate resolves real React under Vitest, so App-level tests render without the editor.
+vi.mock("@/lib/ui/Composer", async (original) => ({ ...await original<typeof import("@/lib/ui/Composer")>(), Composer: () => null }));
 
 function snapshotFor(id: string): RuntimeSnapshot {
   return {
@@ -283,5 +289,164 @@ describe("sidebar UI contracts", () => {
     expect(viewport.scrollTop).toBe(1500);
     expect(follow!.atBottom).toBe(true);
     await act(() => render(null, root));
+  });
+});
+
+describe("history drawer", () => {
+  const now = Date.UTC(2026, 9, 20, 12);
+  const summary = (id: string, title: string, patch: Partial<ConversationSummary> = {}): ConversationSummary => ({
+    id, title, titleSource: "prompt", createdAt: 0, updatedAt: now - 5 * 60_000, pinned: false, itemCount: 2, lastModelId: null, ...patch,
+  });
+  let root: HTMLDivElement;
+  afterEach(() => render(null, root));
+
+  async function mount(overrides: Partial<HistoryDrawerProps> = {}): Promise<HistoryDrawerProps> {
+    const props: HistoryDrawerProps = {
+      sessions: [summary("p", "Pinned trip", { pinned: true }), summary("a", "Alpha <b>bold</b>"), summary("b", "Beta", { updatedAt: now - 3 * 86_400_000 }), summary("e", "")],
+      openId: "a",
+      run: { conversationId: "b", awaitingApproval: false },
+      now,
+      onOpen: vi.fn(), onRename: vi.fn(), onPin: vi.fn(), onExport: vi.fn(), onDelete: vi.fn(), onClose: vi.fn(),
+      ...overrides,
+    };
+    root = document.createElement("div");
+    document.body.append(root);
+    await act(() => render(h(HistoryDrawer, props), root));
+    return props;
+  }
+  const rows = () => [...root.querySelectorAll<HTMLLIElement>(".history__row")];
+  const row = (title: string) => rows().find((candidate) => candidate.querySelector(".history__title")?.textContent === title)!;
+  const labelled = (label: string) => root.querySelector<HTMLElement>(`[aria-label="${label}"]`)!;
+  const key = (target: Element, key: string) => act(() => { target.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true })); });
+  const type = (input: HTMLInputElement, value: string) => act(() => {
+    input.value = value;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+
+  it("lists pinned chats first with titles as text, recency, and open/running markers, focusing search", async () => {
+    await mount();
+    expect([...root.querySelectorAll(".history__group")].map((node) => node.textContent)).toEqual(["Pinned", "Recent"]);
+    expect(rows().map((candidate) => candidate.querySelector(".history__title")?.textContent)).toEqual(["Pinned trip", "Alpha <b>bold</b>", "Beta", "New chat"]);
+    expect(root.querySelector(".history__title b")).toBeNull();
+    expect(row("Alpha <b>bold</b>").getAttribute("aria-current")).toBe("true");
+    expect(row("Alpha <b>bold</b>").querySelector(".history__meta")?.textContent).toBe("5m ago · Current");
+    expect(row("Beta").querySelector(".history__meta")?.textContent).toBe("3d ago · Working");
+    expect(labelled("Delete Beta").hasAttribute("disabled")).toBe(true);
+    expect(document.activeElement).toBe(labelled("Search chats by title"));
+  });
+
+  it("filters by title, case-insensitively", async () => {
+    await mount();
+    const search = labelled("Search chats by title") as HTMLInputElement;
+    await type(search, "  ALPHA ");
+    expect(rows().map((candidate) => candidate.querySelector(".history__title")?.textContent)).toEqual(["Alpha <b>bold</b>"]);
+    expect(root.querySelector(".history__group")).toBeNull();
+    await type(search, "zzz");
+    expect(rows()).toHaveLength(0);
+    expect(root.textContent).toContain("No chats match.");
+  });
+
+  it("opens, pins, unpins, and exports through callbacks", async () => {
+    const props = await mount();
+    await act(() => (row("Beta").querySelector(".history__open") as HTMLButtonElement).click());
+    expect(props.onOpen).toHaveBeenCalledWith("b");
+    await act(() => labelled("Pin Beta").click());
+    expect(props.onPin).toHaveBeenCalledWith("b", true);
+    await act(() => labelled("Unpin Pinned trip").click());
+    expect(props.onPin).toHaveBeenCalledWith("p", false);
+    await act(() => labelled("Export New chat").click());
+    expect(props.onExport).toHaveBeenCalledWith("e");
+  });
+
+  it("renames inline: Enter saves a normalized title, Escape cancels without closing the drawer", async () => {
+    const props = await mount();
+    await act(() => labelled("Rename Beta").click());
+    let input = labelled("Chat title") as HTMLInputElement;
+    expect(document.activeElement).toBe(input);
+    expect(input.value).toBe("Beta");
+    input.value = "  Trip   plans ";
+    await key(input, "Enter");
+    expect(props.onRename).toHaveBeenCalledWith("b", "Trip plans");
+    expect(root.querySelector('[aria-label="Chat title"]')).toBeNull();
+    expect(document.activeElement).toBe(labelled("Rename Beta"));
+
+    await act(() => labelled("Rename Beta").click());
+    input = labelled("Chat title") as HTMLInputElement;
+    input.value = "Discarded";
+    await key(input, "Escape");
+    expect(props.onRename).toHaveBeenCalledTimes(1);
+    expect(props.onClose).not.toHaveBeenCalled();
+    expect(row("Beta")).toBeDefined();
+  });
+
+  it("deletes only after an inline confirmation, which Escape or Cancel dismisses", async () => {
+    const props = await mount();
+    await act(() => labelled("Delete Alpha <b>bold</b>").click());
+    expect(props.onDelete).not.toHaveBeenCalled();
+    expect(labelled("Delete Alpha <b>bold</b>?")).not.toBeNull();
+    expect(document.activeElement?.textContent).toBe("Cancel");
+    await key(document.activeElement!, "Escape");
+    expect(props.onClose).not.toHaveBeenCalled();
+    expect(root.querySelector('[aria-label="Delete Alpha <b>bold</b>?"]')).toBeNull();
+    expect(document.activeElement).toBe(labelled("Delete Alpha <b>bold</b>"));
+
+    await act(() => labelled("Delete Alpha <b>bold</b>").click());
+    await act(() => (root.querySelector(".history__danger") as HTMLButtonElement).click());
+    expect(props.onDelete).toHaveBeenCalledWith("a");
+    expect(document.activeElement).toBe(labelled("Search chats by title"));
+  });
+
+  it("closes on Escape", async () => {
+    const props = await mount();
+    await key(labelled("Search chats by title"), "Escape");
+    expect(props.onClose).toHaveBeenCalled();
+  });
+
+  it("formats recency compactly", () => {
+    expect(formatRelativeTime(now - 20_000, now)).toBe("Just now");
+    expect(formatRelativeTime(now - 59 * 60_000, now)).toBe("59m ago");
+    expect(formatRelativeTime(now - 23 * 3_600_000, now)).toBe("23h ago");
+    expect(formatRelativeTime(now - 6 * 86_400_000, now)).toBe("6d ago");
+    expect(formatRelativeTime(now - 30 * 86_400_000, now)).not.toMatch(/ago|2026/);
+    expect(formatRelativeTime(Date.UTC(2025, 2, 4, 12), now)).toMatch(/2025/);
+  });
+
+  it("toggles from the sidebar header, requests a fresh list, and returns focus on close", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    const posted: Array<{ type: string; sessionId?: string }> = [];
+    const listeners: Array<(message: unknown) => void> = [];
+    vi.spyOn(browser.runtime, "connect").mockReturnValue({
+      postMessage: (message: { type: string }) => posted.push(message),
+      onMessage: { addListener: (listener: (message: unknown) => void) => listeners.push(listener), removeListener: () => {} },
+      disconnect: () => {},
+    } as never);
+    root = document.createElement("div");
+    document.body.append(root);
+    await act(() => render(h(App, {}), root));
+    expect(posted.map((message) => message.type)).toEqual(["state.subscribe", "session.list"]);
+    const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) => act(() => listeners.forEach((listener) => listener({ v: 1, seq: 0, at: 1, ...event })));
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: snapshotFor("a") });
+    await emit({ runId: null, conversationId: null, type: "session.listed", payload: { sessions: [summary("a", "Alpha"), summary("b", "Beta")] } });
+
+    const toggle = labelled("Chat history") as HTMLButtonElement;
+    await act(() => toggle.click());
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(posted.at(-1)?.type).toBe("session.list");
+    expect(root.querySelector(".sidebar__chat")?.hasAttribute("inert")).toBe(true);
+    // A pushed list replaces the rows while the drawer is open.
+    await emit({ runId: null, conversationId: null, type: "session.listed", payload: { sessions: [summary("c", "Gamma"), summary("a", "Alpha")] } });
+    expect(rows().map((candidate) => candidate.querySelector(".history__title")?.textContent)).toEqual(["Gamma", "Alpha"]);
+
+    await key(labelled("Search chats by title"), "Escape");
+    expect(root.querySelector(".history")).toBeNull();
+    expect(document.activeElement).toBe(toggle);
+
+    await act(() => toggle.click());
+    await act(() => labelled("Export Gamma").click());
+    expect(posted.at(-1)).toMatchObject({ type: "context.export", sessionId: "c" });
+    expect(isSidebarCommand(posted.at(-1))).toBe(true);
+    await act(() => (row("Gamma").querySelector(".history__open") as HTMLButtonElement).click());
+    expect(posted.at(-1)).toMatchObject({ type: "session.open", sessionId: "c" });
+    expect(root.querySelector(".history")).toBeNull();
   });
 });

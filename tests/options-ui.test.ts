@@ -4,14 +4,22 @@ import { h, render } from "preact";
 import { act } from "preact/test-utils";
 import { App } from "@/entrypoints/options/App";
 import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
-import type { CredentialRequest, SettingsRequest } from "@/lib/protocol";
+import type { CredentialRequest, HistoryRequest, SettingsRequest } from "@/lib/protocol";
 
 let root: HTMLDivElement;
 afterEach(() => { if (root) render(null, root); document.body.innerHTML = ""; vi.restoreAllMocks(); });
 
 async function mount(connected = false, signInAgain = false) {
+  let retention = "forever";
+  let sessionCount = 3;
   const send = vi.spyOn(browser.runtime, "sendMessage").mockImplementation(async (message: unknown) => {
-    const request = message as CredentialRequest | SettingsRequest;
+    const request = message as CredentialRequest | SettingsRequest | HistoryRequest;
+    if (request.type.startsWith("history.")) {
+      let notice: string | null = null;
+      if (request.type === "history.retention.save") retention = request.retention;
+      if (request.type === "history.deleteAll") { notice = `Deleted ${sessionCount} chats.`; sessionCount = 1; }
+      return { v: 1, id: request.id, ok: true, settings: { version: 1, retention }, sessionCount, notice };
+    }
     if (request.type === "settings.get") return { v: 1, id: request.id, ok: true, notice: null, provider: OPENAI_PROVIDER,
       settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" } };
     if (request.type === "credentials.chatgpt.login") { connected = true; signInAgain = false; }
@@ -34,7 +42,7 @@ describe("ChatGPT settings controls", () => {
   it("signs in with a single button through the background and asks for no PIN", async () => {
     const send = await mount();
     expect(root.textContent).toContain("Not connected.");
-    expect(root.textContent).not.toMatch(/PIN|unlock/i);
+    expect(root.textContent).not.toMatch(/\bPIN\b|unlock/i);
     expect(root.querySelector("input[inputmode=numeric]")).toBeNull();
     await act(async () => { button("Continue with ChatGPT")!.click(); });
     await vi.waitFor(() => expect(root.textContent).toContain("Connected as user@example.test."));
@@ -68,5 +76,39 @@ describe("ChatGPT settings controls", () => {
     await act(async () => { button("Continue with ChatGPT")!.click(); });
     await vi.waitFor(() => expect(root.textContent).toContain("Connected as user@example.test."));
     expect(root.textContent).not.toContain("Sign in with ChatGPT again.");
+  });
+});
+
+describe("History settings", () => {
+  const retentionSelect = () => [...root.querySelectorAll("label")].find((label) => label.textContent?.startsWith("Keep chats"))!.querySelector("select")!;
+
+  it("states that history is local and contains page text, and saves retention through the background", async () => {
+    const send = await mount();
+    await vi.waitFor(() => expect(root.textContent).toContain("3 chats saved."));
+    expect(root.textContent).toContain("only in this Firefox profile");
+    expect(root.textContent).toContain("text from pages bside read");
+    expect(root.textContent).toContain("Pinned chats");
+    expect(retentionSelect().value).toBe("forever");
+    expect([...retentionSelect().options].map((option) => option.textContent)).toEqual(["Forever", "30 days", "7 days"]);
+    await act(async () => {
+      retentionSelect().value = "7d";
+      retentionSelect().dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: "history.retention.save", retention: "7d" }));
+    await vi.waitFor(() => expect(retentionSelect().value).toBe("7d"));
+  });
+
+  it("deletes all history only after an inline confirmation", async () => {
+    const send = await mount();
+    await vi.waitFor(() => expect(button("Delete all history")).toBeDefined());
+    await act(async () => { button("Delete all history")!.click(); });
+    expect(root.textContent).toContain("Delete 3 chats, including pinned ones?");
+    await act(async () => { button("Cancel")!.click(); });
+    expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ type: "history.deleteAll" }));
+    await act(async () => { button("Delete all history")!.click(); });
+    await act(async () => { button("Delete all")!.click(); });
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: "history.deleteAll" }));
+    await vi.waitFor(() => expect(root.textContent).toContain("Deleted 3 chats."));
+    expect(root.textContent).toContain("1 chat saved.");
   });
 });

@@ -1,7 +1,8 @@
 import { useEffect, useState } from "preact/hooks";
 import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
 import type { AppSettingsV1, ChatGPTStatus, ProviderDefinition, ReasoningEffort } from "@/lib/domain/provider";
-import type { CredentialRequest, CredentialResponse, SettingsRequest, SettingsResponse } from "@/lib/protocol";
+import type { HistoryRetention, HistorySettingsV1 } from "@/lib/domain/conversation";
+import type { CredentialRequest, CredentialResponse, HistoryRequest, HistoryResponse, SettingsRequest, SettingsResponse } from "@/lib/protocol";
 
 interface CredentialState {
   configured: boolean;
@@ -21,6 +22,15 @@ async function sendSettingsRequest(request: DistributiveOmit<SettingsRequest, "v
   return (await browser.runtime.sendMessage(full)) as SettingsResponse;
 }
 
+async function sendHistoryRequest(request: DistributiveOmit<HistoryRequest, "v" | "id">): Promise<HistoryResponse> {
+  const full = { v: 1, id: crypto.randomUUID(), ...request } as HistoryRequest;
+  return (await browser.runtime.sendMessage(full)) as HistoryResponse;
+}
+
+const RETENTION_LABELS: Record<HistoryRetention, string> = { forever: "Forever", "30d": "30 days", "7d": "7 days" };
+
+const chatCount = (count: number) => `${count} ${count === 1 ? "chat" : "chats"}`;
+
 export function App() {
   const [credential, setCredential] = useState<CredentialState | null>(null);
   const [settings, setSettings] = useState<AppSettingsV1 | null>(null);
@@ -30,14 +40,20 @@ export function App() {
   const [credentialNotice, setCredentialNotice] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [history, setHistory] = useState<{ settings: HistorySettingsV1; sessionCount: number } | null>(null);
+  const [historyNotice, setHistoryNotice] = useState<string | null>(null);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
 
   useEffect(() => {
     const refresh = async () => {
-      const [credentialResponse, settingsResponse] = await Promise.all([
+      const [credentialResponse, settingsResponse, historyResponse] = await Promise.all([
         sendCredentialRequest({ type: "credentials.openai.status" }),
         sendSettingsRequest({ type: "settings.get" }),
+        sendHistoryRequest({ type: "history.get" }),
       ]);
       if (credentialResponse.ok) setCredential(credentialResponse);
+      if (historyResponse.ok) setHistory(historyResponse);
       if (settingsResponse.ok) {
         setSettings(settingsResponse.settings);
         setProvider(settingsResponse.provider);
@@ -66,6 +82,18 @@ export function App() {
       if (refreshed.ok) { setSettings(refreshed.settings); setProvider(refreshed.provider); }
     } catch { setSaveError("The background could not complete this request. Try again."); }
     finally { setSaving(false); }
+  };
+
+  const performHistoryAction = async (request: DistributiveOmit<HistoryRequest, "v" | "id">) => {
+    setHistoryNotice(null);
+    setHistoryError(null);
+    setConfirmDeleteAll(false);
+    try {
+      const response = await sendHistoryRequest(request);
+      if (!response.ok) { setHistoryError(response.error.message); return; }
+      setHistory(response);
+      setHistoryNotice(response.notice);
+    } catch { setHistoryError("The background could not complete this request. Try again."); }
   };
 
   const handleSaveKey = async (event: Event) => {
@@ -182,6 +210,47 @@ export function App() {
             </label>
           </>
         )}
+      </section>
+
+      <section class="options__section">
+        <h2 class="options__heading">History</h2>
+        <p class="options__disclosure">
+          Chats are saved only in this Firefox profile and are never synced. They contain your prompts, bside's answers, and text
+          from pages bside read for you, such as page titles, addresses, and excerpts.
+        </p>
+        {history && (
+          <>
+            <label class="options__field">
+              Keep chats
+              <select
+                value={history.settings.retention}
+                onChange={(event) => void performHistoryAction({ type: "history.retention.save", retention: (event.target as HTMLSelectElement).value as HistoryRetention })}
+              >
+                {(Object.keys(RETENTION_LABELS) as HistoryRetention[]).map((retention) => (
+                  <option key={retention} value={retention}>{RETENTION_LABELS[retention]}</option>
+                ))}
+              </select>
+            </label>
+            <p class="options__disclosure">
+              Chats not updated within this period are deleted, starting immediately. Pinned chats, the open chat, and a chat with a
+              running task are kept.
+            </p>
+            <p class="options__status">{chatCount(history.sessionCount)} saved.</p>
+            {confirmDeleteAll ? (
+              <div class="options__form options__form--wrap" role="group" aria-label="Confirm deleting all history">
+                <p class="options__confirm">Delete {chatCount(history.sessionCount)}, including pinned ones? This cannot be undone.</p>
+                <button type="button" class="options__secondary" onClick={() => setConfirmDeleteAll(false)}>Cancel</button>
+                <button type="button" class="options__danger" onClick={() => void performHistoryAction({ type: "history.deleteAll" })}>Delete all</button>
+              </div>
+            ) : (
+              <div class="options__form">
+                <button type="button" class="options__danger" onClick={() => setConfirmDeleteAll(true)}>Delete all history</button>
+              </div>
+            )}
+          </>
+        )}
+        {historyNotice && <p class="options__status" role="status">{historyNotice}</p>}
+        {historyError && <p class="options__error" role="alert">{historyError}</p>}
       </section>
     </div>
   );

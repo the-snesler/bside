@@ -5,6 +5,7 @@ import {
   appendConversationItem,
   CONVERSATION_CHUNK_SIZE,
   createSession,
+  deleteAllSessions,
   deleteOpenAICredential,
   deleteSession,
   ensureOpenSession,
@@ -14,13 +15,16 @@ import {
   getOpenAICredential,
   getOpenSessionId,
   getChatGPTCredential,
+  getHistorySettings,
   getRunCheckpoint,
   hasChatGPTSignInNotice,
   listSessions,
   migrateConversation,
   migrateCredentials,
+  pruneSessions,
   recoverInterruptedRun,
   saveAppSettings,
+  saveHistorySettings,
   saveOpenAICredential,
   saveRunCheckpoint,
   touchSession,
@@ -365,6 +369,53 @@ describe("storage: sessions", () => {
     expect(await getOpenSessionId()).toBeNull();
     expect((await listSessions()).map((session) => session.id)).toEqual([keep]);
     expect(await ensureOpenSession()).toBe(keep);
+  });
+});
+
+describe("storage: history retention and bulk deletion", () => {
+  /** Backdates a session's last activity in its record and index entry. */
+  async function setUpdatedAt(id: string, at: number): Promise<void> {
+    const key = `conversation:${id}`;
+    const record = (await browser.storage.local.get(key))[key] as object;
+    await browser.storage.local.set({ [key]: { ...record, updatedAt: at } });
+    await touchSession(id);
+  }
+  const keysOf = async (id: string) => Object.keys(await browser.storage.local.get(null)).filter((key) => key.includes(id));
+
+  it("defaults retention to forever and resets a corrupt record", async () => {
+    expect(await getHistorySettings()).toEqual({ version: 1, retention: "forever" });
+    await saveHistorySettings({ version: 1, retention: "7d" });
+    expect(await getHistorySettings()).toEqual({ version: 1, retention: "7d" });
+    await browser.storage.local.set({ historySettings: { version: 1, retention: "1d" } });
+    expect(await getHistorySettings()).toEqual({ version: 1, retention: "forever" });
+    expect((await browser.storage.local.get("historySettings")).historySettings).toBeUndefined();
+  });
+
+  it("prunes unpinned sessions updated before the cutoff, except kept ones, removing every key", async () => {
+    const old = await sessionWith(CONVERSATION_CHUNK_SIZE + 1);
+    const pinned = await sessionWith(1);
+    const kept = await sessionWith(1);
+    const recent = await sessionWith(1);
+    for (const [id, at] of [[old, 100], [pinned, 100], [kept, 100], [recent, 300]] as const) await setUpdatedAt(id, at);
+    await updateSession(pinned, { pinned: true });
+    await browser.storage.local.set({ openConversation: { version: 1, id: old } });
+
+    expect(await pruneSessions(200, [kept])).toEqual([old]);
+    expect(await keysOf(old)).toEqual([]);
+    expect(await getOpenSessionId()).toBeNull();
+    expect((await listSessions()).map((session) => session.id).sort()).toEqual([pinned, kept, recent].sort());
+    expect(await pruneSessions(200, [kept])).toEqual([]);
+  });
+
+  it("deletes every session except kept ones, pinned included", async () => {
+    const pinned = await sessionWith(1);
+    await updateSession(pinned, { pinned: true });
+    const other = await sessionWith(2);
+    const kept = await sessionWith(1);
+    expect((await deleteAllSessions([kept])).sort()).toEqual([pinned, other].sort());
+    expect([...await keysOf(pinned), ...await keysOf(other)]).toEqual([]);
+    expect((await listSessions()).map((session) => session.id)).toEqual([kept]);
+    expect((await getConversation(kept))?.items).toHaveLength(1);
   });
 });
 

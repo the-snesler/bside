@@ -19,7 +19,8 @@ import type {
   ToolCall,
   ToolResult,
 } from "@/lib/domain/tools";
-import type { Conversation, ConversationSummary } from "@/lib/domain/conversation";
+import type { Conversation, ConversationSummary, HistoryRetention, HistorySettingsV1 } from "@/lib/domain/conversation";
+import { HISTORY_RETENTIONS } from "@/lib/domain/conversation";
 import type { AppSettingsV1, ChatGPTStatus, ProviderDefinition } from "@/lib/domain/provider";
 import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction } from "@/lib/validation";
 
@@ -208,14 +209,15 @@ export type SidebarCommand =
   | { v: 1; id: string; type: "tabs.focus"; tabId: number }
   | { v: 1; id: string; type: "tabs.closeAgentTabs" }
   | { v: 1; id: string; type: "settings.save"; settings: AppSettingsV1 }
-  | { v: 1; id: string; type: "context.export" }
+  /** Exports one session; run diagnostics, model input, tool output, and scratch files are included only for the latest run's session. Answered with `context.exported` to the requesting sidebar only. */
+  | { v: 1; id: string; type: "context.export"; sessionId: string }
   | { v: 1; id: string; type: "state.subscribe"; lastSeq: number | null }
   /**
    * "New chat": opens an empty session (reusing the open one if it is an untouched new chat).
    * With no run active it also clears scratch files and the debug buffers.
    */
   | { v: 1; id: string; type: "session.create" }
-  /** Answered with `session.listed` to the requesting sidebar only. */
+  /** Answered with `session.listed` to the requesting sidebar; every sidebar also gets `session.listed` whenever the index changes. */
   | { v: 1; id: string; type: "session.list" }
   /** Allowed while a run is active elsewhere; the run keeps its own session. Leaving an untouched new chat (no items, pin, or user title) deletes it. */
   | { v: 1; id: string; type: "session.open"; sessionId: string }
@@ -297,7 +299,7 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (candidate.type === "tabs.focus") return Number.isSafeInteger(candidate.tabId);
   if (candidate.type === "tabs.closeAgentTabs") return true;
   if (candidate.type === "settings.save") return isAppSettings(candidate.settings);
-  if (candidate.type === "context.export") return true;
+  if (candidate.type === "context.export") return isSessionId(candidate.sessionId);
   if (candidate.type === "session.create" || candidate.type === "session.list") return true;
   if (candidate.type === "session.open" || candidate.type === "session.delete") return isSessionId(candidate.sessionId);
   if (candidate.type === "session.rename") {
@@ -341,6 +343,26 @@ export type SettingsRequest =
 export type SettingsResponse =
   | { v: 1; id: string; ok: true; settings: AppSettingsV1; provider: ProviderDefinition; notice: string | null }
   | { v: 1; id: string; ok: false; error: NormalizedError };
+
+/** History retention and bulk deletion; options page only, like credentials and settings. */
+export type HistoryRequest =
+  | { v: 1; id: string; type: "history.get" }
+  /** Saves the retention and prunes immediately. */
+  | { v: 1; id: string; type: "history.retention.save"; retention: HistoryRetention }
+  /** Deletes every session, pinned ones included, except the active run's; the open session is replaced by a new empty one. */
+  | { v: 1; id: string; type: "history.deleteAll" };
+
+export type HistoryResponse =
+  | { v: 1; id: string; ok: true; settings: HistorySettingsV1; sessionCount: number; notice: string | null }
+  | { v: 1; id: string; ok: false; error: NormalizedError };
+
+export function isHistoryRequest(value: unknown): value is HistoryRequest {
+  if (!isEnvelope(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.type === "history.get" || candidate.type === "history.deleteAll") return true;
+  if (candidate.type === "history.retention.save") return (HISTORY_RETENTIONS as readonly unknown[]).includes(candidate.retention);
+  return false;
+}
 
 export function isCredentialRequest(value: unknown): value is CredentialRequest {
   if (!isEnvelope(value)) return false;

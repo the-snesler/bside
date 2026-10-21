@@ -1,5 +1,5 @@
-import { isCredentialRequest, isSettingsRequest, SIDEBAR_PORT_NAME } from "@/lib/protocol";
-import type { CredentialResponse, SettingsResponse } from "@/lib/protocol";
+import { isCredentialRequest, isHistoryRequest, isSettingsRequest, SIDEBAR_PORT_NAME } from "@/lib/protocol";
+import type { CredentialResponse, HistoryResponse, SettingsResponse } from "@/lib/protocol";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { BackgroundRuntime } from "@/lib/background/runtime";
 import { ApprovalBadge } from "@/lib/background/approval-badge";
@@ -44,13 +44,14 @@ export default defineBackground({
       }
     });
 
-    // Only the extension's own options page may read/write credentials or
-    // settings; the sidebar Port never exposes these methods.
+    // Only the extension's own options page may read/write credentials,
+    // settings, or history retention; the sidebar Port never exposes these methods.
     const optionsUrl = browser.runtime.getURL("/options.html");
-    browser.runtime.onMessage.addListener((message: unknown, sender): Promise<CredentialResponse | SettingsResponse> | undefined => {
+    browser.runtime.onMessage.addListener((message: unknown, sender): Promise<CredentialResponse | SettingsResponse | HistoryResponse> | undefined => {
       if (sender.id !== browser.runtime.id || sender.url !== optionsUrl) return undefined;
       if (isCredentialRequest(message)) return runtime.handleCredentialRequest(message);
       if (isSettingsRequest(message)) return runtime.handleSettingsRequest(message);
+      if (isHistoryRequest(message)) return runtime.handleHistoryRequest(message);
       return undefined;
     });
 

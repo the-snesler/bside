@@ -12,8 +12,8 @@
 
 import { storage } from "wxt/utils/storage";
 import type { AppSettingsV1, ModelDefinition, ReasoningEffort } from "@/lib/domain/provider";
-import type { Conversation, ConversationIndexV1, ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
-import { titleFromPrompt } from "@/lib/domain/conversation";
+import type { Conversation, ConversationIndexV1, ConversationItem, ConversationSummary, HistorySettingsV1 } from "@/lib/domain/conversation";
+import { HISTORY_RETENTIONS, titleFromPrompt } from "@/lib/domain/conversation";
 import { DEFAULT_MODEL_ID, DEFAULT_REASONING_EFFORT } from "@/lib/providers/openai-models";
 import { deviceKey, type DeviceKey } from "@/lib/background/device-key";
 import { isSessionId } from "@/lib/validation";
@@ -166,6 +166,22 @@ export async function getAppSettings(): Promise<AppSettingsV1> {
 
 export async function saveAppSettings(settings: AppSettingsV1): Promise<void> {
   await appSettingsItem.setValue(settings);
+}
+
+const DEFAULT_HISTORY_SETTINGS: HistorySettingsV1 = { version: 1, retention: "forever" };
+
+const historySettingsItem = storage.defineItem<HistorySettingsV1>("local:historySettings", { version: 1 });
+
+export async function getHistorySettings(): Promise<HistorySettingsV1> {
+  const raw: unknown = await historySettingsItem.getValue();
+  const settings = raw as { version?: unknown; retention?: unknown } | null;
+  if (settings?.version === 1 && (HISTORY_RETENTIONS as readonly unknown[]).includes(settings.retention)) return settings as HistorySettingsV1;
+  if (raw !== null) await historySettingsItem.removeValue();
+  return DEFAULT_HISTORY_SETTINGS;
+}
+
+export async function saveHistorySettings(settings: HistorySettingsV1): Promise<void> {
+  await historySettingsItem.setValue(settings);
 }
 
 // ---------------------------------------------------------------------------
@@ -598,6 +614,38 @@ export function deleteSession(id: string): Promise<void> {
     await storage.removeItems([recordKey(id), ...chunkKeys(id, Math.max(record?.itemCount ?? 0, entry?.itemCount ?? 0))]);
     if (entry) await writeIndex(sessions.filter((session) => session !== entry));
     if ((await openConversationItem.getValue())?.id === id) await openConversationItem.removeValue();
+  });
+}
+
+/** Deletes several sessions' items and records, then their index entries in one write. Clears the open pointer if it pointed at one. */
+async function removeSessions(sessions: ConversationSummary[], doomed: readonly ConversationSummary[]): Promise<void> {
+  if (doomed.length === 0) return;
+  const records = await Promise.all(doomed.map((session) => readRecord(session.id)));
+  await storage.removeItems(doomed.flatMap((session, i) =>
+    [recordKey(session.id), ...chunkKeys(session.id, Math.max(records[i]?.itemCount ?? 0, session.itemCount))]));
+  const ids = new Set(doomed.map((session) => session.id));
+  await writeIndex(sessions.filter((session) => !ids.has(session.id)));
+  const open = await openConversationItem.getValue();
+  if (open && ids.has(open.id)) await openConversationItem.removeValue();
+}
+
+/** Retention: deletes unpinned sessions last updated before `cutoff`, except `keep`. Returns the deleted ids. */
+export function pruneSessions(cutoff: number, keep: readonly string[]): Promise<string[]> {
+  return withConversationLock(async () => {
+    const sessions = await readIndex();
+    const doomed = sessions.filter((session) => !session.pinned && session.updatedAt < cutoff && !keep.includes(session.id));
+    await removeSessions(sessions, doomed);
+    return doomed.map((session) => session.id);
+  });
+}
+
+/** Deletes every session except `keep`, pinned ones included. Returns the deleted ids. */
+export function deleteAllSessions(keep: readonly string[]): Promise<string[]> {
+  return withConversationLock(async () => {
+    const sessions = await readIndex();
+    const doomed = sessions.filter((session) => !keep.includes(session.id));
+    await removeSessions(sessions, doomed);
+    return doomed.map((session) => session.id);
   });
 }
 

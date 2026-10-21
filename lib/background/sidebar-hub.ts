@@ -81,6 +81,20 @@ export class SidebarHub {
     for (const port of this.#ports) port.postMessage(event);
   }
 
+  /** Broadcasts the session index after it changes. Not run-sequenced, like `agent-tabs.changed`. */
+  publishSessions(sessions: ConversationSummary[]): void {
+    const event: SidebarEvent = {
+      v: 1,
+      runId: null,
+      conversationId: null,
+      seq: this.#lastSeq,
+      type: "session.listed",
+      at: Date.now(),
+      payload: { sessions },
+    };
+    for (const port of this.#ports) port.postMessage(event);
+  }
+
   /** Called by BackgroundRuntime when a new run begins in `conversationId`: resets the run-local seq/replay buffer. */
   startRun(conversationId: string): void {
     this.#lastSeq = 0;

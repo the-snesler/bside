@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { validateDomAction } from "@/lib/validation";
 import {
   isCredentialRequest,
+  isHistoryRequest,
   isPageExecuteRequest,
   isPageFindRequest,
   isPageHealthRequest,
@@ -102,6 +103,11 @@ describe("isSidebarCommand: rejects malformed input", () => {
     expect(isSidebarCommand({ v: 1, id: "1", type: "action.deny", runId: 1, callId: "c1" })).toBe(false);
   });
 
+  it("accepts context.export only for a valid session id", () => {
+    expect(isSidebarCommand({ v: 1, id: "1", type: "context.export", sessionId: "default" })).toBe(true);
+    for (const sessionId of [undefined, null, "", "../x"]) expect(isSidebarCommand({ v: 1, id: "1", type: "context.export", sessionId })).toBe(false);
+  });
+
   it("rejects the removed context.reset command", () => {
     expect(isSidebarCommand({ v: 1, id: "1", type: "context.reset" })).toBe(false);
   });
@@ -116,6 +122,23 @@ describe("isSidebarCommand: rejects malformed input", () => {
     expect(isSidebarCommand({ v: 1, id: "1", type: "session.rename", sessionId: "s1", title: "x".repeat(10_000) })).toBe(false);
     expect(isSidebarCommand({ v: 1, id: "1", type: "session.pin", sessionId: "s1", pinned: "yes" })).toBe(false);
     expect(isSidebarCommand({ v: 2, id: "1", type: "session.create" })).toBe(false);
+  });
+});
+
+describe("isHistoryRequest: accepts every valid variant, rejects malformed input", () => {
+  it("accepts get, each retention, and delete-all", () => {
+    expect(isHistoryRequest({ v: 1, id: "1", type: "history.get" })).toBe(true);
+    expect(isHistoryRequest({ v: 1, id: "1", type: "history.deleteAll" })).toBe(true);
+    for (const retention of ["forever", "30d", "7d"]) expect(isHistoryRequest({ v: 1, id: "1", type: "history.retention.save", retention })).toBe(true);
+  });
+
+  it("rejects unknown retentions, wrong envelopes, and sidebar commands", () => {
+    for (const retention of [undefined, "1d", 7, null]) expect(isHistoryRequest({ v: 1, id: "1", type: "history.retention.save", retention })).toBe(false);
+    expect(isHistoryRequest({ v: 2, id: "1", type: "history.deleteAll" })).toBe(false);
+    expect(isHistoryRequest({ v: 1, type: "history.get" })).toBe(false);
+    expect(isHistoryRequest({ v: 1, id: "1", type: "session.delete", sessionId: "s1" })).toBe(false);
+    // History deletion is options-page only, never a sidebar Port command.
+    expect(isSidebarCommand({ v: 1, id: "1", type: "history.deleteAll" })).toBe(false);
   });
 });
 

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Browser } from "wxt/browser";
 import { AGENT_TAB_IDLE_MS, BackgroundRuntime } from "@/lib/background/runtime";
 import { ApprovalBadge } from "@/lib/background/approval-badge";
@@ -11,7 +11,7 @@ import type { RuntimeClock } from "@/lib/background/runtime";
 import { ProviderStreamError } from "@/lib/providers/openai";
 import {
   saveOpenAICredential, appendConversationItem, createSession, ensureOpenSession, getConversation, getOpenAICredential, getOpenSessionId,
-  listSessions, saveRunCheckpoint, setOpenSessionId,
+  listSessions, saveHistorySettings, saveRunCheckpoint, setOpenSessionId, updateSession,
 } from "@/lib/storage";
 import type { ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
 import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
@@ -121,7 +121,7 @@ describe("context controls", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: supportedPageTabControllerFactory });
     hub.delegate = runtime;
     await runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Read the fixture" });
-    const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export" });
+    const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export", sessionId: (await getOpenSessionId())! });
     const outputs = exported?.markdown.split("## Full tool output — latest run")[1]?.split("## Conversation log")[0];
     expect(outputs).toContain("Orchid launch moved to Friday.");
     expect(outputs).toContain("Document: doc-1");
@@ -133,7 +133,7 @@ describe("context controls", () => {
     expect(latestRun).toContain('"name": "browser_program"');
     expect(JSON.stringify(await openConversation())).not.toContain("Orchid launch moved to Friday.");
     await runtime.handleCommand({ v: 1, id: "reset", type: "session.create" });
-    expect((await runtime.handleCommand({ v: 1, id: "export2", type: "context.export" }))?.markdown).not.toContain("Orchid launch moved to Friday.");
+    expect((await runtime.handleCommand({ v: 1, id: "export2", type: "context.export", sessionId: (await getOpenSessionId())! }))?.markdown).not.toContain("Orchid launch moved to Friday.");
   });
 
   it("exports the latest model input without credentials and resets saved conversation", async () => {
@@ -144,7 +144,7 @@ describe("context controls", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
     await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Context export test" });
-    const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export" });
+    const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export", sessionId: (await getOpenSessionId())! });
     expect(exported?.filename).toMatch(/\.md$/);
     expect(exported?.markdown).toContain("Context export test");
     expect(exported?.markdown).toContain("browser_program");
@@ -153,7 +153,7 @@ describe("context controls", () => {
     await runtime.handleCommand({ v: 1, id: "reset", type: "session.create" });
     expect((await openConversation()).items).toEqual([]);
     expect((await getOpenAICredential())?.apiKey).toBe("sk-context-test-secret");
-    const cleared = await runtime.handleCommand({ v: 1, id: "export2", type: "context.export" });
+    const cleared = await runtime.handleCommand({ v: 1, id: "export2", type: "context.export", sessionId: (await getOpenSessionId())! });
     expect(cleared?.markdown).not.toContain("Context export test");
     expect(cleared?.markdown).toContain("No model input captured");
   });
@@ -165,7 +165,7 @@ describe("context controls", () => {
     const first = fakePort();
     const second = fakePort();
     hub.handleConnect(first); hub.handleConnect(second);
-    await first.send({ v: 1, id: "download", type: "context.export" });
+    await first.send({ v: 1, id: "download", type: "context.export", sessionId: (await getOpenSessionId())! });
     expect(first.received.find((event) => event.type === "context.exported")?.payload).toMatchObject({ requestId: "download", markdown: expect.stringContaining("Saved context") });
     expect(second.received.some((event) => event.type === "context.exported")).toBe(false);
   });
@@ -290,7 +290,7 @@ describe("BackgroundRuntime: event sequencing", () => {
 
     await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi" });
 
-    const runEvents = port.received.filter((e) => e.type !== "state.snapshot" && e.type !== "page.attached");
+    const runEvents = port.received.filter((e) => e.type !== "state.snapshot" && e.type !== "page.attached" && e.type !== "session.listed");
     const seqs = runEvents.map((e) => e.seq);
     expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
     expect(new Set(seqs).size).toBe(seqs.length);
@@ -436,8 +436,8 @@ describe("BackgroundRuntime: credential and settings changes from the options pa
     expect(snapshot.settings).toMatchObject({ modelId: "account-model", reasoningEffort: "none" });
     expect(snapshot.provider.models.map((model) => model.id)).toEqual(["account-model"]);
     expect(snapshot.credential).toMatchObject({ configured: true, chatgpt: { connected: true } });
-    const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export" });
-    for (const value of [JSON.stringify(snapshot), exported.markdown]) {
+    const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export", sessionId: (await getOpenSessionId())! });
+    for (const value of [JSON.stringify(snapshot), exported!.markdown]) {
       expect(value).not.toContain("test-subscription-token");
       expect(value).not.toContain("sk-test-existing-key");
     }
@@ -656,7 +656,7 @@ describe("BackgroundRuntime: prompt-cache usage", () => {
     const sessionId = (await runtime.getSnapshot()).conversation.id;
     expect(sessionId).toMatch(/^[\da-f-]{36}$/);
     expect(provider.requests.map((request) => request.sessionId)).toEqual([sessionId, sessionId]);
-    const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export" });
+    const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export", sessionId: (await getOpenSessionId())! });
     expect(exported?.markdown).toContain('"providerResponses": 2');
     expect(exported?.markdown).toContain('"cacheRead": 896');
   });
@@ -998,7 +998,7 @@ describe("BackgroundRuntime: run.retry", () => {
     await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
     const started = port.received.filter((event) => event.type === "run.started").at(-1);
     expect(started?.payload).toMatchObject({ prompt: "Find it", retry: true });
-    expect(port.received.at(-1)?.type).toBe("run.completed");
+    expect(port.received.filter((event) => event.type !== "session.listed").at(-1)?.type).toBe("run.completed");
     expect(await userTexts()).toEqual(["Earlier", "Find it"]);
     expect(provider.requests[2]?.context.messages.map((message) => [message.role, JSON.stringify(message.content)])).toEqual([
       ["user", JSON.stringify("Earlier")],
@@ -1601,9 +1601,9 @@ describe("BackgroundRuntime: sessions", () => {
   it("New chat clears scratch files and the debug buffers when no run is active", async () => {
     const { send } = await setup(["Noted."]);
     await send({ type: "run.start", prompt: "Remember this" });
-    expect((await send({ type: "context.export" }) as { markdown: string }).markdown).toContain('"providerResponses"');
+    expect((await send({ type: "context.export", sessionId: (await getOpenSessionId())! }) as { markdown: string }).markdown).toContain('"providerResponses"');
     await send({ type: "session.create" });
-    expect((await send({ type: "context.export" }) as { markdown: string }).markdown).toContain("No run recorded");
+    expect((await send({ type: "context.export", sessionId: (await getOpenSessionId())! }) as { markdown: string }).markdown).toContain("No run recorded");
   });
 
   it("opens another session, deleting the empty one it leaves, and reopens the last session after a restart", async () => {
@@ -1759,6 +1759,158 @@ describe("BackgroundRuntime: sessions", () => {
     await send({ type: "run.start", prompt: "Follow-up" });
     expect(provider.requests[0]?.sessionId).toBe("default");
     expect((await browser.storage.local.get("conversation")).conversation).toBeUndefined();
+  });
+});
+
+describe("BackgroundRuntime: history drawer support", () => {
+  const DAY = 24 * 60 * 60_000;
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.UTC(2026, 0, 1));
+  });
+  afterEach(() => vi.useRealTimers());
+
+  /** A clock on the (faked) system time; `sweep()` fires the runtime's periodic timer. */
+  function systemClock() {
+    let timer: (() => void) | null = null;
+    const clock: RuntimeClock = { now: () => Date.now(), setInterval: (callback) => { timer = callback; return 1; } };
+    return { clock, async sweep() { timer!(); await tick(); } };
+  }
+
+  async function setup(provider: FakeProvider = new FakeProvider()) {
+    await saveOpenAICredential("sk-test");
+    const { clock, sweep } = systemClock();
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory, clock });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+    const send = (command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+    const history = (request: Record<string, unknown>) => runtime.handleHistoryRequest({ v: 1, id: crypto.randomUUID(), ...request } as never);
+    const listed = () => port.received.flatMap((event) => event.type === "session.listed" ? [event.payload.sessions] : []);
+    return { hub, runtime, port, send, history, listed, sweep };
+  }
+
+  it("prunes unpinned chats past retention at startup, keeping pinned, open, and recent ones", async () => {
+    const old = await createSessionWith(prompt("u1", "Old"));
+    const pinned = await createSessionWith(prompt("u2", "Pinned"));
+    await updateSession(pinned, { pinned: true });
+    const open = await createSessionWith(prompt("u3", "Open"));
+    await setOpenSessionId(open);
+    vi.setSystemTime(Date.now() + 20 * DAY);
+    const recent = await createSessionWith(prompt("u4", "Recent"));
+    await saveHistorySettings({ version: 1, retention: "7d" });
+
+    const { runtime } = await setup();
+    await runtime.initialize();
+    expect((await listSessionIds()).sort()).toEqual([pinned, open, recent].sort());
+    expect(Object.keys(await browser.storage.local.get(null)).filter((key) => key.includes(old))).toEqual([]);
+  });
+
+  it("keeps everything by default, and applies a shorter retention from the options page at once, sparing the active run's chat", async () => {
+    const { provider, release } = blockingProvider();
+    const { runtime, send, history, listed } = await setup(provider);
+    await runtime.initialize();
+    const old = await createSessionWith(prompt("u1", "Old"));
+    const running = (await runtime.getSnapshot()).conversation.id;
+    const run = send({ type: "run.start", prompt: "Long task" });
+    await tick();
+    await send({ type: "session.create" });
+    const open = (await runtime.getSnapshot()).conversation.id;
+    vi.setSystemTime(Date.now() + 40 * DAY);
+
+    expect(await history({ type: "history.retention.save", retention: "forever" })).toMatchObject({ ok: true, sessionCount: 3, notice: null });
+    const saved = await history({ type: "history.retention.save", retention: "30d" });
+    expect(saved).toMatchObject({ ok: true, settings: { version: 1, retention: "30d" }, sessionCount: 2, notice: expect.stringContaining("Deleted 1 chat") });
+    expect(await getConversation(old)).toBeNull();
+    expect(listed().at(-1)?.map((session) => session.id).sort()).toEqual([running, open].sort());
+    release();
+    await run;
+  });
+
+  it("re-applies retention on the first sweep an hour after the last pass", async () => {
+    const { runtime, send, sweep } = await setup();
+    await runtime.initialize();
+    await saveHistorySettings({ version: 1, retention: "7d" });
+    const stale = (await runtime.getSnapshot()).conversation.id;
+    await send({ type: "session.rename", sessionId: stale, title: "Kept until left" });
+    await send({ type: "session.create" });
+    vi.setSystemTime(Date.now() + 30 * 60_000);
+    await sweep();
+    expect(await getConversation(stale)).not.toBeNull();
+    vi.setSystemTime(Date.now() + 8 * DAY);
+    await sweep();
+    expect(await getConversation(stale)).toBeNull();
+    expect(await listSessionIds()).toEqual([(await runtime.getSnapshot()).conversation.id]);
+  });
+
+  it("deletes all history except the active run's chat and opens a fresh empty chat", async () => {
+    const { provider, release } = blockingProvider();
+    const { runtime, send, history, listed, port } = await setup(provider);
+    await runtime.initialize();
+    const pinned = await createSessionWith(prompt("u1", "Pinned"));
+    await updateSession(pinned, { pinned: true });
+    const running = (await runtime.getSnapshot()).conversation.id;
+    const run = send({ type: "run.start", prompt: "Long task" });
+    await tick();
+    await send({ type: "session.create" });
+    const viewing = (await runtime.getSnapshot()).conversation.id;
+
+    const response = await history({ type: "history.deleteAll" });
+    expect(response).toMatchObject({ ok: true, sessionCount: 2, notice: expect.stringContaining("active run was kept") });
+    const fresh = port.received.findLast((event) => event.type === "state.snapshot")!;
+    expect(fresh.type === "state.snapshot" && fresh.payload.conversation).toMatchObject({ items: [] });
+    expect([pinned, viewing, running]).not.toContain(fresh.conversationId);
+    expect(listed().at(-1)?.map((session) => session.id).sort()).toEqual([running, fresh.conversationId].sort());
+    release();
+    await run;
+    expect((await getConversation(running))?.items[0]).toMatchObject({ role: "user", text: "Long task" });
+
+    expect(await history({ type: "history.deleteAll" })).toMatchObject({ ok: true, sessionCount: 1, notice: "Deleted 2 chats." });
+  });
+
+  it("exports any chat by id, with run diagnostics only for the latest run's chat", async () => {
+    const provider = new FakeProvider();
+    provider.script = [{ type: "text.delta", delta: "Answer." }, { type: "turn.completed", replayState: null }];
+    const { runtime, send, port } = await setup(provider);
+    await send({ type: "run.start", prompt: "Alpha question" });
+    const alpha = (await runtime.getSnapshot()).conversation.id;
+    await send({ type: "session.create" });
+    await send({ type: "run.start", prompt: "Beta question" });
+    const beta = (await runtime.getSnapshot()).conversation.id;
+    await send({ type: "session.open", sessionId: alpha });
+
+    const exportOf = async (sessionId: string) => (await send({ type: "context.export", sessionId }) as { markdown: string } | undefined)?.markdown;
+    const alphaExport = await exportOf(alpha);
+    expect(alphaExport).toContain("Alpha question");
+    expect(alphaExport).not.toContain("Beta question");
+    expect(alphaExport).toContain("No run recorded for this chat");
+    const betaExport = await exportOf(beta);
+    expect(betaExport).toContain("Beta question");
+    expect(betaExport).toContain('"providerResponses": 1');
+    expect(betaExport).not.toContain("sk-test");
+
+    expect(await exportOf("missing")).toBeUndefined();
+    expect(port.received.findLast((event) => event.type === "state.snapshot")?.payload).toMatchObject({ notice: expect.stringContaining("no longer exists") });
+  });
+
+  it("pushes the session list to every sidebar when a run titles a chat, when it ends, and on session commands", async () => {
+    const provider = new FakeProvider();
+    provider.script = [{ type: "text.delta", delta: "Answer." }, { type: "turn.completed", replayState: null }];
+    const { hub, runtime, send, listed, port } = await setup(provider);
+    const other = fakePort();
+    hub.handleConnect(other);
+    await send({ type: "run.start", prompt: "Plan a @Trip (tab 4, /tabs/4/page.md, https://example.com/) today" });
+    const id = (await runtime.getSnapshot()).conversation.id;
+    const lists = listed();
+    expect(lists[0]).toEqual([expect.objectContaining({ id, title: "Plan a @Trip today", itemCount: 1 })]);
+    expect(lists.at(-1)).toEqual([expect.objectContaining({ id, itemCount: 2 })]);
+    const runEvents = port.received.map((event) => event.type);
+    expect(runEvents.indexOf("session.listed")).toBeGreaterThan(runEvents.indexOf("run.started"));
+
+    await send({ type: "session.rename", sessionId: id, title: "Trip" });
+    expect(listed().at(-1)).toEqual([expect.objectContaining({ id, title: "Trip", titleSource: "user" })]);
+    expect(other.received.filter((event) => event.type === "session.listed")).toHaveLength(listed().length);
   });
 });
 
