@@ -1,7 +1,8 @@
 /**
- * BackgroundRuntime materializes the sole conversation, owns the active
- * run's AbortController, and is the only place that calls the provider or
- * writes conversation/checkpoint storage. Sidebar and options pages never
+ * BackgroundRuntime tracks the open session, owns the single active run's
+ * AbortController (the run may belong to a session other than the open one),
+ * and is the only place that calls the provider or writes
+ * conversation/checkpoint storage. Sidebar and options pages never
  * own an inference request, tool loop, transcript authority, or credential
  * read — they only ever see what this file publishes through SidebarHub.
  *
@@ -22,9 +23,17 @@ import { OPENAI_PROVIDER, DEFAULT_MODEL_ID } from "@/lib/providers/openai-models
 import {
   appendConversationItem,
   clearRunCheckpoint,
+  createSession,
+  deleteSession,
+  ensureOpenSession,
   getAppSettings,
   getConversation,
-  resetConversation,
+  isSessionUntouched,
+  listSessions,
+  migrateConversation,
+  setOpenSessionId,
+  touchSession,
+  updateSession,
   getCredentialStatus,
   getOpenAICredential,
   migrateCredentials,
@@ -36,9 +45,9 @@ import {
   deleteOpenAICredential as deleteStoredCredential,
 } from "@/lib/storage";
 import type { RunStatus } from "@/lib/storage";
-import { validatePromptText } from "@/lib/validation";
+import { validatePromptText, validateSessionTitle } from "@/lib/validation";
 import type { ContextArtifact } from "@/lib/domain/tools";
-import type { ConversationItem, ConversationRecordV1 } from "@/lib/domain/conversation";
+import type { Conversation, ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
 import type { AppSettingsV1, ModelDefinition, ProviderAdapter, ProviderAuth, ProviderDefinition } from "@/lib/domain/provider";
 import type {
   ApprovalRequest,
@@ -85,6 +94,8 @@ interface RunRecord {
 
 interface ActiveRun {
   runId: string;
+  /** The session the run started in; every item it produces is appended there. */
+  sessionId: string;
   controller: AbortController;
   agentLoop: AgentLoop;
   status: RunLifecycleStatus;
@@ -105,15 +116,19 @@ export class BackgroundRuntime {
   #clock: RuntimeClock;
   #workspace: WorkspaceState;
   #latestContext: string | null = null;
-  #resetting = false;
-  /** Whether the last turn ended failed, cancelled, or interrupted, so `run.retry` may re-run it. */
-  #lastTurnRetryable = false;
+  /** Cached `local:openConversation`; resolved lazily so every path sees a real session. */
+  #openSessionId: string | null = null;
+  #sessionOps: Promise<void> = Promise.resolve();
+  #sessionOpsPending = 0;
   /**
-   * Whether that turn's last attempt committed a consequential page effect
-   * (after an interruption: may have). Retrying it could repeat the effect,
-   * so `run.retry` is refused.
+   * Set when the last run's turn ended failed, cancelled, or interrupted, so
+   * `run.retry` may re-run it while its session is open. `hadPageEffect`:
+   * that attempt committed a consequential page effect (after an
+   * interruption: may have), so retrying could repeat it and is refused.
    */
-  #lastTurnHadPageEffect = false;
+  #retryable: { sessionId: string; hadPageEffect: boolean } | null = null;
+  /** Session of the run the debug buffers below describe. */
+  #debugSessionId: string | null = null;
   #debugOutputs: string[] = [];
   #debugOutputChars = 0;
   #debugOutputTruncated = false;
@@ -149,14 +164,18 @@ export class BackgroundRuntime {
     this.#approvalBadge?.set(false);
     // Each step fails safe on its own: a failed migration retries next startup,
     // a failed recovery offers no retry, and a failed restore leaves no agent
-    // tabs owned. None may cut another short.
+    // tabs owned. None may cut another short. Recovery runs after the
+    // conversation migration, since a pre-sessions checkpoint recovers into it.
     this.#ready = Promise.allSettled([
       migrateCredentials(),
-      recoverInterruptedRun().then(async (recovered) => {
-        if (!recovered) return;
-        this.#lastTurnHadPageEffect = lastTurnRanProgram((await getConversation()).items);
-        this.#lastTurnRetryable = true;
-      }),
+      migrateConversation()
+        .catch(() => console.warn("[bside] Could not migrate the saved conversation; will retry at next startup."))
+        .then(() => recoverInterruptedRun())
+        .then(async (sessionId) => {
+          if (!sessionId) return;
+          this.#retryable = { sessionId, hadPageEffect: lastTurnRanProgram((await getConversation(sessionId))?.items ?? []) };
+        })
+        .finally(() => this.#openSession()),
       this.#restoreAgentTabs(),
     ]).then(() => {});
     await this.#ready;
@@ -180,7 +199,7 @@ export class BackgroundRuntime {
 
   /** Idle auto-close. Skipped entirely while a run is active, so a tab a run may be using is never closed under it. */
   async #closeIdleAgentTabs(): Promise<void> {
-    if (this.#activeRun || this.#resetting) return;
+    if (this.#activeRun) return;
     const cutoff = this.#clock.now() - AGENT_TAB_IDLE_MS;
     await this.#closeAgentTabs((lastUsedAt) => lastUsedAt <= cutoff);
   }
@@ -283,10 +302,24 @@ export class BackgroundRuntime {
     }
   }
 
+  /** The open session's id, resolved once and kept in step with `local:openConversation`. */
+  async #openSession(): Promise<string> {
+    this.#openSessionId ??= await ensureOpenSession();
+    return this.#openSessionId;
+  }
+
+  /** The open session materialized; if it vanished from storage, the most recent (or a new) session is opened instead. */
+  async #openConversation(): Promise<Conversation> {
+    const conversation = await getConversation(await this.#openSession());
+    if (conversation) return conversation;
+    this.#openSessionId = null;
+    return (await getConversation(await this.#openSession()))!;
+  }
+
   async getSnapshot(): Promise<RuntimeSnapshot> {
     await this.#ready;
     const [conversation, credential, settings, provider] = await Promise.all([
-      getConversation(),
+      this.#openConversation(),
       this.#getCredentialStatus(),
       this.#getValidatedSettings(),
       this.#getProviderDefinition(),
@@ -303,6 +336,7 @@ export class BackgroundRuntime {
       activeRun: this.#activeRun
         ? {
             runId: this.#activeRun.runId,
+            conversationId: this.#activeRun.sessionId,
             status: this.#activeRun.status,
             partialAssistantText: this.#activeRun.partialAssistantText,
             pendingApproval: this.#activeRun.pendingApproval,
@@ -314,6 +348,7 @@ export class BackgroundRuntime {
   }
 
   handleCommand(command: { v: 1; id: string; type: "context.export" }): Promise<{ markdown: string; filename: string }>;
+  handleCommand(command: { v: 1; id: string; type: "session.list" }): Promise<{ sessions: ConversationSummary[] }>;
   handleCommand(command: SidebarCommand): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]>;
   async handleCommand(command: SidebarCommand): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]> {
     await this.#ready;
@@ -329,7 +364,7 @@ export class BackgroundRuntime {
     if (command.type === "tabs.closeAgentTabs") {
       // Refused rather than deferred while a run is active: the run may be using
       // these tabs, and a deferred close would fire after the user moved on.
-      if (this.#activeRun || this.#resetting) return;
+      if (this.#activeRun) return;
       await this.#closeAgentTabs(() => true);
       return;
     }
@@ -338,44 +373,31 @@ export class BackgroundRuntime {
       await this.handleSettingsRequest(command);
       return;
     }
+    if (command.type === "session.list") return { sessions: await listSessions() };
+    if (command.type === "session.create" || command.type === "session.open" || command.type === "session.delete" ||
+      command.type === "session.rename" || command.type === "session.pin") {
+      await this.#runSessionCommand(command);
+      return;
+    }
     if (command.type === "context.export") {
-      const conversation = await getConversation();
+      const conversation = await this.#openConversation();
       const fence = (text: string) => {
         const delimiter = "`".repeat(Math.max(3, ...[...text.matchAll(/`+/g)].map((match) => match[0].length + 1)));
         return `${delimiter}\n${text}\n${delimiter}`;
       };
       return { filename: `bside-context-${new Date().toISOString().replace(/[:.]/g, "-")}.md`, markdown: [
         "# bside context export", `Exported: ${new Date().toISOString()}`, `Extension version: ${extensionVersion()}`,
-        "## Latest run", "Model, timing, usage, and per-call results for the latest run in this background session.",
+        "## Latest run", "Model, timing, usage, and per-call results for the latest run in this background session, which may belong to another chat.",
         this.#runRecord ? fence(JSON.stringify(this.#runRecord, null, 2)) : "No run recorded in this background session.",
         "## Latest model input", "This is the most recent request, not an exact live token count. It is held in memory only; after an extension restart only the saved conversation remains. It may include private page content. Credentials are not included.",
         this.#latestContext ? fence(this.#latestContext) : "No model input captured in this background session.",
-        "## Full tool output — latest run", "Exact tool results, including bounded page snapshots and errors. Retained only until the next run, context reset, or extension restart. These are the snapshots exposed to the agent, not the entire page DOM.",
+        "## Full tool output — latest run", "Exact tool results, including bounded page snapshots and errors. Retained only until the next run, New chat, deleting that run's chat, or extension restart. These are the snapshots exposed to the agent, not the entire page DOM.",
         this.#debugOutputTruncated ? "Earlier results were dropped to keep the debug buffer below 2 million characters." : "No tool results dropped from this run.",
         this.#debugOutputs.length ? fence(`[\n${this.#debugOutputs.join(",\n")}\n]`) : "No tool output captured in this run/session.",
-        "## Conversation log", fence(JSON.stringify(conversation, null, 2)),
+        "## Conversation log", "The open chat.", fence(JSON.stringify(conversation, null, 2)),
         "## Partial response", fence(this.#activeRun?.partialAssistantText ?? ""),
         "## Scratch files", fence(JSON.stringify(Object.fromEntries(this.#workspace.files), null, 2)),
       ].join("\n\n") };
-    }
-    if (command.type === "context.reset") {
-      if (this.#activeRun || this.#resetting) return;
-      this.#resetting = true;
-      try {
-        await resetConversation();
-        this.#latestContext = null;
-        this.#runRecord = null;
-        this.#debugOutputs = [];
-        this.#debugOutputChars = 0;
-        this.#debugOutputTruncated = false;
-        this.#workspace.files.clear();
-        this.#lastTurnRetryable = false;
-        this.#lastTurnHadPageEffect = false;
-        this.#sidebarHub.startRun();
-        this.#notice = "Context reset. Conversation history and scratch files cleared; tabs and settings kept.";
-        await this.#sidebarHub.broadcastSnapshot();
-      } finally { this.#resetting = false; }
-      return;
     }
     if (command.type === "run.start") {
       await this.#startRun(command.prompt);
@@ -396,6 +418,82 @@ export class BackgroundRuntime {
     if (command.type === "action.deny") {
       this.#resolveApproval(command.runId, command.callId, false);
     }
+  }
+
+  /**
+   * Serializes session changes and republishes the snapshot. `run.start` and
+   * `run.retry` are refused while one is pending, so a run never starts in a
+   * session that is being switched away from or deleted.
+   */
+  async #runSessionCommand(command: SessionCommand): Promise<void> {
+    this.#sessionOpsPending += 1;
+    const op = this.#sessionOps.then(() => this.#applySessionCommand(command));
+    this.#sessionOps = op.catch(() => {});
+    try { await op; }
+    catch { this.#notice = "Could not update chats. Try again."; }
+    finally { this.#sessionOpsPending -= 1; }
+    await this.#sidebarHub.broadcastSnapshot();
+  }
+
+  async #applySessionCommand(command: SessionCommand): Promise<void> {
+    const openId = await this.#openSession();
+    if (command.type === "session.create") {
+      // An untouched open session already is a new chat. The active run's
+      // session counts as touched even before its user message is written.
+      if (this.#activeRun?.sessionId === openId || !(await isSessionUntouched(openId))) await this.#switchSession((await createSession()).id);
+      // Scratch files and debug buffers belong to the active run while there is one.
+      if (!this.#activeRun) {
+        this.#workspace.files.clear();
+        this.#clearDebugBuffers();
+      }
+      return;
+    }
+    if (command.type === "session.open") {
+      if (command.sessionId === openId) return;
+      if ((await listSessions()).some((session) => session.id === command.sessionId)) await this.#switchSession(command.sessionId);
+      else this.#notice = "That chat no longer exists.";
+      return;
+    }
+    if (command.type === "session.rename" || command.type === "session.pin") {
+      const title = command.type === "session.rename" ? validateSessionTitle(command.title) : undefined;
+      if (title === null) {
+        this.#notice = "Chat titles must be 1 to 120 characters.";
+        return;
+      }
+      const patch = command.type === "session.rename" ? { title } : { pinned: command.pinned };
+      if (!(await updateSession(command.sessionId, patch))) this.#notice = "That chat no longer exists.";
+      return;
+    }
+    // Refused rather than cancelling first: deleting must never be how a run is stopped.
+    if (this.#activeRun?.sessionId === command.sessionId) {
+      this.#notice = "Stop the run in this chat before deleting it.";
+      return;
+    }
+    await deleteSession(command.sessionId);
+    if (this.#retryable?.sessionId === command.sessionId) this.#retryable = null;
+    if (this.#debugSessionId === command.sessionId) this.#clearDebugBuffers();
+    if (command.sessionId === openId) {
+      // Opens the most recently updated remaining session, or a new empty one.
+      this.#openSessionId = null;
+      await this.#openSession();
+    }
+  }
+
+  /** Opens `id`. The previous session is deleted if it is untouched, so abandoned new chats do not pile up. */
+  async #switchSession(id: string): Promise<void> {
+    const previous = await this.#openSession();
+    await setOpenSessionId(id);
+    this.#openSessionId = id;
+    if (previous !== id && this.#activeRun?.sessionId !== previous && await isSessionUntouched(previous)) await deleteSession(previous);
+  }
+
+  #clearDebugBuffers(): void {
+    this.#latestContext = null;
+    this.#runRecord = null;
+    this.#debugOutputs = [];
+    this.#debugOutputChars = 0;
+    this.#debugOutputTruncated = false;
+    this.#debugSessionId = null;
   }
 
   async handleCredentialRequest(request: CredentialRequest): Promise<CredentialResponse> {
@@ -484,14 +582,15 @@ export class BackgroundRuntime {
     return fallback;
   }
 
-  /** A `null` prompt is a retry: it re-runs the last turn's existing user message instead of appending a new one. */
+  /** Starts a run in the open session. A `null` prompt is a retry: it re-runs the last turn's existing user message instead of appending a new one. */
   async #startRun(rawPrompt: string | null): Promise<void> {
     const retry = rawPrompt === null;
-    if (this.#activeRun || this.#resetting || (retry && !this.#lastTurnRetryable)) {
+    const sessionId = await this.#openSession();
+    if (this.#activeRun || this.#sessionOpsPending > 0 || (retry && this.#retryable?.sessionId !== sessionId)) {
       await this.#sidebarHub.broadcastSnapshot();
       return;
     }
-    if (retry && this.#lastTurnHadPageEffect) {
+    if (retry && this.#retryable?.hadPageEffect) {
       this.#notice = "The last attempt already changed a page, so retrying it could repeat that change. Send a new message to continue.";
       await this.#sidebarHub.broadcastSnapshot();
       return;
@@ -511,8 +610,9 @@ export class BackgroundRuntime {
     const controller = new AbortController();
     const tabController = this.#tabControllerFactory();
     const agentLoop = new AgentLoop(this.#provider, tabController, this.#sidebarHub, this.#workspace);
-    this.#activeRun = {
+    const run: ActiveRun = this.#activeRun = {
       runId,
+      sessionId,
       controller,
       agentLoop,
       status: "running",
@@ -522,16 +622,15 @@ export class BackgroundRuntime {
     };
 
     let auth: ProviderAuth;
-    let retryConversation: ConversationRecordV1 | null = null;
+    let conversation: Conversation | null;
     try {
       const chatgpt = await this.#chatgpt.status();
       const credential = chatgpt.connected ? null : await getOpenAICredential();
       if (!chatgpt.connected && !credential) throw new ProviderStreamError("Sign in with ChatGPT or add an OpenAI API key in settings before starting a conversation.", "AUTHENTICATION");
       auth = chatgpt.connected ? await this.#chatgpt.getAuth(controller.signal) : { providerId: "openai", method: "api-key", secret: credential!.apiKey };
-      if (retry) {
-        retryConversation = await getConversation();
-        if (!retryConversation.items.some(isUserMessage)) throw new ProviderStreamError("There is no turn to retry.", "INVALID_REQUEST");
-      }
+      conversation = await getConversation(sessionId);
+      if (!conversation) throw new ProviderStreamError("This chat no longer exists.", "INVALID_REQUEST");
+      if (retry && !conversation.items.some(isUserMessage)) throw new ProviderStreamError("There is no turn to retry.", "INVALID_REQUEST");
     } catch (error) {
       this.#activeRun = null;
       this.#notice = toNormalizedError(error, "setup").message;
@@ -539,7 +638,7 @@ export class BackgroundRuntime {
       return;
     }
 
-    this.#sidebarHub.startRun();
+    this.#sidebarHub.startRun(sessionId);
 
     this.#latestContext = null;
     this.#debugOutputs = [];
@@ -551,21 +650,25 @@ export class BackgroundRuntime {
       ? { ...captureOutcome.value.artifact, target: { kind: "tab", tabId: captureOutcome.value.snapshot.tabId }, snapshot: captureOutcome.value.snapshot }
       : null;
 
-    const conversation = retryConversation ?? await appendConversationItem({
-      id: crypto.randomUUID(),
-      kind: "message",
-      role: "user",
-      text: prompt!,
-      context: artifact ? { artifactId: artifact.artifactId, kind: "page", title: artifact.title, url: artifact.url, capturedAt: artifact.capturedAt } : null,
-      at: Date.now(),
-    });
-    const userIndex = conversation.items.findLastIndex(isUserMessage);
-    const userItem = conversation.items[userIndex] as UserMessage;
-    this.#lastTurnRetryable = false;
-    this.#lastTurnHadPageEffect = false;
+    let items = conversation.items;
+    if (!retry) {
+      const item: UserMessage = {
+        id: crypto.randomUUID(),
+        kind: "message",
+        role: "user",
+        text: prompt!,
+        context: artifact ? { artifactId: artifact.artifactId, kind: "page", title: artifact.title, url: artifact.url, capturedAt: artifact.capturedAt } : null,
+        at: Date.now(),
+      };
+      await appendConversationItem(sessionId, item);
+      items = [...items, item];
+    }
+    const userIndex = items.findLastIndex(isUserMessage);
+    const userItem = items[userIndex] as UserMessage;
+    this.#retryable = null;
 
     this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt: userItem.text, page: userItem.context, retry });
-    await this.#writeCheckpoint(runId, "running", "");
+    await this.#writeCheckpoint(run, "running", "");
 
     // Pi owns assistant/tool replay during this run. Persisted tool items are
     // display/audit records only, so a new run starts from message history.
@@ -573,7 +676,7 @@ export class BackgroundRuntime {
     // attempt's interim/partial assistant text stays visible but is not sent,
     // so the model answers the original prompt afresh against a new page
     // capture. Its page effects are never replayed.
-    const transcript = conversation.items.slice(0, userIndex + 1).filter((item) => item.kind === "message");
+    const transcript = items.slice(0, userIndex + 1).filter((item) => item.kind === "message");
     await this.#runAgentLoop(runId, transcript, artifact, auth);
   }
 
@@ -582,11 +685,15 @@ export class BackgroundRuntime {
     if (!run || run.runId !== runId) return;
 
     const settings = await this.#getValidatedSettings();
+    // Titles a new session from its first prompt and records the model for the history list.
+    // The index only lags on failure, so a failed write never stops the run.
+    await touchSession(run.sessionId, { prompt: transcript.findLast(isUserMessage)?.text, modelId: settings.modelId }).catch(() => {});
     const record: RunRecord = {
       runId, modelId: settings.modelId, reasoningEffort: settings.reasoningEffort, startedAt: Date.now(), endedAt: null, status: "running", error: null,
       providerResponses: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0 }, toolCalls: [],
     };
     this.#runRecord = record;
+    this.#debugSessionId = run.sessionId;
     let coalesced = "";
     let lastFlush = Date.now();
 
@@ -600,7 +707,7 @@ export class BackgroundRuntime {
     const runStartedAt = this.#clock.now();
     const result = await run.agentLoop.run({
       runId,
-      conversationId: "default",
+      conversationId: run.sessionId,
       modelId: settings.modelId,
       reasoningEffort: settings.reasoningEffort,
       transcript,
@@ -635,12 +742,12 @@ export class BackgroundRuntime {
         run.partialAssistantText += delta;
         coalesced += delta;
         if (coalesced.length >= DELTA_COALESCE_BYTES || Date.now() - lastFlush >= DELTA_COALESCE_MS) flushDelta();
-        void this.#maybeCheckpoint(runId, run);
+        void this.#maybeCheckpoint(run);
       },
       onItem: async (item) => {
-        await appendConversationItem(item);
+        await appendConversationItem(run.sessionId, item);
         if (item.kind === "message" && item.role === "assistant") run.partialAssistantText = "";
-        await this.#writeCheckpoint(runId, run.status, run.partialAssistantText);
+        await this.#writeCheckpoint(run, run.status, run.partialAssistantText);
       },
       onApprovalPending: (request) => {
         if (this.#activeRun?.runId !== runId) return;
@@ -660,20 +767,22 @@ export class BackgroundRuntime {
     flushDelta();
     this.#approvalBadge?.set(false);
 
-    if (result.status === "completed") {
-      const messageId = result.finalMessageId ?? (await this.#persistEmptyFinalMessage());
-      this.#sidebarHub.publishRunEvent(runId, "run.completed", { messageId });
+    const finish = async () => {
       await clearRunCheckpoint();
+      await touchSession(run.sessionId).catch(() => {});
       this.#activeRun = null;
+    };
+    if (result.status === "completed") {
+      const messageId = result.finalMessageId ?? (await this.#persistEmptyFinalMessage(run.sessionId));
+      this.#sidebarHub.publishRunEvent(runId, "run.completed", { messageId });
+      await finish();
       return;
     }
     if (result.status === "cancelled") {
-      const messageId = result.partialText ? await this.#persistCancelledMessage(result.partialText) : null;
+      const messageId = result.partialText ? await this.#persistCancelledMessage(run.sessionId, result.partialText) : null;
       this.#sidebarHub.publishRunEvent(runId, "run.cancelled", { partialText: result.partialText, messageId });
-      await clearRunCheckpoint();
-      this.#lastTurnRetryable = true;
-      this.#lastTurnHadPageEffect = result.hadPageEffect;
-      this.#activeRun = null;
+      this.#retryable = { sessionId: run.sessionId, hadPageEffect: result.hadPageEffect };
+      await finish();
       return;
     }
     // Retry is only ever safe to offer when this run touched no page state;
@@ -682,10 +791,8 @@ export class BackgroundRuntime {
     // committed a real effect on the page.
     const error: NormalizedError = result.hadPageEffect ? { ...result.error, retryable: false } : result.error;
     this.#sidebarHub.publishRunEvent(runId, "run.failed", error);
-    await clearRunCheckpoint();
-    this.#lastTurnRetryable = true;
-    this.#lastTurnHadPageEffect = result.hadPageEffect;
-    this.#activeRun = null;
+    this.#retryable = { sessionId: run.sessionId, hadPageEffect: result.hadPageEffect };
+    await finish();
   }
 
   /** Restarts the idle period of every agent tab used since `since`, so tabs a long run used are not closed right after it ends. */
@@ -701,31 +808,32 @@ export class BackgroundRuntime {
   }
 
   /** Persists a cancelled run's uncommitted partial text so the interruption stays visible after reload; never fed back into a future provider request. */
-  async #persistCancelledMessage(partialText: string): Promise<string> {
+  async #persistCancelledMessage(sessionId: string, partialText: string): Promise<string> {
     const id = crypto.randomUUID();
-    await appendConversationItem({ id, kind: "message", role: "assistant", text: `${partialText}${RUN_CANCELLED_SUFFIX}`, at: Date.now() });
+    await appendConversationItem(sessionId, { id, kind: "message", role: "assistant", text: `${partialText}${RUN_CANCELLED_SUFFIX}`, at: Date.now() });
     return id;
   }
 
 
   /** Rare: the model produced neither text nor a tool call. Persist an empty final message so `run.completed` always has a real id. */
-  async #persistEmptyFinalMessage(): Promise<string> {
+  async #persistEmptyFinalMessage(sessionId: string): Promise<string> {
     const id = crypto.randomUUID();
-    await appendConversationItem({ id, kind: "message", role: "assistant", text: "", at: Date.now() });
+    await appendConversationItem(sessionId, { id, kind: "message", role: "assistant", text: "", at: Date.now() });
     return id;
   }
-  async #maybeCheckpoint(runId: string, run: ActiveRun): Promise<void> {
+  async #maybeCheckpoint(run: ActiveRun): Promise<void> {
     const now = Date.now();
     if (now - run.lastCheckpointAt < CHECKPOINT_MIN_INTERVAL_MS) return;
     run.lastCheckpointAt = now;
-    await this.#writeCheckpoint(runId, run.status, run.partialAssistantText);
+    await this.#writeCheckpoint(run, run.status, run.partialAssistantText);
   }
 
-  async #writeCheckpoint(runId: string, status: RunLifecycleStatus, partialAssistantText: string): Promise<void> {
+  async #writeCheckpoint(run: ActiveRun, status: RunLifecycleStatus, partialAssistantText: string): Promise<void> {
     const checkpointStatus: RunStatus = status === "cancelling" ? "cancelled" : status;
     await saveRunCheckpoint({
-      version: 1,
-      runId,
+      version: 2,
+      runId: run.runId,
+      sessionId: run.sessionId,
       status: checkpointStatus,
       partialAssistantText,
       lastSeq: this.#sidebarHub.lastSeq(),
@@ -748,6 +856,7 @@ export class BackgroundRuntime {
 }
 
 type UserMessage = Extract<ConversationItem, { kind: "message"; role: "user" }>;
+type SessionCommand = Extract<SidebarCommand, { type: "session.create" | "session.open" | "session.delete" | "session.rename" | "session.pin" }>;
 
 function isUserMessage(item: ConversationItem): item is UserMessage {
   return item.kind === "message" && item.role === "user";

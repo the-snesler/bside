@@ -11,7 +11,7 @@ import type { SidebarHub } from "@/lib/background/sidebar-hub";
 import type { TabController } from "@/lib/background/tab-controller";
 import type { ContextArtifact, JsonValue, ToolCall, ToolResult } from "@/lib/domain/tools";
 import { BrowserProgram, PROGRAM_HELP, WorkspaceState, renderSnapshot } from "./browser-program";
-import type { ConversationItem, ConversationRecordV1 } from "@/lib/domain/conversation";
+import type { ConversationItem } from "@/lib/domain/conversation";
 import type { ProviderAdapter, ProviderAuth, ReasoningEffort } from "@/lib/domain/provider";
 import type { ApprovalRequest, NormalizedError } from "@/lib/protocol";
 import { isRecord } from "@/lib/validation";
@@ -19,8 +19,8 @@ import { decodeProviderError, ProviderStreamError } from "@/lib/providers/openai
 
 export interface AgentLoopParams {
   runId: string;
-  /** Sent as the provider prompt-cache key so rounds and runs share a cached prefix. */
-  conversationId: ConversationRecordV1["id"];
+  /** The run's session id, sent as the provider prompt-cache key so its rounds and runs share a cached prefix. */
+  conversationId: string;
   modelId: string;
   reasoningEffort: ReasoningEffort;
   /** Persisted transcript so far, including the just-appended user message. */

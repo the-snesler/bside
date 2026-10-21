@@ -28,7 +28,7 @@ entrypoints/
 
 lib/
   background/
-    runtime.ts         Sole owner of runs, persistence, cancellation, retry, terminal transitions, agent-tab ownership.
+    runtime.ts         Sole owner of runs, the open session and session commands, persistence, cancellation, retry, terminal transitions, agent-tab ownership.
     agent-loop.ts      Pi Agent orchestration, system policy, run budgets, approvals, exactly-once tool ledger.
     browser-program.ts browser_program parser/interpreter, tab mounts, /workspace, web.search, agent-tab state.
     tab-controller.ts  Bound-tab capture, page RPC, navigation settlement, tab hide/close, agent-tab session tags.
@@ -52,7 +52,7 @@ lib/
     Markdown.tsx       Model-text Markdown without raw HTML, remote images, or unsafe links.
   protocol.ts          Versioned cross-context request/event unions and type guards.
   validation.ts        Runtime validators for prompts and tool arguments.
-  storage.ts           Versioned `storage.local` records and interrupted-run recovery.
+  storage.ts           Versioned `storage.local` records: settings, sealed credentials, chunked conversation sessions, legacy migration, interrupted-run recovery.
 
 styles/theme.css       Shared system-adaptive design tokens.
 public/                Packaged static extension assets.
@@ -73,12 +73,13 @@ wxt.config.ts          Firefox MV2 manifest, permissions, CSP, and Preact Vite s
 - Pi is the provider boundary. Outside tests, runtime `@earendil-works/pi-ai` imports belong only in `lib/providers/openai.ts` and `@earendil-works/pi-agent-core` only in `lib/background/agent-loop.ts`; `lib/domain/provider.ts` and `agent-loop.ts` may import Pi types. No other provider SDK.
 - The system prompt and tool definitions are a byte-stable cacheable prefix: no per-run content goes there. The attached page outline rides on the current user turn. Requests use `cacheRetention: "short"` with `sessionId` = conversation id, which Pi sends as `prompt_cache_key`.
 - Runs have budgets (`DEFAULT_RUN_LIMITS` in `agent-loop.ts`: provider rounds, active wall-clock time, output tokens), checked between rounds. Exceeding one fails the run with `LIMIT_EXCEEDED` and keeps committed effects. Time awaiting confirmation does not count.
-- The extension has one persisted conversation (`"default"`). Run-local replay state and full page snapshots must not enter persistent storage.
-- `run.retry` re-runs the last failed, cancelled, or interrupted turn against its existing user message and never appends a user item. It is refused if that attempt committed (or, after an interruption, may have committed) a page effect.
+- Conversations are sessions with opaque ids: `local:conversationIndex` lists them; each has a `conversation:<id>` record (the item count, the commit point) and 32-item `conversation:<id>:items:<n>` chunks. Appends write only the tail chunk and record, never a whole history; the index is rewritten only by session commands and at turn boundaries. `local:openConversation` is the session the sidebar shows. Run-local replay state and full page snapshots must not enter persistent storage.
+- One run is active globally. It stays bound to the session it started in (`activeRun.conversationId`, run events' `conversationId`) while the user views or creates other sessions; deleting its session is refused. New chat reuses an untouched open session, and leaving an untouched session deletes it.
+- `run.retry` re-runs the open session's last failed, cancelled, or interrupted turn against its existing user message and never appends a user item. It is refused if that attempt committed (or, after an interruption, may have committed) a page effect. Run checkpoints record their session, and recovery writes the interrupted marker there.
 - Ref-bearing page actions require the exact latest snapshot revision. Surface the real revision in text returned to the model; never guess stale targets.
 - The model uses `browser_program` for bounded capability programs and `request_action_confirmation(title, message, artifact)` before externally visible, destructive, or paid actions. Deciding when to ask is model policy; the background pauses only for explicit confirmation calls and records the decision. Do not reintroduce automatic per-action or per-program approvals. While a confirmation is pending, the toolbar shows a `!` badge, which clears on resolve, cancel, terminal state, and startup. Clicking the toolbar button then opens the sidebar instead of toggling it.
 - Browser programs are parsed and interpreted, never evaluated as JavaScript. Locators resolve uniquely against a fresh snapshot before each effect. Stop on the first failure and retain earlier effects.
-- `/tabs/<id>/page.md` and `/agent-tabs/<id>/page.md` are live read-only snapshots. Explicit cross-mount moves hide/show tabs; removal closes them. `/workspace` is bounded scratch storage for the background session, never host filesystem access.
+- `/tabs/<id>/page.md` and `/agent-tabs/<id>/page.md` are live read-only snapshots. Explicit cross-mount moves hide/show tabs; removal closes them. `/workspace` is bounded scratch storage for the background session (New chat with no run active clears it), never host filesystem access.
 - Agent-tab ownership lives on the tabs themselves as a versioned `sessions` tab value (`AGENT_TAB_TAG_KEY`: role `agent`/`search` and `lastUsedAt`), which Firefox keeps across browser restarts, session restore, and undo-close even though it reassigns tab IDs. Opening, adopting, and moving a tab into `/agent-tabs` tags it. Moving it to `/tabs` untags it, and so does closing it, before the tab is removed. At startup and on `tabs.onCreated`, a tab is adopted only if it carries a valid tag and is hidden; a tagged tab that is visible is untagged and left to the user, never re-hidden. Never adopt an untagged tab by ID or URL. Agent tabs unused for 30 minutes are auto-closed. Idle close and the "Close agent tabs" command are refused while a run is active.
 
 ## Security and privacy boundaries

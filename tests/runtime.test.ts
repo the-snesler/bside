@@ -9,11 +9,28 @@ import { AGENT_TAB_TAG_KEY } from "@/lib/background/tab-controller";
 import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import type { RuntimeClock } from "@/lib/background/runtime";
 import { ProviderStreamError } from "@/lib/providers/openai";
-import { saveOpenAICredential, appendConversationItem, getConversation, getOpenAICredential, saveRunCheckpoint } from "@/lib/storage";
+import {
+  saveOpenAICredential, appendConversationItem, createSession, ensureOpenSession, getConversation, getOpenAICredential, getOpenSessionId,
+  listSessions, saveRunCheckpoint, setOpenSessionId,
+} from "@/lib/storage";
+import type { ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
 import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
 import type { PageSnapshot } from "@/lib/domain/tools";
-import type { SidebarEvent } from "@/lib/protocol";
+import type { SidebarCommand, SidebarEvent } from "@/lib/protocol";
 import { TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
+
+/** The open session, as the sidebar shows it; empty before any session exists. */
+async function openConversation(): Promise<{ items: ConversationItem[] }> {
+  const id = await getOpenSessionId();
+  return (id && await getConversation(id)) || { items: [] };
+}
+
+/** Appends to the open session (creating one), as an earlier background run would have. */
+async function seed(item: ConversationItem): Promise<string> {
+  const id = await ensureOpenSession();
+  await appendConversationItem(id, item);
+  return id;
+}
 
 /** A TabController bound to a browser API that always reports no attachable tab. */
 function unsupportedPageTabControllerFactory(): TabController {
@@ -71,7 +88,7 @@ describe("context controls", () => {
     expect(await runtime.handleCommand({ v: 1, id: "tabs", type: "tabs.list" })).toEqual({ tabs: [
       { id: 1, title: "Agent Fixture", url: "http://127.0.0.1:4173/agent-page.html", path: "/tabs/1/page.md" },
     ] });
-    expect((await getConversation()).items).toHaveLength(0);
+    expect((await openConversation()).items).toHaveLength(0);
   });
 
   it("focuses a mentioned tab without capturing page content", async () => {
@@ -80,7 +97,7 @@ describe("context controls", () => {
     const runtime = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: () => controller });
     await runtime.handleCommand({ v: 1, id: "focus", type: "tabs.focus", tabId: 1 });
     expect(focusTab).toHaveBeenCalledWith(1);
-    expect((await getConversation()).items).toHaveLength(0);
+    expect((await openConversation()).items).toHaveLength(0);
   });
 
   it("saves inline model selection through the background", async () => {
@@ -114,8 +131,8 @@ describe("context controls", () => {
     expect(latestRun).toContain('"status": "completed"');
     expect(latestRun).toContain('"providerResponses": 2');
     expect(latestRun).toContain('"name": "browser_program"');
-    expect(JSON.stringify(await getConversation())).not.toContain("Orchid launch moved to Friday.");
-    await runtime.handleCommand({ v: 1, id: "reset", type: "context.reset" });
+    expect(JSON.stringify(await openConversation())).not.toContain("Orchid launch moved to Friday.");
+    await runtime.handleCommand({ v: 1, id: "reset", type: "session.create" });
     expect((await runtime.handleCommand({ v: 1, id: "export2", type: "context.export" }))?.markdown).not.toContain("Orchid launch moved to Friday.");
   });
 
@@ -133,8 +150,8 @@ describe("context controls", () => {
     expect(exported?.markdown).toContain("browser_program");
     expect(exported?.markdown).toContain("Hello.");
     expect(exported?.markdown).not.toContain("sk-context-test-secret");
-    await runtime.handleCommand({ v: 1, id: "reset", type: "context.reset" });
-    expect((await getConversation()).items).toEqual([]);
+    await runtime.handleCommand({ v: 1, id: "reset", type: "session.create" });
+    expect((await openConversation()).items).toEqual([]);
     expect((await getOpenAICredential())?.apiKey).toBe("sk-context-test-secret");
     const cleared = await runtime.handleCommand({ v: 1, id: "export2", type: "context.export" });
     expect(cleared?.markdown).not.toContain("Context export test");
@@ -142,7 +159,7 @@ describe("context controls", () => {
   });
 
   it("sends a download only to the requesting sidebar", async () => {
-    await appendConversationItem({ id: "u1", kind: "message", role: "user", text: "Saved context", context: null, at: 1 });
+    await seed({ id: "u1", kind: "message", role: "user", text: "Saved context", context: null, at: 1 });
     const hub = new SidebarHub();
     hub.delegate = new BackgroundRuntime(hub, { provider: new FakeProvider() });
     const first = fakePort();
@@ -437,7 +454,7 @@ describe("BackgroundRuntime: credential and settings changes from the options pa
     await port.send({ v: 1, id: "sub", type: "state.subscribe", lastSeq: null });
     await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Hello" });
     expect(provider.requests).toEqual([]);
-    expect((await getConversation()).items).toEqual([]);
+    expect((await openConversation()).items).toEqual([]);
     expect(port.received.some((event) => event.type === "state.snapshot" && event.payload.notice?.includes("Reconnect in settings"))).toBe(true);
   });
 
@@ -450,7 +467,7 @@ describe("BackgroundRuntime: credential and settings changes from the options pa
     const result = await runtime.handleCredentialRequest({ v: 1, id: "test", type: "credentials.chatgpt.test" });
     expect(result).toMatchObject({ ok: true, notice: expect.stringContaining("connection works") });
     expect(provider.requests[0]?.context.tools).toEqual([]);
-    expect((await getConversation()).items).toEqual([]);
+    expect((await openConversation()).items).toEqual([]);
     expect((await runtime.getSnapshot()).activeRun).toBeNull();
     expect(JSON.stringify(result)).not.toContain("test-subscription-token");
   });
@@ -619,7 +636,7 @@ describe("BackgroundRuntime: cross-run transcript (regression)", () => {
 });
 
 describe("BackgroundRuntime: prompt-cache usage", () => {
-  it("keys requests by conversation and accumulates cached input tokens into the run record", async () => {
+  it("keys requests by the run's session and accumulates cached input tokens into the run record", async () => {
     await saveOpenAICredential("sk-test");
     const hub = new SidebarHub();
     const provider = new FakeProvider();
@@ -636,7 +653,9 @@ describe("BackgroundRuntime: prompt-cache usage", () => {
 
     await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hello" });
 
-    expect(provider.requests.map((request) => request.sessionId)).toEqual(["default", "default"]);
+    const sessionId = (await runtime.getSnapshot()).conversation.id;
+    expect(sessionId).toMatch(/^[\da-f-]{36}$/);
+    expect(provider.requests.map((request) => request.sessionId)).toEqual([sessionId, sessionId]);
     const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export" });
     expect(exported?.markdown).toContain('"providerResponses": 2');
     expect(exported?.markdown).toContain('"cacheRead": 896');
@@ -805,10 +824,10 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
 
   it("refuses run.retry after an interrupted attempt that had started a browser program", async () => {
     await saveOpenAICredential("sk-test");
-    await appendConversationItem({ id: "u1", kind: "message", role: "user", text: "Click submit", context: null, at: 1 });
+    await seed({ id: "u1", kind: "message", role: "user", text: "Click submit", context: null, at: 1 });
     // The checkpoint does not record effects, so a program the interrupted attempt started may have committed one.
-    await appendConversationItem({ id: "c1", kind: "tool-call", call: { id: "call_1", name: "browser_program", arguments: { source: click } }, at: 2 });
-    await saveRunCheckpoint({ version: 1, runId: "r1", status: "running", partialAssistantText: "", lastSeq: 2, updatedAt: 1 });
+    await seed({ id: "c1", kind: "tool-call", call: { id: "call_1", name: "browser_program", arguments: { source: click } }, at: 2 });
+    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", lastSeq: 2, updatedAt: 1 });
     const provider = new FakeProvider();
     const { runtime, port } = setup(provider);
     await runtime.initialize();
@@ -819,8 +838,8 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
 
   it("keeps a turn retryable across a failed retry that committed no page effect", async () => {
     await saveOpenAICredential("sk-test");
-    await appendConversationItem({ id: "u1", kind: "message", role: "user", text: "Read it", context: null, at: 1 });
-    await saveRunCheckpoint({ version: 1, runId: "r1", status: "running", partialAssistantText: "", lastSeq: 2, updatedAt: 1 });
+    await seed({ id: "u1", kind: "message", role: "user", text: "Read it", context: null, at: 1 });
+    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", lastSeq: 2, updatedAt: 1 });
     const provider = new FakeProvider();
     let round = 0;
     provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
@@ -834,7 +853,7 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
     await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
     await runtime.handleCommand({ v: 1, id: "retry-again", type: "run.retry" });
     expect(provider.requests).toHaveLength(2);
-    expect((await getConversation()).items.at(-1)).toMatchObject({ role: "assistant", text: "Done." });
+    expect((await openConversation()).items.at(-1)).toMatchObject({ role: "assistant", text: "Done." });
   });
 });
 
@@ -923,18 +942,18 @@ describe("BackgroundRuntime: approval badge", () => {
   });
 
   it("clears a stale badge at startup while recovering an interrupted approval", async () => {
-    await saveRunCheckpoint({ version: 1, runId: "r1", status: "awaiting-approval", partialAssistantText: "", lastSeq: 3, updatedAt: 1 });
+    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "awaiting-approval", partialAssistantText: "", lastSeq: 3, updatedAt: 1 });
     const { badge, texts } = fakeBadge();
     const runtime = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), approvalBadge: badge });
     await runtime.initialize();
     await tick();
     expect(texts).toEqual([""]);
-    expect((await getConversation()).items.at(-1)).toMatchObject({ id: "interrupted-r1", role: "assistant" });
+    expect((await openConversation()).items.at(-1)).toMatchObject({ id: "interrupted-r1", role: "assistant" });
   });
 });
 
 describe("BackgroundRuntime: run.retry", () => {
-  const userTexts = async () => (await getConversation()).items.flatMap((item) => item.kind === "message" && item.role === "user" ? [item.text] : []);
+  const userTexts = async () => (await openConversation()).items.flatMap((item) => item.kind === "message" && item.role === "user" ? [item.text] : []);
   const answer = (text: string): ScriptedProviderEvent[] => [{ type: "text.delta", delta: text }, { type: "turn.completed", replayState: null }];
 
   function scriptedRounds(provider: FakeProvider, rounds: Array<ScriptedProviderEvent[] | Error>): void {
@@ -963,8 +982,8 @@ describe("BackgroundRuntime: run.retry", () => {
 
   it("re-runs a failed turn without a second user message; the model sees history through the original prompt, not the failed attempt's interim text", async () => {
     await saveOpenAICredential("sk-test");
-    await appendConversationItem({ id: "u0", kind: "message", role: "user", text: "Earlier", context: null, at: 1 });
-    await appendConversationItem({ id: "a0", kind: "message", role: "assistant", text: "Earlier answer.", at: 2 });
+    await seed({ id: "u0", kind: "message", role: "user", text: "Earlier", context: null, at: 1 });
+    await seed({ id: "a0", kind: "message", role: "assistant", text: "Earlier answer.", at: 2 });
     const provider = new FakeProvider();
     scriptedRounds(provider, [
       [{ type: "text.delta", delta: "Let me look." }, { type: "tool.call", call: { id: "call_1", name: "browser_program", arguments: { source: 'return await fs.read("/tabs/1/page.md");' } } }, { type: "turn.completed", replayState: null }],
@@ -987,7 +1006,7 @@ describe("BackgroundRuntime: run.retry", () => {
       ["user", JSON.stringify("Find it")],
     ]);
     // The failed attempt stays visible in the same turn, followed by the retried answer.
-    const items = (await getConversation()).items;
+    const items = (await openConversation()).items;
     expect(items.some((item) => item.kind === "message" && item.text === "Let me look.")).toBe(true);
     expect(items.at(-1)).toMatchObject({ role: "assistant", text: "Found it." });
   });
@@ -1006,14 +1025,14 @@ describe("BackgroundRuntime: run.retry", () => {
     await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
     expect(await userTexts()).toEqual(["Read it"]);
     expect(provider.requests[1]?.context.messages.map((message) => message.role)).toEqual(["user"]);
-    const texts = (await getConversation()).items.flatMap((item) => item.kind === "message" && item.role === "assistant" ? [item.text] : []);
+    const texts = (await openConversation()).items.flatMap((item) => item.kind === "message" && item.role === "assistant" ? [item.text] : []);
     expect(texts).toEqual([expect.stringContaining("Stopped"), "Done."]);
   });
 
   it("re-runs a turn interrupted by a background restart", async () => {
     await saveOpenAICredential("sk-test");
-    await appendConversationItem({ id: "u1", kind: "message", role: "user", text: "Before restart", context: null, at: 1 });
-    await saveRunCheckpoint({ version: 1, runId: "r1", status: "running", partialAssistantText: "Half", lastSeq: 2, updatedAt: 1 });
+    await seed({ id: "u1", kind: "message", role: "user", text: "Before restart", context: null, at: 1 });
+    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "Half", lastSeq: 2, updatedAt: 1 });
     const provider = new FakeProvider();
     scriptedRounds(provider, [answer("After restart.")]);
     const { runtime } = setup(provider);
@@ -1022,10 +1041,10 @@ describe("BackgroundRuntime: run.retry", () => {
     await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
     expect(await userTexts()).toEqual(["Before restart"]);
     expect(provider.requests[0]?.context.messages.map((message) => message.role)).toEqual(["user"]);
-    expect((await getConversation()).items.at(-1)).toMatchObject({ role: "assistant", text: "After restart." });
+    expect((await openConversation()).items.at(-1)).toMatchObject({ role: "assistant", text: "After restart." });
   });
 
-  it("drops a retry after a completed turn, a successful retry, a context reset, or with no history", async () => {
+  it("drops a retry after a completed turn, a successful retry, a new chat, or with no history", async () => {
     await saveOpenAICredential("sk-test");
     const provider = new FakeProvider();
     scriptedRounds(provider, [answer("One."), new ProviderStreamError("Rate limited.", "RATE_LIMIT"), answer("Two.")]);
@@ -1047,10 +1066,10 @@ describe("BackgroundRuntime: run.retry", () => {
 
     scriptedRounds(provider, [new ProviderStreamError("Rate limited.", "RATE_LIMIT")]);
     await runtime.handleCommand({ v: 1, id: "start3", type: "run.start", prompt: "Third" });
-    await runtime.handleCommand({ v: 1, id: "reset", type: "context.reset" });
+    await runtime.handleCommand({ v: 1, id: "reset", type: "session.create" });
     await runtime.handleCommand({ v: 1, id: "after-reset", type: "run.retry" });
     expect(provider.requests).toHaveLength(4);
-    expect((await getConversation()).items).toEqual([]);
+    expect((await openConversation()).items).toEqual([]);
   });
 
   it("drops a retry while a run is active", async () => {
@@ -1453,8 +1472,8 @@ describe("BackgroundRuntime: Phase 0 integration (regression)", () => {
 
   it("finishes interrupted-run recovery and starts the idle sweep even when agent-tab restoration fails", async () => {
     await saveOpenAICredential("sk-test");
-    await appendConversationItem({ id: "u1", kind: "message", role: "user", text: "Before restart", context: null, at: 1 });
-    await saveRunCheckpoint({ version: 1, runId: "r1", status: "running", partialAssistantText: "", lastSeq: 2, updatedAt: 1 });
+    await seed({ id: "u1", kind: "message", role: "user", text: "Before restart", context: null, at: 1 });
+    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", lastSeq: 2, updatedAt: 1 });
     const { api, factory } = fakeTabsApi([userTab]);
     api.tabs.query.mockRejectedValueOnce(new Error("Tabs unavailable."));
     const { clock, sweep } = manualClock();
@@ -1468,7 +1487,7 @@ describe("BackgroundRuntime: Phase 0 integration (regression)", () => {
     await sweep();
     await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
     expect(provider.requests).toHaveLength(1);
-    expect((await getConversation()).items.at(-1)).toMatchObject({ role: "assistant", text: "After restart." });
+    expect((await openConversation()).items.at(-1)).toMatchObject({ role: "assistant", text: "After restart." });
   });
 
   it("keeps a tab adopted while an earlier ownership write is still reading the tab list", async () => {
@@ -1522,3 +1541,235 @@ describe("BackgroundRuntime: Phase 0 integration (regression)", () => {
     expect(tabs.map((tab) => [tab.id, tab.hidden])).toEqual([[1, false], [5, false]]);
   });
 });
+
+describe("BackgroundRuntime: sessions", () => {
+  /** Answers each round with `text`; a round scripted as `null` streams "Working" and then waits for cancellation. */
+  function scripted(provider: FakeProvider, rounds: Array<string | null | Error>): void {
+    let round = 0;
+    provider.script = (signal) => {
+      const next = round < rounds.length ? rounds[round++] : "Extra.";
+      return { [Symbol.asyncIterator]: async function* () {
+        if (next instanceof Error) throw next;
+        yield { type: "text.delta", delta: next ?? "Working" } as ScriptedProviderEvent;
+        if (next !== null) {
+          yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+          return;
+        }
+        const { promise, reject } = Promise.withResolvers<never>();
+        signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+        await promise;
+      } };
+    };
+  }
+
+  async function setup(rounds: Array<string | null | Error> = []) {
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    scripted(provider, rounds);
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+    const send = (command: Record<string, unknown>): Promise<unknown> => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+    const snapshot = () => runtime.getSnapshot();
+    /** Notices are one-shot, so read the one the command's own snapshot broadcast carried. */
+    const notice = () => port.received.findLast((event) => event.type === "state.snapshot")?.payload.notice;
+    return { runtime, provider, port, send, snapshot, notice };
+  }
+
+  const texts = (conversation: { items: ConversationItem[] }) => conversation.items.flatMap((item) => item.kind === "message" ? [item.text] : []);
+
+  it("New chat opens an empty session, reuses one that is already empty, and keeps the previous chat", async () => {
+    const { send, snapshot } = await setup(["First answer."]);
+    const empty = (await snapshot()).conversation.id;
+    await send({ type: "session.create" });
+    expect((await snapshot()).conversation.id).toBe(empty);
+
+    await send({ type: "run.start", prompt: "First question" });
+    await send({ type: "session.create" });
+    const fresh = (await snapshot()).conversation;
+    expect(fresh.id).not.toBe(empty);
+    expect(fresh.items).toEqual([]);
+    const { sessions } = await send({ type: "session.list" }) as { sessions: ConversationSummary[] };
+    expect(sessions.map((session) => [session.id, session.title, session.itemCount])).toEqual([
+      [fresh.id, "", 0], [empty, "First question", 2],
+    ]);
+    expect(sessions[1]?.lastModelId).toBe("gpt-5.6-terra");
+  });
+
+  it("New chat clears scratch files and the debug buffers when no run is active", async () => {
+    const { send } = await setup(["Noted."]);
+    await send({ type: "run.start", prompt: "Remember this" });
+    expect((await send({ type: "context.export" }) as { markdown: string }).markdown).toContain('"providerResponses"');
+    await send({ type: "session.create" });
+    expect((await send({ type: "context.export" }) as { markdown: string }).markdown).toContain("No run recorded");
+  });
+
+  it("opens another session, deleting the empty one it leaves, and reopens the last session after a restart", async () => {
+    const { send, snapshot } = await setup(["Answer A."]);
+    await send({ type: "run.start", prompt: "Question A" });
+    const a = (await snapshot()).conversation.id;
+    await send({ type: "session.create" });
+    const empty = (await snapshot()).conversation.id;
+    await send({ type: "session.open", sessionId: a });
+    expect(texts((await snapshot()).conversation)).toEqual(["Question A", "Answer A."]);
+    expect((await listSessionIds())).toEqual([a]);
+    expect(await getConversation(empty)).toBeNull();
+
+    const restarted = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
+    await restarted.initialize();
+    expect((await restarted.getSnapshot()).conversation.id).toBe(a);
+  });
+
+  it("keeps an empty chat the user renamed or pinned when leaving it", async () => {
+    const { send, snapshot } = await setup(["A."]);
+    await send({ type: "run.start", prompt: "Question" });
+    const asked = (await snapshot()).conversation.id;
+    await send({ type: "session.create" });
+    const named = (await snapshot()).conversation.id;
+    await send({ type: "session.rename", sessionId: named, title: "Later" });
+    await send({ type: "session.create" });
+    expect((await snapshot()).conversation.id).not.toBe(named);
+    await send({ type: "session.open", sessionId: asked });
+    expect((await listSessionIds()).sort()).toEqual([asked, named].sort());
+  });
+
+  it("refuses to open an unknown session", async () => {
+    const { send, snapshot, notice } = await setup();
+    const open = (await snapshot()).conversation.id;
+    await send({ type: "session.open", sessionId: "missing" });
+    expect(notice()).toContain("no longer exists");
+    expect((await snapshot()).conversation.id).toBe(open);
+  });
+
+  it("lets another session be viewed while the run keeps writing to its own session", async () => {
+    const { send, snapshot, port } = await setup(["Older answer.", null]);
+    await send({ type: "run.start", prompt: "Older chat" });
+    const older = (await snapshot()).conversation.id;
+    await send({ type: "session.create" });
+    const running = (await snapshot()).conversation.id;
+    const run = send({ type: "run.start", prompt: "Long task" });
+    await tick();
+
+    await send({ type: "session.open", sessionId: older });
+    const viewing = await snapshot();
+    expect(viewing.conversation.id).toBe(older);
+    expect(viewing.activeRun).toMatchObject({ conversationId: running, partialAssistantText: "Working" });
+    expect(port.received.filter((event) => event.type === "run.started").at(-1)?.conversationId).toBe(running);
+    expect(port.received.filter((event) => event.type === "state.snapshot").at(-1)?.conversationId).toBe(older);
+
+    // Still one run globally: a second run is refused in the session on screen.
+    await send({ type: "run.start", prompt: "Meanwhile" });
+    expect(texts((await snapshot()).conversation)).toEqual(["Older chat", "Older answer."]);
+
+    await send({ type: "run.cancel", runId: viewing.activeRun!.runId });
+    await run;
+    expect(texts((await getConversation(running))!)).toEqual(["Long task", expect.stringContaining("Stopped")]);
+    expect(texts((await snapshot()).conversation)).toEqual(["Older chat", "Older answer."]);
+  });
+
+  it("refuses to delete the active run's session, and deleting the open session opens the most recent one", async () => {
+    const { send, snapshot, notice } = await setup(["One.", "Two.", null]);
+    await send({ type: "run.start", prompt: "First" });
+    const first = (await snapshot()).conversation.id;
+    await send({ type: "session.create" });
+    await send({ type: "run.start", prompt: "Second" });
+    const second = (await snapshot()).conversation.id;
+    await send({ type: "session.create" });
+    const third = (await snapshot()).conversation.id;
+    const run = send({ type: "run.start", prompt: "Third" });
+    await tick();
+
+    await send({ type: "session.delete", sessionId: third });
+    expect(notice()).toContain("Stop the run");
+    expect(await getConversation(third)).not.toBeNull();
+    await send({ type: "run.cancel", runId: (await snapshot()).activeRun!.runId });
+    await run;
+
+    await send({ type: "session.delete", sessionId: third });
+    expect((await snapshot()).conversation.id).toBe(second);
+    await send({ type: "session.delete", sessionId: first });
+    expect((await snapshot()).conversation.id).toBe(second);
+    await send({ type: "session.delete", sessionId: second });
+    const fresh = (await snapshot()).conversation;
+    expect([first, second, third]).not.toContain(fresh.id);
+    expect(fresh.items).toEqual([]);
+    expect(await listSessionIds()).toEqual([fresh.id]);
+  });
+
+  it("renames and pins through the background, and answers session.list only to the requesting sidebar", async () => {
+    const { send, snapshot, port, notice } = await setup(["A.", "B."]);
+    await send({ type: "run.start", prompt: "Alpha" });
+    const alpha = (await snapshot()).conversation.id;
+    await send({ type: "session.create" });
+    await send({ type: "run.start", prompt: "Beta" });
+
+    await send({ type: "session.rename", sessionId: alpha, title: "  Trip   plans " });
+    await send({ type: "session.pin", sessionId: alpha, pinned: true });
+    await send({ type: "session.rename", sessionId: alpha, title: "   " });
+    expect(notice()).toContain("1 to 120 characters");
+
+    const before = port.received.length;
+    await port.send({ v: 1, id: "list", type: "session.list" });
+    const listed = port.received.filter((event) => event.type === "session.listed").at(-1);
+    expect(listed?.type === "session.listed" && listed.payload.sessions.map((session) => [session.title, session.titleSource, session.pinned])).toEqual([
+      ["Trip plans", "user", true], ["Beta", "prompt", false],
+    ]);
+    expect(port.received.slice(before).map((event) => event.type)).toEqual(["session.listed"]);
+  });
+
+  it("offers retry only in the session whose turn failed", async () => {
+    const { send, snapshot, provider } = await setup([new ProviderStreamError("Rate limited.", "RATE_LIMIT"), "Recovered."]);
+    await send({ type: "run.start", prompt: "Flaky" });
+    const failed = (await snapshot()).conversation.id;
+    await send({ type: "session.create" });
+    await send({ type: "run.retry" });
+    expect(provider.requests).toHaveLength(1);
+
+    await send({ type: "session.open", sessionId: failed });
+    await send({ type: "run.retry" });
+    expect(provider.requests).toHaveLength(2);
+    expect(texts((await snapshot()).conversation)).toEqual(["Flaky", "Recovered."]);
+  });
+
+  it("recovers an interrupted run into its own session, not the open one", async () => {
+    const interrupted = await createSessionWith(prompt("u1", "Interrupted task"));
+    const open = await createSessionWith(prompt("u2", "Other chat"));
+    await setOpenSessionId(open);
+    await saveRunCheckpoint({ version: 2, runId: "r9", sessionId: interrupted, status: "running", partialAssistantText: "Half", lastSeq: 1, updatedAt: 1 });
+    const { runtime, send, snapshot, provider } = await setup(["After restart."]);
+    await runtime.initialize();
+
+    expect((await snapshot()).conversation.id).toBe(open);
+    expect((await getConversation(interrupted))?.items.at(-1)).toMatchObject({ id: "interrupted-r9", text: expect.stringContaining("Half") });
+    expect((await getConversation(open))?.items).toHaveLength(1);
+    await send({ type: "run.retry" });
+    expect(provider.requests).toHaveLength(0);
+    await send({ type: "session.open", sessionId: interrupted });
+    await send({ type: "run.retry" });
+    expect((await getConversation(interrupted))?.items.at(-1)).toMatchObject({ role: "assistant", text: "After restart." });
+  });
+
+  it("migrates the pre-sessions conversation at startup and keeps its prompt-cache key", async () => {
+    await browser.storage.local.set({ conversation: { version: 1, id: "default", items: [prompt("u1", "Legacy question")], updatedAt: 5 } });
+    const { runtime, send, snapshot, provider } = await setup(["Continued."]);
+    await runtime.initialize();
+    expect((await snapshot()).conversation).toMatchObject({ id: "default", title: "Legacy question" });
+    await send({ type: "run.start", prompt: "Follow-up" });
+    expect(provider.requests[0]?.sessionId).toBe("default");
+    expect((await browser.storage.local.get("conversation")).conversation).toBeUndefined();
+  });
+});
+
+const prompt = (id: string, text: string): ConversationItem => ({ id, kind: "message", role: "user", text, context: null, at: 1 });
+
+async function createSessionWith(...items: ConversationItem[]): Promise<string> {
+  const { id } = await createSession();
+  for (const item of items) await appendConversationItem(id, item);
+  return id;
+}
+
+async function listSessionIds(): Promise<string[]> {
+  return (await listSessions()).map((session) => session.id);
+}

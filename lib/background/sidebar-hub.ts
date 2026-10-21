@@ -6,13 +6,15 @@
  * disconnect is transport loss only — it never cancels anything.
  *
  * Sequence numbers and the 512-entry replay buffer are run-local: they reset
- * whenever a new run starts. Reconnecting with no active run always gets a
+ * whenever a new run starts. Run events carry the run's session id, which may
+ * differ from the session the sidebar has open. Reconnecting with no active run always gets a
  * full `state.snapshot`, since there is no run to gap-replay against.
  */
 
 import type { Browser } from "wxt/browser";
 import { isSidebarCommand, SIDEBAR_PORT_NAME } from "@/lib/protocol";
 import type { RuntimeSnapshot, SidebarCommand, SidebarEvent, TabMention } from "@/lib/protocol";
+import type { ConversationSummary } from "@/lib/domain/conversation";
 import type { PageArtifactSummary } from "@/lib/domain/tools";
 
 const MAX_REPLAY_EVENTS = 512;
@@ -20,10 +22,10 @@ const UNSUPPORTED_HOSTNAME_SUFFIXES = [".mozilla.org", ".mozilla.com"];
 
 export interface SidebarHubDelegate {
   getSnapshot(): Promise<RuntimeSnapshot>;
-  handleCommand(command: SidebarCommand): Promise<{ markdown: string; filename: string } | { tabs: TabMention[] } | void>;
+  handleCommand(command: SidebarCommand): Promise<{ markdown: string; filename: string } | { tabs: TabMention[] } | { sessions: ConversationSummary[] } | void>;
 }
 
-type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" | "agent-tabs.changed" | "context.exported" | "tabs.listed" }>;
+type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" | "agent-tabs.changed" | "context.exported" | "tabs.listed" | "session.listed" }>;
 
 export class SidebarHub {
   delegate: SidebarHubDelegate | null = null;
@@ -32,6 +34,7 @@ export class SidebarHub {
   #attachment: PageArtifactSummary | null = null;
   #lastSeq = 0;
   #eventLog: RunEvent[] = [];
+  #runConversationId: string | null = null;
 
   currentAttachment(): PageArtifactSummary | null {
     return this.#attachment;
@@ -69,7 +72,7 @@ export class SidebarHub {
     const event: SidebarEvent = {
       v: 1,
       runId: null,
-      conversationId: "default",
+      conversationId: null,
       seq: this.#lastSeq,
       type: "agent-tabs.changed",
       at: Date.now(),
@@ -78,10 +81,11 @@ export class SidebarHub {
     for (const port of this.#ports) port.postMessage(event);
   }
 
-  /** Called by BackgroundRuntime when a new run begins: resets the run-local seq/replay buffer. */
-  startRun(): void {
+  /** Called by BackgroundRuntime when a new run begins in `conversationId`: resets the run-local seq/replay buffer. */
+  startRun(conversationId: string): void {
     this.#lastSeq = 0;
     this.#eventLog = [];
+    this.#runConversationId = conversationId;
   }
 
   /** Publishes a run-local sequenced event to every connected port. */
@@ -94,7 +98,7 @@ export class SidebarHub {
     const event = {
       v: 1,
       runId,
-      conversationId: "default",
+      conversationId: this.#runConversationId,
       seq: this.#lastSeq,
       type,
       at: Date.now(),
@@ -120,10 +124,13 @@ export class SidebarHub {
     }
     const result = await this.delegate.handleCommand(message);
     if (message.type === "tabs.list" && result && "tabs" in result) port.postMessage({
-      v: 1, type: "tabs.listed", runId: null, conversationId: "default", seq: this.#lastSeq, at: Date.now(), payload: result,
+      v: 1, type: "tabs.listed", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: result,
+    } satisfies SidebarEvent);
+    if (message.type === "session.list" && result && "sessions" in result) port.postMessage({
+      v: 1, type: "session.listed", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: result,
     } satisfies SidebarEvent);
     if (message.type === "context.export" && result && "markdown" in result) port.postMessage({
-      v: 1, type: "context.exported", runId: null, conversationId: "default", seq: this.#lastSeq, at: Date.now(),
+      v: 1, type: "context.exported", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(),
       payload: { requestId: message.id, ...result },
     } satisfies SidebarEvent);
   }
@@ -149,7 +156,7 @@ export class SidebarHub {
     const event: SidebarEvent = {
       v: 1,
       runId: null,
-      conversationId: "default",
+      conversationId: snapshot.conversation.id,
       seq: this.#lastSeq,
       type: "state.snapshot",
       at: Date.now(),
@@ -162,7 +169,7 @@ export class SidebarHub {
     const event: SidebarEvent = {
       v: 1,
       runId: null,
-      conversationId: "default",
+      conversationId: null,
       seq: 0,
       type: "page.attached",
       at: Date.now(),

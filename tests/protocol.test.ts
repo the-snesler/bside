@@ -41,6 +41,14 @@ describe("isSidebarCommand: accepts every valid variant", () => {
     expect(isSidebarCommand({ v: 2, id: "1", type: "tabs.closeAgentTabs" })).toBe(false);
     expect(isSidebarCommand({ v: 1, type: "tabs.closeAgentTabs" })).toBe(false);
   });
+
+  it("accepts every session command", () => {
+    const sessionId = crypto.randomUUID();
+    for (const command of [
+      { type: "session.create" }, { type: "session.list" }, { type: "session.open", sessionId }, { type: "session.delete", sessionId: "default" },
+      { type: "session.rename", sessionId, title: "Trip plans" }, { type: "session.pin", sessionId, pinned: false },
+    ]) expect(isSidebarCommand({ v: 1, id: "1", ...command })).toBe(true);
+  });
 });
 
 describe("isSidebarCommand: rejects malformed input", () => {
@@ -92,6 +100,22 @@ describe("isSidebarCommand: rejects malformed input", () => {
 
   it("rejects action.deny with a non-string runId", () => {
     expect(isSidebarCommand({ v: 1, id: "1", type: "action.deny", runId: 1, callId: "c1" })).toBe(false);
+  });
+
+  it("rejects the removed context.reset command", () => {
+    expect(isSidebarCommand({ v: 1, id: "1", type: "context.reset" })).toBe(false);
+  });
+
+  it("rejects session commands with a malformed session id, title, or pinned flag", () => {
+    for (const sessionId of [undefined, 7, "", "../x", "a b", "x".repeat(65)]) {
+      expect(isSidebarCommand({ v: 1, id: "1", type: "session.open", sessionId })).toBe(false);
+      expect(isSidebarCommand({ v: 1, id: "1", type: "session.delete", sessionId })).toBe(false);
+    }
+    expect(isSidebarCommand({ v: 1, id: "1", type: "session.rename", sessionId: "s1" })).toBe(false);
+    expect(isSidebarCommand({ v: 1, id: "1", type: "session.rename", sessionId: "s1", title: 5 })).toBe(false);
+    expect(isSidebarCommand({ v: 1, id: "1", type: "session.rename", sessionId: "s1", title: "x".repeat(10_000) })).toBe(false);
+    expect(isSidebarCommand({ v: 1, id: "1", type: "session.pin", sessionId: "s1", pinned: "yes" })).toBe(false);
+    expect(isSidebarCommand({ v: 2, id: "1", type: "session.create" })).toBe(false);
   });
 });
 

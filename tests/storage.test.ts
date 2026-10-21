@@ -3,20 +3,39 @@ import { DeviceKey } from "@/lib/background/device-key";
 import { MemoryDeviceKeyStore } from "@/tests/helpers/memory-key-store";
 import {
   appendConversationItem,
+  CONVERSATION_CHUNK_SIZE,
+  createSession,
   deleteOpenAICredential,
+  deleteSession,
+  ensureOpenSession,
   getAppSettings,
   getConversation,
   getCredentialStatus,
   getOpenAICredential,
+  getOpenSessionId,
   getChatGPTCredential,
   getRunCheckpoint,
   hasChatGPTSignInNotice,
+  listSessions,
+  migrateConversation,
   migrateCredentials,
   recoverInterruptedRun,
   saveAppSettings,
   saveOpenAICredential,
   saveRunCheckpoint,
+  touchSession,
+  updateSession,
 } from "@/lib/storage";
+import { titleFromPrompt, type ConversationItem } from "@/lib/domain/conversation";
+
+const message = (id: string, text = id): ConversationItem => ({ id, kind: "message", role: "assistant", text, at: 1 });
+const prompt = (id: string, text: string): ConversationItem => ({ id, kind: "message", role: "user", text, context: null, at: 1 });
+
+async function sessionWith(count: number): Promise<string> {
+  const { id } = await createSession();
+  for (let i = 0; i < count; i += 1) await appendConversationItem(id, message(`m${i}`));
+  return id;
+}
 
 beforeEach(() => {
   fakeBrowser.reset();
@@ -33,10 +52,13 @@ describe("storage: defaults", () => {
     });
   });
 
-  it("returns an empty default conversation when nothing is stored", async () => {
-    const conversation = await getConversation();
-    expect(conversation.id).toBe("default");
-    expect(conversation.items).toEqual([]);
+  it("lists no sessions, then opens a fresh empty one, when nothing is stored", async () => {
+    expect(await listSessions()).toEqual([]);
+    const id = await ensureOpenSession();
+    expect(id).toMatch(/^[\da-f-]{36}$/);
+    expect(await ensureOpenSession()).toBe(id);
+    expect(await getOpenSessionId()).toBe(id);
+    expect(await getConversation(id)).toMatchObject({ id, title: "", titleSource: "prompt", pinned: false, itemCount: 0, items: [] });
   });
 
   it("returns unconfigured credential status when nothing is stored", async () => {
@@ -60,14 +82,6 @@ describe("storage: malformed-version rejection", () => {
     expect(raw.appSettings).toEqual(settings);
   });
 
-  it("resets a conversation with malformed items to the default", async () => {
-    await browser.storage.local.set({
-      conversation: { version: 1, id: "default", items: [{ garbage: true }], updatedAt: 5 },
-    });
-    const conversation = await getConversation();
-    expect(conversation.items).toEqual([]);
-  });
-
   it("discards a credential with a missing apiKey field", async () => {
     await browser.storage.local.set({ openaiCredential: { version: 1, updatedAt: 1 } });
     expect(await getOpenAICredential()).toBeNull();
@@ -85,6 +99,11 @@ describe("storage: malformed-version rejection", () => {
         updatedAt: 1,
       },
     });
+    expect(await getRunCheckpoint()).toBeNull();
+  });
+
+  it("discards a run checkpoint with an invalid session id", async () => {
+    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: "../escape", status: "running", partialAssistantText: "", lastSeq: 0, updatedAt: 1 });
     expect(await getRunCheckpoint()).toBeNull();
   });
 });
@@ -216,57 +235,244 @@ describe("storage: credential migration", () => {
   });
 });
 
-describe("storage: one-thread restore", () => {
-  it("persists appended items under the single default conversation id", async () => {
-    await appendConversationItem({
-      id: "m1",
-      kind: "message",
-      role: "user",
-      text: "Hello",
-      context: null,
-      at: 1,
+describe("storage: sessions", () => {
+  it("restores appended items from storage, in order, across chunk boundaries", async () => {
+    const id = await sessionWith(CONVERSATION_CHUNK_SIZE * 2 + 3);
+    const conversation = await getConversation(id);
+    expect(conversation?.items.map((item) => item.id)).toEqual(Array.from({ length: CONVERSATION_CHUNK_SIZE * 2 + 3 }, (_, i) => `m${i}`));
+    expect(conversation?.itemCount).toBe(CONVERSATION_CHUNK_SIZE * 2 + 3);
+    expect(await getConversation(id)).toEqual(conversation);
+  });
+
+  it("appends by writing only the tail chunk and the session record, however long the history", async () => {
+    const set = vi.spyOn(browser.storage.local, "set");
+    for (const count of [5, CONVERSATION_CHUNK_SIZE * 3, CONVERSATION_CHUNK_SIZE * 4 + 7]) {
+      const id = await sessionWith(count);
+      set.mockClear();
+      await appendConversationItem(id, message("next"));
+      expect(set).toHaveBeenCalledTimes(1);
+      const written = set.mock.calls[0]![0] as Record<string, { items?: unknown[] }>;
+      const tail = Math.floor(count / CONVERSATION_CHUNK_SIZE);
+      expect(Object.keys(written).sort()).toEqual([`conversation:${id}`, `conversation:${id}:items:${tail}`]);
+      expect(written[`conversation:${id}:items:${tail}`]!.items).toHaveLength(count % CONVERSATION_CHUNK_SIZE + 1);
+    }
+    set.mockRestore();
+  });
+
+  it("serializes concurrent appends without losing items", async () => {
+    const { id } = await createSession();
+    await Promise.all(Array.from({ length: 40 }, (_, i) => appendConversationItem(id, message(`m${i}`))));
+    expect((await getConversation(id))?.items).toHaveLength(40);
+  });
+
+  it("refuses to append to an unknown session", async () => {
+    await expect(appendConversationItem("missing", message("m"))).rejects.toThrow("Unknown session");
+    expect(await browser.storage.local.get(null)).toEqual({});
+  });
+
+  it("truncates history at a corrupt chunk, repairs the record, and keeps appending", async () => {
+    const id = await sessionWith(CONVERSATION_CHUNK_SIZE * 2 + 5);
+    await browser.storage.local.set({ [`conversation:${id}:items:1`]: { version: 1, items: [{ garbage: true }] } });
+    expect((await getConversation(id))?.items).toHaveLength(CONVERSATION_CHUNK_SIZE);
+    const stored = await browser.storage.local.get(null);
+    expect(stored[`conversation:${id}`]).toMatchObject({ itemCount: CONVERSATION_CHUNK_SIZE });
+    expect(stored[`conversation:${id}:items:1`]).toBeUndefined();
+    expect(stored[`conversation:${id}:items:2`]).toBeUndefined();
+    await appendConversationItem(id, message("after"));
+    expect((await getConversation(id))?.items.at(-1)?.id).toBe("after");
+    expect((await getConversation(id))?.items).toHaveLength(CONVERSATION_CHUNK_SIZE + 1);
+  });
+
+  it("loses only the tail chunk's items when appending after the tail chunk is corrupt", async () => {
+    const id = await sessionWith(CONVERSATION_CHUNK_SIZE + 3);
+    await browser.storage.local.set({ [`conversation:${id}:items:1`]: "corrupt" });
+    await appendConversationItem(id, message("after"));
+    const items = (await getConversation(id))!.items;
+    expect(items).toHaveLength(CONVERSATION_CHUNK_SIZE + 1);
+    expect(items.at(-1)?.id).toBe("after");
+  });
+
+  it("ignores items a chunk holds past the committed count", async () => {
+    const id = await sessionWith(2);
+    await browser.storage.local.set({ [`conversation:${id}:items:0`]: { version: 1, items: [message("m0"), message("m1"), message("uncommitted")] } });
+    expect((await getConversation(id))?.items.map((item) => item.id)).toEqual(["m0", "m1"]);
+    await appendConversationItem(id, message("m2"));
+    expect((await getConversation(id))?.items.map((item) => item.id)).toEqual(["m0", "m1", "m2"]);
+  });
+
+  it("reads a session with a corrupt record as empty and restarts it on the next append", async () => {
+    const id = await sessionWith(3);
+    await browser.storage.local.set({ [`conversation:${id}`]: { version: 2, id: "other", itemCount: 3 } });
+    expect(await getConversation(id)).toMatchObject({ id, items: [] });
+    await appendConversationItem(id, message("fresh"));
+    expect((await getConversation(id))?.items.map((item) => item.id)).toEqual(["fresh"]);
+  });
+
+  it("drops invalid index entries and rebuilds a corrupt index from the session records", async () => {
+    const a = await createSession();
+    await appendConversationItem(a.id, prompt("u1", "Plan the trip"));
+    const b = await sessionWith(1);
+    const { conversationIndex } = await browser.storage.local.get("conversationIndex") as { conversationIndex: { sessions: unknown[] } };
+    await browser.storage.local.set({ conversationIndex: { version: 1, sessions: [...conversationIndex.sessions, { id: "bad" }, conversationIndex.sessions[0]] } });
+    expect((await listSessions()).map((session) => session.id).sort()).toEqual([a.id, b].sort());
+
+    await browser.storage.local.set({ conversationIndex: "corrupt" });
+    const rebuilt = await listSessions();
+    expect(rebuilt.map((session) => session.id).sort()).toEqual([a.id, b].sort());
+    expect(rebuilt.find((session) => session.id === a.id)).toMatchObject({ title: "Plan the trip", itemCount: 1 });
+  });
+
+  it("titles a session from its first prompt once, and never overwrites a user title", async () => {
+    const { id } = await createSession();
+    await touchSession(id, { prompt: "  Compare   @Laptops (tab 4, /tabs/4/page.md, https://shop.example/l)\nprices ", modelId: "gpt-5.6-sol" });
+    expect((await listSessions())[0]).toMatchObject({ title: "Compare @Laptops prices", lastModelId: "gpt-5.6-sol" });
+    await touchSession(id, { prompt: "Second prompt" });
+    expect((await listSessions())[0]?.title).toBe("Compare @Laptops prices");
+    await updateSession(id, { title: "Laptop research" });
+    await touchSession(id, { prompt: "Third" });
+    expect((await listSessions())[0]).toMatchObject({ title: "Laptop research", titleSource: "user" });
+    expect(titleFromPrompt("x".repeat(100))).toBe(`${"x".repeat(59)}…`);
+  });
+
+  it("refreshes the index item count and recency from the record at turn boundaries", async () => {
+    const id = await sessionWith(3);
+    expect((await listSessions())[0]?.itemCount).toBe(0);
+    await touchSession(id);
+    expect((await listSessions())[0]?.itemCount).toBe(3);
+  });
+
+  it("lists pinned sessions first, then by most recent activity", async () => {
+    const old = await sessionWith(1);
+    const pinned = await sessionWith(1);
+    const recent = await sessionWith(1);
+    for (const [id, at] of [[old, 1], [pinned, 2], [recent, 3]] as const) {
+      const key = `conversation:${id}`;
+      const record = (await browser.storage.local.get(key))[key] as object;
+      await browser.storage.local.set({ [key]: { ...record, updatedAt: at } });
+      await touchSession(id);
+    }
+    await updateSession(old, { pinned: true });
+    expect((await listSessions()).map((session) => session.id)).toEqual([old, recent, pinned]);
+  });
+
+  it("deletes every key of a session and clears the open pointer", async () => {
+    const keep = await sessionWith(1);
+    const id = await sessionWith(CONVERSATION_CHUNK_SIZE + 1);
+    await ensureOpenSession();
+    await browser.storage.local.set({ openConversation: { version: 1, id } });
+    await deleteSession(id);
+    expect(Object.keys(await browser.storage.local.get(null)).filter((key) => key.includes(id))).toEqual([]);
+    expect(await getOpenSessionId()).toBeNull();
+    expect((await listSessions()).map((session) => session.id)).toEqual([keep]);
+    expect(await ensureOpenSession()).toBe(keep);
+  });
+});
+
+describe("storage: legacy conversation migration", () => {
+  const items: ConversationItem[] = [
+    prompt("u1", "Summarize @Inbox (tab 3, /tabs/3/page.md, https://mail.example/) please"),
+    ...Array.from({ length: CONVERSATION_CHUNK_SIZE + 2 }, (_, i) => message(`a${i}`)),
+  ];
+  const legacy = { version: 1, id: "default", items, updatedAt: 50 };
+
+  it("moves the single conversation into the first session, then removes the old record", async () => {
+    await browser.storage.local.set({ conversation: legacy });
+    await migrateConversation();
+    const stored = await browser.storage.local.get(null);
+    expect(stored.conversation).toBeUndefined();
+    expect(await listSessions()).toEqual([{
+      id: "default", title: "Summarize @Inbox please", titleSource: "prompt", createdAt: 1, updatedAt: 50, pinned: false,
+      itemCount: items.length, lastModelId: null,
+    }]);
+    expect((await getConversation("default"))?.items).toEqual(items);
+    expect(await getOpenSessionId()).toBe("default");
+  });
+
+  it("is a no-op when run again, and never overwrites items added after an incomplete migration", async () => {
+    await browser.storage.local.set({ conversation: legacy });
+    const remove = vi.spyOn(browser.storage.local, "remove").mockRejectedValueOnce(new Error("Interrupted"));
+    await expect(migrateConversation()).rejects.toThrow("Interrupted");
+    remove.mockRestore();
+    expect((await browser.storage.local.get("conversation")).conversation).toEqual(legacy);
+    await appendConversationItem("default", message("later"));
+
+    await migrateConversation();
+    const after = await browser.storage.local.get(null);
+    expect(after.conversation).toBeUndefined();
+    expect((await getConversation("default"))?.items.at(-1)?.id).toBe("later");
+    await migrateConversation();
+    expect(await browser.storage.local.get(null)).toEqual(after);
+  });
+
+  it("keeps the old record when the migrated session does not read back", async () => {
+    await browser.storage.local.set({ conversation: legacy });
+    const set = browser.storage.local.set.bind(browser.storage.local);
+    const spy = vi.spyOn(browser.storage.local, "set").mockImplementation(async (values) =>
+      set(Object.fromEntries(Object.entries(values).filter(([key]) => !key.endsWith(":items:1")))));
+    await expect(migrateConversation()).rejects.toThrow("did not verify");
+    spy.mockRestore();
+    expect((await browser.storage.local.get("conversation")).conversation).toEqual(legacy);
+
+    await migrateConversation();
+    expect((await getConversation("default"))?.items).toEqual(items);
+    expect((await browser.storage.local.get("conversation")).conversation).toBeUndefined();
+  });
+
+  it("removes a malformed or empty legacy record without creating a session", async () => {
+    for (const conversation of [{ version: 1, id: "default", items: [{ garbage: true }], updatedAt: 5 }, "corrupt", { ...legacy, items: [] }]) {
+      await browser.storage.local.set({ conversation });
+      await migrateConversation();
+      expect(await browser.storage.local.get(null)).toEqual({});
+    }
+  });
+
+  it("recovers a pre-sessions interrupted run into the migrated session", async () => {
+    await browser.storage.local.set({
+      conversation: legacy,
+      runCheckpoint: { version: 1, runId: "r0", status: "running", partialAssistantText: "Half", lastSeq: 1, updatedAt: 1 },
     });
-    await appendConversationItem({ id: "m2", kind: "message", role: "assistant", text: "Hi there", at: 2 });
-
-    const conversation = await getConversation();
-    expect(conversation.id).toBe("default");
-    expect(conversation.items.map((item) => item.id)).toEqual(["m1", "m2"]);
-
-    // Simulate a reload: fetch again from the same underlying storage.
-    const restored = await getConversation();
-    expect(restored.items).toEqual(conversation.items);
+    await migrateConversation();
+    expect(await recoverInterruptedRun()).toBe("default");
+    expect((await getConversation("default"))?.items.at(-1)).toMatchObject({ id: "interrupted-r0", text: expect.stringContaining("Half") });
   });
 });
 
 describe("storage: interrupted run recovery", () => {
-  it("converts a checkpoint left running into a visible interrupted assistant message", async () => {
+  it("converts a checkpoint left running into a visible interrupted assistant message in the run's session", async () => {
+    const other = await sessionWith(0);
+    const sessionId = await sessionWith(1);
     await saveRunCheckpoint({
-      version: 1,
+      version: 2,
       runId: "run-1",
+      sessionId,
       status: "running",
       partialAssistantText: "The page says",
       lastSeq: 3,
       updatedAt: 10,
     });
 
-    await recoverInterruptedRun();
+    expect(await recoverInterruptedRun()).toBe(sessionId);
 
-    const conversation = await getConversation();
-    expect(conversation.items).toHaveLength(1);
-    const [item] = conversation.items;
+    const conversation = await getConversation(sessionId);
+    expect(conversation?.items).toHaveLength(2);
+    const item = conversation?.items[1];
     expect(item?.kind).toBe("message");
     if (item?.kind === "message") {
       expect(item.role).toBe("assistant");
       expect(item.text).toContain("The page says");
       expect(item.text).toContain("Interrupted");
     }
+    expect((await getConversation(other))?.items).toEqual([]);
+    expect((await listSessions()).find((session) => session.id === sessionId)?.itemCount).toBe(2);
     expect(await getRunCheckpoint()).toBeNull();
   });
 
   it("converts a checkpoint left awaiting-approval into a visible interrupted message", async () => {
+    const sessionId = await sessionWith(0);
     await saveRunCheckpoint({
-      version: 1,
+      version: 2,
       runId: "run-2",
+      sessionId,
       status: "awaiting-approval",
       partialAssistantText: "",
       lastSeq: 1,
@@ -275,31 +481,26 @@ describe("storage: interrupted run recovery", () => {
 
     await recoverInterruptedRun();
 
-    const conversation = await getConversation();
-    expect(conversation.items).toHaveLength(1);
+    expect((await getConversation(sessionId))?.items).toHaveLength(1);
     expect(await getRunCheckpoint()).toBeNull();
   });
 
-  it("silently clears a checkpoint that already reached a terminal status", async () => {
-    await saveRunCheckpoint({
-      version: 1,
-      runId: "run-3",
-      status: "completed",
-      partialAssistantText: "",
-      lastSeq: 1,
-      updatedAt: 10,
-    });
-
-    await recoverInterruptedRun();
-
-    const conversation = await getConversation();
-    expect(conversation.items).toEqual([]);
-    expect(await getRunCheckpoint()).toBeNull();
+  it("silently clears a checkpoint that already reached a terminal status, or whose session is gone", async () => {
+    const sessionId = await sessionWith(0);
+    for (const checkpoint of [
+      { version: 2, runId: "run-3", sessionId, status: "completed", partialAssistantText: "", lastSeq: 1, updatedAt: 10 },
+      { version: 2, runId: "run-4", sessionId: "deleted", status: "running", partialAssistantText: "", lastSeq: 1, updatedAt: 10 },
+    ] as const) {
+      await saveRunCheckpoint(checkpoint);
+      expect(await recoverInterruptedRun()).toBeNull();
+      expect(await getRunCheckpoint()).toBeNull();
+    }
+    expect((await getConversation(sessionId))?.items).toEqual([]);
+    expect(await getConversation("deleted")).toBeNull();
   });
 
   it("does nothing when there is no checkpoint", async () => {
-    await recoverInterruptedRun();
-    const conversation = await getConversation();
-    expect(conversation.items).toEqual([]);
+    expect(await recoverInterruptedRun()).toBeNull();
+    expect(await listSessions()).toEqual([]);
   });
 });

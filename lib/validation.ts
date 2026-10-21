@@ -142,3 +142,17 @@ export function validatePromptText(raw: string): string | null {
   if (trimmed.length === 0 || trimmed.length > MAX_PROMPT_LEN) return null;
   return trimmed;
 }
+
+/** Session ids are opaque: random UUIDs, or the migrated legacy conversation's id. */
+export function isSessionId(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(value);
+}
+
+export const MAX_SESSION_TITLE_LEN = 120;
+
+/** Normalizes a user-chosen session title: whitespace collapsed, non-empty, bounded. */
+export function validateSessionTitle(raw: string): string | null {
+  const title = raw.replace(/\s+/g, " ").trim();
+  if (title.length === 0 || title.length > MAX_SESSION_TITLE_LEN) return null;
+  return title;
+}

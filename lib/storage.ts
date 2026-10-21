@@ -12,9 +12,11 @@
 
 import { storage } from "wxt/utils/storage";
 import type { AppSettingsV1, ModelDefinition, ReasoningEffort } from "@/lib/domain/provider";
-import type { ConversationItem, ConversationRecordV1 } from "@/lib/domain/conversation";
+import type { Conversation, ConversationIndexV1, ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
+import { titleFromPrompt } from "@/lib/domain/conversation";
 import { DEFAULT_MODEL_ID, DEFAULT_REASONING_EFFORT } from "@/lib/providers/openai-models";
 import { deviceKey, type DeviceKey } from "@/lib/background/device-key";
+import { isSessionId } from "@/lib/validation";
 
 export type { AppSettingsV1 } from "@/lib/domain/provider";
 
@@ -56,9 +58,11 @@ export interface ChatGPTRegistrationV1 {
 
 export type RunStatus = "running" | "awaiting-approval" | "cancelled" | "failed" | "completed";
 
-export interface RunCheckpointV1 {
-  version: 1;
+export interface RunCheckpointV2 {
+  version: 2;
   runId: string;
+  /** The run's session; recovery appends the interrupted marker there. */
+  sessionId: string;
   status: RunStatus;
   partialAssistantText: string;
   lastSeq: number;
@@ -75,8 +79,6 @@ const DEFAULT_APP_SETTINGS: AppSettingsV1 = {
   reasoningEffort: DEFAULT_REASONING_EFFORT,
 };
 
-const DEFAULT_CONVERSATION: ConversationRecordV1 = { version: 1, id: "default", items: [], updatedAt: 0 };
-
 const appSettingsItem = storage.defineItem<AppSettingsV1>("local:appSettings", {
   version: 1,
   fallback: DEFAULT_APP_SETTINGS,
@@ -92,13 +94,8 @@ const chatgptCredentialItem = storage.defineItem<ChatGPTCredentialV2>("local:cha
 const chatgptRegistrationItem = storage.defineItem<ChatGPTRegistrationV1>("local:chatgptRegistration", { version: 1 });
 const chatgptSignInNoticeItem = storage.defineItem<ChatGPTSignInNoticeV1>("local:chatgptSignInNotice", { version: 1 });
 
-const conversationItem = storage.defineItem<ConversationRecordV1>("local:conversation", {
-  version: 1,
-  fallback: DEFAULT_CONVERSATION,
-});
-
-const runCheckpointItem = storage.defineItem<RunCheckpointV1>("local:runCheckpoint", {
-  version: 1,
+const runCheckpointItem = storage.defineItem<RunCheckpointV2>("local:runCheckpoint", {
+  version: 2,
 });
 
 // ---------------------------------------------------------------------------
@@ -142,18 +139,13 @@ function isValidConversationItem(value: unknown): value is ConversationItem {
   return false;
 }
 
-function isValidConversation(value: unknown): value is ConversationRecordV1 {
-  if (typeof value !== "object" || value === null) return false;
-  const v = value as Record<string, unknown>;
-  return v.version === 1 && v.id === "default" && Array.isArray(v.items) && v.items.every(isValidConversationItem);
-}
-
-function isValidRunCheckpoint(value: unknown): value is RunCheckpointV1 {
+function isValidRunCheckpoint(value: unknown): value is RunCheckpointV2 {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
   return (
-    v.version === 1 &&
+    v.version === 2 &&
     typeof v.runId === "string" &&
+    isSessionId(v.sessionId) &&
     (RUN_STATUSES as readonly string[]).includes(v.status as string) &&
     typeof v.partialAssistantText === "string" &&
     typeof v.lastSeq === "number" &&
@@ -314,45 +306,386 @@ export async function migrateCredentials(key: DeviceKey = deviceKey): Promise<vo
   await deleteLegacyChatGPTCredential();
 }
 
+
 // ---------------------------------------------------------------------------
-// Conversation — one local thread.
+// Conversations — one index, plus a record and fixed-size item chunks per session.
+//
+//   local:conversationIndex            ConversationIndexV1 (listing data for every session)
+//   local:conversation:<id>            ConversationRecordV2 (item count; the commit point for appends)
+//   local:conversation:<id>:items:<n>  ConversationChunkV1 (items n*CHUNK .. n*CHUNK+CHUNK-1)
+//   local:openConversation             OpenConversationV1 (the session the sidebar shows)
+//
+// An append writes only the tail chunk and the session record, in one
+// `storage.local.set`, so its cost does not grow with history. The index is
+// rewritten only by session-level changes and `touchSession` at turn boundaries,
+// so its item count and `updatedAt` may lag the record mid-run.
 // ---------------------------------------------------------------------------
 
-export async function getConversation(): Promise<ConversationRecordV1> {
-  const raw = await conversationItem.getValue();
-  if (isValidConversation(raw)) return raw;
-  if (raw !== null) await conversationItem.setValue(DEFAULT_CONVERSATION);
-  return DEFAULT_CONVERSATION;
+/** Items per chunk; bounds the bytes an append rewrites. */
+export const CONVERSATION_CHUNK_SIZE = 32;
+/** Id of the single pre-sessions conversation; it keeps the id as the first session. */
+const LEGACY_SESSION_ID = "default";
+
+export interface ConversationRecordV2 {
+  version: 2;
+  id: string;
+  createdAt: number;
+  updatedAt: number;
+  itemCount: number;
 }
 
-export async function resetConversation(): Promise<void> {
-  await conversationItem.setValue({ ...DEFAULT_CONVERSATION, items: [], updatedAt: Date.now() });
-  await clearRunCheckpoint();
+export interface ConversationChunkV1 {
+  version: 1;
+  items: ConversationItem[];
 }
 
-export async function appendConversationItem(item: ConversationItem): Promise<ConversationRecordV1> {
-  const conversation = await getConversation();
-  const next: ConversationRecordV1 = {
-    ...conversation,
-    items: [...conversation.items, item],
-    updatedAt: Date.now(),
-  };
-  await conversationItem.setValue(next);
-  return next;
+export interface OpenConversationV1 {
+  version: 1;
+  id: string;
+}
+
+/** The pre-sessions single-thread record, read only by the migration. */
+interface LegacyConversationRecordV1 {
+  version: 1;
+  id: "default";
+  items: ConversationItem[];
+  updatedAt: number;
+}
+
+const conversationIndexItem = storage.defineItem<ConversationIndexV1>("local:conversationIndex", { version: 1 });
+const openConversationItem = storage.defineItem<OpenConversationV1>("local:openConversation", { version: 1 });
+const legacyConversationItem = storage.defineItem<LegacyConversationRecordV1>("local:conversation", { version: 1 });
+
+const recordKey = (id: string) => `local:conversation:${id}` as const;
+const chunkKey = (id: string, n: number) => `local:conversation:${id}:items:${n}` as const;
+const chunkKeys = (id: string, itemCount: number) =>
+  Array.from({ length: Math.ceil(itemCount / CONVERSATION_CHUNK_SIZE) }, (_, n) => chunkKey(id, n));
+
+let conversationLock: Promise<unknown> = Promise.resolve();
+
+/** Serializes every conversation read-modify-write. Exported functions take it once; the helpers they call never do. */
+function withConversationLock<T>(task: () => Promise<T>): Promise<T> {
+  const result = conversationLock.then(task);
+  conversationLock = result.catch(() => {});
+  return result;
+}
+
+function isValidSummary(value: unknown): value is ConversationSummary {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return isSessionId(v.id) && typeof v.title === "string" && v.title.length <= 200 &&
+    (v.titleSource === "prompt" || v.titleSource === "user") && Number.isFinite(v.createdAt) && Number.isFinite(v.updatedAt) &&
+    typeof v.pinned === "boolean" && Number.isSafeInteger(v.itemCount) && (v.itemCount as number) >= 0 &&
+    (v.lastModelId === null || (typeof v.lastModelId === "string" && v.lastModelId.length <= 200));
+}
+
+function isValidRecord(value: unknown, id: string): value is ConversationRecordV2 {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return v.version === 2 && v.id === id && Number.isFinite(v.createdAt) && Number.isFinite(v.updatedAt) &&
+    Number.isSafeInteger(v.itemCount) && (v.itemCount as number) >= 0;
+}
+
+function isValidChunk(value: unknown): value is ConversationChunkV1 {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return v.version === 1 && Array.isArray(v.items) && v.items.length <= CONVERSATION_CHUNK_SIZE && v.items.every(isValidConversationItem);
+}
+
+function isValidLegacyConversation(value: unknown): value is LegacyConversationRecordV1 {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return v.version === 1 && v.id === LEGACY_SESSION_ID && Array.isArray(v.items) && v.items.every(isValidConversationItem) &&
+    typeof v.updatedAt === "number";
+}
+
+function firstPromptTitle(items: readonly ConversationItem[]): string {
+  const prompt = items.find((item) => item.kind === "message" && item.role === "user");
+  return prompt ? titleFromPrompt(prompt.text) : "";
+}
+
+/** Pinned first, then most recently updated; ties go to the later-created session. */
+function sortSessions(sessions: readonly ConversationSummary[]): ConversationSummary[] {
+  return [...sessions].reverse().sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt - a.updatedAt || b.createdAt - a.createdAt);
+}
+
+/** Reads the index, dropping invalid or duplicate entries; a corrupt index is rebuilt from the session records. */
+async function readIndex(): Promise<ConversationSummary[]> {
+  const raw: unknown = await conversationIndexItem.getValue();
+  if (raw === null) return [];
+  const index = raw as { version?: unknown; sessions?: unknown };
+  if (index.version === 1 && Array.isArray(index.sessions)) {
+    const all: unknown[] = index.sessions;
+    const sessions = all.filter((entry, i): entry is ConversationSummary =>
+      isValidSummary(entry) && all.findIndex((other) => isValidSummary(other) && other.id === entry.id) === i);
+    if (sessions.length !== all.length) await writeIndex(sessions);
+    return sessions;
+  }
+  const sessions = await rebuildIndex();
+  await writeIndex(sessions);
+  return sessions;
+}
+
+async function writeIndex(sessions: ConversationSummary[]): Promise<void> {
+  await conversationIndexItem.setValue({ version: 1, sessions });
+}
+
+/** Corruption recovery only: scans every stored key, so it is O(stored data). Pins and user titles are lost. */
+async function rebuildIndex(): Promise<ConversationSummary[]> {
+  const all = await storage.snapshot("local");
+  const sessions: ConversationSummary[] = [];
+  for (const [key, value] of Object.entries(all)) {
+    const id = /^conversation:([A-Za-z0-9_-]{1,64})$/.exec(key)?.[1];
+    if (!id || !isValidRecord(value, id)) continue;
+    const first = all[`conversation:${id}:items:0`];
+    sessions.push({
+      id, title: isValidChunk(first) ? firstPromptTitle(first.items) : "", titleSource: "prompt", createdAt: value.createdAt,
+      updatedAt: value.updatedAt, pinned: false, itemCount: value.itemCount, lastModelId: null,
+    });
+  }
+  return sessions;
+}
+
+async function readRecord(id: string): Promise<ConversationRecordV2 | null> {
+  const raw = await storage.getItem<unknown>(recordKey(id));
+  return isValidRecord(raw, id) ? raw : null;
+}
+
+/**
+ * Reads a session's items. Items past the record's count (a write the record
+ * never committed) are ignored. A missing or corrupt chunk truncates history
+ * there, and the record is repaired in place.
+ */
+async function readItems(record: ConversationRecordV2): Promise<ConversationItem[]> {
+  const keys = chunkKeys(record.id, record.itemCount);
+  if (keys.length === 0) return [];
+  const chunks = await storage.getItems(keys);
+  const items: ConversationItem[] = [];
+  for (const [n, { value }] of chunks.entries()) {
+    const expected = Math.min(CONVERSATION_CHUNK_SIZE, record.itemCount - n * CONVERSATION_CHUNK_SIZE);
+    if (!isValidChunk(value) || value.items.length < expected) {
+      await storage.setItem(recordKey(record.id), { ...record, itemCount: items.length });
+      await storage.removeItems(keys.slice(n));
+      break;
+    }
+    items.push(...value.items.slice(0, expected));
+  }
+  return items;
+}
+
+function newSummary(id: string, now: number): ConversationSummary {
+  return { id, title: "", titleSource: "prompt", createdAt: now, updatedAt: now, pinned: false, itemCount: 0, lastModelId: null };
+}
+
+async function insertSession(sessions: ConversationSummary[]): Promise<ConversationSummary> {
+  const now = Date.now();
+  const summary = newSummary(crypto.randomUUID(), now);
+  const record: ConversationRecordV2 = { version: 2, id: summary.id, createdAt: now, updatedAt: now, itemCount: 0 };
+  await storage.setItems([
+    { key: recordKey(summary.id), value: record },
+    { item: conversationIndexItem, value: { version: 1, sessions: [...sessions, summary] } },
+  ]);
+  return summary;
+}
+
+/** Index entries sorted pinned first, then most recently updated first. */
+export function listSessions(): Promise<ConversationSummary[]> {
+  return withConversationLock(async () => sortSessions(await readIndex()));
+}
+
+/** The session materialized for display, or `null` if it is not in the index. */
+export function getConversation(id: string): Promise<Conversation | null> {
+  return withConversationLock(async () => {
+    const summary = (await readIndex()).find((session) => session.id === id);
+    if (!summary) return null;
+    const record = await readRecord(id);
+    if (!record) return { ...summary, itemCount: 0, items: [] };
+    const items = await readItems(record);
+    return { ...summary, updatedAt: record.updatedAt, itemCount: items.length, items };
+  });
+}
+
+/** Creates an empty session; it is not opened. */
+export function createSession(): Promise<ConversationSummary> {
+  return withConversationLock(async () => insertSession(await readIndex()));
+}
+
+/**
+ * Whether a session is an untouched new chat: no items, not pinned, no user
+ * title. The record is read, so a lagging index count does not matter.
+ */
+export function isSessionUntouched(id: string): Promise<boolean> {
+  return withConversationLock(async () => {
+    const session = (await readIndex()).find((candidate) => candidate.id === id);
+    return !session?.pinned && session?.titleSource !== "user" && ((await readRecord(id))?.itemCount ?? 0) === 0;
+  });
+}
+
+/**
+ * Appends one item, writing only the tail chunk and the record. Throws for a
+ * session missing from the index. A corrupt tail chunk loses only its own items.
+ */
+export function appendConversationItem(id: string, item: ConversationItem): Promise<void> {
+  return withConversationLock(async () => {
+    let record = await readRecord(id);
+    if (!record) {
+      const summary = (await readIndex()).find((session) => session.id === id);
+      if (!summary) throw new Error("Unknown session.");
+      record = { version: 2, id, createdAt: summary.createdAt, updatedAt: summary.updatedAt, itemCount: 0 };
+    }
+    const n = Math.floor(record.itemCount / CONVERSATION_CHUNK_SIZE);
+    const offset = record.itemCount - n * CONVERSATION_CHUNK_SIZE;
+    let tail: ConversationItem[] = [];
+    let itemCount = record.itemCount;
+    if (offset > 0) {
+      const raw = await storage.getItem<unknown>(chunkKey(id, n));
+      if (isValidChunk(raw) && raw.items.length >= offset) tail = raw.items.slice(0, offset);
+      else itemCount -= offset;
+    }
+    await storage.setItems([
+      { key: chunkKey(id, n), value: { version: 1, items: [...tail, item] } satisfies ConversationChunkV1 },
+      { key: recordKey(id), value: { ...record, itemCount: itemCount + 1, updatedAt: Date.now() } satisfies ConversationRecordV2 },
+    ]);
+  });
+}
+
+/**
+ * Refreshes a session's index entry at a turn boundary: item count and
+ * `updatedAt` from its record, the run's model, and a title from the first
+ * prompt unless the session already has one.
+ */
+export function touchSession(id: string, turn: { prompt?: string; modelId?: string } = {}): Promise<void> {
+  return withConversationLock(async () => {
+    const sessions = await readIndex();
+    const index = sessions.findIndex((session) => session.id === id);
+    if (index < 0) return;
+    const session = sessions[index]!;
+    const record = await readRecord(id);
+    sessions[index] = {
+      ...session,
+      itemCount: record?.itemCount ?? session.itemCount,
+      updatedAt: record?.updatedAt ?? session.updatedAt,
+      lastModelId: turn.modelId ?? session.lastModelId,
+      title: session.titleSource === "prompt" && !session.title && turn.prompt ? titleFromPrompt(turn.prompt) : session.title,
+    };
+    await writeIndex(sessions);
+  });
+}
+
+/** Renames (a user title, never auto-overwritten) and/or pins a session. Returns `null` for an unknown session. */
+export function updateSession(id: string, patch: { title?: string; pinned?: boolean }): Promise<ConversationSummary | null> {
+  return withConversationLock(async () => {
+    const sessions = await readIndex();
+    const index = sessions.findIndex((session) => session.id === id);
+    if (index < 0) return null;
+    const session: ConversationSummary = {
+      ...sessions[index]!,
+      ...(patch.title !== undefined ? { title: patch.title, titleSource: "user" as const } : {}),
+      ...(patch.pinned !== undefined ? { pinned: patch.pinned } : {}),
+    };
+    sessions[index] = session;
+    await writeIndex(sessions);
+    return session;
+  });
+}
+
+/** Deletes a session's items, record, and index entry, in that order, and clears the open pointer if it pointed there. */
+export function deleteSession(id: string): Promise<void> {
+  return withConversationLock(async () => {
+    const sessions = await readIndex();
+    const entry = sessions.find((session) => session.id === id);
+    const record = await readRecord(id);
+    await storage.removeItems([recordKey(id), ...chunkKeys(id, Math.max(record?.itemCount ?? 0, entry?.itemCount ?? 0))]);
+    if (entry) await writeIndex(sessions.filter((session) => session !== entry));
+    if ((await openConversationItem.getValue())?.id === id) await openConversationItem.removeValue();
+  });
+}
+
+export async function getOpenSessionId(): Promise<string | null> {
+  const raw = await openConversationItem.getValue();
+  if (raw?.version === 1 && isSessionId(raw.id)) return raw.id;
+  if (raw !== null) await openConversationItem.removeValue();
+  return null;
+}
+
+export async function setOpenSessionId(id: string): Promise<void> {
+  await openConversationItem.setValue({ version: 1, id });
+}
+
+/** Returns the open session, else opens the most recently updated one, else creates and opens an empty one. */
+export function ensureOpenSession(): Promise<string> {
+  return withConversationLock(async () => {
+    const sessions = await readIndex();
+    const open = await getOpenSessionId();
+    if (open && sessions.some((session) => session.id === open)) return open;
+    const recent = sessions.reduce<ConversationSummary | null>((best, session) => !best || session.updatedAt >= best.updatedAt ? session : best, null);
+    const id = recent?.id ?? (await insertSession(sessions)).id;
+    await setOpenSessionId(id);
+    return id;
+  });
+}
+
+/**
+ * Idempotent startup migration of the pre-sessions `local:conversation`
+ * record into the first session (keeping its id). The session's chunks,
+ * record, and index entry are written in one `storage.local.set`; the legacy
+ * record is removed only after the session reads back with the same items.
+ * A malformed or empty legacy record is removed without creating a session.
+ */
+export async function migrateConversation(): Promise<void> {
+  const raw: unknown = await legacyConversationItem.getValue();
+  if (raw === null) return;
+  if (!isValidLegacyConversation(raw) || raw.items.length === 0) {
+    await legacyConversationItem.removeValue();
+    return;
+  }
+  const legacy = raw;
+  await withConversationLock(async () => {
+    const sessions = await readIndex();
+    const record = await readRecord(LEGACY_SESSION_ID);
+    // A previous attempt that wrote the session but failed to remove the legacy record must not overwrite later items.
+    if (!record || !sessions.some((session) => session.id === LEGACY_SESSION_ID) || record.itemCount < legacy.items.length) {
+      const createdAt = legacy.items[0]!.at;
+      const updatedAt = legacy.updatedAt || legacy.items.at(-1)!.at;
+      const summary: ConversationSummary = {
+        ...newSummary(LEGACY_SESSION_ID, createdAt), title: firstPromptTitle(legacy.items), updatedAt, itemCount: legacy.items.length,
+      };
+      const chunks = Array.from({ length: Math.ceil(legacy.items.length / CONVERSATION_CHUNK_SIZE) }, (_, n) => ({
+        key: chunkKey(LEGACY_SESSION_ID, n),
+        value: { version: 1, items: legacy.items.slice(n * CONVERSATION_CHUNK_SIZE, (n + 1) * CONVERSATION_CHUNK_SIZE) } satisfies ConversationChunkV1,
+      }));
+      await storage.setItems([
+        ...chunks,
+        { key: recordKey(LEGACY_SESSION_ID), value: { version: 2, id: LEGACY_SESSION_ID, createdAt, updatedAt, itemCount: legacy.items.length } satisfies ConversationRecordV2 },
+        { item: conversationIndexItem, value: { version: 1, sessions: [...sessions.filter((session) => session.id !== LEGACY_SESSION_ID), summary] } },
+      ]);
+    }
+    if (!(await getOpenSessionId())) await setOpenSessionId(LEGACY_SESSION_ID);
+    const migrated = await readRecord(LEGACY_SESSION_ID);
+    const items = migrated ? await readItems(migrated) : [];
+    if (JSON.stringify(items.slice(0, legacy.items.length)) !== JSON.stringify(legacy.items) ||
+      !(await readIndex()).some((session) => session.id === LEGACY_SESSION_ID)) {
+      throw new Error("The conversation migration did not verify; the original record was kept.");
+    }
+  });
+  await legacyConversationItem.removeValue();
 }
 
 // ---------------------------------------------------------------------------
 // Run checkpoint — run-local recovery marker, not the transcript itself.
 // ---------------------------------------------------------------------------
 
-export async function getRunCheckpoint(): Promise<RunCheckpointV1 | null> {
-  const raw = await runCheckpointItem.getValue();
+export async function getRunCheckpoint(): Promise<RunCheckpointV2 | null> {
+  const raw: unknown = await runCheckpointItem.getValue();
   if (isValidRunCheckpoint(raw)) return raw;
+  // A pre-sessions checkpoint belonged to the legacy conversation.
+  const legacy = { ...(raw as object), version: 2, sessionId: LEGACY_SESSION_ID };
+  if ((raw as { version?: unknown } | null)?.version === 1 && isValidRunCheckpoint(legacy)) return legacy;
   if (raw !== null) await runCheckpointItem.removeValue();
   return null;
 }
 
-export async function saveRunCheckpoint(checkpoint: RunCheckpointV1): Promise<void> {
+export async function saveRunCheckpoint(checkpoint: RunCheckpointV2): Promise<void> {
   await runCheckpointItem.setValue(checkpoint);
 }
 
@@ -365,28 +698,33 @@ const INTERRUPTED_SUFFIX ="\n\n[Interrupted: the extension restarted before this
 /**
  * Startup recovery: a checkpoint left "running"/"awaiting-approval" means the
  * background died mid-run. Convert it into a visible interrupted assistant
- * message rather than silently dropping it or claiming stream resumption.
- * Returns whether a run was interrupted.
+ * message in the run's session rather than silently dropping it or claiming
+ * stream resumption. Returns the session a run was interrupted in, if any.
  */
-export async function recoverInterruptedRun(): Promise<boolean> {
+export async function recoverInterruptedRun(): Promise<string | null> {
   const checkpoint = await getRunCheckpoint();
-  if (!checkpoint) return false;
+  if (!checkpoint) return null;
   if (checkpoint.status !== "running" && checkpoint.status !== "awaiting-approval") {
     await clearRunCheckpoint();
-    return false;
+    return null;
+  }
+  if (!(await listSessions()).some((session) => session.id === checkpoint.sessionId)) {
+    await clearRunCheckpoint();
+    return null;
   }
 
   const text = checkpoint.partialAssistantText
     ? `${checkpoint.partialAssistantText}${INTERRUPTED_SUFFIX}`
     : INTERRUPTED_SUFFIX.trim();
 
-  await appendConversationItem({
+  await appendConversationItem(checkpoint.sessionId, {
     id: `interrupted-${checkpoint.runId}`,
     kind: "message",
     role: "assistant",
     text,
     at: Date.now(),
   });
+  await touchSession(checkpoint.sessionId);
   await clearRunCheckpoint();
-  return true;
+  return checkpoint.sessionId;
 }

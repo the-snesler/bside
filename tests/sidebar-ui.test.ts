@@ -10,7 +10,18 @@ import { isSidebarCommand } from "@/lib/protocol";
 import { buildTurns, formatDuration } from "@/lib/ui/turns";
 import { TurnTrace } from "@/lib/ui/TurnTrace";
 import type { ConversationItem } from "@/lib/domain/conversation";
-import type { SidebarEvent } from "@/lib/protocol";
+import type { RuntimeSnapshot, SidebarEvent } from "@/lib/protocol";
+import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
+
+function snapshotFor(id: string): RuntimeSnapshot {
+  return {
+    conversation: { id, title: "", titleSource: "prompt", createdAt: 0, updatedAt: 0, pinned: false, itemCount: 0, lastModelId: null, items: [] },
+    credential: { configured: true, maskedSuffix: null, chatgpt: { connected: false, email: null, signInAgain: false } },
+    provider: OPENAI_PROVIDER,
+    settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
+    page: null, agentTabs: 0, activeRun: null, lastSeq: 0, notice: null,
+  };
+}
 
 const turnItems: ConversationItem[] = [
   { id: "u1", kind: "message", role: "user", text: "Fill the form", context: null, at: 0 },
@@ -180,8 +191,9 @@ describe("sidebar UI contracts", () => {
     const root = document.createElement("div");
     document.body.append(root);
     await act(() => render(h(Harness, {}), root));
-    const emit = (event: Omit<SidebarEvent, "v" | "conversationId" | "seq" | "at">) =>
-      act(() => listeners.forEach((listener) => listener({ v: 1, conversationId: "default", seq: 1, at: 1, ...event })));
+    const emit = (event: Omit<SidebarEvent, "v" | "conversationId" | "seq" | "at">, conversationId: string | null = "s1") =>
+      act(() => listeners.forEach((listener) => listener({ v: 1, conversationId, seq: 1, at: 1, ...event })));
+    await emit({ runId: null, type: "state.snapshot", payload: snapshotFor("s1") });
 
     await emit({ runId: "r1", type: "run.started", payload: { prompt: "Find it", page: null, retry: false } });
     await emit({ runId: "r1", type: "run.failed", payload: { code: "RATE_LIMIT", message: "Rate limited.", retryable: true, phase: "provider" } });
@@ -194,6 +206,36 @@ describe("sidebar UI contracts", () => {
     await emit({ runId: "r2", type: "run.started", payload: { prompt: "Find it", page: null, retry: true } });
     expect(background!.conversation.items.filter((item) => item.kind === "message" && item.role === "user")).toHaveLength(1);
     expect(background!.activeRun?.runId).toBe("r2");
+    expect(background!.lastError).toBeNull();
+    await act(() => render(null, root));
+  });
+
+  it("tracks a run in another session without adding its items to the open one", async () => {
+    const listeners: Array<(message: unknown) => void> = [];
+    vi.spyOn(browser.runtime, "connect").mockReturnValue({
+      postMessage: () => {},
+      onMessage: { addListener: (listener: (message: unknown) => void) => listeners.push(listener), removeListener: () => {} },
+      disconnect: () => {},
+    } as never);
+    let background: ReturnType<typeof useBackground>;
+    function Harness() {
+      background = useBackground();
+      return null;
+    }
+    const root = document.createElement("div");
+    document.body.append(root);
+    await act(() => render(h(Harness, {}), root));
+    const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) =>
+      act(() => listeners.forEach((listener) => listener({ v: 1, seq: 1, at: 1, ...event })));
+    await emit({ runId: null, conversationId: "open", type: "state.snapshot", payload: snapshotFor("open") });
+
+    await emit({ runId: "r1", conversationId: "other", type: "run.started", payload: { prompt: "Elsewhere", page: null, retry: false } });
+    await emit({ runId: "r1", conversationId: "other", type: "assistant.delta", payload: { delta: "Working" } });
+    await emit({ runId: "r1", conversationId: "other", type: "tool.requested", payload: { call: { id: "c1", name: "browser_program", arguments: {} }, display: "" } });
+    expect(background!.activeRun).toMatchObject({ runId: "r1", conversationId: "other" });
+    expect(background!.conversation.items).toEqual([]);
+    await emit({ runId: "r1", conversationId: "other", type: "run.failed", payload: { code: "RATE_LIMIT", message: "Rate limited.", retryable: true, phase: "provider" } });
+    expect(background!.activeRun).toBeNull();
     expect(background!.lastError).toBeNull();
     await act(() => render(null, root));
   });

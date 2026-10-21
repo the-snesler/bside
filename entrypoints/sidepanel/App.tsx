@@ -1,8 +1,7 @@
 import { Fragment } from "preact";
-import { useState } from "preact/hooks";
 import Settings from "~icons/tabler/settings";
 import Download from "~icons/tabler/download";
-import Refresh from "~icons/tabler/refresh";
+import MessagePlus from "~icons/tabler/message-plus";
 import Globe from "~icons/tabler/world";
 import ArrowDown from "~icons/tabler/arrow-down";
 import BrowserX from "~icons/tabler/browser-x";
@@ -46,23 +45,25 @@ export function App() {
     cancelRun,
     approveAction,
     denyAction,
-    resetContext,
+    newChat,
+    openSession,
     downloadContext,
   } = useBackground();
-  const [confirmReset, setConfirmReset] = useState(false);
   const scroll = useBottomScroll();
 
+  // One run at a time across all chats; it may belong to a chat other than the one on screen.
   const composerDisabled = activeRun !== null || !credential.configured;
+  const runHere = activeRun !== null && activeRun.conversationId === conversation.id;
   const model =
     provider.models.find((model) => model.id === settings.modelId) ??
     provider.models[0];
-  const turns = buildTurns(conversation.items, activeRun !== null);
-  const pendingApproval = activeRun?.pendingApproval ?? null;
+  const turns = buildTurns(conversation.items, runHere);
+  const pendingApproval = runHere ? activeRun.pendingApproval : null;
 
   return (
     <div class="sidebar">
       <header class="sidebar__header">
-        <h1 class="sidebar__title">bside</h1>
+        <h1 class="sidebar__title" title={conversation.title || undefined}>bside</h1>
         <div class="sidebar__header-actions">
           {agentTabs > 0 && (
             <button
@@ -89,12 +90,11 @@ export function App() {
           <button
             type="button"
             class="icon-button"
-            disabled={activeRun !== null}
-            onClick={() => setConfirmReset(!confirmReset)}
-            aria-label="Reset context"
-            title="Reset context"
+            onClick={newChat}
+            aria-label="New chat"
+            title="New chat"
           >
-            <Refresh />
+            <MessagePlus />
           </button>
           <button
             type="button"
@@ -107,33 +107,21 @@ export function App() {
           </button>
         </div>
       </header>
-      {confirmReset && (
-        <div
-          class="reset-confirmation"
-          role="group"
-          aria-label="Confirm context reset"
-        >
+      {activeRun && !runHere && (
+        <div class="run-elsewhere" role="status">
           <p>
-            Clear this conversation and scratch files? Tabs and settings stay.
+            {activeRun.pendingApproval
+              ? "Another chat is waiting for your confirmation."
+              : "bside is working in another chat."}
           </p>
-          <button
-            type="button"
-            disabled={!!activeRun}
-            onClick={() => {
-              resetContext();
-              setConfirmReset(false);
-            }}
-          >
-            Clear context
-          </button>
-          <button type="button" onClick={() => setConfirmReset(false)}>
-            Cancel
+          <button type="button" onClick={() => openSession(activeRun.conversationId)}>
+            Show
           </button>
         </div>
       )}
       <main class="sidebar__body" ref={scroll.viewport}>
         <div ref={scroll.content}>
-          {turns.length === 0 && !activeRun ? (
+          {turns.length === 0 && !runHere ? (
             <p class="sidebar__empty">
               {page
                 ? `Ask about ${page.title || "this page"}, or start a conversation.`
@@ -168,11 +156,11 @@ export function App() {
                     </li>
                   )}
                   {(turn.steps.length > 0 ||
-                    (activeRun && index === turns.length - 1)) && (
+                    (runHere && index === turns.length - 1)) && (
                     <li class="timeline__item timeline__item--work">
                       <TurnTrace
                         turn={turn}
-                        active={!!activeRun && index === turns.length - 1}
+                        active={runHere && index === turns.length - 1}
                         pendingApproval={pendingApproval}
                         onApprove={approveAction}
                         onDeny={denyAction}
@@ -186,7 +174,7 @@ export function App() {
                   )}
                 </Fragment>
               ))}
-              {activeRun?.partialAssistantText && (
+              {runHere && activeRun.partialAssistantText && (
                 <li class="timeline__item timeline__item--assistant timeline__item--streaming">
                   <Markdown text={activeRun.partialAssistantText} />
                 </li>

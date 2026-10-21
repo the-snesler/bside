@@ -19,9 +19,9 @@ import type {
   ToolCall,
   ToolResult,
 } from "@/lib/domain/tools";
-import type { ConversationRecordV1 } from "@/lib/domain/conversation";
+import type { Conversation, ConversationSummary } from "@/lib/domain/conversation";
 import type { AppSettingsV1, ChatGPTStatus, ProviderDefinition } from "@/lib/domain/provider";
-import { validateDomAction } from "@/lib/validation";
+import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction } from "@/lib/validation";
 
 // ---------------------------------------------------------------------------
 // Content script <-> background: PageRequest / PageResponse (tabs.sendMessage)
@@ -208,10 +208,25 @@ export type SidebarCommand =
   | { v: 1; id: string; type: "tabs.focus"; tabId: number }
   | { v: 1; id: string; type: "tabs.closeAgentTabs" }
   | { v: 1; id: string; type: "settings.save"; settings: AppSettingsV1 }
-  | { v: 1; id: string; type: "context.reset" | "context.export" }
+  | { v: 1; id: string; type: "context.export" }
   | { v: 1; id: string; type: "state.subscribe"; lastSeq: number | null }
+  /**
+   * "New chat": opens an empty session (reusing the open one if it is an untouched new chat).
+   * With no run active it also clears scratch files and the debug buffers.
+   */
+  | { v: 1; id: string; type: "session.create" }
+  /** Answered with `session.listed` to the requesting sidebar only. */
+  | { v: 1; id: string; type: "session.list" }
+  /** Allowed while a run is active elsewhere; the run keeps its own session. Leaving an untouched new chat (no items, pin, or user title) deletes it. */
+  | { v: 1; id: string; type: "session.open"; sessionId: string }
+  /** Refused for the active run's session. Deleting the open session opens the most recent remaining one, or a new empty one. */
+  | { v: 1; id: string; type: "session.delete"; sessionId: string }
+  /** Sets a user title, which is never auto-overwritten. */
+  | { v: 1; id: string; type: "session.rename"; sessionId: string; title: string }
+  | { v: 1; id: string; type: "session.pin"; sessionId: string; pinned: boolean }
+  /** Starts a run in the open session. */
   | { v: 1; id: string; type: "run.start"; prompt: string }
-  /** Re-runs the last turn's existing user message; accepted only when no run is active and that turn ended failed, cancelled, or interrupted without a committed page effect. */
+  /** Re-runs the open session's last turn's existing user message; accepted only when no run is active and that turn ended failed, cancelled, or interrupted without a committed page effect. */
   | { v: 1; id: string; type: "run.retry" }
   | { v: 1; id: string; type: "run.cancel"; runId: string }
   | { v: 1; id: string; type: "action.approve"; runId: string; callId: string }
@@ -225,15 +240,18 @@ export interface ApprovalRequest {
 }
 
 export interface RuntimeSnapshot {
-  conversation: ConversationRecordV1;
+  /** The open session. */
+  conversation: Conversation;
   credential: { configured: boolean; maskedSuffix: string | null; chatgpt: ChatGPTStatus };
   provider: ProviderDefinition;
   settings: AppSettingsV1;
   page: PageArtifactSummary | null;
   /** Number of hidden agent-owned tabs, including the search tab. */
   agentTabs: number;
+  /** The single active run, which may belong to a session other than the open one. */
   activeRun: {
     runId: string;
+    conversationId: string;
     status: "running" | "awaiting-approval" | "cancelling";
     partialAssistantText: string;
     pendingApproval: ApprovalRequest | null;
@@ -245,7 +263,8 @@ export interface RuntimeSnapshot {
 export interface EventBase<T extends string, P> {
   v: 1;
   runId: string | null;
-  conversationId: "default";
+  /** Run events: the run's session. `state.snapshot`: the open session. Events not about one session: `null`. */
+  conversationId: string | null;
   seq: number;
   type: T;
   at: number;
@@ -259,6 +278,7 @@ export type SidebarEvent =
   | EventBase<"tabs.listed", { tabs: TabMention[] }>
   | EventBase<"context.exported", { requestId: string; markdown: string; filename: string }>
   | EventBase<"state.snapshot", RuntimeSnapshot>
+  | EventBase<"session.listed", { sessions: ConversationSummary[] }>
   | EventBase<"page.attached", PageArtifactSummary | null>
   | EventBase<"agent-tabs.changed", { count: number }>
   | EventBase<"run.started", { prompt: string; page: PageArtifactSummary | null; retry: boolean }>
@@ -277,7 +297,13 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (candidate.type === "tabs.focus") return Number.isSafeInteger(candidate.tabId);
   if (candidate.type === "tabs.closeAgentTabs") return true;
   if (candidate.type === "settings.save") return isAppSettings(candidate.settings);
-  if (candidate.type === "context.reset" || candidate.type === "context.export") return true;
+  if (candidate.type === "context.export") return true;
+  if (candidate.type === "session.create" || candidate.type === "session.list") return true;
+  if (candidate.type === "session.open" || candidate.type === "session.delete") return isSessionId(candidate.sessionId);
+  if (candidate.type === "session.rename") {
+    return isSessionId(candidate.sessionId) && typeof candidate.title === "string" && candidate.title.length <= MAX_SESSION_TITLE_LEN * 4;
+  }
+  if (candidate.type === "session.pin") return isSessionId(candidate.sessionId) && typeof candidate.pinned === "boolean";
   if (candidate.type === "state.subscribe") {
     return candidate.lastSeq === null || typeof candidate.lastSeq === "number";
   }

@@ -12,6 +12,7 @@ import {
 import { Editable, ReactEditor, Slate, withReact } from "slate-react";
 import { withHistory } from "slate-history";
 import type { TabMention } from "@/lib/protocol";
+import { PROMPT_MENTION_PATTERN } from "@/lib/domain/conversation";
 import ArrowUp from "~icons/tabler/arrow-up";
 import PlayerStop from "~icons/tabler/player-stop";
 
@@ -49,9 +50,8 @@ export type PromptSegment =
 /** Splits a sent prompt back into text and the mentions `serializeDraft` encoded. */
 export function parsePromptMentions(prompt: string): PromptSegment[] {
   const segments: PromptSegment[] = [];
-  const pattern = /@([^\n]+?) \(tab (\d+), \/(agent-tabs|tabs)\/\2\/page\.md, (\S+)\)/g;
   let last = 0;
-  for (const match of prompt.matchAll(pattern)) {
+  for (const match of prompt.matchAll(PROMPT_MENTION_PATTERN)) {
     if (match.index > last) segments.push({ kind: "text", text: prompt.slice(last, match.index) });
     segments.push({ kind: "mention", label: match[1]!, tabId: Number(match[2]), agentTab: match[3] === "agent-tabs", url: match[4]! });
     last = match.index + match[0].length;

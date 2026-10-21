@@ -232,7 +232,7 @@ summary.trace__line:focus-visible .trace__chevron,
   margin: 8px 0 6px;
 }
 .trace__actions button,
-.reset-confirmation button {
+.run-elsewhere button {
   border: 1px solid color-mix(in srgb, var(--muted) 30%, transparent);
   background: var(--surface);
   padding: 6px 12px;
@@ -438,18 +438,19 @@ summary.trace__line:focus-visible .trace__chevron,
   border: 1px solid color-mix(in srgb, var(--muted) 25%, transparent);
   box-shadow: 0 2px 8px #0001;
 }
-.reset-confirmation {
+.run-elsewhere {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   margin: 0 12px;
-  padding: 12px;
+  padding: 8px 12px;
   font-size: 12px;
   border-radius: 10px;
   background: var(--surface);
 }
-.reset-confirmation p {
-  margin: 0 0 8px;
-}
-.reset-confirmation button {
-  margin-right: 5px;
+.run-elsewhere p {
+  flex: 1;
+  margin: 0;
 }
 .markdown {
   overflow-wrap: anywhere;

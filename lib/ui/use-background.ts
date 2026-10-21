@@ -4,19 +4,24 @@
  * inference request, tool loop, transcript authority, or credential read.
  * Between full `state.snapshot` syncs, run-lifecycle events are applied
  * incrementally so the composer/timeline update live without re-fetching.
+ * The single active run may belong to another session than the open one: its
+ * events always update `activeRun`, but change `conversation` only when their
+ * `conversationId` is the open session's.
  */
 
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import type { Browser } from "wxt/browser";
 import { RUN_CANCELLED_SUFFIX, SIDEBAR_PORT_NAME } from "@/lib/protocol";
 import type { NormalizedError, RuntimeSnapshot, SidebarCommand, SidebarEvent } from "@/lib/protocol";
-import type { ConversationItem } from "@/lib/domain/conversation";
+import type { Conversation, ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
 import type { AppSettingsV1 } from "@/lib/domain/provider";
 import type { TabMention } from "@/lib/protocol";
 import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
 
 export interface BackgroundState extends RuntimeSnapshot {
   tabs: TabMention[];
+  /** The last `session.listed` reply; empty until `listSessions()` is called. */
+  sessions: ConversationSummary[];
   lastError: NormalizedError | null;
 }
 
@@ -30,13 +35,23 @@ export interface BackgroundActions {
   cancelRun(): void;
   approveAction(callId: string): void;
   denyAction(callId: string): void;
-  resetContext(): void;
+  newChat(): void;
+  listSessions(): void;
+  openSession(sessionId: string): void;
+  renameSession(sessionId: string, title: string): void;
+  pinSession(sessionId: string, pinned: boolean): void;
+  deleteSession(sessionId: string): void;
   downloadContext(): void;
 }
 
+const EMPTY_CONVERSATION: Conversation = {
+  id: "", title: "", titleSource: "prompt", createdAt: 0, updatedAt: 0, pinned: false, itemCount: 0, lastModelId: null, items: [],
+};
+
 const INITIAL_STATE: BackgroundState = {
   tabs: [],
-  conversation: { version: 1, id: "default", items: [], updatedAt: 0 },
+  sessions: [],
+  conversation: EMPTY_CONVERSATION,
   credential: { configured: false, maskedSuffix: null, chatgpt: { connected: false, email: null, signInAgain: false } },
   provider: OPENAI_PROVIDER,
   settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
@@ -119,8 +134,23 @@ export function useBackground(): BackgroundState & BackgroundActions {
     portRef.current?.postMessage(command);
   }, []);
 
-  const resetContext = useCallback(() => {
-    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "context.reset" } satisfies SidebarCommand);
+  const newChat = useCallback(() => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.create" } satisfies SidebarCommand);
+  }, []);
+  const listSessions = useCallback(() => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.list" } satisfies SidebarCommand);
+  }, []);
+  const openSession = useCallback((sessionId: string) => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.open", sessionId } satisfies SidebarCommand);
+  }, []);
+  const renameSession = useCallback((sessionId: string, title: string) => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.rename", sessionId, title } satisfies SidebarCommand);
+  }, []);
+  const pinSession = useCallback((sessionId: string, pinned: boolean) => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.pin", sessionId, pinned } satisfies SidebarCommand);
+  }, []);
+  const deleteSession = useCallback((sessionId: string) => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.delete", sessionId } satisfies SidebarCommand);
   }, []);
 
   const downloadContext = useCallback(() => {
@@ -142,10 +172,19 @@ export function useBackground(): BackgroundState & BackgroundActions {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "settings.save", settings } satisfies SidebarCommand);
   }, []);
 
-  return { ...state, sendPrompt, retryRun, cancelRun, approveAction, denyAction, resetContext, downloadContext, listTabs, focusTab, closeAgentTabs, saveSettings };
+  return {
+    ...state, sendPrompt, retryRun, cancelRun, approveAction, denyAction, newChat, listSessions, openSession, renameSession, pinSession,
+    deleteSession, downloadContext, listTabs, focusTab, closeAgentTabs, saveSettings,
+  };
 }
 
-function commitPendingText(prev: BackgroundState): BackgroundState {
+/** Appends a run item to the timeline only when the run belongs to the open session. */
+function appendItem(prev: BackgroundState, conversationId: string | null, item: ConversationItem, updatedAt?: number): BackgroundState["conversation"] {
+  if (conversationId !== prev.conversation.id) return prev.conversation;
+  return { ...prev.conversation, items: [...prev.conversation.items, item], ...(updatedAt === undefined ? {} : { updatedAt }) };
+}
+
+function commitPendingText(prev: BackgroundState, conversationId: string | null): BackgroundState {
   if (!prev.activeRun || !prev.activeRun.partialAssistantText) return prev;
   const message: ConversationItem = {
     id: `${prev.activeRun.runId}-msg-${prev.conversation.items.length}`,
@@ -157,7 +196,7 @@ function commitPendingText(prev: BackgroundState): BackgroundState {
   return {
     ...prev,
     activeRun: { ...prev.activeRun, partialAssistantText: "" },
-    conversation: { ...prev.conversation, items: [...prev.conversation.items, message] },
+    conversation: appendItem(prev, conversationId, message),
   };
 }
 
@@ -168,6 +207,10 @@ function applyEvent(
 ): void {
   if (event.type === "tabs.listed") {
     setState((prev) => ({ ...prev, tabs: event.payload.tabs }));
+    return;
+  }
+  if (event.type === "session.listed") {
+    setState((prev) => ({ ...prev, sessions: event.payload.sessions }));
     return;
   }
   if (event.type === "state.snapshot") {
@@ -194,13 +237,13 @@ function applyEvent(
         context: event.payload.page,
         at: event.at,
       };
-      // A retry re-runs the turn's existing user message rather than adding one.
-      const items = event.payload.retry ? prev.conversation.items : [...prev.conversation.items, userItem];
+      const conversationId = event.conversationId!;
       return {
         ...prev,
         lastError: null,
-        activeRun: { runId: event.runId as string, status: "running", partialAssistantText: "", pendingApproval: null },
-        conversation: { ...prev.conversation, items, updatedAt: event.at },
+        activeRun: { runId: event.runId as string, conversationId, status: "running", partialAssistantText: "", pendingApproval: null },
+        // A retry re-runs the turn's existing user message rather than adding one.
+        conversation: event.payload.retry ? prev.conversation : appendItem(prev, conversationId, userItem, event.at),
       };
     });
     return;
@@ -215,22 +258,22 @@ function applyEvent(
   }
   if (event.type === "tool.requested") {
     setState((prev) => {
-      const committed = commitPendingText(prev);
+      const committed = commitPendingText(prev, event.conversationId);
       if (!committed.activeRun) return committed;
       const callItem: ConversationItem = { id: `${event.payload.call.id}-call`, kind: "tool-call", call: event.payload.call, at: event.at };
-      return { ...committed, conversation: { ...committed.conversation, items: [...committed.conversation.items, callItem] } };
+      return { ...committed, conversation: appendItem(committed, event.conversationId, callItem) };
     });
     return;
   }
   if (event.type === "action.approval-required") {
     setState((prev) => {
-      const committed = commitPendingText(prev);
+      const committed = commitPendingText(prev, event.conversationId);
       if (!committed.activeRun) return committed;
       const callItem: ConversationItem = { id: `${event.payload.call.id}-call`, kind: "tool-call", call: event.payload.call, at: event.at };
       return {
         ...committed,
         activeRun: { ...committed.activeRun, status: "awaiting-approval", pendingApproval: event.payload },
-        conversation: { ...committed.conversation, items: [...committed.conversation.items, callItem] },
+        conversation: appendItem(committed, event.conversationId, callItem),
       };
     });
     return;
@@ -253,7 +296,7 @@ function applyEvent(
           status: stillPending ? "awaiting-approval" : "running",
           pendingApproval: stillPending,
         },
-        conversation: { ...prev.conversation, items: [...prev.conversation.items, resultItem] },
+        conversation: appendItem(prev, event.conversationId, resultItem),
       };
     });
     return;
@@ -270,11 +313,7 @@ function applyEvent(
         text: prev.activeRun.partialAssistantText,
         at: event.at,
       };
-      return {
-        ...prev,
-        activeRun: null,
-        conversation: { ...prev.conversation, items: [...prev.conversation.items, assistantItem], updatedAt: event.at },
-      };
+      return { ...prev, activeRun: null, conversation: appendItem(prev, event.conversationId, assistantItem, event.at) };
     });
     return;
   }
@@ -290,16 +329,13 @@ function applyEvent(
         text: `${prev.activeRun.partialAssistantText}${RUN_CANCELLED_SUFFIX}`,
         at: event.at,
       };
-      return {
-        ...prev,
-        activeRun: null,
-        conversation: { ...prev.conversation, items: [...prev.conversation.items, assistantItem], updatedAt: event.at },
-      };
+      return { ...prev, activeRun: null, conversation: appendItem(prev, event.conversationId, assistantItem, event.at) };
     });
     return;
   }
   if (event.type === "run.failed") {
     activeRunIdRef.current = null;
-    setState((prev) => ({ ...prev, activeRun: null, lastError: event.payload }));
+    // Retry targets the open session, so only a failure there offers it.
+    setState((prev) => ({ ...prev, activeRun: null, lastError: event.conversationId === prev.conversation.id ? event.payload : prev.lastError }));
   }
 }
