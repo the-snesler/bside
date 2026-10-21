@@ -16,16 +16,17 @@ import { isSidebarCommand, SIDEBAR_PORT_NAME } from "@/lib/protocol";
 import type { RuntimeSnapshot, SidebarCommand, SidebarEvent, TabMention } from "@/lib/protocol";
 import type { ConversationSummary, QueuedMessage } from "@/lib/domain/conversation";
 import type { PageArtifactSummary } from "@/lib/domain/tools";
+import type { SkillSummary } from "@/lib/domain/skills";
 
 const MAX_REPLAY_EVENTS = 512;
 const UNSUPPORTED_HOSTNAME_SUFFIXES = [".mozilla.org", ".mozilla.com"];
 
 export interface SidebarHubDelegate {
   getSnapshot(): Promise<RuntimeSnapshot>;
-  handleCommand(command: SidebarCommand): Promise<{ markdown: string; filename: string } | { tabs: TabMention[] } | { sessions: ConversationSummary[] } | void>;
+  handleCommand(command: SidebarCommand): Promise<{ markdown: string; filename: string } | { tabs: TabMention[] } | { skills: SkillSummary[] } | { sessions: ConversationSummary[] } | void>;
 }
 
-type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" | "agent-tabs.changed" | "queue.changed" | "context.exported" | "tabs.listed" | "session.listed" }>;
+type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" | "agent-tabs.changed" | "queue.changed" | "context.exported" | "tabs.listed" | "skills.listed" | "session.listed" }>;
 
 export class SidebarHub {
   delegate: SidebarHubDelegate | null = null;
@@ -151,6 +152,9 @@ export class SidebarHub {
       return;
     }
     const result = await this.delegate.handleCommand(message);
+    if (message.type === "skills.list" && result && "skills" in result) port.postMessage({
+      v: 1, type: "skills.listed", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: result,
+    } satisfies SidebarEvent);
     if (message.type === "tabs.list" && result && "tabs" in result) port.postMessage({
       v: 1, type: "tabs.listed", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: result,
     } satisfies SidebarEvent);

@@ -28,6 +28,7 @@ export interface BackgroundState extends RuntimeSnapshot {
 
 export interface BackgroundActions {
   listTabs(): void;
+  listSkills(): void;
   focusTab(tabId: number): void;
   /** Closes one session's hidden agent tabs. */
   closeAgentTabs(sessionId: string): void;
@@ -58,6 +59,7 @@ const EMPTY_CONVERSATION: Conversation = {
 };
 
 const INITIAL_STATE: BackgroundState = {
+  skills: [],
   tabs: [],
   sessions: [],
   conversation: EMPTY_CONVERSATION,
@@ -201,7 +203,7 @@ export function useBackground(): BackgroundState & BackgroundActions {
 
   return {
     ...state, sendPrompt, steer, removeQueued, sendQueued, retryRun, cancelRun, approveAction, denyAction, newChat, listSessions, openSession, renameSession, pinSession,
-    deleteSession, downloadContext, listTabs, focusTab, closeAgentTabs, saveSettings,
+    deleteSession, downloadContext, listTabs, listSkills: () => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "skills.list" } satisfies SidebarCommand), focusTab, closeAgentTabs, saveSettings,
   };
 }
 
@@ -243,6 +245,10 @@ function applyEvent(
   setState: (updater: (prev: BackgroundState) => BackgroundState) => void,
   activeRunIdRef: { current: string | null },
 ): void {
+  if (event.type === "skills.listed") {
+    setState((prev) => ({ ...prev, skills: event.payload.skills }));
+    return;
+  }
   if (event.type === "tabs.listed") {
     setState((prev) => ({ ...prev, tabs: event.payload.tabs }));
     return;

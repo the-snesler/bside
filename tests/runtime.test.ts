@@ -20,6 +20,7 @@ import type { PageSnapshot } from "@/lib/domain/tools";
 import type { SidebarCommand, SidebarEvent } from "@/lib/protocol";
 import { splitSystemMessage, TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
 import { buildTurns } from "@/lib/ui/turns";
+import { handleSkillsRequest } from "@/lib/background/skills";
 
 type ProviderUsage = NonNullable<Extract<ScriptedProviderEvent, { type: "turn.completed" }>["usage"]>;
 
@@ -175,6 +176,96 @@ describe("context controls", () => {
     await first.send({ v: 1, id: "download", type: "context.export", sessionId: (await getOpenSessionId())! });
     expect(first.received.find((event) => event.type === "context.exported")?.payload).toMatchObject({ requestId: "download", markdown: expect.stringContaining("Saved context") });
     expect(second.received.some((event) => event.type === "context.exported")).toBe(false);
+  });
+});
+
+describe("BackgroundRuntime: saved skills", () => {
+  const skill = { name: "brief", description: "Brief summary", body: "ORIGINAL_SKILL_BODY" };
+  const save = (body = skill.body) => handleSkillsRequest({ v: 1, id: "save", type: "skills.save", skill: { ...skill, body } });
+  const read: ScriptedProviderEvent[] = [{ type: "tool.call", call: { id: "read-skill", name: "browser_program", arguments: { source: 'return fs.read("/skills/brief.md");' } } }, { type: "turn.completed", replayState: null }];
+  const answer: ScriptedProviderEvent[] = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
+  const send = (runtime: BackgroundRuntime, command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+
+  it("keeps bodies out of prompts, reads on demand, and pins retry/history despite edits", async () => {
+    await saveOpenAICredential("sk-test");
+    await save();
+    const provider = new FakeProvider();
+    let round = 0;
+    provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      const current = round++;
+      if (current === 1) throw new ProviderStreamError("Temporary failure", "NETWORK");
+      yield* current === 0 || current === 2 ? read : answer;
+    } });
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
+    await send(runtime, { type: "run.start", prompt: "/brief this page" });
+    const originalRequest = provider.requests[0]!;
+    expect(JSON.stringify(originalRequest)).not.toContain(skill.body);
+    expect(JSON.stringify(provider.requests[1])).toContain(skill.body);
+    await save("CHANGED_SKILL_BODY");
+    await send(runtime, { type: "run.retry" });
+    expect(provider.requests[2]!.context.messages[0]).toEqual(originalRequest.context.messages[0]);
+    expect(JSON.stringify(provider.requests[3])).toContain(skill.body);
+    expect(JSON.stringify(provider.requests[3])).not.toContain("CHANGED_SKILL_BODY");
+    await send(runtime, { type: "run.start", prompt: "Follow up" });
+    expect(provider.requests[4]!.context.messages[0]).toEqual(originalRequest.context.messages[0]);
+    expect(provider.requests[4]!.context.systemPrompt).toEqual(originalRequest.context.systemPrompt);
+    expect((await openConversation()).items.filter((item) => item.kind === "message" && item.role === "user")).toHaveLength(2);
+  });
+
+  it.each(["follow-up", "steer"] as const)("pins a %s invocation at acceptance through deletion and delivery", async (mode) => {
+    await saveOpenAICredential("sk-test");
+    await save();
+    const gate = Promise.withResolvers<void>();
+    const provider = new FakeProvider();
+    let round = 0;
+    provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      const current = round++;
+      if (current === 0) { await gate.promise; yield* answer; }
+      else yield* current === 1 ? read : answer;
+    } });
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
+    const running = send(runtime, { type: "run.start", prompt: "Start" });
+    await vi.waitFor(() => expect(provider.requests).toHaveLength(1));
+    if (mode === "steer") await send(runtime, { type: "run.steer", runId: (await runtime.getSnapshot()).activeRun!.runId, text: "/brief" });
+    else await send(runtime, { type: "run.start", prompt: "/brief" });
+    expect((await runtime.getSnapshot()).queue[0]?.skills?.invoked).toEqual(skill);
+    await handleSkillsRequest({ v: 1, id: "delete", type: "skills.delete", name: skill.name });
+    gate.resolve();
+    await running;
+    await vi.waitFor(() => expect(provider.requests).toHaveLength(3));
+    expect(JSON.stringify(provider.requests[2])).toContain(skill.body);
+    const user = (await openConversation()).items.find((item) => item.kind === "message" && item.role === "user" && item.text === "/brief");
+    expect(user).toMatchObject({ skills: { invoked: skill }, ...(mode === "steer" ? { delivery: "steer" } : {}) });
+  });
+
+  it("refuses unknown explicit names before sending a provider request or persisting a turn", async () => {
+    await saveOpenAICredential("sk-test");
+    const provider = new FakeProvider();
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
+    await send(runtime, { type: "run.start", prompt: "/missing" });
+    expect(provider.requests).toHaveLength(0);
+    expect((await openConversation()).items).toHaveLength(0);
+  });
+
+  it("keeps an empty acceptance-time catalog empty when a queued prompt dispatches after a skill is created", async () => {
+    await saveOpenAICredential("sk-test");
+    const gate = Promise.withResolvers<void>();
+    const provider = new FakeProvider();
+    let round = 0;
+    provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      if (round++ === 0) await gate.promise;
+      yield* answer;
+    } });
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
+    const running = send(runtime, { type: "run.start", prompt: "Start" });
+    await vi.waitFor(() => expect(provider.requests).toHaveLength(1));
+    await send(runtime, { type: "run.start", prompt: "Queued without skills" });
+    await save();
+    gate.resolve();
+    await running;
+    await vi.waitFor(() => expect(provider.requests).toHaveLength(2));
+    const messages = provider.requests[1]!.context.messages;
+    expect(messages.at(-1)?.content).toBe("Queued without skills");
   });
 });
 

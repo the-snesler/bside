@@ -4,7 +4,7 @@ import { h, render } from "preact";
 import { act } from "preact/test-utils";
 import { App } from "@/entrypoints/options/App";
 import { OPENAI_API_KEY_PROVIDER } from "@/lib/providers/openai";
-import type { CredentialRequest, HistoryRequest, SettingsRequest } from "@/lib/protocol";
+import type { CredentialRequest, HistoryRequest, SettingsRequest, SkillsRequest } from "@/lib/protocol";
 
 let root: HTMLDivElement;
 afterEach(() => { if (root) render(null, root); document.body.innerHTML = ""; vi.restoreAllMocks(); });
@@ -13,7 +13,8 @@ async function mount(connected = false, signInAgain = false) {
   let retention = "forever";
   let sessionCount = 3;
   const send = vi.spyOn(browser.runtime, "sendMessage").mockImplementation(async (message: unknown) => {
-    const request = message as CredentialRequest | SettingsRequest | HistoryRequest;
+    const request = message as CredentialRequest | SettingsRequest | HistoryRequest | SkillsRequest;
+    if (request.type === "skills.list") return { v: 1, id: request.id, ok: true, skills: [], builtinNames: [] };
     if (request.type.startsWith("history.")) {
       let notice: string | null = null;
       if (request.type === "history.retention.save") retention = request.retention;

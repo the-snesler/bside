@@ -12,6 +12,9 @@
  */
 
 import { AgentLoop } from "@/lib/background/agent-loop";
+import { getSkills } from "@/lib/background/skills";
+import { captureSkillContext } from "@/lib/background/skill-context";
+import { skillCatalog, type Skill, type SkillContext } from "@/lib/domain/skills";
 import type { ApprovalBadge } from "@/lib/background/approval-badge";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
@@ -377,6 +380,7 @@ export class BackgroundRuntime {
       credential: { ...credential, configured: credential.chatgpt.connected || credential.configured },
       provider,
       settings,
+      skills: skillCatalog(await getSkills()),
       page: this.#sidebarHub.currentAttachment(),
       agentTabs: this.#agentTabCounts(),
       queue: [...await this.#queue(conversation.id)],
@@ -400,6 +404,7 @@ export class BackgroundRuntime {
   handleCommand(command: SidebarCommand): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]>;
   async handleCommand(command: SidebarCommand): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]> {
     await this.#ready;
+    if (command.type === "skills.list") return { skills: skillCatalog(await getSkills()) };
     if (command.type === "tabs.list") {
       // As the open session's runs see them: other sessions' agent tabs are left out.
       const openId = await this.#openSession();
@@ -813,7 +818,21 @@ export class BackgroundRuntime {
     const prompt = validatePromptText(rawPrompt);
     if (!prompt || this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, rawPrompt);
     if (await this.#queueFull(queue)) return;
-    await this.#setQueue(sessionId, [...queue, { id: crypto.randomUUID(), mode: "follow-up", text: prompt, at: Date.now() }]);
+    const skills = await this.#captureSkills(prompt);
+    if (skills === null) return;
+    if (this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, prompt, undefined, skills ?? { version: 1, catalog: [] });
+    const current = await this.#queue(sessionId);
+    if (await this.#queueFull(current)) return;
+    await this.#setQueue(sessionId, [...current, { id: crypto.randomUUID(), mode: "follow-up", text: prompt, ...(skills ? { skills } : {}), at: Date.now() }]);
+  }
+
+  async #captureSkills(text: string): Promise<SkillContext | undefined | null> {
+    try { return await captureSkillContext(text); }
+    catch (error) {
+      this.#notice = error instanceof Error ? error.message : "Could not read saved skills.";
+      await this.#sidebarHub.broadcastSnapshot();
+      return null;
+    }
   }
 
   /** `run.steer`: hands guidance to the active run's agent loop and shows it as pending until delivered. */
@@ -825,9 +844,14 @@ export class BackgroundRuntime {
     // Re-checked after loading: once a run ends or is cancelling, a steer could never be delivered.
     if (!text || this.#activeRun !== run || run.status === "cancelling") return this.#submitPrompt(rawText);
     if (await this.#queueFull(queue)) return;
-    const message: QueuedMessage = { id: crypto.randomUUID(), mode: "steer", text, at: Date.now() };
+    const skills = await this.#captureSkills(text);
+    if (skills === null) return;
+    if (this.#activeRun !== run || run.controller.signal.aborted) return this.#submitPrompt(rawText);
+    const current = await this.#queue(run.sessionId);
+    if (await this.#queueFull(current)) return;
+    const message: QueuedMessage = { id: crypto.randomUUID(), mode: "steer", text, ...(skills ? { skills } : {}), at: Date.now() };
     run.agentLoop.steer(message);
-    await this.#setQueue(run.sessionId, [...queue, message]);
+    await this.#setQueue(run.sessionId, [...current, message]);
   }
 
   /** Steers the run never delivered become follow-ups: kept visible, and sent next only if the run completed. */
@@ -845,7 +869,7 @@ export class BackgroundRuntime {
       await this.#sidebarHub.broadcastSnapshot();
       return;
     }
-    await this.#startRun(sessionId, message.text, message.id);
+    await this.#startRun(sessionId, message.text, message.id, message.skills);
   }
 
   /**
@@ -856,7 +880,7 @@ export class BackgroundRuntime {
   async #dispatchFollowUp(sessionId: string): Promise<void> {
     if (this.#activeRun || this.#sessionOpsPending > 0) return;
     const next = (await this.#queue(sessionId)).find((message) => message.mode === "follow-up");
-    if (next) await this.#startRun(sessionId, next.text, next.id);
+    if (next) await this.#startRun(sessionId, next.text, next.id, next.skills);
   }
 
   /**
@@ -866,7 +890,7 @@ export class BackgroundRuntime {
    * names the queued follow-up the prompt came from; its user message keeps
    * that id, and it leaves the queue once that message is written.
    */
-  async #startRun(sessionId: string, rawPrompt: string | null, queuedId?: string): Promise<void> {
+  async #startRun(sessionId: string, rawPrompt: string | null, queuedId?: string, queuedSkills?: SkillContext): Promise<void> {
     const retry = rawPrompt === null;
     if (this.#activeRun || this.#sessionOpsPending > 0 || (retry && this.#retryable?.sessionId !== sessionId)) {
       await this.#sidebarHub.broadcastSnapshot();
@@ -892,7 +916,7 @@ export class BackgroundRuntime {
     const controller = new AbortController();
     const tabController = this.#tabControllerFactory();
     // The session's scratch files load on the first program that uses them.
-    const scope = { state: this.#workspace, sessionId, files: new ScratchFiles(workspaceStore(sessionId)) };
+    const scope = { state: this.#workspace, sessionId, files: new ScratchFiles(workspaceStore(sessionId)), skills: new Map<string, Skill>() };
     const agentLoop = new AgentLoop(this.#provider, tabController, this.#sidebarHub, scope);
     const run: ActiveRun = this.#activeRun = {
       runId,
@@ -908,7 +932,11 @@ export class BackgroundRuntime {
 
     let auth: ProviderAuth;
     let conversation: Conversation | null;
+    let skills: SkillContext | undefined;
     try {
+      const available = await getSkills();
+      for (const skill of available) scope.skills.set(skill.name, skill);
+      if (!retry) skills = queuedId ? queuedSkills : queuedSkills ?? await captureSkillContext(prompt!, available);
       const chatgpt = await this.#chatgpt.status();
       const credential = chatgpt.connected ? null : await getOpenAICredential();
       if (!chatgpt.connected && !credential) throw new ProviderStreamError("Sign in with ChatGPT or add an OpenAI API key in settings before starting a conversation.", "AUTHENTICATION");
@@ -943,6 +971,7 @@ export class BackgroundRuntime {
         kind: "message",
         role: "user",
         text: prompt!,
+        skills,
         context: artifact ? { artifactId: artifact.artifactId, kind: "page", title: artifact.title, url: artifact.url, capturedAt: artifact.capturedAt } : null,
         at: Date.now(),
       };
@@ -968,6 +997,9 @@ export class BackgroundRuntime {
     // its delivered steers, which are the user's guidance for this turn.
     const transcript = [...items.slice(0, userIndex + 1), ...items.slice(userIndex + 1).filter((item) =>
       item.kind === "compaction" || (item.kind === "message" && item.role === "user"))];
+    for (const item of transcript.slice(userIndex)) {
+      if (item.kind === "message" && item.role === "user" && item.skills?.invoked) scope.skills.set(item.skills.invoked.name, item.skills.invoked);
+    }
     await this.#runAgentLoop(runId, transcript, artifact, auth);
   }
 
