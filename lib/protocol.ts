@@ -22,6 +22,7 @@ import type {
 import type { Conversation, ConversationItem, ConversationSummary, HistoryRetention, HistorySettingsV1, QueuedMessage } from "@/lib/domain/conversation";
 import { HISTORY_RETENTIONS } from "@/lib/domain/conversation";
 import type { AppSettingsV1, ChatGPTStatus, ProviderDefinition } from "@/lib/domain/provider";
+import type { RunUsageV1 } from "@/lib/domain/usage";
 import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction } from "@/lib/validation";
 
 // ---------------------------------------------------------------------------
@@ -274,6 +275,8 @@ export interface RuntimeSnapshot {
     status: "running" | "awaiting-approval" | "cancelling";
     partialAssistantText: string;
     pendingApproval: ApprovalRequest | null;
+    /** Usage of the run's provider responses so far; `null` until one reports tokens. */
+    usage: RunUsageV1 | null;
   } | null;
   lastSeq: number;
   notice: string | null;
@@ -309,6 +312,8 @@ export type SidebarEvent =
   | EventBase<"tool.result", { callId: string; result: ToolResult }>
   /** A steer reached the model; `item` is the persisted user message (`delivery: "steer"`), whose id is the queued message's. */
   | EventBase<"steer.delivered", { item: ConversationItem }>
+  /** The run's cumulative usage after a provider response. At the run's end it is persisted as the `run-usage` item `usage-<runId>`. */
+  | EventBase<"run.usage", { usage: RunUsageV1 }>
   | EventBase<"run.completed", { messageId: string }>
   | EventBase<"run.cancelled", { partialText: string; messageId: string | null }>
   | EventBase<"run.failed", NormalizedError>;

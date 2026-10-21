@@ -59,6 +59,7 @@ import type { ContextArtifact } from "@/lib/domain/tools";
 import type { Conversation, ConversationItem, ConversationSummary, QueuedMessage, UserMessageItem } from "@/lib/domain/conversation";
 import { isTurnStart, MAX_QUEUED_MESSAGES, retentionCutoff } from "@/lib/domain/conversation";
 import { buildRunDigest } from "@/lib/domain/run-digest";
+import { hasTokens, newRunUsage, type RunUsageV1 } from "@/lib/domain/usage";
 import type { AppSettingsV1, ModelDefinition, ProviderAdapter, ProviderAuth, ProviderDefinition } from "@/lib/domain/provider";
 import type {
   ApprovalRequest,
@@ -116,6 +117,8 @@ interface ActiveRun {
   status: RunLifecycleStatus;
   partialAssistantText: string;
   pendingApproval: ApprovalRequest | null;
+  /** Published and checkpointed once a provider response reports tokens. */
+  usage: RunUsageV1 | null;
   lastCheckpointAt: number;
 }
 
@@ -384,6 +387,7 @@ export class BackgroundRuntime {
             status: this.#activeRun.status,
             partialAssistantText: this.#activeRun.partialAssistantText,
             pendingApproval: this.#activeRun.pendingApproval,
+            usage: this.#activeRun.usage,
           }
         : null,
       lastSeq: this.#sidebarHub.lastSeq(),
@@ -887,6 +891,7 @@ export class BackgroundRuntime {
       status: "running",
       partialAssistantText: "",
       pendingApproval: null,
+      usage: null,
       lastCheckpointAt: 0,
     };
 
@@ -970,6 +975,11 @@ export class BackgroundRuntime {
     };
     this.#runRecord = record;
     this.#debugSessionId = run.sessionId;
+    // Pi prices each response from its bundled catalog; a model it does not
+    // list (an account-catalog model) is given zero prices, so no estimate.
+    const model = this.#provider.getModel(settings.modelId);
+    const priced = auth.method === "api-key" && model !== null && (model.cost.input > 0 || model.cost.output > 0);
+    const runUsage = newRunUsage(runId, auth.method, settings.modelId, priced);
     let coalesced = "";
     let lastFlush = Date.now();
 
@@ -998,6 +1008,16 @@ export class BackgroundRuntime {
         record.usage.cacheWrite += usage.cacheWrite;
         record.usage.totalTokens += usage.totalTokens;
         record.usage.cost += usage.cost.total;
+        runUsage.responses += 1;
+        runUsage.input += usage.input;
+        runUsage.cacheRead += usage.cacheRead;
+        runUsage.cacheWrite += usage.cacheWrite;
+        runUsage.output += usage.output;
+        runUsage.reasoning += usage.reasoning ?? 0;
+        if (runUsage.costUsd !== null) runUsage.costUsd += usage.cost.total;
+        if (this.#activeRun?.runId !== runId || !hasTokens(runUsage)) return;
+        run.usage = { ...runUsage };
+        this.#sidebarHub.publishRunEvent(runId, "run.usage", { usage: run.usage });
       },
       onToolOutput: (call, result, timing) => {
         record.toolCalls.push({
@@ -1054,13 +1074,16 @@ export class BackgroundRuntime {
     // Written after the run's last message, so a replayed digest follows the
     // answer it describes, and before the terminal event, so a run started
     // right after it sees the digest. A failed write only loses the digest.
-    const persistDigest = async () => {
+    // The run's usage follows its digest, under the id the sidebar gives the
+    // item it builds from `run.usage`; the session total counts it once the index is touched.
+    const persistDigestAndUsage = async () => {
       const digest = buildRunDigest(run.agentLoop.digestSteps(), result.status, result.status === "failed" ? result.error.message : null);
       if (digest) await appendConversationItem(run.sessionId, { id: crypto.randomUUID(), kind: "run-digest", digest, at: Date.now() }).catch(() => {});
+      if (run.usage) await appendConversationItem(run.sessionId, { id: `usage-${runId}`, kind: "run-usage", usage: run.usage, at: Date.now() }).catch(() => {});
     };
     const finish = async () => {
       await clearRunCheckpoint();
-      await touchSession(run.sessionId).catch(() => {});
+      await touchSession(run.sessionId, { usage: run.usage ?? undefined }).catch(() => {});
       this.#activeRun = null;
       // After the run slot is released, so no steer can be accepted for this run any more.
       await this.#settleSteers(run.sessionId);
@@ -1068,7 +1091,7 @@ export class BackgroundRuntime {
     };
     if (result.status === "completed") {
       const messageId = result.finalMessageId ?? (await this.#persistEmptyFinalMessage(run.sessionId));
-      await persistDigest();
+      await persistDigestAndUsage();
       this.#sidebarHub.publishRunEvent(runId, "run.completed", { messageId });
       await finish();
       await this.#dispatchFollowUp(run.sessionId);
@@ -1076,7 +1099,7 @@ export class BackgroundRuntime {
     }
     if (result.status === "cancelled") {
       const messageId = result.partialText ? await this.#persistCancelledMessage(run.sessionId, result.partialText) : null;
-      await persistDigest();
+      await persistDigestAndUsage();
       this.#sidebarHub.publishRunEvent(runId, "run.cancelled", { partialText: result.partialText, messageId });
       this.#retryable = { sessionId: run.sessionId, hadPageEffect: result.hadPageEffect };
       await finish();
@@ -1087,7 +1110,7 @@ export class BackgroundRuntime {
     // imply retry-safety once a consequential tool call has already
     // committed a real effect on the page.
     const error: NormalizedError = result.hadPageEffect ? { ...result.error, retryable: false } : result.error;
-    await persistDigest();
+    await persistDigestAndUsage();
     this.#sidebarHub.publishRunEvent(runId, "run.failed", error);
     this.#retryable = { sessionId: run.sessionId, hadPageEffect: result.hadPageEffect };
     await finish();
@@ -1134,6 +1157,7 @@ export class BackgroundRuntime {
       sessionId: run.sessionId,
       status: checkpointStatus,
       partialAssistantText,
+      usage: run.usage,
       lastSeq: this.#sidebarHub.lastSeq(),
       updatedAt: Date.now(),
     });

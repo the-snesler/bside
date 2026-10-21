@@ -38,7 +38,7 @@ lib/
     device-key.ts      Non-extractable AES-GCM device key; seals and opens stored credentials.
     device-key-store.ts  Thin IndexedDB adapter holding the device CryptoKey.
     chatgpt-browser-auth.ts  Sign-in popup; captures the loopback OAuth callback with blocking webRequest.
-  domain/              Framework-independent conversation, provider, and tool contracts; `run-digest.ts` builds and renders run digests.
+  domain/              Framework-independent conversation, provider, and tool contracts; `run-digest.ts` builds and renders run digests; `usage.ts` holds run usage and totals.
   providers/
     openai.ts          Pi OpenAI Responses adapter: request policy, cache options, safe error envelope.
     openai-models.ts   Source-controlled API-key model catalog/defaults.
@@ -46,7 +46,8 @@ lib/
     page-executor.ts   Pure DOM snapshot/action semantics used by the content script.
   ui/
     use-background.ts  Preact hook consuming the sidebar Port; renders background state.
-    turns.ts           Groups conversation items into turns and activities.
+    turns.ts           Groups conversation items into turns and activities; sums each turn's run usage.
+    usage.ts           Compact token/cost labels for turn footers and history rows.
     TurnTrace.tsx      Per-turn work trace (built on Trace.tsx).
     Composer.tsx       Slate prompt editor with tab mentions.
     Markdown.tsx       Model-text Markdown without raw HTML, remote images, or unsafe links.
@@ -75,6 +76,7 @@ wxt.config.ts          Firefox MV2 manifest, permissions, CSP, and Preact Vite s
 - The system prompt and tool definitions are a byte-stable cacheable prefix: no per-run content goes there. The attached page outline rides on the current user turn. Requests use `cacheRetention: "short"` with `sessionId` = conversation id, which Pi sends as `prompt_cache_key`.
 - Model history is rendered from session items by `renderHistory` in `agent-loop.ts`, deterministically, so earlier turns replay byte-identically across runs: user/assistant text (delivered steers as plain user messages where the model received them), each run's `run-digest` as a user-role note after its answer (newest within `DIGEST_REPLAY_CHARS`, dropped in steps), and, after a `compaction`, its summary note in place of every item before `firstKeptItemId`. Prior tool calls/results are never replayed. Digests and summaries are untrusted page-derived notes: label them so, never put them in the system prompt.
 - A run digest is built by the background from the tool ledger (sources, URLs read, bounded result excerpts, failures, confirmations), never from model text, and appended at every terminal state (rebuilt from persisted calls on interrupted-run recovery). At run start, when the estimate passes 60% of the model's `contextWindow`, older turns are summarized with Pi's `compact` through the provider adapter and persisted; on failure the run continues, leaving the oldest turns out of that request only. Compaction never deletes items; the sidebar shows an "Earlier conversation summarized" marker.
+- Usage: each run's provider-reported tokens (compaction calls included) accumulate in a `RunUsageV1`, published as `run.usage`, kept in the run checkpoint, and appended at every terminal state (on interrupted-run recovery, as checkpointed) as the `run-usage` item `usage-<runId>`, only if tokens were reported. It is never sent to the model. `costUsd` is an API-key-only estimate, summed from Pi's per-response `usage.cost` (its bundled catalog prices, long-context tiers included) and fixed at run end; ChatGPT-plan runs and models with no bundled price record `null` and show "plan usage" or tokens, never dollars. Never fetch prices. `touchSession` adds the ended run's usage to `ConversationSummary.usage` (O(1), no item rescans; missing or invalid totals read as zero). A turn's footer sums all its runs (retries, steered rounds); the history row shows the session total.
 - Runs have budgets (`DEFAULT_RUN_LIMITS` in `agent-loop.ts`: provider rounds, active wall-clock time, output tokens), checked between rounds. Exceeding one fails the run with `LIMIT_EXCEEDED` and keeps committed effects. Time awaiting confirmation does not count.
 - Conversations are sessions with opaque ids: `local:conversationIndex` lists them; each has a `conversation:<id>` record (the item count, the commit point) and 32-item `conversation:<id>:items:<n>` chunks. Appends write only the tail chunk and record, never a whole history; the index is rewritten only by session commands, pruning, and at turn boundaries, and every rewrite is pushed to all sidebars as `session.listed`. `local:openConversation` is the session the sidebar shows. Run-local replay state and full page snapshots must not enter persistent storage; run digests keep only bounded excerpts.
 - One run is active globally. It stays bound to the session it started in (`activeRun.conversationId`, run events' `conversationId`) while the user views or creates other sessions; deleting its session is refused. New chat reuses an untouched open session, and leaving an untouched session deletes it.

@@ -15,6 +15,7 @@ import Search from "~icons/tabler/search";
 import Trash from "~icons/tabler/trash";
 import type { ConversationSummary } from "@/lib/domain/conversation";
 import { MAX_SESSION_TITLE_LEN, validateSessionTitle } from "@/lib/validation";
+import { describeSessionUsage } from "@/lib/ui/usage";
 
 export interface HistoryDrawerProps {
   /** In display order, as the background lists them. */
@@ -145,6 +146,7 @@ function Row({ session, openId, run, agentTabs, now, onOpen, onRename, onPin, on
   const updated = new Date(session.updatedAt);
   const tabs = agentTabs[session.id] ?? 0;
   const tabsLabel = `${tabs} hidden ${tabs === 1 ? "tab" : "tabs"}`;
+  const usage = describeSessionUsage(session.usage);
   const confirmDelete = (closeAgentTabs: boolean) => {
     onDelete(session.id, closeAgentTabs);
     // The row goes away once the background confirms; keep focus inside the drawer.
@@ -189,6 +191,8 @@ function Row({ session, openId, run, agentTabs, now, onOpen, onRename, onPin, on
             {isOpen && " · Current"}
             {tabs > 0 && ` · ${tabsLabel}`}
             {runHere && <span class="history__status">{run!.awaitingApproval ? " · Needs confirmation" : " · Working"}</span>}
+            {/* Last, so a narrow row truncates it before the status. */}
+            {usage && <span class="history__usage" title={usage.title}>{` · ${usage.text}`}</span>}
           </span>
         </button>
       )}

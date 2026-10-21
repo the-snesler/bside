@@ -15,6 +15,8 @@ import { App } from "@/entrypoints/sidepanel/App";
 import type { ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
 import type { RuntimeSnapshot, SidebarEvent } from "@/lib/protocol";
 import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
+import { EMPTY_USAGE, type RunUsageV1 } from "@/lib/domain/usage";
+import { describeSessionUsage, describeTurnUsage, formatTokens, formatUsd } from "@/lib/ui/usage";
 
 // Slate resolves real React under Vitest, so App-level tests render without the editor and read the props it would get.
 const composer = vi.hoisted(() => ({ props: null as null | Record<string, unknown> }));
@@ -28,7 +30,7 @@ vi.mock("@/lib/ui/Composer", async (original) => ({
 
 function snapshotFor(id: string): RuntimeSnapshot {
   return {
-    conversation: { id, title: "", titleSource: "prompt", createdAt: 0, updatedAt: 0, pinned: false, itemCount: 0, lastModelId: null, items: [] },
+    conversation: { id, title: "", titleSource: "prompt", createdAt: 0, updatedAt: 0, pinned: false, itemCount: 0, lastModelId: null, usage: EMPTY_USAGE, items: [] },
     credential: { configured: true, maskedSuffix: null, chatgpt: { connected: false, email: null, signInAgain: false } },
     provider: OPENAI_PROVIDER,
     settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
@@ -141,6 +143,79 @@ describe("sidebar UI contracts", () => {
     expect(turns[0]!.answer).toEqual({ id: "a2", text: "Okay, not submitted." });
     expect(turns.map((turn) => turn.summary)).toEqual([null, null, "Newer summary"]);
     expect(turns[2]!.answer?.text).toBe("Final.");
+  });
+
+  it("sums the usage of every run that worked on a turn, across retries and steers, into that turn only", () => {
+    const usage = (runId: string, patch: Partial<RunUsageV1> = {}): ConversationItem => ({ id: `usage-${runId}`, kind: "run-usage", at: 0, usage: {
+      version: 1, runId, billing: "api-key", modelId: "gpt-5.6-terra", responses: 1, input: 1000, cacheRead: 500, cacheWrite: 0, output: 100, reasoning: 10, costUsd: 0.01, ...patch,
+    } });
+    const items: ConversationItem[] = [
+      { id: "u1", kind: "message", role: "user", text: "Find it", context: null, at: 0 },
+      usage("failed"),
+      { id: "s1", kind: "message", role: "user", text: "Only red", context: null, delivery: "steer", at: 1 },
+      { id: "a1", kind: "message", role: "assistant", text: "Found.", at: 2 },
+      usage("retry", { input: 2000, cacheRead: 0, output: 200, costUsd: 0.02 }),
+      { id: "u2", kind: "message", role: "user", text: "Follow-up", context: null, at: 3 },
+      { id: "a2", kind: "message", role: "assistant", text: "Sure.", at: 4 },
+      usage("plan", { billing: "chatgpt", costUsd: null }),
+      { id: "u3", kind: "message", role: "user", text: "No usage recorded", context: null, at: 5 },
+    ];
+    const turns = buildTurns(items, false);
+    expect(turns).toHaveLength(3);
+    expect(turns[0]!.answer?.text).toBe("Found.");
+    expect(turns[0]!.usage).toEqual({
+      responses: 2, input: 3500, cacheRead: 500, output: 300, reasoning: 20, costUsd: expect.closeTo(0.03, 10), pricedRuns: 2, planRuns: 0, unpricedRuns: 0,
+    });
+    expect(turns[1]!.usage).toMatchObject({ input: 1500, planRuns: 1, pricedRuns: 0, costUsd: 0 });
+    expect(turns[2]!.usage).toBeNull();
+  });
+
+  it("formats usage compactly: tokens, cached input, estimated dollars on the API-key path, plan usage on ChatGPT", () => {
+    expect([950, 1_234, 12_345, 99_960, 123_456, 999_600, 1_234_567].map(formatTokens)).toEqual(["950", "1.2k", "12.3k", "100k", "123k", "1M", "1.2M"]);
+    expect([0, 0.00001, 0.0004, 0.012, 0.0999, 0.43, 12.345].map(formatUsd)).toEqual(["$0.00", "<$0.0001", "$0.0004", "$0.012", "$0.10", "$0.43", "$12.35"]);
+    const totals = { ...EMPTY_USAGE, responses: 3, input: 12_300, cacheRead: 8_100, output: 1_200, reasoning: 400 };
+    const priced = describeTurnUsage({ ...totals, costUsd: 0.0123, pricedRuns: 1 });
+    expect(priced.text).toBe("12.3k in (8.1k cached) · 1.2k out · ~$0.012");
+    expect(priced.title).toBe("Input: 12,300 tokens (8,100 cached)\nOutput: 1,200 tokens (400 reasoning)\n3 responses\nEstimated cost: $0.012 at bundled list prices");
+    const plan = describeTurnUsage({ ...totals, cacheRead: 0, planRuns: 1 });
+    expect(plan.text).toBe("12.3k in · 1.2k out · plan usage");
+    expect(plan.title).not.toContain("$");
+    const unpriced = describeTurnUsage({ ...totals, unpricedRuns: 1 });
+    expect(unpriced.text).toBe("12.3k in (8.1k cached) · 1.2k out");
+    expect(unpriced.title).toContain("No price is bundled");
+    expect(describeSessionUsage(EMPTY_USAGE)).toBeNull();
+    expect(describeSessionUsage({ ...totals, costUsd: 0.43, pricedRuns: 2, planRuns: 1 })?.text).toBe("~$0.43");
+    expect(describeSessionUsage({ ...totals, input: 1_200_000, planRuns: 4 })?.text).toBe("1.2M tokens");
+  });
+
+  it("shows a turn's usage below its answer once the run ends, built live from run.usage events", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    const listeners: Array<(message: unknown) => void> = [];
+    vi.spyOn(browser.runtime, "connect").mockReturnValue({
+      postMessage: () => {},
+      onMessage: { addListener: (listener: (message: unknown) => void) => listeners.push(listener), removeListener: () => {} },
+      disconnect: () => {},
+    } as never);
+    const root = document.createElement("div");
+    document.body.append(root);
+    await act(() => render(h(App, {}), root));
+    const emit = (event: Omit<SidebarEvent, "v" | "conversationId" | "seq" | "at">) =>
+      act(() => listeners.forEach((listener) => listener({ v: 1, conversationId: "a", seq: 1, at: 5, ...event })));
+    await emit({ runId: null, type: "state.snapshot", payload: snapshotFor("a") });
+    const usage: RunUsageV1 = {
+      version: 1, runId: "r1", billing: "api-key", modelId: "gpt-5.6-terra", responses: 1, input: 4_000, cacheRead: 8_100, cacheWrite: 200, output: 1_200, reasoning: 0, costUsd: 0.0123,
+    };
+    await emit({ runId: "r1", type: "run.started", payload: { prompt: "Hello", page: null, retry: false } });
+    await emit({ runId: "r1", type: "assistant.delta", payload: { delta: "Hi." } });
+    await emit({ runId: "r1", type: "run.usage", payload: { usage } });
+    expect(root.querySelector(".turn-usage")).toBeNull();
+    await emit({ runId: "r1", type: "run.completed", payload: { messageId: "m1" } });
+    const line = root.querySelector<HTMLElement>(".turn-usage")!;
+    expect(line.textContent).toBe("12.3k in (8.1k cached) · 1.2k out · ~$0.012");
+    expect(line.title).toContain("Estimated cost: $0.012");
+    const text = root.querySelector(".timeline")!.textContent!;
+    expect(text.indexOf("Hi.")).toBeLessThan(text.indexOf("12.3k in"));
+    render(null, root);
   });
 
   it("shows an \"Earlier conversation summarized\" marker while keeping earlier turns visible", async () => {
@@ -431,7 +506,7 @@ describe("sidebar UI contracts", () => {
 describe("history drawer", () => {
   const now = Date.UTC(2026, 9, 20, 12);
   const summary = (id: string, title: string, patch: Partial<ConversationSummary> = {}): ConversationSummary => ({
-    id, title, titleSource: "prompt", createdAt: 0, updatedAt: now - 5 * 60_000, pinned: false, itemCount: 2, lastModelId: null, ...patch,
+    id, title, titleSource: "prompt", createdAt: 0, updatedAt: now - 5 * 60_000, pinned: false, itemCount: 2, lastModelId: null, usage: EMPTY_USAGE, ...patch,
   });
   let root: HTMLDivElement;
   afterEach(() => render(null, root));
@@ -470,6 +545,15 @@ describe("history drawer", () => {
     expect(row("Beta").querySelector(".history__meta")?.textContent).toBe("3d ago · Working");
     expect(labelled("Delete Beta").hasAttribute("disabled")).toBe(true);
     expect(document.activeElement).toBe(labelled("Search chats by title"));
+  });
+
+  it("shows each chat's running usage total compactly in its row", async () => {
+    const priced = { ...EMPTY_USAGE, responses: 4, input: 90_000, cacheRead: 60_000, output: 3_000, costUsd: 0.4321, pricedRuns: 2 };
+    const plan = { ...EMPTY_USAGE, responses: 9, input: 1_150_000, output: 50_000, planRuns: 3 };
+    await mount({ sessions: [summary("a", "Alpha", { usage: priced }), summary("b", "Beta", { usage: plan })] });
+    expect(row("Alpha").querySelector(".history__meta")?.textContent).toBe("5m ago · Current · ~$0.43");
+    expect(row("Beta").querySelector(".history__meta")?.textContent).toBe("5m ago · Working · 1.2M tokens");
+    expect(row("Alpha").querySelector<HTMLElement>(".history__usage")?.title).toContain("Input: 90,000 tokens (60,000 cached)");
   });
 
   it("filters by title, case-insensitively", async () => {

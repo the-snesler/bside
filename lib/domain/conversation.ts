@@ -5,6 +5,7 @@
  */
 
 import type { PageArtifactSummary, ToolCall, ToolResult } from "@/lib/domain/tools";
+import type { RunUsageV1, UsageTotals } from "@/lib/domain/usage";
 
 export type ConversationItem =
   | {
@@ -32,6 +33,8 @@ export type ConversationItem =
     }
   /** What a run did, appended when it ends; replayed to later runs as notes (see `lib/domain/run-digest.ts`). Not shown in the transcript. */
   | { id: string; kind: "run-digest"; digest: RunDigestV1; at: number }
+  /** A run's tokens and estimated cost, appended when it ends (see `lib/domain/usage.ts`). Never sent to the model. */
+  | { id: string; kind: "run-usage"; usage: RunUsageV1; at: number }
   /**
    * Model-written summary of every item before `firstKeptItemId` (a user
    * message), replacing them in later requests. The items themselves stay
@@ -101,6 +104,8 @@ export interface ConversationSummary {
   itemCount: number;
   /** Model of the latest run started in the session. */
   lastModelId: string | null;
+  /** Running total of every run's usage, added as each run ends. */
+  usage: UsageTotals;
 }
 
 export interface ConversationIndexV1 {

@@ -17,6 +17,7 @@ import { useBackground } from "@/lib/ui/use-background";
 import type { PageArtifactSummary } from "@/lib/domain/tools";
 import { TurnTrace } from "@/lib/ui/TurnTrace";
 import { buildTurns } from "@/lib/ui/turns";
+import { describeTurnUsage } from "@/lib/ui/usage";
 import { HistoryDrawer } from "@/lib/ui/HistoryDrawer";
 import { PROMPT_MENTION_PATTERN } from "@/lib/domain/conversation";
 
@@ -175,62 +176,70 @@ export function App() {
                 </p>
               ) : (
                 <ul class="timeline">
-                  {turns.map((turn, index) => (
-                    <Fragment key={turn.id}>
-                      {turn.summary !== null && (
-                        <li class="timeline__item timeline__item--summary">
-                          <details class="summary-marker">
-                            <summary class="summary-marker__line">Earlier conversation summarized</summary>
-                            <p class="summary-marker__note">
-                              bside now sees this summary instead of the turns above. They stay here and in exports.
+                  {turns.map((turn, index) => {
+                    const active = runHere && index === turns.length - 1;
+                    const usage = turn.usage && !active ? describeTurnUsage(turn.usage) : null;
+                    return (
+                      <Fragment key={turn.id}>
+                        {turn.summary !== null && (
+                          <li class="timeline__item timeline__item--summary">
+                            <details class="summary-marker">
+                              <summary class="summary-marker__line">Earlier conversation summarized</summary>
+                              <p class="summary-marker__note">
+                                bside now sees this summary instead of the turns above. They stay here and in exports.
+                              </p>
+                              <Markdown text={turn.summary} />
+                            </details>
+                          </li>
+                        )}
+                        {turn.prompt && (
+                          <li class="timeline__item timeline__item--user">
+                            <p class="timeline__text">
+                              {parsePromptMentions(turn.prompt.text).map((segment) =>
+                                segment.kind === "text" ? (
+                                  segment.text
+                                ) : segment.agentTab ? (
+                                  <span class="tab-mention" title={segment.url}>
+                                    @{segment.label}
+                                  </span>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    class="tab-mention tab-mention--link"
+                                    title={`Switch to ${segment.url}`}
+                                    onClick={() => focusTab(segment.tabId)}
+                                  >
+                                    @{segment.label}
+                                  </button>
+                                ),
+                              )}
                             </p>
-                            <Markdown text={turn.summary} />
-                          </details>
-                        </li>
-                      )}
-                      {turn.prompt && (
-                        <li class="timeline__item timeline__item--user">
-                          <p class="timeline__text">
-                            {parsePromptMentions(turn.prompt.text).map((segment) =>
-                              segment.kind === "text" ? (
-                                segment.text
-                              ) : segment.agentTab ? (
-                                <span class="tab-mention" title={segment.url}>
-                                  @{segment.label}
-                                </span>
-                              ) : (
-                                <button
-                                  type="button"
-                                  class="tab-mention tab-mention--link"
-                                  title={`Switch to ${segment.url}`}
-                                  onClick={() => focusTab(segment.tabId)}
-                                >
-                                  @{segment.label}
-                                </button>
-                              ),
-                            )}
-                          </p>
-                        </li>
-                      )}
-                      {(turn.steps.length > 0 ||
-                        (runHere && index === turns.length - 1)) && (
-                        <li class="timeline__item timeline__item--work">
-                          <TurnTrace
-                            turn={turn}
-                            active={runHere && index === turns.length - 1}
-                            pendingApproval={pendingApproval}
-                            onApprove={approveAction}
-                            onDeny={denyAction}
-                          />
-                        </li>
-                      )}
-                      {turn.answer && (
-                        <li class="timeline__item timeline__item--assistant">
-                          <Markdown text={turn.answer.text} />
-                        </li>
-                      )}
-                    </Fragment>
-                  ))}
+                          </li>
+                        )}
+                        {(turn.steps.length > 0 || active) && (
+                          <li class="timeline__item timeline__item--work">
+                            <TurnTrace
+                              turn={turn}
+                              active={active}
+                              pendingApproval={pendingApproval}
+                              onApprove={approveAction}
+                              onDeny={denyAction}
+                            />
+                          </li>
+                        )}
+                        {turn.answer && (
+                          <li class="timeline__item timeline__item--assistant">
+                            <Markdown text={turn.answer.text} />
+                          </li>
+                        )}
+                        {usage && (
+                          <li class="timeline__item timeline__item--usage">
+                            <p class="turn-usage" title={usage.title}>{usage.text}</p>
+                          </li>
+                        )}
+                      </Fragment>
+                    );
+                  })}
                   {runHere && activeRun.partialAssistantText && (
                     <li class="timeline__item timeline__item--assistant timeline__item--streaming">
                       <Markdown text={activeRun.partialAssistantText} />

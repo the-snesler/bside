@@ -35,6 +35,7 @@ import {
   workspaceStore,
 } from "@/lib/storage";
 import { titleFromPrompt, type ConversationItem } from "@/lib/domain/conversation";
+import { EMPTY_USAGE, type RunUsageV1 } from "@/lib/domain/usage";
 
 const message = (id: string, text = id): ConversationItem => ({ id, kind: "message", role: "assistant", text, at: 1 });
 const prompt = (id: string, text: string): ConversationItem => ({ id, kind: "message", role: "user", text, context: null, at: 1 });
@@ -45,6 +46,10 @@ async function sessionWith(count: number): Promise<string> {
   for (let i = 0; i < count; i += 1) await appendConversationItem(id, message(`m${i}`));
   await workspaceStore(id).write({ slot: 63, path: "/workspace/notes.md", content: "Scratch" });
   return id;
+}
+
+function runUsage(patch: Partial<RunUsageV1> = {}): RunUsageV1 {
+  return { version: 1, runId: "run-1", billing: "api-key", modelId: "gpt-5.6-terra", responses: 1, input: 0, cacheRead: 0, cacheWrite: 0, output: 0, reasoning: 0, costUsd: 0, ...patch };
 }
 
 beforeEach(() => {
@@ -113,7 +118,7 @@ describe("storage: malformed-version rejection", () => {
   });
 
   it("discards a run checkpoint with an invalid session id", async () => {
-    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: "../escape", status: "running", partialAssistantText: "", lastSeq: 0, updatedAt: 1 });
+    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: "../escape", status: "running", partialAssistantText: "", usage: null, lastSeq: 0, updatedAt: 1 });
     expect(await getRunCheckpoint()).toBeNull();
   });
 });
@@ -370,6 +375,37 @@ describe("storage: sessions", () => {
     expect((await listSessions())[0]?.itemCount).toBe(3);
   });
 
+  it("adds each ended run's usage to the session total, kept across reads and revalidated", async () => {
+    const id = await sessionWith(0);
+    expect((await listSessions())[0]?.usage).toEqual(EMPTY_USAGE);
+    await touchSession(id, { usage: runUsage({ runId: "r1", input: 1000, cacheRead: 3000, cacheWrite: 500, output: 200, reasoning: 50, costUsd: 0.01 }) });
+    await touchSession(id, { usage: runUsage({ runId: "r2", billing: "chatgpt", input: 100, output: 10, costUsd: null }) });
+    await touchSession(id, { usage: runUsage({ runId: "r3", modelId: "account-model", input: 10, output: 1, costUsd: null }) });
+    await touchSession(id);
+    expect((await listSessions())[0]?.usage).toEqual({
+      responses: 3, input: 4610, cacheRead: 3000, output: 211, reasoning: 50, costUsd: 0.01, pricedRuns: 1, planRuns: 1, unpricedRuns: 1,
+    });
+
+    // An entry written before totals existed, or with corrupt ones, is kept and counts from zero.
+    const { conversationIndex } = await browser.storage.local.get("conversationIndex") as { conversationIndex: { sessions: Record<string, unknown>[] } };
+    const { usage: _usage, ...legacy } = conversationIndex.sessions[0]!;
+    const other = { ...legacy, id: "other", usage: { input: -1 } };
+    await browser.storage.local.set({ conversationIndex: { version: 1, sessions: [legacy, other] } });
+    expect(await listSessions()).toEqual(expect.arrayContaining([expect.objectContaining({ id, usage: EMPTY_USAGE }), expect.objectContaining({ id: "other", usage: EMPTY_USAGE })]));
+  });
+
+  it("stores run-usage items and sums them when rebuilding a corrupt index", async () => {
+    const id = await sessionWith(1);
+    const usage = runUsage({ input: 900, cacheRead: 100, output: 50, costUsd: 0.002 });
+    await appendConversationItem(id, { id: "usage-run-1", kind: "run-usage", usage, at: 2 });
+    expect((await getConversation(id))?.items.at(-1)).toEqual({ id: "usage-run-1", kind: "run-usage", usage, at: 2 });
+    await browser.storage.local.set({ conversationIndex: "corrupt" });
+    expect((await listSessions())[0]?.usage).toMatchObject({ input: 1000, cacheRead: 100, output: 50, costUsd: 0.002, pricedRuns: 1 });
+    // A malformed usage item invalidates its chunk like any other malformed item.
+    await appendConversationItem(id, { id: "bad", kind: "run-usage", usage: { ...usage, billing: "chatgpt", costUsd: 1 }, at: 3 });
+    expect((await getConversation(id))?.items.map((item) => item.id)).toEqual([]);
+  });
+
   it("lists pinned sessions first, then by most recent activity", async () => {
     const old = await sessionWith(1);
     const pinned = await sessionWith(1);
@@ -516,7 +552,7 @@ describe("storage: legacy conversation migration", () => {
     expect(stored.conversation).toBeUndefined();
     expect(await listSessions()).toEqual([{
       id: "default", title: "Summarize @Inbox please", titleSource: "prompt", createdAt: 1, updatedAt: 50, pinned: false,
-      itemCount: items.length, lastModelId: null,
+      itemCount: items.length, lastModelId: null, usage: EMPTY_USAGE,
     }]);
     expect((await getConversation("default"))?.items).toEqual(items);
     expect(await getOpenSessionId()).toBe("default");
@@ -581,6 +617,7 @@ describe("storage: interrupted run recovery", () => {
       sessionId,
       status: "running",
       partialAssistantText: "The page says",
+      usage: null,
       lastSeq: 3,
       updatedAt: 10,
     });
@@ -601,6 +638,16 @@ describe("storage: interrupted run recovery", () => {
     expect(await getRunCheckpoint()).toBeNull();
   });
 
+  it("persists the usage an interrupted run had checkpointed and adds it to the session total", async () => {
+    const sessionId = await sessionWith(1);
+    const usage = runUsage({ runId: "run-5", input: 400, output: 40, costUsd: 0.001 });
+    await saveRunCheckpoint({ version: 2, runId: "run-5", sessionId, status: "running", partialAssistantText: "", usage, lastSeq: 2, updatedAt: 10 });
+    await recoverInterruptedRun();
+    expect((await getConversation(sessionId))?.items.slice(1).map((item) => item.kind === "run-usage" ? [item.id, item.usage] : item.kind))
+      .toEqual(["message", ["usage-run-5", usage]]);
+    expect((await listSessions())[0]?.usage).toMatchObject({ responses: 1, input: 400, output: 40, costUsd: 0.001 });
+  });
+
   it("converts a checkpoint left awaiting-approval into a visible interrupted message", async () => {
     const sessionId = await sessionWith(0);
     await saveRunCheckpoint({
@@ -609,6 +656,7 @@ describe("storage: interrupted run recovery", () => {
       sessionId,
       status: "awaiting-approval",
       partialAssistantText: "",
+      usage: null,
       lastSeq: 1,
       updatedAt: 10,
     });
@@ -622,8 +670,8 @@ describe("storage: interrupted run recovery", () => {
   it("silently clears a checkpoint that already reached a terminal status, or whose session is gone", async () => {
     const sessionId = await sessionWith(0);
     for (const checkpoint of [
-      { version: 2, runId: "run-3", sessionId, status: "completed", partialAssistantText: "", lastSeq: 1, updatedAt: 10 },
-      { version: 2, runId: "run-4", sessionId: "deleted", status: "running", partialAssistantText: "", lastSeq: 1, updatedAt: 10 },
+      { version: 2, runId: "run-3", sessionId, status: "completed", partialAssistantText: "", usage: null, lastSeq: 1, updatedAt: 10 },
+      { version: 2, runId: "run-4", sessionId: "deleted", status: "running", partialAssistantText: "", usage: null, lastSeq: 1, updatedAt: 10 },
     ] as const) {
       await saveRunCheckpoint(checkpoint);
       expect(await recoverInterruptedRun()).toBeNull();

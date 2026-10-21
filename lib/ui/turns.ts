@@ -1,5 +1,6 @@
 import { isTurnStart, type ConversationItem, type UserMessageItem } from "@/lib/domain/conversation";
 import type { ToolCall, ToolResult } from "@/lib/domain/tools";
+import { addRunUsage, EMPTY_USAGE, type UsageTotals } from "@/lib/domain/usage";
 
 export type Activity = {
   kind: "activity";
@@ -21,6 +22,8 @@ export type Turn = {
   answer: { id: string; text: string } | null;
   /** Set on the first turn the model still sees verbatim after the latest compaction: the summary of everything before it. */
   summary: string | null;
+  /** Summed usage of every run that worked on the turn (retries and steered rounds included); `null` if none recorded any. */
+  usage: UsageTotals | null;
   startedAt: number;
   endedAt: number;
 };
@@ -30,8 +33,8 @@ export type Turn = {
  * message is its answer; earlier assistant text is interim work. The active
  * turn has no answer yet because any committed text may still be followed by
  * more tool calls. A steer is a step of the turn it was sent in, never a new
- * turn. Run digests are not shown; the latest compaction marks the turn it
- * starts at, and every item stays visible.
+ * turn. Run digests are not shown; run usage is summed into its turn; the
+ * latest compaction marks the turn it starts at, and every item stays visible.
  */
 export function buildTurns(items: ConversationItem[], running: boolean): Turn[] {
   const turns: Turn[] = [];
@@ -40,6 +43,10 @@ export function buildTurns(items: ConversationItem[], running: boolean): Turn[] 
   for (const item of items) {
     if (item.kind === "run-digest" || item.kind === "compaction") continue;
     let turn = turns.at(-1);
+    if (item.kind === "run-usage") {
+      if (turn) turn.usage = addRunUsage(turn.usage ?? EMPTY_USAGE, item.usage);
+      continue;
+    }
     if (isTurnStart(item) || !turn) {
       turn = {
         id: item.id,
@@ -47,6 +54,7 @@ export function buildTurns(items: ConversationItem[], running: boolean): Turn[] 
         steps: [],
         answer: null,
         summary: compaction?.kind === "compaction" && compaction.firstKeptItemId === item.id ? compaction.summary : null,
+        usage: null,
         startedAt: item.at,
         endedAt: item.at,
       };

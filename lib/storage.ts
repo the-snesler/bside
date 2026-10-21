@@ -15,6 +15,7 @@ import type { AppSettingsV1, ModelDefinition, ReasoningEffort } from "@/lib/doma
 import type { Conversation, ConversationIndexV1, ConversationItem, ConversationSummary, HistorySettingsV1, MessageQueueV1, QueuedMessage } from "@/lib/domain/conversation";
 import { COMPACTION_SUMMARY_MAX_CHARS, HISTORY_RETENTIONS, isTurnStart, MAX_QUEUED_MESSAGES, titleFromPrompt } from "@/lib/domain/conversation";
 import { digestFromItems, isValidRunDigest } from "@/lib/domain/run-digest";
+import { addRunUsage, EMPTY_USAGE, hasTokens, isValidRunUsage, isValidUsageTotals, type RunUsageV1 } from "@/lib/domain/usage";
 import { DEFAULT_MODEL_ID, DEFAULT_REASONING_EFFORT } from "@/lib/providers/openai-models";
 import { deviceKey, type DeviceKey } from "@/lib/background/device-key";
 import { isSessionId, isWorkspacePath, validatePromptText, WORKSPACE_MAX_FILE_CHARS, WORKSPACE_MAX_FILES } from "@/lib/validation";
@@ -67,6 +68,8 @@ export interface RunCheckpointV2 {
   sessionId: string;
   status: RunStatus;
   partialAssistantText: string;
+  /** The run's usage so far; recovery persists it for an interrupted run. */
+  usage: RunUsageV1 | null;
   lastSeq: number;
   updatedAt: number;
 }
@@ -139,6 +142,7 @@ function isValidConversationItem(value: unknown): value is ConversationItem {
   if (v.kind === "tool-call") return typeof v.call === "object" && v.call !== null;
   if (v.kind === "tool-result") return typeof v.callId === "string" && typeof v.result === "object" && v.result !== null;
   if (v.kind === "run-digest") return isValidRunDigest(v.digest);
+  if (v.kind === "run-usage") return isValidRunUsage(v.usage);
   if (v.kind === "compaction") {
     return typeof v.summary === "string" && v.summary.length <= COMPACTION_SUMMARY_MAX_CHARS && typeof v.firstKeptItemId === "string" &&
       Number.isSafeInteger(v.tokensBefore) && (v.tokensBefore as number) >= 0;
@@ -155,6 +159,7 @@ function isValidRunCheckpoint(value: unknown): value is RunCheckpointV2 {
     isSessionId(v.sessionId) &&
     (RUN_STATUSES as readonly string[]).includes(v.status as string) &&
     typeof v.partialAssistantText === "string" &&
+    (v.usage === null || isValidRunUsage(v.usage)) &&
     typeof v.lastSeq === "number" &&
     typeof v.updatedAt === "number"
   );
@@ -401,7 +406,15 @@ function isValidSummary(value: unknown): value is ConversationSummary {
   return isSessionId(v.id) && typeof v.title === "string" && v.title.length <= 200 &&
     (v.titleSource === "prompt" || v.titleSource === "user") && Number.isFinite(v.createdAt) && Number.isFinite(v.updatedAt) &&
     typeof v.pinned === "boolean" && Number.isSafeInteger(v.itemCount) && (v.itemCount as number) >= 0 &&
-    (v.lastModelId === null || (typeof v.lastModelId === "string" && v.lastModelId.length <= 200));
+    (v.lastModelId === null || (typeof v.lastModelId === "string" && v.lastModelId.length <= 200)) && isValidUsageTotals(v.usage);
+}
+
+/** An index entry as stored; one written before usage totals existed, or with corrupt totals, counts from zero. */
+function readSummary(value: unknown): ConversationSummary | null {
+  if (typeof value !== "object" || value === null) return null;
+  const entry = value as Record<string, unknown>;
+  const summary = isValidUsageTotals(entry.usage) ? entry : { ...entry, usage: { ...EMPTY_USAGE } };
+  return isValidSummary(summary) ? summary : null;
 }
 
 function isValidRecord(value: unknown, id: string): value is ConversationRecordV2 {
@@ -440,9 +453,9 @@ async function readIndex(): Promise<ConversationSummary[]> {
   if (raw === null) return [];
   const index = raw as { version?: unknown; sessions?: unknown };
   if (index.version === 1 && Array.isArray(index.sessions)) {
-    const all: unknown[] = index.sessions;
+    const all = (index.sessions as unknown[]).map(readSummary);
     const sessions = all.filter((entry, i): entry is ConversationSummary =>
-      isValidSummary(entry) && all.findIndex((other) => isValidSummary(other) && other.id === entry.id) === i);
+      entry !== null && all.findIndex((other) => other?.id === entry.id) === i);
     if (sessions.length !== all.length) await writeIndex(sessions);
     return sessions;
   }
@@ -455,7 +468,7 @@ async function writeIndex(sessions: ConversationSummary[]): Promise<void> {
   await conversationIndexItem.setValue({ version: 1, sessions });
 }
 
-/** Corruption recovery only: scans every stored key, so it is O(stored data). Pins and user titles are lost. */
+/** Corruption recovery only: scans every stored key, so it is O(stored data). Pins and user titles are lost; usage totals are summed from the items. */
 async function rebuildIndex(): Promise<ConversationSummary[]> {
   const all = await storage.snapshot("local");
   const sessions: ConversationSummary[] = [];
@@ -463,9 +476,14 @@ async function rebuildIndex(): Promise<ConversationSummary[]> {
     const id = /^conversation:([A-Za-z0-9_-]{1,64})$/.exec(key)?.[1];
     if (!id || !isValidRecord(value, id)) continue;
     const first = all[`conversation:${id}:items:0`];
+    let usage = EMPTY_USAGE;
+    for (const chunk of chunkKeys(id, value.itemCount).map((chunk) => all[chunk.slice("local:".length)])) {
+      if (!isValidChunk(chunk)) break;
+      for (const item of chunk.items) if (item.kind === "run-usage") usage = addRunUsage(usage, item.usage);
+    }
     sessions.push({
       id, title: isValidChunk(first) ? firstPromptTitle(first.items) : "", titleSource: "prompt", createdAt: value.createdAt,
-      updatedAt: value.updatedAt, pinned: false, itemCount: value.itemCount, lastModelId: null,
+      updatedAt: value.updatedAt, pinned: false, itemCount: value.itemCount, lastModelId: null, usage: { ...usage },
     });
   }
   return sessions;
@@ -499,7 +517,7 @@ async function readItems(record: ConversationRecordV2): Promise<ConversationItem
 }
 
 function newSummary(id: string, now: number): ConversationSummary {
-  return { id, title: "", titleSource: "prompt", createdAt: now, updatedAt: now, pinned: false, itemCount: 0, lastModelId: null };
+  return { id, title: "", titleSource: "prompt", createdAt: now, updatedAt: now, pinned: false, itemCount: 0, lastModelId: null, usage: { ...EMPTY_USAGE } };
 }
 
 async function insertSession(sessions: ConversationSummary[]): Promise<ConversationSummary> {
@@ -576,10 +594,11 @@ export function appendConversationItem(id: string, item: ConversationItem): Prom
 
 /**
  * Refreshes a session's index entry at a turn boundary: item count and
- * `updatedAt` from its record, the run's model, and a title from the first
- * prompt unless the session already has one.
+ * `updatedAt` from its record, the run's model, a title from the first
+ * prompt unless the session already has one, and an ended run's usage added
+ * to the running total.
  */
-export function touchSession(id: string, turn: { prompt?: string; modelId?: string } = {}): Promise<void> {
+export function touchSession(id: string, turn: { prompt?: string; modelId?: string; usage?: RunUsageV1 } = {}): Promise<void> {
   return withConversationLock(async () => {
     const sessions = await readIndex();
     const index = sessions.findIndex((session) => session.id === id);
@@ -591,6 +610,7 @@ export function touchSession(id: string, turn: { prompt?: string; modelId?: stri
       itemCount: record?.itemCount ?? session.itemCount,
       updatedAt: record?.updatedAt ?? session.updatedAt,
       lastModelId: turn.modelId ?? session.lastModelId,
+      usage: turn.usage ? addRunUsage(session.usage, turn.usage) : session.usage,
       title: session.titleSource === "prompt" && !session.title && turn.prompt ? titleFromPrompt(turn.prompt) : session.title,
     };
     await writeIndex(sessions);
@@ -814,7 +834,7 @@ export async function getRunCheckpoint(): Promise<RunCheckpointV2 | null> {
   const raw: unknown = await runCheckpointItem.getValue();
   if (isValidRunCheckpoint(raw)) return raw;
   // A pre-sessions checkpoint belonged to the legacy conversation.
-  const legacy = { ...(raw as object), version: 2, sessionId: LEGACY_SESSION_ID };
+  const legacy = { ...(raw as object), version: 2, sessionId: LEGACY_SESSION_ID, usage: null };
   if ((raw as { version?: unknown } | null)?.version === 1 && isValidRunCheckpoint(legacy)) return legacy;
   if (raw !== null) await runCheckpointItem.removeValue();
   return null;
@@ -834,7 +854,8 @@ const INTERRUPTED_SUFFIX ="\n\n[Interrupted: the extension restarted before this
  * Startup recovery: a checkpoint left "running"/"awaiting-approval" means the
  * background died mid-run. Convert it into a visible interrupted assistant
  * message in the run's session rather than silently dropping it or claiming
- * stream resumption, followed by a digest of the calls it had started.
+ * stream resumption, followed by a digest of the calls it had started and
+ * the usage it had checkpointed.
  * Returns the session a run was interrupted in, if any.
  */
 export async function recoverInterruptedRun(): Promise<string | null> {
@@ -863,7 +884,10 @@ export async function recoverInterruptedRun(): Promise<string | null> {
   // The tool ledger died with the background; the persisted calls still say what the run did.
   const digest = digestFromItems((await getConversation(checkpoint.sessionId))?.items ?? []);
   if (digest) await appendConversationItem(checkpoint.sessionId, { id: `digest-${checkpoint.runId}`, kind: "run-digest", digest, at: Date.now() });
-  await touchSession(checkpoint.sessionId);
+  // Usage as of the last checkpoint; a response that ended after it is not counted.
+  const usage = checkpoint.usage && hasTokens(checkpoint.usage) ? checkpoint.usage : undefined;
+  if (usage) await appendConversationItem(checkpoint.sessionId, { id: `usage-${checkpoint.runId}`, kind: "run-usage", usage, at: Date.now() });
+  await touchSession(checkpoint.sessionId, { usage });
   await clearRunCheckpoint();
   return checkpoint.sessionId;
 }

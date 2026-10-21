@@ -18,6 +18,9 @@ import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/d
 import type { PageSnapshot } from "@/lib/domain/tools";
 import type { SidebarCommand, SidebarEvent } from "@/lib/protocol";
 import { TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
+import { buildTurns } from "@/lib/ui/turns";
+
+type ProviderUsage = NonNullable<Extract<ScriptedProviderEvent, { type: "turn.completed" }>["usage"]>;
 
 /** The open session, as the sidebar shows it; empty before any session exists. */
 async function openConversation(): Promise<{ items: ConversationItem[] }> {
@@ -243,6 +246,7 @@ describe("BackgroundRuntime: single active run", () => {
     void port.send({ v: 1, id: "1", type: "run.start", prompt: "Hello" });
     await tick();
     await port.send({ v: 1, id: "2", type: "run.start", prompt: "Second" });
+    await tick();
 
     const snapshot = await runtime.getSnapshot();
     expect(snapshot.activeRun).not.toBeNull();
@@ -832,7 +836,7 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
     await seed({ id: "u1", kind: "message", role: "user", text: "Click submit", context: null, at: 1 });
     // The checkpoint does not record effects, so a program the interrupted attempt started may have committed one.
     await seed({ id: "c1", kind: "tool-call", call: { id: "call_1", name: "browser_program", arguments: { source: click } }, at: 2 });
-    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", lastSeq: 2, updatedAt: 1 });
+    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
     const provider = new FakeProvider();
     const { runtime, port } = setup(provider);
     await runtime.initialize();
@@ -844,7 +848,7 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
   it("keeps a turn retryable across a failed retry that committed no page effect", async () => {
     await saveOpenAICredential("sk-test");
     await seed({ id: "u1", kind: "message", role: "user", text: "Read it", context: null, at: 1 });
-    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", lastSeq: 2, updatedAt: 1 });
+    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
     const provider = new FakeProvider();
     let round = 0;
     provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
@@ -947,7 +951,7 @@ describe("BackgroundRuntime: approval badge", () => {
   });
 
   it("clears a stale badge at startup while recovering an interrupted approval", async () => {
-    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "awaiting-approval", partialAssistantText: "", lastSeq: 3, updatedAt: 1 });
+    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "awaiting-approval", partialAssistantText: "", usage: null, lastSeq: 3, updatedAt: 1 });
     const { badge, texts } = fakeBadge();
     const runtime = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), approvalBadge: badge });
     await runtime.initialize();
@@ -1037,7 +1041,7 @@ describe("BackgroundRuntime: run.retry", () => {
   it("re-runs a turn interrupted by a background restart", async () => {
     await saveOpenAICredential("sk-test");
     await seed({ id: "u1", kind: "message", role: "user", text: "Before restart", context: null, at: 1 });
-    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "Half", lastSeq: 2, updatedAt: 1 });
+    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "Half", usage: null, lastSeq: 2, updatedAt: 1 });
     const provider = new FakeProvider();
     scriptedRounds(provider, [answer("After restart.")]);
     const { runtime } = setup(provider);
@@ -1485,7 +1489,7 @@ describe("BackgroundRuntime: Phase 0 integration (regression)", () => {
   it("finishes interrupted-run recovery and starts the idle sweep even when agent-tab restoration fails", async () => {
     await saveOpenAICredential("sk-test");
     await seed({ id: "u1", kind: "message", role: "user", text: "Before restart", context: null, at: 1 });
-    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", lastSeq: 2, updatedAt: 1 });
+    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
     const { api, factory } = fakeTabsApi([userTab]);
     api.tabs.query.mockRejectedValueOnce(new Error("Tabs unavailable."));
     const { clock, sweep } = manualClock();
@@ -1878,7 +1882,7 @@ describe("BackgroundRuntime: sessions", () => {
     const interrupted = await createSessionWith(prompt("u1", "Interrupted task"));
     const open = await createSessionWith(prompt("u2", "Other chat"));
     await setOpenSessionId(open);
-    await saveRunCheckpoint({ version: 2, runId: "r9", sessionId: interrupted, status: "running", partialAssistantText: "Half", lastSeq: 1, updatedAt: 1 });
+    await saveRunCheckpoint({ version: 2, runId: "r9", sessionId: interrupted, status: "running", partialAssistantText: "Half", usage: null, lastSeq: 1, updatedAt: 1 });
     const { runtime, send, snapshot, provider } = await setup(["After restart."]);
     await runtime.initialize();
 
@@ -2159,7 +2163,7 @@ describe("BackgroundRuntime: run digests and context continuity", () => {
   it("rebuilds a digest from the persisted calls of a run interrupted by a restart", async () => {
     await seed({ id: "u1", kind: "message", role: "user", text: "Before restart", context: null, at: 1 });
     await seed({ id: "t1", kind: "tool-call", call: { id: "call_1", name: "browser_program", arguments: { source: 'return await web.search("orchids");' } }, at: 2 });
-    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", lastSeq: 2, updatedAt: 1 });
+    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
     const { runtime } = setup([[{ type: "text.delta", delta: "Ok." }, done]]);
     await runtime.initialize();
     const items = (await openConversation()).items;
@@ -2379,5 +2383,140 @@ describe("BackgroundRuntime: talk while it works", () => {
     expect(provider.requests[2]!.context.messages.map((message) => message.content)).toEqual(["A", "S"]);
     expect(userTexts((await openConversation()).items)).toEqual(["A", "S"]);
     expect((await openConversation()).items.at(-1)).toMatchObject({ role: "assistant", text: "Done." });
+  });
+});
+
+describe("BackgroundRuntime: usage visibility", () => {
+  const PRICED_MODEL = { ...TEST_MODEL, cost: { input: 2, output: 12, cacheRead: 0.2, cacheWrite: 2.5 } };
+  const cost = (total: number) => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total });
+  const round = (events: ScriptedProviderEvent[], usage: Partial<ProviderUsage>): ScriptedProviderEvent[] =>
+    [...events, { type: "turn.completed", replayState: null, usage }];
+  const toolCall: ScriptedProviderEvent = { type: "tool.call", call: { id: "call_1", name: "browser_program", arguments: { source: "return 1;" } } };
+  const text = (delta: string): ScriptedProviderEvent => ({ type: "text.delta", delta });
+
+  function setup(rounds: Array<ScriptedProviderEvent[] | Error | "hang">, options: { chatgpt?: ChatGPTAuth } = {}) {
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    provider.getModel = () => PRICED_MODEL;
+    let index = 0;
+    provider.script = (signal) => {
+      const next = rounds[Math.min(index++, rounds.length - 1)]!;
+      return { [Symbol.asyncIterator]: async function* () {
+        if (next instanceof Error) throw next;
+        if (next === "hang") {
+          const { promise, reject } = Promise.withResolvers<never>();
+          signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+          await promise;
+        }
+        yield* next as ScriptedProviderEvent[];
+      } };
+    };
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory, ...options });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+    return { runtime, provider, port };
+  }
+  const usageItems = async () => (await openConversation()).items.flatMap((item) => item.kind === "run-usage" ? [item] : []);
+
+  it("persists a completed run's tokens and estimated cost after its digest, publishes it live, and totals it on the session", async () => {
+    await saveOpenAICredential("sk-test");
+    const { runtime, provider, port } = setup([
+      round([toolCall], { input: 900, cacheRead: 0, cacheWrite: 100, output: 100, reasoning: 40, cost: cost(0.003) }),
+      round([text("Done.")], { input: 100, cacheRead: 896, output: 50, cost: cost(0.001) }),
+      round([text("Again.")], { input: 10, output: 5, cost: cost(0.0001) }),
+    ]);
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hello" });
+    const items = (await openConversation()).items;
+    expect(items.map((item) => item.kind)).toEqual(["message", "tool-call", "tool-result", "message", "run-digest", "run-usage"]);
+    const runId = port.received.find((event) => event.type === "run.started")!.runId!;
+    const expected = {
+      version: 1, runId, billing: "api-key", modelId: "gpt-5.6-terra", responses: 2,
+      input: 1000, cacheRead: 896, cacheWrite: 100, output: 150, reasoning: 40, costUsd: expect.closeTo(0.004, 10),
+    };
+    expect(items.at(-1)).toEqual({ id: `usage-${runId}`, kind: "run-usage", usage: expected, at: expect.any(Number) });
+    const live = port.received.filter((event) => event.type === "run.usage");
+    expect(live.map((event) => event.type === "run.usage" && event.payload.usage.responses)).toEqual([1, 2]);
+    expect(port.received.findIndex((event) => event.type === "run.usage")).toBeLessThan(port.received.findIndex((event) => event.type === "run.completed"));
+    expect((await listSessions())[0]?.usage).toEqual({
+      responses: 2, input: 1996, cacheRead: 896, output: 150, reasoning: 40, costUsd: expect.closeTo(0.004, 10), pricedRuns: 1, planRuns: 0, unpricedRuns: 0,
+    });
+
+    // Usage items never reach the model, so later requests replay history unchanged.
+    await runtime.handleCommand({ v: 1, id: "2", type: "run.start", prompt: "Again" });
+    expect(JSON.stringify(provider.requests[2]!.context.messages)).not.toMatch(/run-usage|costUsd|usage-/);
+    expect(provider.requests[2]!.context.messages.map((message) => message.role)).toEqual(["user", "assistant", "user", "user"]);
+    // Totals keep accumulating, and a restarted background lists them from storage.
+    const restarted = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
+    await restarted.initialize();
+    const { sessions } = await restarted.handleCommand({ v: 1, id: "list", type: "session.list" });
+    expect(sessions[0]?.usage).toMatchObject({ responses: 3, input: 2006, output: 155, costUsd: expect.closeTo(0.0041, 10), pricedRuns: 2 });
+  });
+
+  it("records plan usage with no dollars on the ChatGPT path, and tokens only for a model without a bundled price", async () => {
+    const chatgpt = new ChatGPTAuth();
+    vi.spyOn(chatgpt, "status").mockResolvedValue({ connected: true, email: "user@example.test", signInAgain: false });
+    vi.spyOn(chatgpt, "models").mockResolvedValue(null);
+    vi.spyOn(chatgpt, "getAuth").mockResolvedValue({ providerId: "openai", method: "chatgpt", secret: "token" });
+    const plan = setup([round([text("Hi.")], { input: 500, output: 20, cost: cost(0.5) })], { chatgpt });
+    await plan.runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hello" });
+    expect((await usageItems())[0]?.usage).toMatchObject({ billing: "chatgpt", input: 500, output: 20, costUsd: null });
+    expect((await listSessions())[0]?.usage).toMatchObject({ planRuns: 1, pricedRuns: 0, costUsd: 0 });
+
+    fakeBrowser.reset();
+    await saveOpenAICredential("sk-test");
+    const unpriced = setup([round([text("Hi.")], { input: 500, output: 20 })]);
+    unpriced.provider.getModel = () => TEST_MODEL;
+    await unpriced.runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hello" });
+    expect((await usageItems())[0]?.usage).toMatchObject({ billing: "api-key", input: 500, costUsd: null });
+    expect((await listSessions())[0]?.usage).toMatchObject({ unpricedRuns: 1, pricedRuns: 0 });
+  });
+
+  it("persists usage for failed and cancelled runs, sums a retried turn's runs, and records nothing for a run without tokens", async () => {
+    await saveOpenAICredential("sk-test");
+    const { runtime, port } = setup([
+      round([toolCall], { input: 300, output: 30, cost: cost(0.001) }),
+      new ProviderStreamError("Rate limited.", "RATE_LIMIT"),
+      round([text("Done.")], { input: 200, output: 20, cost: cost(0.002) }),
+      round([toolCall], { input: 50, output: 5, cost: cost(0.0005) }),
+      "hang",
+    ]);
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Try" });
+    expect(port.received.some((event) => event.type === "run.failed")).toBe(true);
+    await runtime.handleCommand({ v: 1, id: "2", type: "run.retry" });
+    expect((await usageItems()).map((item) => [item.usage.input, item.usage.costUsd])).toEqual([[300, 0.001], [200, 0.002]]);
+    const turns = buildTurns((await openConversation()).items, false);
+    expect(turns).toHaveLength(1);
+    expect(turns[0]!.usage).toMatchObject({ input: 500, output: 50, costUsd: expect.closeTo(0.003, 10), pricedRuns: 2 });
+
+    const run = runtime.handleCommand({ v: 1, id: "3", type: "run.start", prompt: "Go" });
+    await tick();
+    await runtime.handleCommand({ v: 1, id: "4", type: "run.cancel", runId: (await runtime.getSnapshot()).activeRun!.runId });
+    await run;
+    expect((await usageItems()).map((item) => item.usage.input)).toEqual([300, 200, 50]);
+    expect((await listSessions())[0]?.usage).toMatchObject({ input: 550, pricedRuns: 3 });
+
+    await saveOpenAICredential("sk-test");
+    const silent = setup([[text("Hi.")]]);
+    await silent.runtime.handleCommand({ v: 1, id: "5", type: "run.start", prompt: "Quiet" });
+    expect(await usageItems()).toHaveLength(3);
+  });
+
+  it("checkpoints usage during a run, so a restart persists what the interrupted run had used", async () => {
+    await saveOpenAICredential("sk-test");
+    const { runtime } = setup([round([toolCall], { input: 700, output: 70, cost: cost(0.002) }), "hang"]);
+    void runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Long" });
+    await tick();
+    const snapshot = await runtime.getSnapshot();
+    expect(snapshot.activeRun?.usage).toMatchObject({ input: 700, responses: 1 });
+    const { runCheckpoint } = await fakeBrowser.storage.local.get("runCheckpoint") as { runCheckpoint: { usage: unknown } };
+    expect(runCheckpoint.usage).toEqual(snapshot.activeRun?.usage);
+
+    // The background dies; the next one recovers the run from its checkpoint.
+    const restarted = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
+    await restarted.initialize();
+    const runId = snapshot.activeRun!.runId;
+    expect((await openConversation()).items.at(-1)).toMatchObject({ id: `usage-${runId}`, kind: "run-usage", usage: { input: 700, costUsd: 0.002 } });
+    expect((await listSessions())[0]?.usage).toMatchObject({ input: 700, pricedRuns: 1 });
   });
 });

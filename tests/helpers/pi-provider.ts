@@ -23,7 +23,7 @@ export const TEST_MODEL: Model<"openai-responses"> = {
 export type ScriptedProviderEvent =
   | { type: "text.delta"; delta: string }
   | { type: "tool.call"; call: { id: string; name: ToolCall["name"]; arguments: Record<string, JsonValue> } }
-  | { type: "turn.completed"; replayState: JsonValue | null; usage?: Partial<Omit<AssistantMessage["usage"], "cost">> };
+  | { type: "turn.completed"; replayState: JsonValue | null; usage?: Partial<AssistantMessage["usage"]> };
 
 export function toPiStream(
   events: Iterable<ScriptedProviderEvent> | AsyncIterable<ScriptedProviderEvent>,

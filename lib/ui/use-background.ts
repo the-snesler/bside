@@ -17,6 +17,7 @@ import type { Conversation, ConversationItem, ConversationSummary } from "@/lib/
 import type { AppSettingsV1 } from "@/lib/domain/provider";
 import type { TabMention } from "@/lib/protocol";
 import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
+import { EMPTY_USAGE } from "@/lib/domain/usage";
 
 export interface BackgroundState extends RuntimeSnapshot {
   tabs: TabMention[];
@@ -53,7 +54,7 @@ export interface BackgroundActions {
 }
 
 const EMPTY_CONVERSATION: Conversation = {
-  id: "", title: "", titleSource: "prompt", createdAt: 0, updatedAt: 0, pinned: false, itemCount: 0, lastModelId: null, items: [],
+  id: "", title: "", titleSource: "prompt", createdAt: 0, updatedAt: 0, pinned: false, itemCount: 0, lastModelId: null, usage: EMPTY_USAGE, items: [],
 };
 
 const INITIAL_STATE: BackgroundState = {
@@ -210,6 +211,17 @@ function appendItem(prev: BackgroundState, conversationId: string | null, item: 
   return { ...prev.conversation, items: [...prev.conversation.items, item], ...(updatedAt === undefined ? {} : { updatedAt }) };
 }
 
+/**
+ * The ended run's usage as the `run-usage` item the background persisted
+ * under the same id, after the run's last message. A no-op when no response
+ * reported tokens.
+ */
+function endRun(prev: BackgroundState, conversationId: string | null, at: number): BackgroundState {
+  const usage = prev.activeRun?.usage;
+  const conversation = usage ? appendItem(prev, conversationId, { id: `usage-${usage.runId}`, kind: "run-usage", usage, at }) : prev.conversation;
+  return { ...prev, activeRun: null, conversation };
+}
+
 function commitPendingText(prev: BackgroundState, conversationId: string | null): BackgroundState {
   if (!prev.activeRun || !prev.activeRun.partialAssistantText) return prev;
   const message: ConversationItem = {
@@ -269,6 +281,10 @@ function applyEvent(
     });
     return;
   }
+  if (event.type === "run.usage") {
+    setState((prev) => prev.activeRun?.runId === event.runId ? { ...prev, activeRun: { ...prev.activeRun, usage: event.payload.usage } } : prev);
+    return;
+  }
   if (event.type === "run.started") {
     activeRunIdRef.current = event.runId;
     setState((prev) => {
@@ -284,7 +300,7 @@ function applyEvent(
       return {
         ...prev,
         lastError: null,
-        activeRun: { runId: event.runId as string, conversationId, status: "running", partialAssistantText: "", pendingApproval: null },
+        activeRun: { runId: event.runId as string, conversationId, status: "running", partialAssistantText: "", pendingApproval: null, usage: null },
         // A retry re-runs the turn's existing user message rather than adding one.
         conversation: event.payload.retry ? prev.conversation : appendItem(prev, conversationId, userItem, event.at),
       };
@@ -348,7 +364,7 @@ function applyEvent(
     activeRunIdRef.current = null;
     setState((prev) => {
       if (!prev.activeRun) return prev;
-      if (!prev.activeRun.partialAssistantText) return { ...prev, activeRun: null };
+      if (!prev.activeRun.partialAssistantText) return endRun(prev, event.conversationId, event.at);
       const assistantItem: ConversationItem = {
         id: event.payload.messageId,
         kind: "message",
@@ -356,7 +372,7 @@ function applyEvent(
         text: prev.activeRun.partialAssistantText,
         at: event.at,
       };
-      return { ...prev, activeRun: null, conversation: appendItem(prev, event.conversationId, assistantItem, event.at) };
+      return endRun({ ...prev, conversation: appendItem(prev, event.conversationId, assistantItem, event.at) }, event.conversationId, event.at);
     });
     return;
   }
@@ -364,7 +380,7 @@ function applyEvent(
     activeRunIdRef.current = null;
     setState((prev) => {
       if (!prev.activeRun) return prev;
-      if (!event.payload.messageId) return { ...prev, activeRun: null };
+      if (!event.payload.messageId) return endRun(prev, event.conversationId, event.at);
       const assistantItem: ConversationItem = {
         id: event.payload.messageId,
         kind: "message",
@@ -372,13 +388,13 @@ function applyEvent(
         text: `${prev.activeRun.partialAssistantText}${RUN_CANCELLED_SUFFIX}`,
         at: event.at,
       };
-      return { ...prev, activeRun: null, conversation: appendItem(prev, event.conversationId, assistantItem, event.at) };
+      return endRun({ ...prev, conversation: appendItem(prev, event.conversationId, assistantItem, event.at) }, event.conversationId, event.at);
     });
     return;
   }
   if (event.type === "run.failed") {
     activeRunIdRef.current = null;
     // Retry targets the open session, so only a failure there offers it.
-    setState((prev) => ({ ...prev, activeRun: null, lastError: event.conversationId === prev.conversation.id ? event.payload : prev.lastError }));
+    setState((prev) => ({ ...endRun(prev, event.conversationId, event.at), lastError: event.conversationId === prev.conversation.id ? event.payload : prev.lastError }));
   }
 }

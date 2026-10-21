@@ -682,6 +682,15 @@ describe("AgentLoop: history replay", () => {
     expect(later.map((message) => message.role)).toEqual(["user", "assistant", "user", "user", "assistant", "user", "user"]);
   });
 
+  it("never sends run-usage items: history renders byte-identically with or without them", async () => {
+    const usageItem = (id: string): ConversationItem => ({ id, kind: "run-usage", at: 0, usage: {
+      version: 1, runId: id, billing: "api-key", modelId: "gpt-5.6-terra", responses: 2, input: 900, cacheRead: 100, cacheWrite: 0, output: 50, reasoning: 0, costUsd: 0.002,
+    } });
+    const transcript = [user("u0", "Search orchids"), assistant("a0", "Found three."), digestItem("d0", "Orchid A"), user("u1", "Cheapest?")];
+    const withUsage = [...transcript.slice(0, 3), usageItem("x0"), transcript[3]!];
+    expect(JSON.stringify(await firstRequest(withUsage))).toBe(JSON.stringify(await firstRequest(transcript)));
+  });
+
   it("replays a delivered steer as a user message inside its turn, where it was received, without making it a turn start", async () => {
     const steerItem: ConversationItem = { id: "s0", kind: "message", role: "user", text: "Only red ones", context: null, delivery: "steer", at: 0 };
     const transcript: ConversationItem[] = [
