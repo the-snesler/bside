@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { h, render } from "preact";
 import { act } from "preact/test-utils";
 import { App } from "@/entrypoints/options/App";
-import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
+import { OPENAI_API_KEY_PROVIDER } from "@/lib/providers/openai";
 import type { CredentialRequest, HistoryRequest, SettingsRequest } from "@/lib/protocol";
 
 let root: HTMLDivElement;
@@ -20,7 +20,7 @@ async function mount(connected = false, signInAgain = false) {
       if (request.type === "history.deleteAll") { notice = `Deleted ${sessionCount} chats.`; sessionCount = 1; }
       return { v: 1, id: request.id, ok: true, settings: { version: 1, retention }, sessionCount, notice };
     }
-    if (request.type === "settings.get") return { v: 1, id: request.id, ok: true, notice: null, provider: OPENAI_PROVIDER,
+    if (request.type === "settings.get") return { v: 1, id: request.id, ok: true, notice: null, provider: OPENAI_API_KEY_PROVIDER,
       settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" } };
     if (request.type === "credentials.chatgpt.login") { connected = true; signInAgain = false; }
     if (request.type === "credentials.chatgpt.notice.dismiss") signInAgain = false;

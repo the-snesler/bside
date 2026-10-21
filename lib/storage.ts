@@ -11,7 +11,7 @@
  */
 
 import { storage } from "wxt/utils/storage";
-import type { AppSettingsV1, ModelDefinition, ReasoningEffort } from "@/lib/domain/provider";
+import { REASONING_EFFORTS, type AppSettingsV1, type ModelListing, type ReasoningEffort } from "@/lib/domain/provider";
 import type { Conversation, ConversationIndexV1, ConversationItem, ConversationSummary, HistorySettingsV1, MessageQueueV1, QueuedMessage } from "@/lib/domain/conversation";
 import { COMPACTION_SUMMARY_MAX_CHARS, HISTORY_RETENTIONS, isTurnStart, MAX_QUEUED_MESSAGES, titleFromPrompt } from "@/lib/domain/conversation";
 import { digestFromItems, isValidRunDigest } from "@/lib/domain/run-digest";
@@ -37,12 +37,16 @@ export interface OpenAICredential {
   updatedAt: number;
 }
 
-/** ChatGPT tokens sealed with the device key, plus the account's non-secret model catalog. */
+/**
+ * ChatGPT tokens sealed with the device key, plus the account's non-secret
+ * model catalog. Reasoning efforts are not stored: the background derives them
+ * from Pi's model metadata on every read, so a Pi update reaches saved catalogs.
+ */
 export interface ChatGPTCredentialV2 {
   version: 2;
   iv: string;
   ciphertext: string;
-  models: ModelDefinition[];
+  models: ModelListing[];
 }
 
 /** Set when an upgrade removed a PIN-wrapped ChatGPT credential; cleared on dismissal or sign-in. */
@@ -74,7 +78,6 @@ export interface RunCheckpointV2 {
   updatedAt: number;
 }
 
-const REASONING_EFFORTS: readonly ReasoningEffort[] = ["none", "low", "medium", "high", "xhigh", "max"];
 const RUN_STATUSES: readonly RunStatus[] = ["running", "awaiting-approval", "cancelled", "failed", "completed"];
 
 const DEFAULT_APP_SETTINGS: AppSettingsV1 = {
@@ -249,9 +252,9 @@ export async function getChatGPTCredential(): Promise<ChatGPTCredentialV2 | null
     raw.ciphertext.length > 0 && raw.ciphertext.length < 200_000 && Array.isArray(raw.models) &&
     raw.models.length > 0 && raw.models.length <= 200 && raw.models.every((model) =>
       model && typeof model.id === "string" && /^[\w.:-]{1,200}$/.test(model.id) &&
-      typeof model.name === "string" && model.name.length <= 200 && Array.isArray(model.reasoningEfforts) &&
-      model.reasoningEfforts.length > 0 && model.reasoningEfforts.every(isReasoningEffort) &&
-      isReasoningEffort(model.defaultReasoningEffort) && model.reasoningEfforts.includes(model.defaultReasoningEffort))) return raw;
+      typeof model.name === "string" && model.name.length <= 200))
+    // Records saved before efforts were derived also carry them per model; drop them.
+    return { ...raw, models: raw.models.map(({ id, name }) => ({ id, name })) };
   if (raw !== null) await chatgptCredentialItem.removeValue();
   return null;
 }

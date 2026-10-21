@@ -6,20 +6,24 @@
 
 import {
   createAssistantMessageEventStream,
+  getSupportedThinkingLevels,
   hasApi,
+  normalizeContext,
   type Api,
   type AssistantMessage,
   type Model,
 } from "@earendil-works/pi-ai";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
-import type {
-  ProviderAdapter,
-  ProviderAuth,
-  ProviderDefinition,
-  ProviderTurnRequest,
-  ModelDefinition,
+import {
+  REASONING_EFFORTS,
+  type ProviderAdapter,
+  type ProviderAuth,
+  type ProviderDefinition,
+  type ProviderTurnRequest,
+  type ModelDefinition,
+  type ModelListing,
 } from "@/lib/domain/provider";
-import { BUNDLED_CONTEXT_WINDOWS, DEFAULT_CONTEXT_WINDOW, OPENAI_PROVIDER } from "@/lib/providers/openai-models";
+import { DEFAULT_CONTEXT_WINDOW, DEFAULT_REASONING_EFFORT, OPENAI_MODELS, OPENAI_PROVIDER } from "@/lib/providers/openai-models";
 
 const REQUEST_TIMEOUT_MS = 120_000;
 const MAX_OUTPUT_TOKENS = 8192;
@@ -61,14 +65,34 @@ export class ProviderStreamError extends Error {
 
 const provider = openaiProvider();
 
+/**
+ * Adds each model's reasoning efforts from Pi's model metadata, which tracks
+ * what the API accepts (some models reject `none`). A model Pi does not list
+ * is sent without reasoning controls, so it offers only `none`.
+ */
+export function describeModels(listings: readonly ModelListing[]): ModelDefinition[] {
+  const known = provider.getModels();
+  return listings.map(({ id, name }) => {
+    const model = known.find((candidate) => candidate.id === id);
+    const levels: readonly string[] = model ? getSupportedThinkingLevels(model) : ["off"];
+    const supported = REASONING_EFFORTS.filter((effort) => levels.includes(effort === "none" ? "off" : effort));
+    const reasoningEfforts = supported.length ? supported : ["none" as const];
+    return { id, name, reasoningEfforts,
+      defaultReasoningEffort: reasoningEfforts.includes(DEFAULT_REASONING_EFFORT) ? DEFAULT_REASONING_EFFORT : reasoningEfforts[0]! };
+  });
+}
+
+/** The API-key provider definition. */
+export const OPENAI_API_KEY_PROVIDER: ProviderDefinition = { ...OPENAI_PROVIDER, models: describeModels(OPENAI_MODELS) };
+
 export class OpenAIProvider implements ProviderAdapter {
-  readonly definition: ProviderDefinition = OPENAI_PROVIDER;
+  readonly definition: ProviderDefinition = OPENAI_API_KEY_PROVIDER;
   #resolveAuth: (auth: ProviderAuth, signal: AbortSignal) => Promise<ProviderAuth>;
-  #findModel: (id: string) => ModelDefinition | undefined;
+  #findModel: (id: string) => ModelListing | undefined;
 
   constructor(
     resolveAuth = async (auth: ProviderAuth, _signal: AbortSignal) => auth,
-    findModel: (id: string) => ModelDefinition | undefined = () => undefined,
+    findModel: (id: string) => ModelListing | undefined = () => undefined,
   ) {
     this.#resolveAuth = resolveAuth;
     this.#findModel = findModel;
@@ -80,11 +104,10 @@ export class OpenAIProvider implements ProviderAdapter {
     const accountModel = this.#findModel(modelId);
     // A server-listed model can be newer than Pi's bundled catalog. Omit
     // reasoning controls and pricing assumptions for unknown models; the
-    // context window (which only decides when history is summarized) comes
-    // from the bundled catalog or a conservative default.
+    // context window only decides when history is summarized.
     return accountModel ? {
       id: modelId, name: accountModel.name, api: "openai-responses", provider: "openai", baseUrl: API_BASE_URL,
-      reasoning: false, input: ["text", "image"], contextWindow: BUNDLED_CONTEXT_WINDOWS[modelId] ?? DEFAULT_CONTEXT_WINDOW, maxTokens: MAX_OUTPUT_TOKENS,
+      reasoning: false, input: ["text", "image"], contextWindow: DEFAULT_CONTEXT_WINDOW, maxTokens: MAX_OUTPUT_TOKENS,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, compat: { supportsStrictMode: true },
     } : null;
   }
@@ -130,7 +153,7 @@ export class OpenAIProvider implements ProviderAdapter {
         auth = await this.#resolveAuth(auth, signal);
         const source = provider.streamSimple(auth.method === "chatgpt" ? {
           ...model, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        } : model, request.context, {
+        } : model, normalizeContext(request.context), {
           apiKey: auth.secret, signal, fetch: safeFetch,
           reasoning: request.reasoningEffort === "none" ? undefined : request.reasoningEffort,
           // "short" keeps OpenAI's default in-memory prompt cache (no 24h

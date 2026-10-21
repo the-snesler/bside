@@ -10,7 +10,7 @@ import { ProviderStreamError } from "@/lib/providers/openai";
 import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
 import type { PageSnapshot, ToolCall } from "@/lib/domain/tools";
 import type { ApprovalRequest, SidebarEvent } from "@/lib/protocol";
-import { TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
+import { splitSystemMessage, TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
 
 function buildSnapshot(overrides: Partial<PageSnapshot> = {}): PageSnapshot {
   const text = 'Orchid launch moved to Friday.\n[e1 button "Submit"]';
@@ -76,7 +76,7 @@ class ScriptedProvider implements ProviderAdapter {
   getModel() { return TEST_MODEL; }
 
   streamTurn(request: ProviderTurnRequest, _auth: ProviderAuth, signal: AbortSignal) {
-    this.requests.push(request);
+    this.requests.push(splitSystemMessage(request));
     const round = this.#rounds[this.#callIndex] ?? (() => [{ type: "turn.completed", replayState: null } as ScriptedProviderEvent]);
     this.#callIndex += 1;
     try {

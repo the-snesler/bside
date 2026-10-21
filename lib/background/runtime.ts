@@ -19,8 +19,8 @@ import type { AgentTab } from "@/lib/background/browser-program";
 import type { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController } from "@/lib/background/tab-controller";
 import type { AgentTabTagV1, AgentTabTagV2, TabControllerBrowserApi } from "@/lib/background/tab-controller";
-import { decodeProviderError, OpenAIProvider, ProviderStreamError } from "@/lib/providers/openai";
-import { OPENAI_PROVIDER, DEFAULT_MODEL_ID } from "@/lib/providers/openai-models";
+import { decodeProviderError, describeModels, OPENAI_API_KEY_PROVIDER, OpenAIProvider, ProviderStreamError } from "@/lib/providers/openai";
+import { DEFAULT_MODEL_ID } from "@/lib/providers/openai-models";
 import {
   appendConversationItem,
   clearRunCheckpoint,
@@ -126,7 +126,7 @@ export class BackgroundRuntime {
   #sidebarHub: SidebarHub;
   #provider: ProviderAdapter;
   #chatgpt: ChatGPTAuth;
-  #modelCatalog: readonly ModelDefinition[] = OPENAI_PROVIDER.models;
+  #modelCatalog: readonly ModelDefinition[] = OPENAI_API_KEY_PROVIDER.models;
   #tabControllerFactory: () => TabController;
   #approvalBadge: ApprovalBadge | null;
   #activeRun: ActiveRun | null = null;
@@ -718,8 +718,10 @@ export class BackgroundRuntime {
   }
 
   async #getProviderDefinition(): Promise<ProviderDefinition> {
-    this.#modelCatalog = await this.#chatgpt.models() ?? OPENAI_PROVIDER.models;
-    return { ...OPENAI_PROVIDER, models: this.#modelCatalog };
+    // Efforts are derived on every read, so an updated Pi catalog reaches a saved account catalog.
+    const account = await this.#chatgpt.models();
+    this.#modelCatalog = account ? describeModels(account) : OPENAI_API_KEY_PROVIDER.models;
+    return { ...OPENAI_API_KEY_PROVIDER, models: this.#modelCatalog };
   }
 
   async handleSettingsRequest(request: SettingsRequest): Promise<SettingsResponse> {
@@ -739,13 +741,22 @@ export class BackgroundRuntime {
     return { v: 1, id: request.id, ok: true, settings: request.settings, provider, notice: null };
   }
 
-  /** Resets an invalid persisted model/effort combination once, surfacing a one-time notice. */
+  /**
+   * Resets an invalid persisted selection once, surfacing a one-time notice: an
+   * unsupported effort to the model's default, an unavailable model to the defaults.
+   */
   async #getValidatedSettings(): Promise<AppSettingsV1> {
     const settings = await getAppSettings();
     const provider = await this.#getProviderDefinition();
     const model = provider.models.find((candidate) => candidate.id === settings.modelId);
     if (model && (model.reasoningEfforts as readonly string[]).includes(settings.reasoningEffort)) {
       return settings;
+    }
+    if (model) {
+      const fallback: AppSettingsV1 = { ...settings, reasoningEffort: model.defaultReasoningEffort };
+      await saveAppSettings(fallback);
+      this.#notice = `${model.name} does not support "${settings.reasoningEffort}" reasoning, so it was reset to "${model.defaultReasoningEffort}".`;
+      return fallback;
     }
     const defaultModel = provider.models.find((candidate) => candidate.id === DEFAULT_MODEL_ID) ?? provider.models[0]!;
     const fallback: AppSettingsV1 = {

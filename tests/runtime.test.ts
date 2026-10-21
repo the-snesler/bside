@@ -12,12 +12,13 @@ import { ProviderStreamError } from "@/lib/providers/openai";
 import {
   saveOpenAICredential, appendConversationItem, createSession, ensureOpenSession, getConversation, getOpenAICredential, getOpenSessionId,
   listSessions, loadMessageQueue, saveHistorySettings, saveMessageQueue, saveRunCheckpoint, setOpenSessionId, updateSession,
+  getAppSettings, saveAppSettings,
 } from "@/lib/storage";
 import type { ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
 import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
 import type { PageSnapshot } from "@/lib/domain/tools";
 import type { SidebarCommand, SidebarEvent } from "@/lib/protocol";
-import { TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
+import { splitSystemMessage, TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
 import { buildTurns } from "@/lib/ui/turns";
 
 type ProviderUsage = NonNullable<Extract<ScriptedProviderEvent, { type: "turn.completed" }>["usage"]>;
@@ -187,7 +188,7 @@ class FakeProvider implements ProviderAdapter {
   getModel() { return TEST_MODEL; }
 
   streamTurn(request: ProviderTurnRequest, _auth: ProviderAuth, signal: AbortSignal) {
-    this.requests.push(request);
+    this.requests.push(splitSystemMessage(request));
     const events = typeof this.script === "function" ? this.script(signal) : this.script;
     return toPiStream(events, signal);
   }
@@ -423,7 +424,7 @@ describe("BackgroundRuntime: credential and settings changes from the options pa
   function subscription(failing = false) {
     const auth = new ChatGPTAuth();
     vi.spyOn(auth, "status").mockResolvedValue({ connected: true, email: "user@example.test", signInAgain: false });
-    vi.spyOn(auth, "models").mockResolvedValue([{ id: "account-model", name: "Account model", reasoningEfforts: ["none"], defaultReasoningEffort: "none" }]);
+    vi.spyOn(auth, "models").mockResolvedValue([{ id: "account-model", name: "Account model" }]);
     vi.spyOn(auth, "getAuth").mockImplementation(async () => {
       if (failing) throw new ProviderStreamError("ChatGPT token exchange failed. Reconnect in settings.", "AUTHENTICATION");
       return { providerId: "openai", method: "chatgpt", secret: "test-subscription-token" };
@@ -450,6 +451,21 @@ describe("BackgroundRuntime: credential and settings changes from the options pa
       expect(value).not.toContain("test-subscription-token");
       expect(value).not.toContain("sk-test-existing-key");
     }
+  });
+
+  it("derives account models' efforts from Pi and resets only an effort the saved model does not support", async () => {
+    const auth = subscription();
+    vi.spyOn(auth, "models").mockResolvedValue([{ id: "gpt-6.1-sol", name: "GPT-6.1 Sol" }]);
+    await saveAppSettings({ version: 1, providerId: "openai", modelId: "gpt-6.1-sol", reasoningEffort: "none" });
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), chatgpt: auth, tabControllerFactory: unsupportedPageTabControllerFactory });
+    const response = await runtime.handleSettingsRequest({ v: 1, id: "get", type: "settings.get" });
+    expect(response).toMatchObject({
+      ok: true,
+      settings: { modelId: "gpt-6.1-sol", reasoningEffort: "medium" },
+      provider: { models: [{ id: "gpt-6.1-sol", reasoningEfforts: ["low", "medium", "high", "xhigh", "max"], defaultReasoningEffort: "medium" }] },
+      notice: 'GPT-6.1 Sol does not support "none" reasoning, so it was reset to "medium".',
+    });
+    expect(await getAppSettings()).toMatchObject({ modelId: "gpt-6.1-sol", reasoningEffort: "medium" });
   });
 
   it("does not fall back to the saved API key when the subscription cannot authenticate", async () => {

@@ -21,7 +21,7 @@ import type {
 } from "@/lib/domain/tools";
 import type { Conversation, ConversationItem, ConversationSummary, HistoryRetention, HistorySettingsV1, QueuedMessage } from "@/lib/domain/conversation";
 import { HISTORY_RETENTIONS } from "@/lib/domain/conversation";
-import type { AppSettingsV1, ChatGPTStatus, ProviderDefinition } from "@/lib/domain/provider";
+import { REASONING_EFFORTS, type AppSettingsV1, type ChatGPTStatus, type ProviderDefinition } from "@/lib/domain/provider";
 import type { RunUsageV1 } from "@/lib/domain/usage";
 import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction } from "@/lib/validation";
 
@@ -421,5 +421,5 @@ export function isAppSettings(value: unknown): value is AppSettingsV1 {
   const settings = value as AppSettingsV1;
   return Object.keys(value).length === 4 && settings.version === 1 && settings.providerId === "openai" &&
     typeof settings.modelId === "string" && /^[\w.:-]{1,200}$/.test(settings.modelId) &&
-    ["none", "low", "medium", "high", "xhigh", "max"].includes(settings.reasoningEffort);
+    REASONING_EFFORTS.includes(settings.reasoningEffort);
 }

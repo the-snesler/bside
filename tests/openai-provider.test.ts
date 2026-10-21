@@ -77,12 +77,23 @@ describe("OpenAIProvider Pi adapter", () => {
     expect(provider.getModel("missing")).toBeNull();
   });
 
-  it("gives account-catalog models outside Pi's catalog a bundled or conservative context window", async () => {
+  it("gives account-catalog models outside Pi's catalog a conservative context window and no reasoning controls", async () => {
     const { OpenAIProvider } = await import("@/lib/providers/openai");
-    const account = (id: string) => ({ id, name: id, reasoningEfforts: ["medium" as const], defaultReasoningEffort: "medium" as const });
-    const provider = new OpenAIProvider(undefined, account);
-    expect(provider.getModel("gpt-5.6-sol")?.contextWindow).toBe(272_000);
-    expect(provider.getModel("gpt-future-1")?.contextWindow).toBe(128_000);
+    const provider = new OpenAIProvider(undefined, (id) => ({ id, name: id }));
+    expect(provider.getModel("gpt-5.6-terra")).toBe(MODEL);
+    expect(provider.getModel("gpt-future-1")).toMatchObject({ contextWindow: 128_000, reasoning: false });
+  });
+
+  it("sends Pi a normalized transcript with the system prompt and tools in a leading system message", async () => {
+    let context: unknown;
+    streamSimpleMock.mockImplementation((_model, received) => {
+      context = received;
+      return completedStream();
+    });
+    const { OpenAIProvider } = await import("@/lib/providers/openai");
+    await collect(new OpenAIProvider().streamTurn(request(), AUTH, new AbortController().signal));
+    expect(context).toMatchObject({ messages: [{ role: "system", content: "policy" }, { role: "user", content: "Hello" }] });
+    expect(context).not.toHaveProperty("systemPrompt");
   });
 
   it("preserves request privacy, retry, cache, token, and sequential-call policy", async () => {

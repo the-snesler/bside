@@ -14,7 +14,7 @@ import type { HistoryDrawerProps } from "@/lib/ui/HistoryDrawer";
 import { App } from "@/entrypoints/sidepanel/App";
 import type { ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
 import type { RuntimeSnapshot, SidebarEvent } from "@/lib/protocol";
-import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
+import { OPENAI_API_KEY_PROVIDER } from "@/lib/providers/openai";
 import { EMPTY_USAGE, type RunUsageV1 } from "@/lib/domain/usage";
 import { describeSessionUsage, describeTurnUsage, formatTokens, formatUsd } from "@/lib/ui/usage";
 
@@ -32,7 +32,7 @@ function snapshotFor(id: string): RuntimeSnapshot {
   return {
     conversation: { id, title: "", titleSource: "prompt", createdAt: 0, updatedAt: 0, pinned: false, itemCount: 0, lastModelId: null, usage: EMPTY_USAGE, items: [] },
     credential: { configured: true, maskedSuffix: null, chatgpt: { connected: false, email: null, signInAgain: false } },
-    provider: OPENAI_PROVIDER,
+    provider: OPENAI_API_KEY_PROVIDER,
     settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
     page: null, agentTabs: {}, queue: [], activeRun: null, lastSeq: 0, notice: null,
   };

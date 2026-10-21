@@ -1,8 +1,11 @@
 import {
+  contentText,
   createAssistantMessageEventStream,
+  getInitialSystemMessage,
   type AssistantMessage,
   type Model,
 } from "@earendil-works/pi-ai";
+import type { ProviderTurnRequest } from "@/lib/domain/provider";
 import type { JsonValue, ToolCall } from "@/lib/domain/tools";
 import { encodeProviderErrorMessage, ProviderStreamError } from "@/lib/providers/openai";
 
@@ -19,6 +22,16 @@ export const TEST_MODEL: Model<"openai-responses"> = {
   maxTokens: 128_000,
   compat: { supportsStrictMode: true },
 };
+
+/**
+ * The request as tests inspect it: Pi carries the system prompt and tools in a
+ * leading system message, split back out here so `messages` is the conversation.
+ */
+export function splitSystemMessage(request: ProviderTurnRequest): ProviderTurnRequest {
+  const system = getInitialSystemMessage(request.context.messages);
+  if (!system) return request;
+  return { ...request, context: { systemPrompt: contentText(system.content), tools: system.toolsAdded ?? [], messages: request.context.messages.slice(1) } };
+}
 
 export type ScriptedProviderEvent =
   | { type: "text.delta"; delta: string }

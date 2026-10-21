@@ -173,6 +173,15 @@ describe("storage: API key encryption at rest", () => {
   });
 });
 
+describe("storage: ChatGPT model catalog", () => {
+  it("reads a catalog saved with per-model efforts as plain listings, so efforts come from Pi", async () => {
+    const sealed = { version: 2, iv: "B".repeat(16), ciphertext: "C".repeat(64) };
+    await browser.storage.local.set({ chatgptCredential: { ...sealed,
+      models: [{ id: "gpt-6.1-sol", name: "GPT-6.1 Sol", reasoningEfforts: ["none"], defaultReasoningEffort: "none" }] } });
+    expect(await getChatGPTCredential()).toEqual({ ...sealed, models: [{ id: "gpt-6.1-sol", name: "GPT-6.1 Sol" }] });
+  });
+});
+
 describe("storage: credential migration", () => {
   const legacyApiKey = { version: 1, apiKey: "sk-test-legacy-plaintext", updatedAt: 5 };
   const legacyChatGPT = { version: 1, salt: "A".repeat(24), iv: "B".repeat(16), ciphertext: "C".repeat(64),

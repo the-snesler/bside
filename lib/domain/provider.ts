@@ -10,6 +10,8 @@ export type ProviderId = "openai";
 
 export type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 
+export const REASONING_EFFORTS: readonly ReasoningEffort[] = ["none", "low", "medium", "high", "xhigh", "max"];
+
 export type ProviderAuth = { providerId: "openai"; method: "api-key" | "chatgpt"; secret: string };
 
 export interface ChatGPTStatus {
@@ -27,9 +29,13 @@ export interface AppSettingsV1 {
   reasoningEffort: ReasoningEffort;
 }
 
-export interface ModelDefinition {
+/** A model as a catalog lists it; the background adds its reasoning efforts from Pi's model metadata. */
+export interface ModelListing {
   id: string;
   name: string;
+}
+
+export interface ModelDefinition extends ModelListing {
   reasoningEfforts: readonly ReasoningEffort[];
   defaultReasoningEffort: ReasoningEffort;
 }

@@ -1,7 +1,6 @@
 /** OAuth and the device-key-sealed tokens live only in the persistent background page. */
 import { createLocalJWKSet, jwtVerify, type JSONWebKeySet } from "jose";
-import type { ChatGPTStatus, ModelDefinition, ProviderAuth } from "@/lib/domain/provider";
-import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
+import type { ChatGPTStatus, ModelListing, ProviderAuth } from "@/lib/domain/provider";
 import { ProviderStreamError } from "@/lib/providers/openai";
 import { FirefoxChatGPTAuthBrowser, type ChatGPTAuthBrowser } from "@/lib/background/chatgpt-browser-auth";
 import { deviceKey, type DeviceKey } from "@/lib/background/device-key";
@@ -65,7 +64,7 @@ export class ChatGPTAuth {
     return { connected: credential !== null, email: credential?.email ?? null, signInAgain: await hasChatGPTSignInNotice() };
   }
 
-  async models(): Promise<ModelDefinition[] | null> {
+  async models(): Promise<ModelListing[] | null> {
     if (!await this.#load()) return null;
     return (await getChatGPTCredential())?.models ?? null;
   }
@@ -240,25 +239,23 @@ export class ChatGPTAuth {
     return { subject: payload.sub, email: typeof payload.email === "string" ? payload.email : null };
   }
 
-  async #loadModels(accessToken: string): Promise<ModelDefinition[]> {
+  async #loadModels(accessToken: string): Promise<ModelListing[]> {
     const response = await this.#request(`${RESOURCE}/models`, { headers: { Authorization: `Bearer ${accessToken}` } });
     if (!response.ok) throw new ProviderStreamError("Could not load models for this ChatGPT account.", "AUTHENTICATION", response.status);
     const catalog = await response.json() as { models?: unknown };
     if (!Array.isArray(catalog.models)) throw new ProviderStreamError("ChatGPT returned an invalid model catalog.", "AUTHENTICATION");
-    const models = catalog.models.flatMap((entry: unknown): ModelDefinition[] => {
+    const models = catalog.models.flatMap((entry: unknown): ModelListing[] => {
       if (!entry || typeof entry !== "object") return [];
       const model = entry as Record<string, unknown>;
       if (model.visibility !== "list" || typeof model.slug !== "string" || !/^[\w.:-]{1,200}$/.test(model.slug) ||
         typeof model.display_name !== "string" || model.display_name.length > 200) return [];
-      const known = OPENAI_PROVIDER.models.find((candidate) => candidate.id === model.slug);
-      return [{ id: model.slug, name: model.display_name, reasoningEfforts: known?.reasoningEfforts ?? ["none"],
-        defaultReasoningEffort: known?.defaultReasoningEffort ?? "none" }];
+      return [{ id: model.slug, name: model.display_name }];
     }).slice(0, 200);
     if (!models.length) throw new ProviderStreamError("No models are available for this ChatGPT account.", "AUTHENTICATION");
     return models;
   }
 
-  async #save(credential: ChatGPTCredential, models: ModelDefinition[]): Promise<void> {
+  async #save(credential: ChatGPTCredential, models: ModelListing[]): Promise<void> {
     const sealed = await this.#deviceKey.seal(JSON.stringify(credential), ENCRYPTION_CONTEXT);
     await saveChatGPTCredential({ version: 2, ...sealed, models });
   }
