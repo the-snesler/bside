@@ -5,6 +5,7 @@ import { isSkill, renderSkillCatalog, skillCatalog, type Skill } from "@/lib/dom
 import { isSidebarCommand, isSkillsRequest } from "@/lib/protocol";
 
 const skill: Skill = { name: "research", description: "Research a topic", body: "Read sources carefully." };
+const packaged = [...BUILTIN_SKILLS];
 const save = (value: Skill) => handleSkillsRequest({ v: 1, id: value.name, type: "skills.save", skill: value });
 
 beforeEach(() => { fakeBrowser.reset(); });
@@ -36,18 +37,18 @@ describe("skill contracts", () => {
 
 describe("background-owned skills", () => {
   it("lists, creates, updates, and deletes skills", async () => {
-    expect(await getSkills()).toEqual([]);
+    expect(await getSkills()).toEqual(packaged);
     expect((await save(skill)).ok).toBe(true);
     expect((await save({ ...skill, body: "Updated" })).ok).toBe(true);
-    expect(await getSkills()).toEqual([{ ...skill, body: "Updated" }]);
-    expect(await handleSkillsRequest({ v: 1, id: "list", type: "skills.list" })).toEqual({ v: 1, id: "list", ok: true, skills: [{ ...skill, body: "Updated" }], builtinNames: [] });
+    expect(await getSkills()).toEqual([...packaged, { ...skill, body: "Updated" }]);
+    expect(await handleSkillsRequest({ v: 1, id: "list", type: "skills.list" })).toEqual({ v: 1, id: "list", ok: true, skills: [...packaged, { ...skill, body: "Updated" }], builtinNames: packaged.map((item) => item.name) });
     expect((await handleSkillsRequest({ v: 1, id: "delete", type: "skills.delete", name: skill.name })).ok).toBe(true);
-    expect(await getSkills()).toEqual([]);
+    expect(await getSkills()).toEqual(packaged);
   });
 
   it("serializes concurrent changes without losing records", async () => {
     await Promise.all(Array.from({ length: 32 }, (_, i) => save({ ...skill, name: `skill-${i}` })));
-    expect(await getSkills()).toHaveLength(32);
+    expect(await getSkills()).toHaveLength(32 + packaged.length);
     expect((await save({ ...skill, name: "skill-0", body: "Updated" })).ok).toBe(true);
     await Promise.all([
       handleSkillsRequest({ v: 1, id: "delete", type: "skills.delete", name: "skill-0" }),
@@ -60,12 +61,12 @@ describe("background-owned skills", () => {
   it("revalidates corrupt records and strips unknown fields", async () => {
     for (const value of [null, [], "bad", { version: 2, skills: [skill] }, { version: 1, skills: {} }]) {
       await storage.setItem("local:skills", value);
-      expect(await getSkills()).toEqual([]);
+      expect(await getSkills()).toEqual(packaged);
     }
     await storage.setItem("local:skills", { version: 1, skills: [null, { ...skill, body: "" }, { ...skill, extra: "discard" }, skill] });
-    expect(await getSkills()).toEqual([skill]);
+    expect(await getSkills()).toEqual([...packaged, skill]);
     await storage.setItem("local:skills", { version: 1, skills: Array.from({ length: 100 }, (_, i) => ({ ...skill, name: `skill-${i}` })) });
-    expect(await getSkills()).toHaveLength(100);
+    expect(await getSkills()).toHaveLength(100 + packaged.length);
   });
 
   it("protects packaged skills against shadowing, saves, and deletion", async () => {
@@ -73,7 +74,7 @@ describe("background-owned skills", () => {
     builtins.push(skill);
     try {
       await storage.setItem("local:skills", { version: 1, skills: [{ ...skill, body: "Shadow" }] });
-      expect(await getSkills()).toEqual([skill]);
+      expect(await getSkills()).toEqual([...packaged, skill]);
       expect((await save(skill)).ok).toBe(false);
       expect((await handleSkillsRequest({ v: 1, id: "delete", type: "skills.delete", name: skill.name })).ok).toBe(false);
     } finally { builtins.pop(); }
@@ -86,7 +87,7 @@ describe("background-owned skills", () => {
       expect(result).toMatchObject({ ok: false, error: { phase: "persistence", retryable: true } });
       expect(JSON.stringify(result)).not.toContain("private storage detail");
       expect((await save(skill)).ok).toBe(true);
-      expect(await getSkills()).toEqual([skill]);
+      expect(await getSkills()).toEqual([...packaged, skill]);
     } finally { write.mockRestore(); }
   });
 });

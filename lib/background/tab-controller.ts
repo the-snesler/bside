@@ -16,9 +16,11 @@ import type {
   PageResponse,
   PageSearchResultsRequest,
   PageSnapshotRequest,
+  PageYouTubeRequest,
 } from "@/lib/protocol";
 import type { DomAction, PageArtifactSummary, PageErrorCode, PageFindResult, PageSnapshot, SearchResult, ToolResult } from "@/lib/domain/tools";
 import { isSessionId, validateHttpUrl } from "@/lib/validation";
+import { isYouTubeResult, type YouTubeRequest, type YouTubeResult } from "@/lib/domain/youtube";
 
 const NAVIGATION_TIMEOUT_MS = 10_000;
 const PROBE_DELAYS_MS = [100, 200, 400, 800, 1_600, 3_200];
@@ -226,6 +228,11 @@ export class TabController {
     return this.#request(this.#tabId, { type: "page.search-results", tabId: this.#tabId }, "page.search-results");
   }
 
+  async youtube(request: YouTubeRequest): Promise<PageOutcome<YouTubeResult>> {
+    if (this.#tabId === null) return pageError("TAB_CHANGED", "No tab is bound.");
+    return this.#request(this.#tabId, { type: "page.youtube", tabId: this.#tabId, request }, "page.youtube");
+  }
+
   /** Forwards one DOM action. A click/press that tears down the document settles like a navigation instead of repeating. */
   async act(action: DomAction): Promise<ActionOutcome> {
     const tabId = this.#tabId;
@@ -285,8 +292,8 @@ export class TabController {
 
   async #request<T>(
     tabId: number,
-    body: Omit<PageSnapshotRequest, "v" | "id"> | Omit<PageFindRequest, "v" | "id"> | Omit<PageSearchResultsRequest, "v" | "id">,
-    type: "page.snapshot" | "page.find" | "page.search-results",
+    body: Omit<PageSnapshotRequest, "v" | "id"> | Omit<PageFindRequest, "v" | "id"> | Omit<PageSearchResultsRequest, "v" | "id"> | Omit<PageYouTubeRequest, "v" | "id">,
+    type: "page.snapshot" | "page.find" | "page.search-results" | "page.youtube",
   ): Promise<PageOutcome<T>> {
     const request = { v: 1, id: crypto.randomUUID(), ...body };
     let response: PageResponse | undefined;
@@ -298,6 +305,10 @@ export class TabController {
     if (!response) return pageError("TAB_CHANGED", "The page did not respond.");
     if (!response.ok) return { ok: false, error: response.error };
     if (response.type !== type) return pageError("TAB_CHANGED", "Unexpected response from the page.");
+    if (response.type === "page.youtube") {
+      if (!isYouTubeResult(response.result)) return pageError("TAB_CHANGED", "Invalid or oversized YouTube response.");
+      return { ok: true, value: response.result as T };
+    }
     if (response.type === "page.snapshot") return { ok: true, value: response.snapshot as T };
     if (response.type === "page.find") return { ok: true, value: response.result as T };
     if (response.type === "page.search-results") return { ok: true, value: { results: response.results, url: response.url, excerpt: response.excerpt } as T };

@@ -24,11 +24,34 @@ import { HISTORY_RETENTIONS } from "@/lib/domain/conversation";
 import { REASONING_EFFORTS, type AppSettingsV1, type ChatGPTStatus, type ProviderDefinition } from "@/lib/domain/provider";
 import type { RunUsageV1 } from "@/lib/domain/usage";
 import { isSkill, isSkillName, type Skill, type SkillSummary } from "@/lib/domain/skills";
+import { isYouTubeRequest, type YouTubeRequest, type YouTubeResult } from "@/lib/domain/youtube";
 import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction } from "@/lib/validation";
 
 // ---------------------------------------------------------------------------
 // Content script <-> background: PageRequest / PageResponse (tabs.sendMessage)
 // ---------------------------------------------------------------------------
+
+export interface PageYouTubeRequest {
+  v: 1;
+  id: string;
+  type: "page.youtube";
+  tabId: number;
+  request: YouTubeRequest;
+}
+
+export interface PageYouTubeResponse {
+  v: 1;
+  id: string;
+  ok: true;
+  type: "page.youtube";
+  result: YouTubeResult;
+}
+
+export function isPageYouTubeRequest(value: unknown): value is PageYouTubeRequest {
+  if (!isEnvelope(value) || value.type !== "page.youtube") return false;
+  const candidate = value as Record<string, unknown>;
+  return isTabId(candidate.tabId) && isYouTubeRequest(candidate.request);
+}
 
 export const MAX_SNAPSHOT_CHARS = 40_000;
 export const MAX_FIND_QUERY_LEN = 200;
@@ -71,7 +94,7 @@ export interface PageExecuteRequest {
   action: DomAction;
 }
 
-export type PageRequest = PageHealthRequest | PageSnapshotRequest | PageFindRequest | PageSearchResultsRequest | PageExecuteRequest;
+export type PageRequest = PageHealthRequest | PageSnapshotRequest | PageFindRequest | PageSearchResultsRequest | PageExecuteRequest | PageYouTubeRequest;
 
 export interface PageHealthResponse {
   v: 1;
@@ -124,6 +147,7 @@ export interface PageErrorResponse {
 }
 
 export type PageResponse =
+  | PageYouTubeResponse
   | PageHealthResponse
   | PageSnapshotResponse
   | PageFindResponse

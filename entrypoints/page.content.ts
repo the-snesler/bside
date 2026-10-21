@@ -4,8 +4,10 @@ import {
   isPageHealthRequest,
   isPageSearchResultsRequest,
   isPageSnapshotRequest,
+  isPageYouTubeRequest,
 } from "@/lib/protocol";
 import type { PageResponse } from "@/lib/protocol";
+import { readYouTubePage } from "@/lib/tools/youtube-page";
 import {
   createElementRefRegistry,
   executeDomAction,
@@ -32,6 +34,9 @@ export default defineContentScript({
       }
       if (isPageFindRequest(message)) {
         return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.find", result: findInPage(document, registry, message.query) });
+      }
+      if (isPageYouTubeRequest(message)) {
+        return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.youtube", result: readYouTubePage(document, message.request) });
       }
       if (isPageSearchResultsRequest(message)) {
         const excerpt = (document.body?.innerText ?? "").replace(/\s+/g, " ").trim().slice(0, 600);
