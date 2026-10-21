@@ -752,10 +752,10 @@ describe("AgentLoop: compaction", () => {
   }
   const WINDOW = 40_000;
   const isSummaryRequest = (request: ProviderTurnRequest) => request.context.systemPrompt?.startsWith("You are a context summarization assistant.") === true;
-  /** `count` earlier turns of ~4k estimated tokens each, then the current prompt. */
+  /** `count` earlier turns of ~4k estimated tokens each (Pi estimates 3.5 characters per token), then the current prompt. */
   const history = (count: number): ConversationItem[] => [
     ...Array.from({ length: count }, (_, i): ConversationItem[] => [
-      { id: `u${i}`, kind: "message", role: "user", text: `Question ${i} ${"q".repeat(16_000)}`, context: null, at: i },
+      { id: `u${i}`, kind: "message", role: "user", text: `Question ${i} ${"q".repeat(14_000)}`, context: null, at: i },
       { id: `a${i}`, kind: "message", role: "assistant", text: `Answer ${i}`, at: i },
     ]).flat(),
     { id: "now", kind: "message", role: "user", text: "And the latest?", context: null, at: 100 },
@@ -857,6 +857,68 @@ describe("AgentLoop: compaction", () => {
     expect(result).toEqual({ status: "cancelled", partialText: "", hadPageEffect: false });
     expect(items).toEqual([]);
     expect(provider.requests).toHaveLength(1);
+  });
+
+  it("does not save a summary cut off at the output limit, though its tokens count", async () => {
+    const provider = new WindowProvider([
+      () => [{ type: "text.delta", delta: "## Goal\nOrchid res" }, { type: "turn.completed", replayState: null, usage: { output: 8192 }, stopReason: "length" }],
+      answer,
+    ], WINDOW);
+    const { result, items, usage } = await run(provider, history(8));
+    expect(result.status).toBe("completed");
+    expect(items.some((item) => item.kind === "compaction")).toBe(false);
+    expect(usage[0]).toBe(8192);
+    expect(provider.requests[1]!.context.messages).toHaveLength(17);
+  });
+
+  it("folds the previous summary into the next one, as the first summarized message", async () => {
+    const provider = new WindowProvider([
+      () => [{ type: "text.delta", delta: "## Goal\nTulips, then orchids." }, { type: "turn.completed", replayState: null }],
+      answer,
+    ], WINDOW);
+    const items = history(12);
+    items.splice(items.length - 1, 0, { id: "c1", kind: "compaction", summary: "## Goal\nTulip research.", firstKeptItemId: "u4", tokensBefore: 30_000, at: 50 });
+    const { items: created } = await run(provider, items);
+    const text = JSON.stringify(provider.requests[0]!.context.messages);
+    expect(text).toMatch(/<conversation>\\n\[User\]: \[bside conversation summary\][^]*Tulip research\.[^]*Question 4/);
+    expect(text).not.toContain("Question 3");
+    expect(text).toContain("fold the newer messages into it");
+    expect(created.find((item) => item.kind === "compaction")).toMatchObject({ summary: "## Goal\nTulips, then orchids.", firstKeptItemId: "u11" });
+  });
+
+  describe("when the provider says the request is too long", () => {
+    const overflow = () => { throw new ProviderStreamError("The conversation is too long for this model's context window.", "CONTEXT_OVERFLOW"); };
+    const summary = (): ScriptedProviderEvent[] => [{ type: "text.delta", delta: "## Goal\nOrchid research." }, { type: "turn.completed", replayState: null }];
+    // Large enough that no summary is made at run start.
+    const ROOMY = 100_000;
+
+    it("summarizes older turns and retries the round once, keeping this run's tool rounds", async () => {
+      const provider = new WindowProvider([
+        () => [toolCallEvent("call_1", "browser_program", { source: "return 1;" }), { type: "turn.completed", replayState: null }],
+        overflow, summary, answer,
+      ], ROOMY);
+      const { result, items } = await run(provider, history(8));
+      expect(result.status).toBe("completed");
+      expect(provider.requests).toHaveLength(4);
+      expect(isSummaryRequest(provider.requests[2]!)).toBe(true);
+      expect(items.map((item) => item.kind)).toEqual(["tool-call", "tool-result", "compaction", "message"]);
+      const retried = provider.requests[3]!.context.messages;
+      expect(retried[0]!.content).toMatch(/^\[bside conversation summary\][\s\S]*Orchid research\./);
+      expect(JSON.stringify(retried)).not.toContain("Question 0 ");
+      expect(JSON.stringify(retried)).toContain("Question 7 ");
+      expect(retried.slice(-3).map((message) => message.role)).toEqual(["user", "assistant", "toolResult"]);
+      expect(retried.filter((message) => message.role === "assistant" && message.stopReason === "error")).toEqual([]);
+    });
+
+    it("fails with the overflow when there is nothing to summarize, or the retry overflows too", async () => {
+      const alone = new WindowProvider([overflow, answer], ROOMY);
+      expect((await run(alone, history(0))).result).toMatchObject({ status: "failed", error: { code: "CONTEXT_OVERFLOW" } });
+      expect(alone.requests).toHaveLength(1);
+
+      const again = new WindowProvider([overflow, summary, overflow, answer], ROOMY);
+      expect((await run(again, history(8))).result).toMatchObject({ status: "failed", error: { code: "CONTEXT_OVERFLOW" } });
+      expect(again.requests).toHaveLength(3);
+    });
   });
 });
 

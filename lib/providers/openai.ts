@@ -8,12 +8,15 @@ import {
   createAssistantMessageEventStream,
   getSupportedThinkingLevels,
   hasApi,
+  isContextOverflow,
   normalizeContext,
   type Api,
   type AssistantMessage,
+  type Message,
   type Model,
 } from "@earendil-works/pi-ai";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
+import { estimateMessageTokens } from "@earendil-works/pi-ai/utils/estimate";
 import {
   REASONING_EFFORTS,
   type ProviderAdapter,
@@ -37,7 +40,8 @@ export type ProviderErrorCode =
   | "TIMEOUT"
   | "NETWORK"
   | "PROVIDER_UNAVAILABLE"
-  | "PROVIDER_RESPONSE_FAILED";
+  | "PROVIDER_RESPONSE_FAILED"
+  | "CONTEXT_OVERFLOW";
 
 interface SafeProviderError {
   code: ProviderErrorCode;
@@ -80,6 +84,11 @@ export function describeModels(listings: readonly ModelListing[]): ModelDefiniti
     return { id, name, reasoningEfforts,
       defaultReasoningEffort: reasoningEfforts.includes(DEFAULT_REASONING_EFFORT) ? DEFAULT_REASONING_EFFORT : reasoningEfforts[0]! };
   });
+}
+
+/** Pi's token estimate of messages: about 3.5 characters per token, tool declarations included, images at a fixed size. */
+export function estimateTokens(messages: readonly Message[]): number {
+  return messages.reduce((total, message) => total + estimateMessageTokens(message), 0);
 }
 
 /** The API-key provider definition. */
@@ -166,15 +175,18 @@ export class OpenAIProvider implements ProviderAdapter {
             output.push(event);
             continue;
           }
+          // OpenAI reports an oversized request as a failed stream after HTTP 200.
           const normalized = signal.aborted
             ? new ProviderStreamError("The request was cancelled.", "TIMEOUT")
             : networkFailed
               ? new ProviderStreamError("Could not reach OpenAI.", "NETWORK")
-              : auth.method === "chatgpt" && /subscription_sharing_usage_(limit_exceeded|unavailable)/.test(event.error.errorMessage ?? "")
-                ? new ProviderStreamError("ChatGPT plan usage is unavailable or its limit has been reached. Review usage in ChatGPT settings.", "RATE_LIMIT", responseMeta.status, responseMeta.requestId)
-                : responseMeta.status !== undefined
-                  ? fromStatus(responseMeta.status, responseMeta.requestId, auth.method)
-                  : new ProviderStreamError("OpenAI did not complete the response.", "PROVIDER_RESPONSE_FAILED");
+              : isContextOverflow(event.error)
+                ? new ProviderStreamError("The conversation is too long for this model's context window.", "CONTEXT_OVERFLOW", responseMeta.status, responseMeta.requestId)
+                : auth.method === "chatgpt" && /subscription_sharing_usage_(limit_exceeded|unavailable)/.test(event.error.errorMessage ?? "")
+                  ? new ProviderStreamError("ChatGPT plan usage is unavailable or its limit has been reached. Review usage in ChatGPT settings.", "RATE_LIMIT", responseMeta.status, responseMeta.requestId)
+                  : responseMeta.status !== undefined
+                    ? fromStatus(responseMeta.status, responseMeta.requestId, auth.method)
+                    : new ProviderStreamError("OpenAI did not complete the response.", "PROVIDER_RESPONSE_FAILED");
           output.push({ ...event, error: withSafeError(event.error, normalized) });
         }
       } catch (error) {
@@ -253,6 +265,7 @@ function isProviderErrorCode(value: unknown): value is ProviderErrorCode {
     "NETWORK",
     "PROVIDER_UNAVAILABLE",
     "PROVIDER_RESPONSE_FAILED",
+    "CONTEXT_OVERFLOW",
   ].includes(value);
 }
 

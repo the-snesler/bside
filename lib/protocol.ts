@@ -184,6 +184,7 @@ export interface NormalizedError {
     | "NETWORK"
     | "PROVIDER_UNAVAILABLE"
     | "PROVIDER_RESPONSE_FAILED"
+    | "CONTEXT_OVERFLOW"
     | "INVALID_TOOL_ARGUMENTS"
     | "LIMIT_EXCEEDED"
     | "PROTOCOL_ERROR"

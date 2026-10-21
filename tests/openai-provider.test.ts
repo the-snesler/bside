@@ -133,6 +133,27 @@ describe("OpenAIProvider Pi adapter", () => {
     expect(decodeProviderError(failed.error.errorMessage)).toMatchObject({ code: "RATE_LIMIT", retryable: true, status: 429, requestId: "req_123" });
   });
 
+  it("recognizes a context overflow that OpenAI reports as a failed stream after HTTP 200", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("", { status: 200, headers: { "x-request-id": "req_456" } })));
+    streamSimpleMock.mockImplementation((_model: unknown, _context: unknown, options: SimpleStreamOptions) => {
+      const stream = createAssistantMessageEventStream();
+      void (async () => {
+        await options?.fetch?.("https://api.openai.com/v1/responses");
+        stream.push({ type: "start", partial: message({ content: [], stopReason: "pending" }) });
+        // The message as observed live from the Responses API.
+        const failed = message({ content: [], stopReason: "error", errorMessage: "Your input exceeds the context window of this model. Please adjust your input and try again." });
+        stream.push({ type: "error", reason: "error", error: failed });
+        stream.end();
+      })();
+      return stream;
+    });
+    const { decodeProviderError, OpenAIProvider } = await import("@/lib/providers/openai");
+    const events = await collect(new OpenAIProvider().streamTurn(request(), AUTH, new AbortController().signal));
+    const failed = events.find((event) => event.type === "error");
+    if (failed?.type !== "error") throw new Error("expected error");
+    expect(decodeProviderError(failed.error.errorMessage)).toMatchObject({ code: "CONTEXT_OVERFLOW", retryable: false, status: 200, requestId: "req_456" });
+  });
+
   it("validates a key with a direct bounded OpenAI models request", async () => {
     const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
