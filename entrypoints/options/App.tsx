@@ -1,4 +1,5 @@
 import { useEffect, useState } from "preact/hooks";
+import { SkillsEditor } from "@/lib/ui/SkillsEditor";
 import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
 import type { AppSettingsV1, ChatGPTStatus, ProviderDefinition, ReasoningEffort } from "@/lib/domain/provider";
 import type { HistoryRetention, HistorySettingsV1 } from "@/lib/domain/conversation";
@@ -211,6 +212,8 @@ export function App() {
           </>
         )}
       </section>
+
+      <SkillsEditor />
 
       <section class="options__section">
         <h2 class="options__heading">History</h2>

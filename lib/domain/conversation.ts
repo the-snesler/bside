@@ -6,6 +6,7 @@
 
 import type { PageArtifactSummary, ToolCall, ToolResult } from "@/lib/domain/tools";
 import type { RunUsageV1, UsageTotals } from "@/lib/domain/usage";
+import type { SkillContext } from "@/lib/domain/skills";
 
 export type ConversationItem =
   | {
@@ -14,6 +15,7 @@ export type ConversationItem =
       role: "user";
       text: string;
       context: PageArtifactSummary | null;
+      skills?: SkillContext;
       /**
        * `"steer"`: guidance sent while the turn's run was working, persisted
        * where the model received it (after a tool round). It belongs to the
@@ -56,6 +58,7 @@ export function isTurnStart(item: ConversationItem): item is UserMessageItem {
  * first. Persisted per session as `MessageQueueV1` until it is delivered.
  */
 export interface QueuedMessage {
+  skills?: SkillContext;
   id: string;
   mode: "follow-up" | "steer";
   /** Validated prompt text, mentions encoded as the composer serializes them. */

@@ -12,6 +12,7 @@ import {
 import { Editable, ReactEditor, Slate, withReact } from "slate-react";
 import { withHistory } from "slate-history";
 import type { TabMention } from "@/lib/protocol";
+import type { SkillSummary } from "@/lib/domain/skills";
 import { PROMPT_MENTION_PATTERN } from "@/lib/domain/conversation";
 import ArrowUp from "~icons/tabler/arrow-up";
 import PlayerStop from "~icons/tabler/player-stop";
@@ -84,6 +85,8 @@ export function Composer(props: {
   canSteer: boolean;
   configured: boolean;
   tabs: TabMention[];
+  skills?: SkillSummary[];
+  onListSkills?: () => void;
   onListTabs: () => void;
   onSend: (text: string) => void;
   onSteer: (text: string) => void;
@@ -102,11 +105,22 @@ export function Composer(props: {
   const [search, setSearch] = useState("");
   const [index, setIndex] = useState(0);
   const [text, setText] = useState("");
+  const [skillMode, setSkillMode] = useState(false);
+  const skillMatches = (props.skills ?? []).filter((skill) => skill.name.startsWith(search.toLowerCase())).slice(0, 8);
   const matches = props.tabs
     .filter((tab) =>
       `${tab.title} ${tab.url}`.toLowerCase().includes(search.toLowerCase()),
     )
     .slice(0, 8);
+  const matchCount = skillMode ? skillMatches.length : matches.length;
+  const selectMatch = () => {
+    if (!skillMode) return mention(matches[index]!);
+    if (!target || !skillMatches[index]) return;
+    Transforms.select(editor, target);
+    Transforms.insertText(editor, `/${skillMatches[index]!.name} `);
+    setTarget(null);
+    ReactEditor.focus(editor);
+  };
   const send = (steer = false) => {
     const value = serializeDraft(editor.children);
     if (!value || value.length > 16000 || props.disabled) return;
@@ -142,13 +156,20 @@ export function Composer(props: {
             anchor: start,
             focus: selection.anchor,
           });
-          const match = /(?:^|\s)@([^@\n]*)$/.exec(before);
+          const skillMatch = /^\/([a-z0-9-]*)$/.exec(before);
+          const atStart = Editor.isStart(editor, start, []);
+          const isSkill = !!skillMatch && atStart;
+          const match = isSkill ? skillMatch : /(?:^|\s)@([^@\n]*)$/.exec(before);
           if (match) {
             const anchor = {
               ...selection.anchor,
               offset: selection.anchor.offset - match[1]!.length - 1,
             };
-            if (!target) props.onListTabs();
+            if (!target || skillMode !== isSkill) {
+              if (isSkill) props.onListSkills?.();
+              else props.onListTabs();
+            }
+            setSkillMode(isSkill);
             setTarget({ anchor, focus: selection.anchor });
             setSearch(match[1]!);
             setIndex(0);
@@ -169,8 +190,8 @@ export function Composer(props: {
           aria-expanded={!!target}
           aria-controls={target ? "tab-suggestions" : undefined}
           aria-activedescendant={
-            target && matches[index]
-              ? `tab-option-${matches[index]!.id}`
+            target && matchCount > index
+              ? skillMode ? `skill-option-${skillMatches[index]!.name}` : `tab-option-${matches[index]!.id}`
               : undefined
           }
           placeholder={
@@ -178,7 +199,7 @@ export function Composer(props: {
               ? "Connect OpenAI in settings to start."
               : props.working
                 ? "Enter queues, Ctrl/⌘+Enter steers…"
-                : "Ask a task, @ for tabs…"
+                : "Ask a task, / for skills, @ for tabs…"
           }
           renderElement={({ attributes, children, element }) =>
             element.type === "mention" ? (
@@ -203,15 +224,15 @@ export function Composer(props: {
                 return;
               }
               if (
-                matches.length &&
+                matchCount &&
                 ["ArrowDown", "ArrowUp", "Enter", "Tab"].includes(event.key)
               ) {
                 event.preventDefault();
                 if (event.key === "ArrowDown")
-                  setIndex((index + 1) % matches.length);
+                  setIndex((index + 1) % matchCount);
                 else if (event.key === "ArrowUp")
-                  setIndex((index + matches.length - 1) % matches.length);
-                else mention(matches[index]!);
+                  setIndex((index + matchCount - 1) % matchCount);
+                else selectMatch();
                 return;
               }
             }
@@ -281,10 +302,22 @@ export function Composer(props: {
           class="tab-suggestions"
           id="tab-suggestions"
           role="listbox"
-          aria-label="Open tabs"
+          aria-label={skillMode ? "Saved skills" : "Open tabs"}
         >
-          <div class="tab-suggestions__heading">Mention a tab</div>
-          {matches.length ? (
+          <div class="tab-suggestions__heading">{skillMode ? "Invoke a skill" : "Mention a tab"}</div>
+          {skillMode ? skillMatches.length ? skillMatches.map((skill, i) => (
+            <div key={skill.name} role="option" id={`skill-option-${skill.name}`} aria-selected={index === i} class="tab-suggestions__option"
+              onMouseDown={(event) => {
+                event.preventDefault();
+                if (!target) return;
+                Transforms.select(editor, target);
+                Transforms.insertText(editor, `/${skill.name} `);
+                setTarget(null);
+                ReactEditor.focus(editor);
+              }}>
+              <strong>/{skill.name}</strong><small>{skill.description}</small>
+            </div>
+          )) : <p>No matching skills. Add one in Settings → Skills.</p> : matches.length ? (
             matches.map((tab, i) => (
               <div
                 key={tab.id}

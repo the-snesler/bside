@@ -43,6 +43,8 @@ export function App() {
     settings,
     tabs,
     listTabs,
+    skills,
+    listSkills,
     focusTab,
     agentTabs,
     closeAgentTabs,
@@ -326,6 +328,8 @@ export function App() {
                 canSteer={runHere && activeRun.status !== "cancelling"}
                 configured={credential.configured}
                 tabs={tabs}
+                skills={skills ?? []}
+                onListSkills={listSkills}
                 onListTabs={listTabs}
                 onSend={(text) => {
                   scroll.scrollToBottom();

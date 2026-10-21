@@ -23,6 +23,7 @@ import type { Conversation, ConversationItem, ConversationSummary, HistoryRetent
 import { HISTORY_RETENTIONS } from "@/lib/domain/conversation";
 import { REASONING_EFFORTS, type AppSettingsV1, type ChatGPTStatus, type ProviderDefinition } from "@/lib/domain/provider";
 import type { RunUsageV1 } from "@/lib/domain/usage";
+import { isSkill, isSkillName, type Skill, type SkillSummary } from "@/lib/domain/skills";
 import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction } from "@/lib/validation";
 
 // ---------------------------------------------------------------------------
@@ -207,6 +208,7 @@ export interface NormalizedError {
 export const SIDEBAR_PORT_NAME = "agent-sidebar:v1";
 
 export type SidebarCommand =
+  | { v: 1; id: string; type: "skills.list" }
   | { v: 1; id: string; type: "tabs.list" }
   | { v: 1; id: string; type: "tabs.focus"; tabId: number }
   /** Closes one session's hidden agent tabs (the sidebar sends the open session's); refused while a run is active. */
@@ -259,6 +261,7 @@ export interface ApprovalRequest {
 }
 
 export interface RuntimeSnapshot {
+  skills?: SkillSummary[];
   /** The open session. */
   conversation: Conversation;
   credential: { configured: boolean; maskedSuffix: string | null; chatgpt: ChatGPTStatus };
@@ -298,6 +301,7 @@ export interface EventBase<T extends string, P> {
 export const RUN_CANCELLED_SUFFIX = "\n\n[Stopped: cancelled before this response finished.]";
 
 export type SidebarEvent =
+  | EventBase<"skills.listed", { skills: SkillSummary[] }>
   | EventBase<"tabs.listed", { tabs: TabMention[] }>
   | EventBase<"context.exported", { requestId: string; markdown: string; filename: string }>
   | EventBase<"state.snapshot", RuntimeSnapshot>
@@ -322,6 +326,7 @@ export type SidebarEvent =
 export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (!isEnvelope(value)) return false;
   const candidate = value as Record<string, unknown>;
+  if (candidate.type === "skills.list") return true;
   if (candidate.type === "tabs.list") return true;
   if (candidate.type === "tabs.focus") return Number.isSafeInteger(candidate.tabId);
   if (candidate.type === "tabs.closeAgentTabs") return isSessionId(candidate.sessionId);
@@ -357,6 +362,24 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
 // `sender.url === browser.runtime.getURL("options.html")`; never expose
 // credential methods on the sidebar Port.
 // ---------------------------------------------------------------------------
+
+export type SkillsRequest =
+  | { v: 1; id: string; type: "skills.list" }
+  | { v: 1; id: string; type: "skills.save"; skill: Skill }
+  | { v: 1; id: string; type: "skills.delete"; name: string };
+
+export type SkillsResponse =
+  | { v: 1; id: string; ok: true; skills: Skill[]; builtinNames: string[] }
+  | { v: 1; id: string; ok: false; error: NormalizedError };
+
+export function isSkillsRequest(value: unknown): value is SkillsRequest {
+  if (!isEnvelope(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.type === "skills.list") return true;
+  if (candidate.type === "skills.save") return isSkill(candidate.skill);
+  if (candidate.type === "skills.delete") return isSkillName(candidate.name);
+  return false;
+}
 
 export type CredentialRequest =
   | { v: 1; id: string; type: "credentials.openai.status" }

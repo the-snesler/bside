@@ -88,11 +88,25 @@
   margin-bottom: var(--space-3);
 }
 
-.options__field select {
+.options__field select,
+.options__field input,
+.options__field textarea {
   padding: var(--space-2);
   border-radius: var(--radius-control);
   border: 1px solid var(--muted);
   background: var(--bg);
+}
+
+.options__field textarea {
+  resize: vertical;
+  font: inherit;
+  min-width: 0;
+}
+
+.skills__list {
+  list-style: none;
+  padding: 0;
+  overflow-wrap: anywhere;
 }
 
 .options__form .options__danger {

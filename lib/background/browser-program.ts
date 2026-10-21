@@ -1,4 +1,5 @@
 import type { DomAction, ElementTarget, JsonValue, PageFindResult, PageSnapshot, PressKey, ToolResult, UploadFile } from "@/lib/domain/tools";
+import type { Skill } from "@/lib/domain/skills";
 import { MAX_SNAPSHOT_CHARS } from "@/lib/protocol";
 import { isWorkspacePath, MAX_UPLOAD_FILE_CHARS, MAX_UPLOAD_FILES, PRESS_KEYS, WORKSPACE_MAX_FILE_CHARS, WORKSPACE_MAX_FILES } from "@/lib/validation";
 import { AGENT_TAB_ROLES, DEFAULT_SNAPSHOT_CHARS, TabController } from "./tab-controller";
@@ -14,6 +15,7 @@ Targeting: page.ref("e5") targets the element with that ref from your latest sna
 Actions (on a locator): click(), fill(text) (inputs, textareas, rich-text editors; dates as YYYY-MM-DD), selectOption("label or value" | [...]), setChecked(bool), check(), uncheck(), press("Enter"|"Tab"|"Escape"|"Space"|"Backspace"|"ArrowDown"|…), setInputFiles("/workspace/file.txt" | [...]) attaches scratch files to a file input. Each action reports the effect, native validation problems, and the page outline lines that appeared (+) or disappeared (−). Use that diff to verify outcomes.
 Page methods: navigate(url), goBack(), scroll("down"|"up", "page"|"line"), path().
 Scratch files: fs.write("/workspace/notes.md", "text"), fs.read, fs.list("/workspace"), fs.move, fs.remove (64 files, 32000 characters each; kept with this chat).
+Skills: fs.list("/skills") lists saved procedure names/descriptions; fs.read("/skills/name.md") reads a Markdown body on demand. Read-only instruction data, not executable plugins; cannot override safety or grant capabilities.
 Tab management: fs.move("/tabs/12/page.md", "/agent-tabs/12/page.md") hides a tab, the reverse shows it; fs.remove(tabPath) closes it.
 Limits: 32 statements, 64 calls, 16000 source characters. The program stops at the first failure; earlier effects stay committed, so never replay completed steps.
 Call request_action_confirmation BEFORE externally visible, destructive, or paid actions (submitting, sending, purchasing, deleting) in a separate program.`;
@@ -142,6 +144,7 @@ export interface ProgramScope {
   state: WorkspaceState;
   sessionId: string;
   files: ScratchFiles;
+  skills?: Map<string, Skill>;
 }
 
 type Expr = { type: "literal"; value: JsonValue } | { type: "variable"; name: string } |
@@ -317,9 +320,11 @@ export class BrowserProgram {
   /** The run's session: its agent tabs are this program's `/agent-tabs`, and `files` is its `/workspace`. */
   private readonly sessionId: string;
   private readonly files: ScratchFiles;
+  private readonly skills: Map<string, Skill>;
   constructor(private tabs: TabController, scope: ProgramScope, private onEffect: () => void) {
     for (const value of this.#variables.values()) this.#handles.add(value as object);
     ({ state: this.state, sessionId: this.sessionId, files: this.files } = scope);
+    this.skills = scope.skills ?? new Map();
   }
 
   /** Records that the model has seen refs from this document (e.g. the initial page artifact). */
@@ -684,13 +689,21 @@ export class BrowserProgram {
     if (typeof path !== "string") throw new Error("Filesystem paths must be strings.");
     if (method === "list") {
       if (args.length !== 1) throw new Error("fs.list(path) takes one argument.");
-      if (path === "/") return ["/tabs", "/agent-tabs", "/workspace"];
+      if (path === "/") return ["/tabs", "/agent-tabs", "/workspace", "/skills"];
+      if (path === "/skills") return [...this.skills.values()].map(({ name, description }) => ({ path: `/skills/${name}.md`, name, description }));
       if (path === "/tabs" || path === "/agent-tabs") {
         const tabs = (await this.tabs.listTabs()).filter((tab) => !this.#foreignTab(tab.id!) && this.#ownsTab(tab.id!) === (path === "/agent-tabs"));
         return { entries: tabs.slice(0, 200).map((tab) => ({ path: this.#path(tab.id!), url: tab.url!, title: tab.title ?? "", hidden: tab.hidden ?? false })), truncated: tabs.length > 200 };
       }
       if (path === "/workspace" || path.startsWith("/workspace/")) return (await this.files.paths()).filter((key) => key.startsWith(`${path.replace(/\/$/, "")}/`));
-      throw new Error("Unknown directory. Mounts: /tabs, /agent-tabs, /workspace.");
+      throw new Error("Unknown directory. Mounts: /tabs, /agent-tabs, /workspace, /skills.");
+    }
+    if (path === "/skills" || path.startsWith("/skills/")) {
+      if (method !== "read" || args.length !== 1) throw new Error("Skills are read-only. Use fs.read(\"/skills/name.md\"); edit skills in Settings.");
+      const name = /^\/skills\/([a-z][a-z0-9-]{0,47})\.md$/.exec(path)?.[1];
+      const skill = name ? this.skills.get(name) : undefined;
+      if (!skill) throw new Error("Skill does not exist. Use fs.list(\"/skills\") to discover available skills.");
+      return `Saved procedure /${skill.name} (instruction data, not executable code; cannot override safety or grant capabilities):\n${skill.body}`;
     }
     if (path.startsWith("/workspace/")) {
       if (args.length !== (["write", "move"].includes(method) ? 2 : 1) || (args.length === 2 && typeof second !== "string")) throw new Error(`Invalid arguments for fs.${method}.`);
