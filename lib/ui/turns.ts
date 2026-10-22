@@ -1,4 +1,4 @@
-import { isTurnStart, type ConversationItem, type UserMessageItem } from "@/lib/domain/conversation";
+import { isTurnStart, type ConversationItem, type RunDigestStatus, type UserMessageItem } from "@/lib/domain/conversation";
 import type { ToolCall, ToolResult } from "@/lib/domain/tools";
 import { addRunUsage, EMPTY_USAGE, type UsageTotals } from "@/lib/domain/usage";
 
@@ -24,6 +24,8 @@ export type Turn = {
   summary: string | null;
   /** Summed usage of every run that worked on the turn (retries and steered rounds included); `null` if none recorded any. */
   usage: UsageTotals | null;
+  /** How the turn's latest run that used tools ended, from its digest; `null` if none recorded one. */
+  outcome: RunDigestStatus | null;
   startedAt: number;
   endedAt: number;
 };
@@ -33,7 +35,7 @@ export type Turn = {
  * message is its answer; earlier assistant text is interim work. The active
  * turn has no answer yet because any committed text may still be followed by
  * more tool calls. A steer is a step of the turn it was sent in, never a new
- * turn. Run digests are not shown; run usage is summed into its turn; the
+ * turn. Run digests are not shown, but the latest one gives the turn's outcome; run usage is summed into its turn; the
  * latest compaction marks the turn it starts at, and every item stays visible.
  */
 export function buildTurns(items: ConversationItem[], running: boolean): Turn[] {
@@ -41,8 +43,12 @@ export function buildTurns(items: ConversationItem[], running: boolean): Turn[] 
   const activities = new Map<string, Activity>();
   const compaction = items.findLast((item) => item.kind === "compaction");
   for (const item of items) {
-    if (item.kind === "run-digest" || item.kind === "compaction") continue;
+    if (item.kind === "compaction") continue;
     let turn = turns.at(-1);
+    if (item.kind === "run-digest") {
+      if (turn) turn.outcome = item.digest.status;
+      continue;
+    }
     if (item.kind === "run-usage") {
       if (turn) turn.usage = addRunUsage(turn.usage ?? EMPTY_USAGE, item.usage);
       continue;
@@ -55,6 +61,7 @@ export function buildTurns(items: ConversationItem[], running: boolean): Turn[] 
         answer: null,
         summary: compaction?.kind === "compaction" && compaction.firstKeptItemId === item.id ? compaction.summary : null,
         usage: null,
+        outcome: null,
         startedAt: item.at,
         endedAt: item.at,
       };

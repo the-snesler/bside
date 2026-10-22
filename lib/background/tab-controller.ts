@@ -49,7 +49,16 @@ export interface AgentTabTagV1 {
   lastUsedAt: number;
 }
 
-type TabSnapshot = { id?: number; url?: string; title?: string; hidden?: boolean };
+export type TabSnapshot = {
+  id?: number;
+  url?: string;
+  title?: string;
+  hidden?: boolean;
+  active?: boolean;
+  windowId?: number;
+  index?: number;
+  favIconUrl?: string;
+};
 type TabUpdatedListener = (tabId: number, changeInfo: { status?: string }, tab: TabSnapshot) => void;
 
 export interface TabControllerBrowserApi {
@@ -58,6 +67,7 @@ export interface TabControllerBrowserApi {
     create?(properties: { url: string; active: boolean }): Promise<TabSnapshot>;
     hide?(tabId: number): Promise<number[]>;
     show?(tabId: number): Promise<void>;
+    move?(tabId: number, moveProperties: { windowId: number; index: number }): Promise<unknown>;
     remove?(tabId: number): Promise<void>;
     update(tabId: number, updateProperties: { url: string } | { active: true }): Promise<unknown>;
     goBack(tabId: number): Promise<void>;
@@ -134,6 +144,27 @@ export class TabController {
     const tab = (await this.listTabs()).find((tab) => tab.id === tabId);
     if (!tab || tab.hidden) return;
     await this.#browserApi.tabs.update(tabId, { active: true });
+  }
+
+  /** Switches to any tab, including a page bside cannot read (a new tab page, say). */
+  async activateTab(tabId: number): Promise<void> {
+    await this.#browserApi.tabs.update(tabId, { active: true });
+  }
+
+  /**
+   * Moves a hidden tab next to the last-focused window's active tab, shows
+   * it, and switches to it. Returns the tab that was active before, unless it
+   * is the revealed tab itself. A failed move only leaves the tab where it was.
+   */
+  async revealTab(tabId: number): Promise<number | null> {
+    const [active] = await this.#browserApi.tabs.query({ active: true, lastFocusedWindow: true });
+    const previous = active?.id !== undefined && active.id !== tabId ? active.id : null;
+    if (previous !== null && active!.windowId !== undefined && this.#browserApi.tabs.move) {
+      await this.#browserApi.tabs.move(tabId, { windowId: active!.windowId, index: (active!.index ?? -2) + 1 }).catch(() => {});
+    }
+    await this.showTab(tabId);
+    await this.#browserApi.tabs.update(tabId, { active: true });
+    return previous;
   }
 
   /** Untags the tab first, so reopening it from recently closed tabs yields an ordinary tab. */

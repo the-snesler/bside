@@ -13,7 +13,7 @@ import { formatRelativeTime, HistoryDrawer } from "@/lib/ui/HistoryDrawer";
 import type { HistoryDrawerProps } from "@/lib/ui/HistoryDrawer";
 import { App } from "@/entrypoints/sidepanel/App";
 import type { ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
-import type { RuntimeSnapshot, SidebarEvent } from "@/lib/protocol";
+import type { AgentTabSummary, RuntimeSnapshot, SidebarEvent } from "@/lib/protocol";
 import { OPENAI_API_KEY_PROVIDER } from "@/lib/providers/openai";
 import { EMPTY_USAGE, type RunUsageV1 } from "@/lib/domain/usage";
 import { describeSessionUsage, describeTurnUsage, formatTokens, formatUsd } from "@/lib/ui/usage";
@@ -34,7 +34,7 @@ function snapshotFor(id: string): RuntimeSnapshot {
     credential: { configured: true, maskedSuffix: null, chatgpt: { connected: false, email: null, signInAgain: false } },
     provider: OPENAI_API_KEY_PROVIDER,
     settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
-    page: null, agentTabs: {}, queue: [], activeRun: null, lastSeq: 0, notice: null,
+    page: null, agentTabs: { bySession: {}, watching: null }, queue: [], activeRun: null, lastSeq: 0, notice: null,
   };
 }
 
@@ -255,11 +255,36 @@ describe("sidebar UI contracts", () => {
     render(h(TurnTrace, { turn: turn!, active: false, pendingApproval: null, onApprove: () => {}, onDeny: () => {} }), root);
     const header = root.querySelector("details")!;
     expect(header.open).toBe(false);
-    expect(header.querySelector("summary")?.textContent).toContain("Worked for 1m 4s, 1 failed");
+    // A failed step the run moved past is counted quietly; the run itself completed.
+    expect(header.querySelector("summary .trace__title")?.textContent).toBe("Worked for 1m 4s");
+    expect(header.querySelector("summary .trace__description")?.textContent).toBe("2 steps · 1 failed");
+    expect(header.querySelector("summary .trace__failed")?.textContent).toBe(" · 1 failed");
+    expect(header.querySelector(".mascot")?.getAttribute("data-mood")).toBe("idle");
+    expect(header.querySelector(".mascot")?.getAttribute("aria-hidden")).toBe("true");
     const titles = [...root.querySelectorAll(".trace__content .trace__title")].map((node) => node.textContent);
     expect(titles).toEqual(["Couldn't fill page fields", "Denied: Submit form"]);
     expect(root.querySelector("b")).toBeNull();
     expect(root.textContent).toContain("No field <b>x</b>");
+    render(null, root);
+  });
+
+  it("leads each turn with bside's face: working while active, drooping and saying so when the run did not complete", () => {
+    const root = document.createElement("div");
+    document.body.append(root);
+    const digest = (status: "completed" | "failed" | "cancelled" | "interrupted"): ConversationItem =>
+      ({ id: `d-${status}`, kind: "run-digest", digest: { version: 1, status, error: null, entries: [], omittedEntries: 0 }, at: 64_500 });
+    const header = (items: ConversationItem[], active = false) => {
+      const [turn] = buildTurns(items, active);
+      render(h(TurnTrace, { turn: turn!, active, pendingApproval: null, onApprove: () => {}, onDeny: () => {} }), root);
+      return { title: root.querySelector("summary .trace__title")?.textContent, mood: root.querySelector("summary .mascot")?.getAttribute("data-mood") };
+    };
+    expect(header(turnItems.slice(0, 3), true)).toEqual({ title: expect.stringMatching(/^Working for /), mood: "working" });
+    expect(header([...turnItems, digest("completed")])).toEqual({ title: "Worked for 1m 4s", mood: "idle" });
+    expect(header([...turnItems, digest("failed")])).toEqual({ title: "Failed after 1m 4s", mood: "failed" });
+    expect(header([...turnItems, digest("cancelled")])).toEqual({ title: "Stopped after 1m 4s", mood: "failed" });
+    // A retry that completes after an interruption leaves the turn completed.
+    expect(header([...turnItems, digest("interrupted")])).toEqual({ title: "Interrupted after 1m 4s", mood: "failed" });
+    expect(header([...turnItems, digest("interrupted"), digest("completed")])).toEqual({ title: "Worked for 1m 4s", mood: "idle" });
     render(null, root);
   });
 
@@ -275,6 +300,7 @@ describe("sidebar UI contracts", () => {
       onApprove: approve, onDeny: () => {},
     }), root);
     expect(root.querySelector("summary")?.textContent).toContain("Waiting for your approval");
+    expect(root.querySelector("summary .mascot")?.getAttribute("data-mood")).toBe("needs");
     expect([...root.querySelectorAll("details")].every((details) => details.open || !details.querySelector(".trace__actions"))).toBe(true);
     expect(root.textContent).toContain("Waiting for approval: Submit form");
     (root.querySelector(".trace__approve") as HTMLButtonElement).click();
@@ -690,9 +716,33 @@ describe("history drawer", () => {
     expect(root.querySelector(".history")).toBeNull();
   });
 
-  it("counts and closes only the open chat's agent tabs from the header", async () => {
+  it("introduces bside in an empty chat and titles the header with the chat, with no export button", async () => {
     vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
-    const posted: Array<{ type: string; sessionId?: string }> = [];
+    const listeners: Array<(message: unknown) => void> = [];
+    vi.spyOn(browser.runtime, "connect").mockReturnValue({
+      postMessage: () => {},
+      onMessage: { addListener: (listener: (message: unknown) => void) => listeners.push(listener), removeListener: () => {} },
+      disconnect: () => {},
+    } as never);
+    root = document.createElement("div");
+    document.body.append(root);
+    await act(() => render(h(App, {}), root));
+    const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) => act(() => listeners.forEach((listener) => listener({ v: 1, seq: 0, at: 1, ...event })));
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: snapshotFor("a") });
+
+    expect(root.querySelector(".sidebar__title")?.textContent).toBe("New chat");
+    expect(root.querySelector(".sidebar__empty h2")?.textContent).toBe("Hi, I'm bside");
+    expect(root.querySelector(".sidebar__empty .mascot--blink")?.getAttribute("data-mood")).toBe("idle");
+    expect(root.querySelector('[aria-label="Download context"]')).toBeNull();
+
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), conversation: { ...snapshotFor("a").conversation, title: "Little guy <b>tweet</b>" } } });
+    expect(root.querySelector(".sidebar__title")?.textContent).toBe("Little guy <b>tweet</b>");
+    expect(root.querySelector(".sidebar__title b")).toBeNull();
+  });
+
+  it("lists only the open chat's agent tabs on the composer, watches one, and goes back", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    const posted: Array<{ type: string; sessionId?: string; tabId?: number }> = [];
     const listeners: Array<(message: unknown) => void> = [];
     vi.spyOn(browser.runtime, "connect").mockReturnValue({
       postMessage: (message: { type: string }) => posted.push(message),
@@ -703,14 +753,51 @@ describe("history drawer", () => {
     document.body.append(root);
     await act(() => render(h(App, {}), root));
     const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) => act(() => listeners.forEach((listener) => listener({ v: 1, seq: 0, at: 1, ...event })));
-    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), agentTabs: { b: 3 } } });
-    expect(root.querySelector(".agent-tabs-button")).toBeNull();
+    const tab = (id: number, patch: Partial<AgentTabSummary> = {}): AgentTabSummary => ({
+      id, role: "agent", title: `Tab <i>${id}</i>`, url: `https://www.site-${id}.test/page`, favIconUrl: null, lastUsedAt: 0, ...patch,
+    });
+    const attached = (tabId: number) => ({ tabId, artifactId: `page:${tabId}`, kind: "page" as const, title: `Tab <i>${tabId}</i>`, url: `https://www.site-${tabId}.test/page`, capturedAt: 1 });
+    const bySession = { a: [tab(5), tab(6, { favIconUrl: "data:image/png;base64,AAAA" })], b: [tab(9)] };
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), agentTabs: { bySession: { b: [tab(9)] }, watching: null } } });
+    expect(root.querySelector(".agent-tabs-toggle")).toBeNull();
 
-    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession: { a: 2, b: 3 } } });
-    const button = labelled("Close this chat's 2 agent tabs") as HTMLButtonElement;
-    expect(button.textContent).toBe("2");
-    await act(() => button.click());
-    expect(posted.at(-1)).toMatchObject({ type: "tabs.closeAgentTabs", sessionId: "a" });
+    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession, watching: null } });
+    const toggle = root.querySelector<HTMLButtonElement>(".agent-tabs-toggle")!;
+    expect(toggle.textContent).toBe("2 background tabs");
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(root.querySelector(".agent-tabs")).toBeNull();
+    await act(() => toggle.click());
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect([...root.querySelectorAll(".agent-tab strong")].map((node) => node.textContent)).toEqual(["Tab <i>5</i>", "Tab <i>6</i>"]);
+    expect(root.querySelector(".agent-tab i")).toBeNull();
+    expect(root.querySelector(".agent-tab img")?.getAttribute("src")).toBe("data:image/png;base64,AAAA");
+    expect(root.querySelector(".agent-tab__icon--letter")?.textContent).toBe("S");
+
+    await act(() => labelled("Watch Tab <i>5</i>").click());
+    expect(posted.at(-1)).toEqual(expect.objectContaining({ type: "tabs.watch", tabId: 5 }));
+    expect(isSidebarCommand(posted.at(-1))).toBe(true);
+
+    // Watching: the background reports the tab watched, and it is the attached page.
+    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession, watching: 5 } });
+    await emit({ runId: null, conversationId: null, type: "page.attached", payload: attached(5) });
+    expect(toggle.textContent).toBe("Watching site-5.test");
+    expect(root.querySelector(".composer--watching")).not.toBeNull();
+    expect(root.querySelector(".agent-tab--watched small")?.textContent).toBe("You're watching");
+    expect(root.querySelector(".context-chip--agent")?.textContent).toBe("Tab <i>5</i>bside's tab");
+    expect(root.textContent).not.toContain("Close all");
+    await act(() => root.querySelector<HTMLButtonElement>(".agent-tab__action--primary")!.click());
+    expect(posted.at(-1)).toEqual(expect.objectContaining({ type: "tabs.unwatch" }));
+    expect(isSidebarCommand(posted.at(-1))).toBe(true);
+
+    // Another chat's agent tab is never shown as this chat's attached page.
+    await emit({ runId: null, conversationId: null, type: "page.attached", payload: attached(9) });
+    expect(root.querySelector(".context-chip")).toBeNull();
+    await emit({ runId: null, conversationId: null, type: "page.attached", payload: attached(1) });
+    expect(root.querySelector(".context-chip")?.textContent).toBe("Tab <i>1</i>www.site-1.test");
+
+    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession, watching: null } });
+    await act(() => [...root.querySelectorAll<HTMLButtonElement>(".agent-tabs__close")][0]!.click());
+    expect(posted.at(-1)).toEqual(expect.objectContaining({ type: "tabs.closeAgentTabs", sessionId: "a" }));
     expect(isSidebarCommand(posted.at(-1))).toBe(true);
   });
 });

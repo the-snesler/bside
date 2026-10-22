@@ -34,18 +34,20 @@ export default defineBackground({
       void (approvalBadge.pending ? sidebarAction.open() : sidebarAction.toggle());
     });
 
-    browser.tabs.onActivated.addListener(() => {
+    browser.tabs.onActivated.addListener(({ tabId }) => {
       void sidebarHub.refreshAttachment();
+      void runtime.handleTabActivated(tabId);
     });
 
     browser.tabs.onCreated.addListener((tab) => {
       if (tab.id !== undefined) void runtime.handleTabCreated(tab.id);
     });
 
-    browser.tabs.onUpdated.addListener((_tabId, changeInfo) => {
+    browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
       if (changeInfo.status === "complete") {
         void sidebarHub.refreshAttachment();
       }
+      runtime.handleTabUpdated(tabId, changeInfo);
     });
 
     // Only the extension's own options page may read/write credentials,

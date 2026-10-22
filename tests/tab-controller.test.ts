@@ -276,3 +276,33 @@ describe("TabController: agent-tab session tags", () => {
     expect(calls).toEqual(["untag", "remove"]);
   });
 });
+
+describe("TabController: revealing a hidden tab", () => {
+  function windowApi(move: () => Promise<unknown>) {
+    const calls: string[] = [];
+    const api: TabControllerBrowserApi = {
+      tabs: {
+        query: vi.fn(async () => [{ id: 1, url: "https://user.test/", title: "User", active: true, windowId: 3, index: 4 }]),
+        move: vi.fn(async (tabId: number, properties: { windowId: number; index: number }) => { calls.push(`move ${tabId} ${properties.windowId}:${properties.index}`); return move(); }),
+        show: vi.fn(async (tabId: number) => { calls.push(`show ${tabId}`); }),
+        update: vi.fn(async (tabId: number) => { calls.push(`activate ${tabId}`); }),
+        goBack: vi.fn(async () => {}),
+        sendMessage: vi.fn(async () => undefined),
+        onUpdated: { addListener: () => {}, removeListener: () => {} },
+      },
+    };
+    return { api, calls };
+  }
+
+  it("moves the tab beside the active one, shows it, switches to it, and reports the tab it left", async () => {
+    const { api, calls } = windowApi(async () => {});
+    expect(await new TabController(api).revealTab(9)).toBe(1);
+    expect(calls).toEqual(["move 9 3:5", "show 9", "activate 9"]);
+  });
+
+  it("still shows and switches to the tab when it cannot be moved", async () => {
+    const { api, calls } = windowApi(async () => { throw new Error("Cannot move"); });
+    expect(await new TabController(api).revealTab(9)).toBe(1);
+    expect(calls).toEqual(["move 9 3:5", "show 9", "activate 9"]);
+  });
+});

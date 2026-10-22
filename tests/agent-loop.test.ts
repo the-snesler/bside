@@ -119,7 +119,7 @@ const artifact = {
   title: "Agent Fixture",
   url: "http://127.0.0.1:4173/agent-page.html",
   capturedAt: 1,
-  target: { kind: "tab" as const, tabId: 1 },
+  target: { kind: "tab" as const, tabId: 1, mount: "tabs" as const },
   snapshot: buildSnapshot(),
 };
 

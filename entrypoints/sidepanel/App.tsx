@@ -1,12 +1,11 @@
 import { Fragment } from "preact";
-import { useRef, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import History from "~icons/tabler/history";
 import Settings from "~icons/tabler/settings";
-import Download from "~icons/tabler/download";
 import MessagePlus from "~icons/tabler/message-plus";
 import Globe from "~icons/tabler/world";
+import Eye from "~icons/tabler/eye";
 import ArrowDown from "~icons/tabler/arrow-down";
-import BrowserX from "~icons/tabler/browser-x";
 import ArrowUp from "~icons/tabler/arrow-up";
 import X from "~icons/tabler/x";
 import { Markdown } from "@/lib/ui/Markdown";
@@ -19,6 +18,8 @@ import { TurnTrace } from "@/lib/ui/TurnTrace";
 import { buildTurns } from "@/lib/ui/turns";
 import { describeTurnUsage } from "@/lib/ui/usage";
 import { HistoryDrawer } from "@/lib/ui/HistoryDrawer";
+import { Mascot } from "@/lib/ui/Mascot";
+import { AgentTabsPanel, AgentTabsToggle } from "@/lib/ui/AgentTabsTray";
 import { PROMPT_MENTION_PATTERN } from "@/lib/domain/conversation";
 
 function describeAttachment(page: PageArtifactSummary): string {
@@ -48,6 +49,8 @@ export function App() {
     focusTab,
     agentTabs,
     closeAgentTabs,
+    watchTab,
+    unwatchTab,
     saveSettings,
     sendPrompt,
     steer,
@@ -84,75 +87,62 @@ export function App() {
     provider.models[0];
   const turns = buildTurns(conversation.items, runHere);
   const pendingApproval = runHere ? activeRun.pendingApproval : null;
-  const chatAgentTabs = agentTabs[conversation.id] ?? 0;
+
+  // This chat's agent tabs ride on the composer. The attached page is one of
+  // them while the user watches it; another chat's agent tab is never shown as attached.
+  const chatAgentTabs = agentTabs.bySession[conversation.id] ?? [];
+  const watchedTab = chatAgentTabs.find((tab) => tab.id === agentTabs.watching) ?? null;
+  const agentTabCounts = Object.fromEntries(Object.entries(agentTabs.bySession).map(([id, tabs]) => [id, tabs.length]));
+  const pageOwner = page ? Object.keys(agentTabs.bySession).find((id) => agentTabs.bySession[id]!.some((tab) => tab.id === page.tabId)) : undefined;
+  const inUseSince = runHere ? turns.at(-1)?.startedAt ?? null : null;
+  const [trayOpen, setTrayOpen] = useState(false);
+  useEffect(() => {
+    if (watchedTab) setTrayOpen(true);
+  }, [watchedTab?.id]);
 
   return (
     <div class="sidebar">
       <header class="sidebar__header">
-        <div class="sidebar__header-start">
-          <button
-            type="button"
-            class="icon-button"
-            ref={historyButton}
-            onClick={() => {
-              if (historyOpen) return closeHistory();
-              listSessions();
-              setHistoryOpen(true);
-            }}
-            aria-label="Chat history"
-            aria-expanded={historyOpen}
-            aria-controls="history-drawer"
-            title="Chat history"
-          >
-            <History />
-          </button>
-          <h1 class="sidebar__title" title={conversation.title || undefined}>bside</h1>
-        </div>
-        <div class="sidebar__header-actions">
-          {chatAgentTabs > 0 && (
-            <button
-              type="button"
-              class="icon-button agent-tabs-button"
-              disabled={activeRun !== null}
-              onClick={() => closeAgentTabs(conversation.id)}
-              aria-label={`Close this chat's ${chatAgentTabs} agent ${chatAgentTabs === 1 ? "tab" : "tabs"}`}
-              title={`Close this chat's ${chatAgentTabs} hidden agent ${chatAgentTabs === 1 ? "tab" : "tabs"} (unused ones close after 30 minutes)`}
-            >
-              <BrowserX />
-              <span>{chatAgentTabs}</span>
-            </button>
-          )}
-          <button
-            type="button"
-            class="icon-button"
-            onClick={() => downloadContext(conversation.id)}
-            aria-label="Download context"
-            title="Download this chat's context (may contain private page content)"
-          >
-            <Download />
-          </button>
-          <button
-            type="button"
-            class="icon-button"
-            onClick={() => {
-              setHistoryOpen(false);
-              newChat();
-            }}
-            aria-label="New chat"
-            title="New chat"
-          >
-            <MessagePlus />
-          </button>
-          <button
-            type="button"
-            class="icon-button"
-            onClick={() => browser.runtime.openOptionsPage()}
-            aria-label="Settings"
-            title="Settings"
-          >
-            <Settings />
-          </button>
-        </div>
+        <button
+          type="button"
+          class="icon-button"
+          ref={historyButton}
+          onClick={() => {
+            if (historyOpen) return closeHistory();
+            listSessions();
+            setHistoryOpen(true);
+          }}
+          aria-label="Chat history"
+          aria-expanded={historyOpen}
+          aria-controls="history-drawer"
+          title="Chat history"
+        >
+          <History />
+        </button>
+        <h1 class={conversation.title ? "sidebar__title" : "sidebar__title sidebar__title--new"} title={conversation.title || undefined}>
+          {conversation.title || "New chat"}
+        </h1>
+        <button
+          type="button"
+          class="icon-button"
+          onClick={() => {
+            setHistoryOpen(false);
+            newChat();
+          }}
+          aria-label="New chat"
+          title="New chat"
+        >
+          <MessagePlus />
+        </button>
+        <button
+          type="button"
+          class="icon-button"
+          onClick={() => browser.runtime.openOptionsPage()}
+          aria-label="Settings"
+          title="Settings"
+        >
+          <Settings />
+        </button>
       </header>
       <div class="sidebar__content">
         <div class="sidebar__chat" inert={historyOpen}>
@@ -171,11 +161,14 @@ export function App() {
           <main class="sidebar__body" ref={scroll.viewport}>
             <div ref={scroll.content}>
               {turns.length === 0 && !runHere ? (
-                <p class="sidebar__empty">
-                  {page
-                    ? `Ask about ${page.title || "this page"}, or start a conversation.`
-                    : "Open a page, then start a conversation."}
-                </p>
+                <div class="sidebar__empty">
+                  <Mascot mood="idle" size={64} blink />
+                  <h2>Hi, I'm bside</h2>
+                  <p>
+                    {page ? "I can read this tab and open my own in the background to get things done." : "I can open tabs of my own in the background to get things done."}
+                    {" Your chats stay in this browser."}
+                  </p>
+                </div>
               ) : (
                 <ul class="timeline">
                   {turns.map((turn, index) => {
@@ -311,14 +304,39 @@ export function App() {
                 })}
               </ul>
             )}
-            <div class="composer">
-              {page && (
+            {chatAgentTabs.length > 0 && (
+              <AgentTabsToggle
+                tabs={chatAgentTabs}
+                watching={watchedTab}
+                busy={inUseSince !== null && chatAgentTabs.some((tab) => tab.lastUsedAt >= inUseSince)}
+                open={trayOpen}
+                onToggle={() => setTrayOpen(!trayOpen)}
+              />
+            )}
+            <div class={watchedTab ? "composer composer--watching" : "composer"}>
+              {trayOpen && chatAgentTabs.length > 0 && (
+                <AgentTabsPanel
+                  tabs={chatAgentTabs}
+                  watching={watchedTab}
+                  inUseSince={inUseSince}
+                  canClose={activeRun === null}
+                  now={Date.now()}
+                  onWatch={watchTab}
+                  onUnwatch={unwatchTab}
+                  onCloseAll={() => closeAgentTabs(conversation.id)}
+                />
+              )}
+              {page && pageOwner === conversation.id ? (
+                <div class="context-chip context-chip--agent" title={describeAttachment(page)}>
+                  <Eye />
+                  <strong>{page.title || "bside's tab"}</strong>
+                  <small>bside's tab</small>
+                </div>
+              ) : page && pageOwner === undefined && (
                 <div class="context-chip" title={describeAttachment(page)}>
                   <Globe />
-                  <span>
-                    <strong>{page.title || "Current tab"}</strong>
-                    <small>{new URL(page.url).hostname}</small>
-                  </span>
+                  <strong>{page.title || "Current tab"}</strong>
+                  <small>{new URL(page.url).hostname}</small>
                 </div>
               )}
               <Composer
@@ -392,7 +410,7 @@ export function App() {
             sessions={sessions}
             openId={conversation.id}
             run={activeRun && { conversationId: activeRun.conversationId, awaitingApproval: activeRun.pendingApproval !== null }}
-            agentTabs={agentTabs}
+            agentTabs={agentTabCounts}
             now={Date.now()}
             onOpen={(sessionId) => {
               closeHistory();

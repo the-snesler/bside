@@ -13,9 +13,8 @@
 
 import type { Browser } from "wxt/browser";
 import { isSidebarCommand, SIDEBAR_PORT_NAME } from "@/lib/protocol";
-import type { RuntimeSnapshot, SidebarCommand, SidebarEvent, TabMention } from "@/lib/protocol";
+import type { AgentTabsState, AttachedPage, RuntimeSnapshot, SidebarCommand, SidebarEvent, TabMention } from "@/lib/protocol";
 import type { ConversationSummary, QueuedMessage } from "@/lib/domain/conversation";
-import type { PageArtifactSummary } from "@/lib/domain/tools";
 import type { SkillSummary } from "@/lib/domain/skills";
 
 const MAX_REPLAY_EVENTS = 512;
@@ -32,12 +31,12 @@ export class SidebarHub {
   delegate: SidebarHubDelegate | null = null;
 
   #ports = new Set<Browser.runtime.Port>();
-  #attachment: PageArtifactSummary | null = null;
+  #attachment: AttachedPage | null = null;
   #lastSeq = 0;
   #eventLog: RunEvent[] = [];
   #runConversationId: string | null = null;
 
-  currentAttachment(): PageArtifactSummary | null {
+  currentAttachment(): AttachedPage | null {
     return this.#attachment;
   }
 
@@ -68,8 +67,8 @@ export class SidebarHub {
     }
   }
 
-  /** Broadcasts hidden agent-tab counts per session. Not run-sequenced, so it is safe mid-run and never clears sidebar error state. */
-  publishAgentTabs(bySession: Record<string, number>): void {
+  /** Broadcasts every session's agent tabs and the watched one. Not run-sequenced, so it is safe mid-run and never clears sidebar error state. */
+  publishAgentTabs(state: AgentTabsState): void {
     const event: SidebarEvent = {
       v: 1,
       runId: null,
@@ -77,7 +76,7 @@ export class SidebarHub {
       seq: this.#lastSeq,
       type: "agent-tabs.changed",
       at: Date.now(),
-      payload: { bySession },
+      payload: state,
     };
     for (const port of this.#ports) port.postMessage(event);
   }
@@ -197,7 +196,7 @@ export class SidebarHub {
     port.postMessage(event);
   }
 
-  #sendAttachment(port: Browser.runtime.Port, attachment: PageArtifactSummary | null): void {
+  #sendAttachment(port: Browser.runtime.Port, attachment: AttachedPage | null): void {
     const event: SidebarEvent = {
       v: 1,
       runId: null,
@@ -211,8 +210,9 @@ export class SidebarHub {
   }
 }
 
-function toAttachment(tab: { id?: number; url?: string; title?: string }): PageArtifactSummary {
+function toAttachment(tab: { id?: number; url?: string; title?: string }): AttachedPage {
   return {
+    tabId: tab.id!,
     artifactId: `page:${tab.id}:${tab.url}`,
     kind: "page",
     title: tab.title ?? "",
@@ -221,9 +221,9 @@ function toAttachment(tab: { id?: number; url?: string; title?: string }): PageA
   };
 }
 
-function attachmentsEqual(a: PageArtifactSummary | null, b: PageArtifactSummary | null): boolean {
+function attachmentsEqual(a: AttachedPage | null, b: AttachedPage | null): boolean {
   if (a === null || b === null) return a === b;
-  return a.url === b.url && a.title === b.title;
+  return a.tabId === b.tabId && a.url === b.url && a.title === b.title;
 }
 
 function isSupportedUrl(url: string | undefined): boolean {

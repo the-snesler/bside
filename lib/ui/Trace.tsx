@@ -5,9 +5,9 @@ import ChevronRight from "~icons/tabler/chevron-right";
 export type TraceStatus = "running" | "error" | "pending";
 
 /** A list of one-line work rows, modelled on shadcn's Trace. */
-export function Trace(props: { label?: string; children: ComponentChildren }) {
+export function Trace(props: { label?: string; class?: string; children: ComponentChildren }) {
   return (
-    <ul class="trace" aria-label={props.label}>
+    <ul class={props.class ? `trace ${props.class}` : "trace"} aria-label={props.label}>
       {props.children}
     </ul>
   );
@@ -22,7 +22,7 @@ export function Trace(props: { label?: string; children: ComponentChildren }) {
 export function TraceLine(props: {
   icon: ComponentChildren;
   title: string;
-  description?: string;
+  description?: ComponentChildren;
   status?: TraceStatus;
   open?: boolean;
   children?: ComponentChildren;
