@@ -115,7 +115,7 @@ describe("browser program boundary", () => {
     'return {__proto__: {}};', 'return (() => 1)();',
     'return browser.tab("/tabs/1/page.md").evaluate("alert(1)");',
     'return browser.tab("/tabs/1/page.md").locator("#email");',
-    "return fs.read('/workspace/x');",
+    'return fs.read(`/workspace/x`);',
     'await fs.list("/");'.repeat(33),
   ])("rejects unsupported source before executing anything: %s", async (source) => {
     const { run, scratch, effect } = setup();
@@ -413,6 +413,56 @@ describe("browser program values", () => {
     expect(result.summary).toContain(message);
   });
 
+  it("reads single-quoted strings like JavaScript", async () => {
+    const [statement] = parseProgram(`return ['site:x.com "little guy"', 'it\\'s', "it\\'s", '\\u0041\\n'];`);
+    expect(statement?.expression).toEqual({ type: "array", values: ['site:x.com "little guy"', "it's", "it's", "A\n"].map((value) => ({ type: "literal", value })) });
+    const { run } = setup();
+    expect((await run("const r = {'a b': 1}; return r['a b'];")).summary).toBe("1");
+    expect(() => parseProgram("return 'unterminated;")).toThrow("Unsupported syntax");
+  });
+
+  it("joins strings and adds numbers with + like JavaScript", async () => {
+    const { run } = setup();
+    expect((await run(`const domain = "x.com"; return 'site:' + domain + ' "little guy"';`)).summary).toBe('site:x.com "little guy"');
+    expect((await run('return 1 + 2 + "a" + 1 + 2;')).summary).toBe("3a12");
+    expect((await run('return {offset: 16000 + 16000};')).summary).toBe('{"offset":32000}');
+    expect((await run('const listing = fs.list("/tabs"); return listing.entries[0].path + " of " + listing.entries.length;')).summary)
+      .toBe("/tabs/1/page.md of 1");
+    for (const source of ['return "a" +;', 'return + "a";', 'return "a" ++ "b";']) expect(() => parseProgram(source), source).toThrow();
+  });
+
+  it.each([
+    ['return "a" + null;', "got null (a missing key reads as null)"],
+    ['const r = {}; return "a" + r.title;', "got null"],
+    ['return "a" + true;', "got a boolean"],
+    ['return "a" + [1];', "got an array"],
+    ['return "a" + {};', "got an object"],
+    ['return "a" + fs;', "got <fs>"],
+  ])("rejects + on values other than strings and numbers: %s", async (source, message) => {
+    const result = await setup().run(source);
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain(message);
+  });
+
+  it("bounds strings built with +", async () => {
+    const { run } = setup();
+    const result = await run(`const s = "${"x".repeat(1000)}";${" const s = s + s;".repeat(9)}`);
+    expect(result.code).toBe("LIMIT_EXCEEDED");
+    expect(result.summary).toContain("9 statements completed");
+  });
+
+  it("destructures arrays like JavaScript", async () => {
+    const { run } = setup();
+    expect((await run('const [a, , c, d] = ["x", "y", "z"]; return {a, c, d};')).summary).toBe('{"a":"x","c":"z","d":null}');
+    expect((await run('let [first,] = [1, 2]; return first;')).summary).toBe("1");
+    const result = await run('const [x] = "text";');
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain("Destructuring needs an array");
+    for (const source of ['const [] = [1];', 'const [,] = [1];', 'const [a, a] = [1, 2];', 'const [fs] = [1];', 'const [a b] = [1];', 'const [...a] = [1];', 'return [a] = [1];']) {
+      expect(() => parseProgram(source), source).toThrow();
+    }
+  });
+
   it("rejects prototype keys and reserved names at parse time", () => {
     for (const source of ['return fs.list("/").__proto__;', 'const r = {}; return r.prototype;', 'const youtube = 1;', 'const Promise = 1;']) {
       expect(() => parseProgram(source), source).toThrow();
@@ -429,6 +479,15 @@ describe("browser program concurrency", () => {
     expect(result.summary).toBe('["Title aaaaaaaaaaa","Title bbbbbbbbbbb"]');
     expect(stats.maxActive).toBe(2);
     expect((result.data as { visited: string[] }).visited).toEqual(["https://www.youtube.com/watch?v=aaaaaaaaaaa", "https://www.youtube.com/watch?v=bbbbbbbbbbb"]);
+  });
+
+  it("destructures Promise.all results into variables", async () => {
+    const { sites } = playerSites();
+    const { run } = setup({ sites });
+    const result = await run('const [a, b] = await Promise.all([youtube.getMetadata("aaaaaaaaaaa"), youtube.getMetadata("bbbbbbbbbbb")]); return [a.title, b.title];');
+    expect(result.summary, result.summary).toBe('["Title aaaaaaaaaaa","Title bbbbbbbbbbb"]');
+    // Bindings persist across programs like other variables.
+    expect((await run("return b.title;")).summary).toBe("Title bbbbbbbbbbb");
   });
 
   it("caps concurrency and accepts an array of values already computed", async () => {

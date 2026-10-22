@@ -7,15 +7,15 @@ Use the `youtube` global in `browser_program`. It calls YouTube's backend direct
 ```js
 const results = await youtube.search("OpenAI DevDay 2025", {limit: 5});
 const id = results[0].videoId;
-const info = await Promise.all([
+const [metadata, transcript, comments] = await Promise.all([
   youtube.getMetadata(id),
   youtube.getTranscript(id),
   youtube.getComments(id, {limit: 20}),
 ]);
-return {metadata: info[0], transcript: info[1], comments: info[2]};
+return {metadata, transcript, comments};
 ```
 
-Every method that takes a video accepts a raw ID (`"hS1YqcewH0c"`) or a watch, Shorts, live, embed, or `youtu.be` URL. Strings must be double-quoted. Read fields with `x.key`, `x[0]`, and `x.length`; a missing field reads as `null`.
+Every method that takes a video accepts a raw ID (`"hS1YqcewH0c"`) or a watch, Shorts, live, embed, or `youtu.be` URL. Read fields with `x.key`, `x[0]`, and `x.length`; a missing field reads as `null`.
 
 ## Methods
 
