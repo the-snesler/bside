@@ -1,6 +1,7 @@
 import { useEffect, useState } from "preact/hooks";
 import ArrowsMove from "~icons/tabler/arrows-move";
 import ArrowsVertical from "~icons/tabler/arrows-vertical";
+import BrandYoutube from "~icons/tabler/brand-youtube";
 import Checkbox from "~icons/tabler/checkbox";
 import Clock from "~icons/tabler/clock";
 import ExternalLink from "~icons/tabler/external-link";
@@ -32,6 +33,7 @@ const PROGRAM_ACTIONS: [RegExp, Icon, string, string, string][] = [
   [/\.selectOption\(/, Selector, "Selecting an option", "Selected an option", "Couldn't select an option"],
   [/\.setChecked\(|\.check\(|\.uncheck\(/, Checkbox, "Updating a checkbox", "Updated a checkbox", "Couldn't update a checkbox"],
   [/web\.search\(/, WorldSearch, "Searching the web", "Searched the web", "Web search failed"],
+  [/youtube\s*\.\s*\w+\s*\(/, BrandYoutube, "Reading YouTube", "Read YouTube", "Couldn't read YouTube"],
   [/\.navigate\(|\.goBack\(|browser\.open\(/, ExternalLink, "Opening a page", "Opened a page", "Couldn't open a page"],
   [/fs\.remove\(/, Trash, "Removing a file or tab", "Removed a file or tab", "Couldn't remove a file or tab"],
   [/fs\.move\(/, ArrowsMove, "Moving a file or tab", "Moved a file or tab", "Couldn't move a file or tab"],

@@ -3,6 +3,7 @@ import { BrowserProgram, parseProgram, ScratchFiles, WorkspaceState } from "@/li
 import type { ScratchFileEntry, ScratchStore } from "@/lib/background/browser-program";
 import { TabController, type TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import type { DomAction, PageSnapshot, SearchResult } from "@/lib/domain/tools";
+import type { SiteEnv } from "@/lib/sites/site-api";
 
 /** A scratch store over a slot map, standing in for the session's storage.local records. */
 function memoryStore(initial: ScratchFileEntry[] = []) {
@@ -17,7 +18,7 @@ function memoryStore(initial: ScratchFileEntry[] = []) {
   return { store, slots, files };
 }
 
-function setup(options: { outline?: string; searchResults?: (url: string) => SearchResult[] } = {}) {
+function setup(options: { outline?: string; searchResults?: (url: string) => SearchResult[]; sites?: SiteEnv } = {}) {
   const tabs = new Map([[1, { id: 1, url: "https://example.com", title: "Example", hidden: false }]]);
   const documents = new Map<number, string>([[1, "doc-1"]]);
   const actions: DomAction[] = [];
@@ -59,7 +60,7 @@ function setup(options: { outline?: string; searchResults?: (url: string) => Sea
   const scratch = memoryStore();
   const files = new ScratchFiles(scratch.store);
   const controller = new TabController(api);
-  const program = new BrowserProgram(controller, { state, sessionId: "s1", files }, effect);
+  const program = new BrowserProgram(controller, { state, sessionId: "s1", files, sites: options.sites }, effect);
   const run = (source: string) => program.execute(source, abort.signal);
   return { run, tabs, actions, api, effect, state, scratch, files, controller, abort, sendMessage, program, documents };
 }
@@ -110,7 +111,7 @@ describe("browser program boundary", () => {
   it.each([
     'await fs.write("/workspace/x", "x"); fetch("https://evil.example");',
     'browser.constructor("return globalThis")();', 'while (true) {}',
-    'import("node:fs");', 'return globalThis.browser;', 'return fs["read"]("/workspace/x");',
+    'import("node:fs");', 'return globalThis.browser();', 'return fs["read"]("/workspace/x");',
     'return {__proto__: {}};', 'return (() => 1)();',
     'return browser.tab("/tabs/1/page.md").evaluate("alert(1)");',
     'return browser.tab("/tabs/1/page.md").locator("#email");',
@@ -359,5 +360,135 @@ describe("browser program tabs, files, and search", () => {
     expect((await other.execute('return web.search("box office 2020");', new AbortController().signal)).ok).toBe(true);
     expect(api.tabs.create).toHaveBeenCalledTimes(2);
     expect(state.searchTab("s2")).not.toBe(state.searchTab("s1"));
+  });
+});
+
+/** A YouTube player backend whose responses wait `delay` ms, abort with their signal, and count overlapping requests. */
+function playerSites(delay: (videoId: string) => number = () => 5) {
+  let active = 0;
+  const stats = { maxActive: 0, aborted: [] as string[] };
+  const sites: SiteEnv = {
+    cookie: async () => null,
+    now: () => 0,
+    fetch: async (_url, init) => {
+      const videoId = JSON.parse(init.body as string).videoId as string;
+      active++;
+      stats.maxActive = Math.max(stats.maxActive, active);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const onAbort = () => { clearTimeout(timer); stats.aborted.push(videoId); reject(init.signal!.reason); };
+          const timer = setTimeout(() => { init.signal?.removeEventListener("abort", onAbort); resolve(); }, delay(videoId));
+          init.signal?.addEventListener("abort", onAbort, { once: true });
+        });
+      } finally { active--; }
+      const body = videoId.startsWith("missing")
+        ? { playabilityStatus: { status: "ERROR", reason: "Video unavailable" } }
+        : { videoDetails: { videoId, title: `Title ${videoId}` } };
+      return new Response(JSON.stringify(body));
+    },
+  };
+  return { sites, stats };
+}
+
+describe("browser program values", () => {
+  it("reads properties, indexes, and lengths of returned values", async () => {
+    const { run } = setup();
+    await run('const listing = fs.list("/tabs"); const words = ["alpha", "beta"]; const record = {"a b": 1};');
+    expect((await run('return listing.entries[0].path;')).summary).toBe("/tabs/1/page.md");
+    expect((await run('return [words.length, words[1], words[1].length, words[1][0], words[5], listing.missing, record["a b"]];')).summary)
+      .toBe('[2,"beta",4,"b",null,null,1]');
+    expect((await run('return fs.list("/tabs").entries.length;')).summary).toBe("1");
+  });
+
+  it.each([
+    ['return fs.path;', "Capability handles have no properties"],
+    ['const w = ["a"]; return w.first;', "Arrays and strings support [index] and .length"],
+    ['const n = null; return n.x;', "Cannot read \"x\" of null"],
+    ['const r = {}; return r["constructor"];', "Invalid property name"],
+    ['const r = {}; return r[true];', "Index with a number or string"],
+  ])("rejects unsafe or invalid reads: %s", async (source, message) => {
+    const { run } = setup();
+    const result = await run(source);
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain(message);
+  });
+
+  it("rejects prototype keys and reserved names at parse time", () => {
+    for (const source of ['return fs.list("/").__proto__;', 'const r = {}; return r.prototype;', 'const youtube = 1;', 'const Promise = 1;']) {
+      expect(() => parseProgram(source), source).toThrow();
+    }
+  });
+});
+
+describe("browser program concurrency", () => {
+  it("runs Promise.all items concurrently and keeps their order", async () => {
+    const { sites, stats } = playerSites((id) => id === "aaaaaaaaaaa" ? 20 : 1);
+    const { run } = setup({ sites });
+    const result = await run('const both = await Promise.all([youtube.getMetadata("aaaaaaaaaaa"), youtube.getMetadata("bbbbbbbbbbb")]); return [both[0].title, both[1].title];');
+    expect(result.ok, result.summary).toBe(true);
+    expect(result.summary).toBe('["Title aaaaaaaaaaa","Title bbbbbbbbbbb"]');
+    expect(stats.maxActive).toBe(2);
+    expect((result.data as { visited: string[] }).visited).toEqual(["https://www.youtube.com/watch?v=aaaaaaaaaaa", "https://www.youtube.com/watch?v=bbbbbbbbbbb"]);
+  });
+
+  it("caps concurrency and accepts an array of values already computed", async () => {
+    const { sites, stats } = playerSites();
+    const { run } = setup({ sites });
+    const ids = Array.from({ length: 10 }, (_, i) => `video${String(i).padStart(6, "0")}`);
+    const result = await run(`const all = await Promise.all([${ids.map((id) => `youtube.getMetadata("${id}")`).join(", ")}]); return all.length;`);
+    expect(result.summary).toBe("10");
+    expect(stats.maxActive).toBe(8);
+    expect((await run('const xs = [1, 2]; return Promise.all(xs);')).summary).toBe("[1,2]");
+  });
+
+  it("cancels the remaining items when one fails and says which finished", async () => {
+    const { sites, stats } = playerSites((id) => id === "slowslowslo" ? 1000 : 1);
+    const { run } = setup({ sites });
+    const result = await run('const x = await Promise.all([youtube.getMetadata("fastfastfas"), youtube.getMetadata("missing0000"), youtube.getMetadata("slowslowslo")]);');
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe("TARGET_MISSING");
+    expect(result.summary).toContain("Promise.all item 2 of 3 failed: youtube.getMetadata: YouTube video missing0000 is unavailable: Video unavailable. Items 1 finished; the others were cancelled.");
+    expect(stats.aborted).toEqual(["slowslowslo"]);
+  });
+
+  it("serializes calls on one tab while different tabs run in parallel", async () => {
+    const { run, sendMessage, tabs } = setup();
+    tabs.set(2, { id: 2, url: "https://example.org", title: "Other", hidden: false });
+    const original = sendMessage.getMockImplementation()!;
+    const active = new Map<number, number>();
+    let maxPerTab = 0;
+    let maxOverall = 0;
+    sendMessage.mockImplementation(async (id: number, message: unknown) => {
+      active.set(id, (active.get(id) ?? 0) + 1);
+      maxPerTab = Math.max(maxPerTab, active.get(id)!);
+      maxOverall = Math.max(maxOverall, [...active.values()].reduce((sum, n) => sum + n, 0));
+      try { await new Promise((resolve) => setTimeout(resolve, 5)); return await original(id, message); }
+      finally { active.set(id, active.get(id)! - 1); }
+    });
+    const result = await run('const a = browser.tab("/tabs/1/page.md"); const b = browser.tab("/tabs/2/page.md"); const r = await Promise.all([a.snapshot(), a.find("Continue"), b.snapshot(), b.find("Continue")]); return r.length;');
+    expect(result.ok, result.summary).toBe(true);
+    expect(maxPerTab).toBe(1);
+    expect(maxOverall).toBe(2);
+  });
+
+  it("gives concurrent scratch writes distinct slots", async () => {
+    const { run, scratch } = setup();
+    const result = await run('await Promise.all([fs.write("/workspace/a.md", "A"), fs.write("/workspace/b.md", "B"), fs.write("/workspace/c.md", "C")]);');
+    expect(result.ok, result.summary).toBe(true);
+    expect(scratch.files()).toEqual({ "/workspace/a.md": "A", "/workspace/b.md": "B", "/workspace/c.md": "C" });
+    expect([...scratch.slots.keys()].sort()).toEqual([0, 1, 2]);
+  });
+});
+
+describe("browser program site APIs", () => {
+  it("passes only plain values to site APIs and fails cleanly without network access", async () => {
+    const { sites } = playerSites();
+    const withSites = setup({ sites });
+    const handle = await withSites.run('return youtube.getMetadata(fs);');
+    expect(handle.ok).toBe(false);
+    expect(handle.summary).toContain("youtube.getMetadata() takes plain strings, numbers, and option objects.");
+    expect((await withSites.run('return youtube.listChannels("x");')).summary).toContain("Unsupported method listChannels");
+    const without = await setup().run('return youtube.getMetadata("aaaaaaaaaaa");');
+    expect(without).toMatchObject({ ok: false, code: "UNSUPPORTED_PAGE" });
   });
 });

@@ -27,6 +27,13 @@ describe("trace read labels", () => {
     expect(describeActivity(activity(source, false), false)).toMatchObject({ title: "Couldn't read file content", status: "error" });
   });
 
+  it("labels YouTube site calls", () => {
+    const source = 'const both = await Promise.all([youtube.getMetadata("x"), youtube.getTranscript("x")]);';
+    expect(describeActivity(activity(source), false).title).toBe("Reading YouTube");
+    expect(describeActivity(activity(source, true), false).title).toBe("Read YouTube");
+    expect(describeActivity(activity(source, false), false)).toMatchObject({ title: "Couldn't read YouTube", status: "error" });
+  });
+
   it("keeps page labels for page snapshots", () => {
     const source = 'const page = browser.tab("/tabs/12/page.md"); page.snapshot();';
     expect(describeActivity(activity(source), false).title).toBe("Reading page content");
