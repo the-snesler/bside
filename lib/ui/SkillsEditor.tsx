@@ -1,5 +1,5 @@
 import { useEffect, useState } from "preact/hooks";
-import { isSkill, MAX_SKILLS, MAX_SKILL_BODY, MAX_SKILL_DESCRIPTION, type Skill } from "@/lib/domain/skills";
+import { isSkill, MAX_SKILL_BODY, MAX_SKILL_DESCRIPTION, type Skill } from "@/lib/domain/skills";
 import type { SkillsRequest, SkillsResponse } from "@/lib/protocol";
 
 const emptySkill = (): Skill => ({ name: "", description: "", body: "" });
@@ -63,7 +63,7 @@ export function SkillsEditor() {
       <label class="options__field">Name
         <input value={draft.name} maxLength={48} pattern="[a-z][a-z0-9-]{0,47}" required disabled={busy || editing} placeholder="research-summary" onInput={(event) => setDraft({ ...draft, name: event.currentTarget.value })} />
       </label>
-      <p class="options__disclosure">Lowercase letters, numbers, and hyphens; start with a letter. Up to {MAX_SKILLS} skills.</p>
+      <p class="options__disclosure">Lowercase letters, numbers, and hyphens; start with a letter. Every skill's name and description is sent with each request.</p>
       <label class="options__field">Description
         <input value={draft.description} maxLength={MAX_SKILL_DESCRIPTION} required disabled={busy || readonly} onInput={(event) => setDraft({ ...draft, description: event.currentTarget.value })} />
       </label>
@@ -72,7 +72,7 @@ export function SkillsEditor() {
       </label>
       {duplicate && <p class="options__error">That name already exists. Select it above to edit.</p>}
       <div class="options__form options__form--wrap">
-        <button type="submit" disabled={!loaded || busy || readonly || duplicate || !isSkill(draft) || (!editing && skills.length >= MAX_SKILLS)}>{editing ? "Save changes" : "Create skill"}</button>
+        <button type="submit" disabled={!loaded || busy || readonly || duplicate || !isSkill(draft)}>{editing ? "Save changes" : "Create skill"}</button>
         {editing && <button type="button" class="options__secondary" disabled={busy} onClick={() => { setDraft(emptySkill()); setEditing(false); }}>New skill</button>}
       </div>
     </form>

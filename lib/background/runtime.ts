@@ -13,8 +13,8 @@
 
 import { AgentLoop } from "@/lib/background/agent-loop";
 import { getSkills } from "@/lib/background/skills";
-import { captureSkillContext } from "@/lib/background/skill-context";
-import { skillCatalog, type Skill, type SkillContext } from "@/lib/domain/skills";
+import { captureInvokedSkill } from "@/lib/background/skill-context";
+import { skillCatalog, type Skill, type SkillSummary } from "@/lib/domain/skills";
 import type { ApprovalBadge } from "@/lib/background/approval-badge";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
@@ -818,16 +818,16 @@ export class BackgroundRuntime {
     const prompt = validatePromptText(rawPrompt);
     if (!prompt || this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, rawPrompt);
     if (await this.#queueFull(queue)) return;
-    const skills = await this.#captureSkills(prompt);
-    if (skills === null) return;
-    if (this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, prompt, undefined, skills ?? { version: 1, catalog: [] });
+    const skill = await this.#captureSkill(prompt);
+    if (skill === null) return;
+    if (this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, prompt, undefined, { skill });
     const current = await this.#queue(sessionId);
     if (await this.#queueFull(current)) return;
-    await this.#setQueue(sessionId, [...current, { id: crypto.randomUUID(), mode: "follow-up", text: prompt, ...(skills ? { skills } : {}), at: Date.now() }]);
+    await this.#setQueue(sessionId, [...current, { id: crypto.randomUUID(), mode: "follow-up", text: prompt, ...(skill ? { skill } : {}), at: Date.now() }]);
   }
 
-  async #captureSkills(text: string): Promise<SkillContext | undefined | null> {
-    try { return await captureSkillContext(text); }
+  async #captureSkill(text: string): Promise<Skill | undefined | null> {
+    try { return await captureInvokedSkill(text); }
     catch (error) {
       this.#notice = error instanceof Error ? error.message : "Could not read saved skills.";
       await this.#sidebarHub.broadcastSnapshot();
@@ -844,12 +844,12 @@ export class BackgroundRuntime {
     // Re-checked after loading: once a run ends or is cancelling, a steer could never be delivered.
     if (!text || this.#activeRun !== run || run.status === "cancelling") return this.#submitPrompt(rawText);
     if (await this.#queueFull(queue)) return;
-    const skills = await this.#captureSkills(text);
-    if (skills === null) return;
+    const skill = await this.#captureSkill(text);
+    if (skill === null) return;
     if (this.#activeRun !== run || run.controller.signal.aborted) return this.#submitPrompt(rawText);
     const current = await this.#queue(run.sessionId);
     if (await this.#queueFull(current)) return;
-    const message: QueuedMessage = { id: crypto.randomUUID(), mode: "steer", text, ...(skills ? { skills } : {}), at: Date.now() };
+    const message: QueuedMessage = { id: crypto.randomUUID(), mode: "steer", text, ...(skill ? { skill } : {}), at: Date.now() };
     run.agentLoop.steer(message);
     await this.#setQueue(run.sessionId, [...current, message]);
   }
@@ -869,7 +869,7 @@ export class BackgroundRuntime {
       await this.#sidebarHub.broadcastSnapshot();
       return;
     }
-    await this.#startRun(sessionId, message.text, message.id, message.skills);
+    await this.#startRun(sessionId, message.text, message.id, { skill: message.skill });
   }
 
   /**
@@ -880,7 +880,7 @@ export class BackgroundRuntime {
   async #dispatchFollowUp(sessionId: string): Promise<void> {
     if (this.#activeRun || this.#sessionOpsPending > 0) return;
     const next = (await this.#queue(sessionId)).find((message) => message.mode === "follow-up");
-    if (next) await this.#startRun(sessionId, next.text, next.id, next.skills);
+    if (next) await this.#startRun(sessionId, next.text, next.id, { skill: next.skill });
   }
 
   /**
@@ -890,7 +890,7 @@ export class BackgroundRuntime {
    * names the queued follow-up the prompt came from; its user message keeps
    * that id, and it leaves the queue once that message is written.
    */
-  async #startRun(sessionId: string, rawPrompt: string | null, queuedId?: string, queuedSkills?: SkillContext): Promise<void> {
+  async #startRun(sessionId: string, rawPrompt: string | null, queuedId?: string, accepted?: { skill?: Skill }): Promise<void> {
     const retry = rawPrompt === null;
     if (this.#activeRun || this.#sessionOpsPending > 0 || (retry && this.#retryable?.sessionId !== sessionId)) {
       await this.#sidebarHub.broadcastSnapshot();
@@ -932,11 +932,13 @@ export class BackgroundRuntime {
 
     let auth: ProviderAuth;
     let conversation: Conversation | null;
-    let skills: SkillContext | undefined;
+    let skill: Skill | undefined;
+    let catalog: SkillSummary[];
     try {
       const available = await getSkills();
+      catalog = skillCatalog(available);
       for (const skill of available) scope.skills.set(skill.name, skill);
-      if (!retry) skills = queuedId ? queuedSkills : queuedSkills ?? await captureSkillContext(prompt!, available);
+      if (!retry) skill = accepted ? accepted.skill : await captureInvokedSkill(prompt!, available);
       const chatgpt = await this.#chatgpt.status();
       const credential = chatgpt.connected ? null : await getOpenAICredential();
       if (!chatgpt.connected && !credential) throw new ProviderStreamError("Sign in with ChatGPT or add an OpenAI API key in settings before starting a conversation.", "AUTHENTICATION");
@@ -971,7 +973,7 @@ export class BackgroundRuntime {
         kind: "message",
         role: "user",
         text: prompt!,
-        skills,
+        skill,
         context: artifact ? { artifactId: artifact.artifactId, kind: "page", title: artifact.title, url: artifact.url, capturedAt: artifact.capturedAt } : null,
         at: Date.now(),
       };
@@ -998,12 +1000,12 @@ export class BackgroundRuntime {
     const transcript = [...items.slice(0, userIndex + 1), ...items.slice(userIndex + 1).filter((item) =>
       item.kind === "compaction" || (item.kind === "message" && item.role === "user"))];
     for (const item of transcript.slice(userIndex)) {
-      if (item.kind === "message" && item.role === "user" && item.skills?.invoked) scope.skills.set(item.skills.invoked.name, item.skills.invoked);
+      if (item.kind === "message" && item.role === "user" && item.skill) scope.skills.set(item.skill.name, item.skill);
     }
-    await this.#runAgentLoop(runId, transcript, artifact, auth);
+    await this.#runAgentLoop(runId, transcript, catalog, artifact, auth);
   }
 
-  async #runAgentLoop(runId: string, transcript: ConversationItem[], artifact: ContextArtifact | null, auth: ProviderAuth): Promise<void> {
+  async #runAgentLoop(runId: string, transcript: ConversationItem[], catalog: SkillSummary[], artifact: ContextArtifact | null, auth: ProviderAuth): Promise<void> {
     const run = this.#activeRun;
     if (!run || run.runId !== runId) return;
 
@@ -1040,6 +1042,7 @@ export class BackgroundRuntime {
       modelId: settings.modelId,
       reasoningEffort: settings.reasoningEffort,
       transcript,
+      skills: catalog,
       contextArtifact: artifact,
       auth,
       onContext: (context) => { this.#latestContext = context; },

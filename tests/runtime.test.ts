@@ -228,14 +228,14 @@ describe("BackgroundRuntime: saved skills", () => {
     await vi.waitFor(() => expect(provider.requests).toHaveLength(1));
     if (mode === "steer") await send(runtime, { type: "run.steer", runId: (await runtime.getSnapshot()).activeRun!.runId, text: "/brief" });
     else await send(runtime, { type: "run.start", prompt: "/brief" });
-    expect((await runtime.getSnapshot()).queue[0]?.skills?.invoked).toEqual(skill);
+    expect((await runtime.getSnapshot()).queue[0]?.skill).toEqual(skill);
     await handleSkillsRequest({ v: 1, id: "delete", type: "skills.delete", name: skill.name });
     gate.resolve();
     await running;
     await vi.waitFor(() => expect(provider.requests).toHaveLength(3));
     expect(JSON.stringify(provider.requests[2])).toContain(skill.body);
     const user = (await openConversation()).items.find((item) => item.kind === "message" && item.role === "user" && item.text === "/brief");
-    expect(user).toMatchObject({ skills: { invoked: skill }, ...(mode === "steer" ? { delivery: "steer" } : {}) });
+    expect(user).toMatchObject({ skill, ...(mode === "steer" ? { delivery: "steer" } : {}) });
   });
 
   it("refuses unknown explicit names before sending a provider request or persisting a turn", async () => {
@@ -247,7 +247,7 @@ describe("BackgroundRuntime: saved skills", () => {
     expect((await openConversation()).items).toHaveLength(0);
   });
 
-  it("keeps an empty acceptance-time catalog empty when a queued prompt dispatches after a skill is created", async () => {
+  it("lists the current catalog in the system prompt and never on user messages, queued ones included", async () => {
     await saveOpenAICredential("sk-test");
     const gate = Promise.withResolvers<void>();
     const provider = new FakeProvider();
@@ -264,7 +264,11 @@ describe("BackgroundRuntime: saved skills", () => {
     gate.resolve();
     await running;
     await vi.waitFor(() => expect(provider.requests).toHaveLength(2));
-    const messages = provider.requests[1]!.context.messages;
+    expect(provider.requests[0]!.context.systemPrompt).not.toContain("/skills/brief.md");
+    const { systemPrompt, messages } = provider.requests[1]!.context;
+    expect(systemPrompt).toContain(JSON.stringify({ name: skill.name, description: skill.description, path: "/skills/brief.md" }));
+    expect(systemPrompt).not.toContain(skill.body);
+    expect(messages[0]).toEqual(provider.requests[0]!.context.messages[0]);
     expect(messages.at(-1)?.content).toBe("Queued without skills");
   });
 });
