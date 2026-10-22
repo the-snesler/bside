@@ -86,7 +86,16 @@ const AGENT_TOOLS = [
   { name: "request_action_confirmation" as const, description: "Ask the user to confirm before externally visible, destructive, or paid actions. Supply a clear title, explanation of the exact action/recipient/cost, and the complete proposed artifact as plain text (empty string if none). Wait for approved:true before performing that action. Denial is not authorization; do not retry or bypass it.", parameters: {
     type: "object", properties: { title: { type: "string", minLength: 1, maxLength: 160 }, message: { type: "string", minLength: 1, maxLength: 4000 }, artifact: { type: "string", maxLength: 32000 } }, required: ["title", "message", "artifact"], additionalProperties: false,
   } },
+  { name: "current_time" as const, description: "Get the current date and time: the user's local time with its time zone. Call it whenever an answer depends on today's date or the time instead of guessing.", parameters: {
+    type: "object", properties: {}, required: [], additionalProperties: false,
+  } },
 ];
+
+type AgentToolName = (typeof AGENT_TOOLS)[number]["name"];
+
+function isAgentToolName(name: string): name is AgentToolName {
+  return AGENT_TOOLS.some((tool) => tool.name === name);
+}
 
 export class AgentLoop {
   #provider: ProviderAdapter;
@@ -102,6 +111,8 @@ export class AgentLoop {
   #approvalWaitMs = 0;
   /** Every executed call in order, for the run digest. */
   #steps: DigestStep[] = [];
+  /** Whether a call in the current provider round failed or was denied; the round's later calls are then not run. */
+  #roundFailed = false;
   #agent: Agent | null = null;
   /** Steers accepted before the Pi agent exists; handed to it when the run starts. */
   #earlySteers: AgentMessage[] = [];
@@ -192,6 +203,7 @@ export class AgentLoop {
       },
       streamFn: (_model, context, options) => {
         rounds += 1;
+        this.#roundFailed = false;
         params.onContext?.(JSON.stringify(context, null, 2));
         return this.#provider.streamTurn(
         { model: _model, reasoningEffort: params.reasoningEffort, context, sessionId: params.conversationId },
@@ -279,7 +291,7 @@ export class AgentLoop {
 
   async #handleToolEvent(params: AgentLoopParams, event: AgentEvent): Promise<void> {
     if (event.type === "tool_execution_start") {
-      if (event.toolName !== "browser_program" && event.toolName !== "request_action_confirmation") return;
+      if (!isAgentToolName(event.toolName)) return;
       const call: ToolCall = { id: event.toolCallId, name: event.toolName, arguments: toJsonValue(event.args) };
       this.#calls.set(call.id, call);
       this.#startedAt.set(call.id, Date.now());
@@ -289,7 +301,10 @@ export class AgentLoop {
     if (event.type !== "tool_execution_end" || params.signal.aborted) return;
     const call = this.#calls.get(event.toolCallId);
     if (!call) return;
-    const result = readToolResult(event.result) ?? {
+    const executed = readToolResult(event.result);
+    // Pi rejected the call before it ran; the round's later calls are not run either.
+    if (!executed) this.#roundFailed = true;
+    const result = executed ?? {
       ok: false,
       code: "INVALID_TOOL_ARGUMENTS",
       summary: "Invalid or missing arguments for this tool call.",
@@ -327,7 +342,15 @@ export class AgentLoop {
     if (!isRecord(call.arguments)) {
       const invalid: ToolResult = { ok: false, code: "INVALID_TOOL_ARGUMENTS", summary: "Invalid or missing arguments for this tool call." };
       this.#executedCallIds.set(call.id, invalid);
+      this.#roundFailed = true;
       return invalid;
+    }
+    // A response's calls run one at a time, in order. Later calls were chosen
+    // before an earlier one's outcome, so after a failure or denial they never run.
+    if (this.#roundFailed) {
+      const skipped: ToolResult = { ok: false, code: "SKIPPED", summary: "Not run: an earlier tool call in this response failed or was denied. Effects of the calls before it stand; read their results before deciding what to do next." };
+      this.#executedCallIds.set(call.id, skipped);
+      return skipped;
     }
 
     if (signal.aborted || params.signal.aborted) return { ok: false, code: "ACTION_DENIED", summary: "Cancelled." };
@@ -350,7 +373,11 @@ export class AgentLoop {
     } else if (call.name === "browser_program" && typeof args.source === "string" && Object.keys(args).length === 1) {
       this.#sidebarHub.publishRunEvent(params.runId, "tool.requested", { call, display: "Browser program" });
       result = await this.#program.execute(args.source, signal);
+    } else if (call.name === "current_time" && Object.keys(args).length === 0) {
+      this.#sidebarHub.publishRunEvent(params.runId, "tool.requested", { call, display: "Current time" });
+      result = currentTime(new Date());
     } else result = { ok: false, code: "INVALID_TOOL_ARGUMENTS", summary: "Invalid tool arguments." };
+    if (!result.ok) this.#roundFailed = true;
     this.#executedCallIds.set(call.id, result);
     this.#steps.push({ call, result: stripData(result), urls: visitedUrls(result.data) });
     return result;
@@ -445,7 +472,8 @@ export class AgentLoop {
 }
 
 const DEVELOPER_POLICY = [
-  "You are a browser agent working inside the user's Firefox. Use browser_program to read and operate tabs; request_action_confirmation gates consequential actions.",
+  "You are a browser agent working inside the user's Firefox. Use browser_program to read and operate tabs; request_action_confirmation gates consequential actions; current_time tells you today's date and the time.",
+  "You may call several tools in one response. They run one at a time, in order; once a call fails or a confirmation is denied, the response's later calls are not run.",
   "Work from observation. Read pages with page.snapshot() (paged outline with inline [eN …] refs) or page.find(text) on long pages, then act with page.ref(\"eN\") or a unique getByRole/getByText locator. Batch independent reads and form fills in one program; never guess refs, selectors, or option values you have not observed.",
   "Prefer the site's own UI for what the user asked (e.g. its advanced search, filters, sort controls). If you construct a URL instead, confirm on the resulting page that the requested filters/sort are actually applied before using its data.",
   "Verify outcomes before claiming them. A click or fill succeeding is not proof the task succeeded: check the action's page diff or a fresh snapshot for the requested postcondition (an explicit success message, the applied filter values, the expected results, the new URL). If validation errors or missing required fields appear, fix them and retry. If you cannot confirm the outcome, say plainly that it is unconfirmed and what you observed.",
@@ -620,6 +648,13 @@ function estimateHistoryTokens(params: Pick<AgentLoopParams, "skills">, entries:
 
 function contextWindow(model: Model<Api>): number {
   return model.contextWindow > 0 ? model.contextWindow : DEFAULT_CONTEXT_WINDOW;
+}
+
+/** The user's local time for the `current_time` tool. */
+export function currentTime(now: Date): ToolResult {
+  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const local = now.toLocaleString("en-US", { dateStyle: "full", timeStyle: "long", timeZone });
+  return { ok: true, summary: `${local}` };
 }
 
 function messageText(message: Message): string {

@@ -3,6 +3,7 @@ import ArrowsMove from "~icons/tabler/arrows-move";
 import ArrowsVertical from "~icons/tabler/arrows-vertical";
 import BrandYoutube from "~icons/tabler/brand-youtube";
 import Checkbox from "~icons/tabler/checkbox";
+import Clock from "~icons/tabler/clock";
 import ExternalLink from "~icons/tabler/external-link";
 import FilePencil from "~icons/tabler/file-pencil";
 import FileText from "~icons/tabler/file-text";
@@ -51,9 +52,9 @@ function stringArg(activity: Activity, key: string): string {
   return typeof value === "string" ? value : "";
 }
 
-/** A denied confirmation is the user's decision, not a failed step. */
+/** A denied confirmation is the user's decision, and a skipped call never ran: neither is a failed step. */
 function failed(activity: Activity): boolean {
-  if (!activity.result || activity.result.ok) return false;
+  if (!activity.result || activity.result.ok || activity.result.code === "SKIPPED") return false;
   return !(activity.call.name === "request_action_confirmation" && activity.result.code === "ACTION_DENIED");
 }
 
@@ -63,13 +64,16 @@ export function describeActivity(activity: Activity, pending: boolean): { Icon: 
     const title = stringArg(activity, "title") || "an action";
     if (pending) return { Icon: Shield, title: `Waiting for approval: ${title}`, status: "pending" };
     if (!activity.result) return { Icon: Shield, title: `Asking to confirm: ${title}`, status: "running" };
+    if (activity.result.code === "SKIPPED") return { Icon: Shield, title: `Skipped asking to confirm: ${title}` };
     return { Icon: Shield, title: `${activity.result.ok ? "Approved" : "Denied"}: ${title}` };
   }
   const source = stringArg(activity, "source");
   const [, Icon, running, done, error] =
+    activity.call.name === "current_time" ? [null, Clock, "Checking the time", "Checked the time", "Couldn't check the time"] :
     PROGRAM_ACTIONS.find(([pattern]) => pattern.test(source)) ??
     [null, Terminal, "Running a browser program", "Ran a browser program", "Browser program failed"];
   if (!activity.result) return { Icon, title: running, status: "running" };
+  if (activity.result.code === "SKIPPED") return { Icon, title: `Skipped ${running.charAt(0).toLowerCase()}${running.slice(1)}` };
   return failed(activity) ? { Icon, title: error, status: "error" } : { Icon, title: done };
 }
 
@@ -97,11 +101,11 @@ function ActivityLine(props: {
           <p>{stringArg(activity, "message")}</p>
           {artifact && <pre class="tool-call">{artifact}</pre>}
         </>
-      ) : (
+      ) : activity.call.name === "browser_program" ? (
         <pre class="tool-call">
           {stringArg(activity, "source") || JSON.stringify(activity.call.arguments)}
         </pre>
-      )}
+      ) : null}
       {activity.result && <p class="trace__result">{activity.result.summary}</p>}
       {pending && (
         <div class="trace__actions">

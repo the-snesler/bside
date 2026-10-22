@@ -51,7 +51,7 @@ describe("ChatGPT requests through the real Pi Responses transport", () => {
     expect(resolve).toHaveBeenCalledTimes(2);
     expect(headers.map((value) => value.get("Authorization"))).toEqual(["Bearer test-token-1", "Bearer test-token-2"]);
     for (const body of bodies) {
-      expect(body).toMatchObject({ model: MODEL.id, store: false, stream: true, parallel_tool_calls: false });
+      expect(body).toMatchObject({ model: MODEL.id, store: false, stream: true, parallel_tool_calls: true });
       for (const field of ["tools", "max_output_tokens", "prompt_cache_options", "prompt_cache_retention", "previous_response_id"])
         expect(body).not.toHaveProperty(field);
       expect(body.input).toContainEqual(expect.objectContaining({ role: "developer", content: "Browser policy." }));
@@ -113,7 +113,7 @@ describe("Prompt caching through the real Pi Responses transport", () => {
     const done = await provider.streamTurn({ model, reasoningEffort: "none", context, sessionId: "default" }, auth, new AbortController().signal).result();
     await provider.streamTurn({ model, reasoningEffort: "none", context }, auth, new AbortController().signal).result();
 
-    expect(bodies[0]).toMatchObject({ prompt_cache_key: "default", store: false, parallel_tool_calls: false });
+    expect(bodies[0]).toMatchObject({ prompt_cache_key: "default", store: false, parallel_tool_calls: true });
     for (const field of ["prompt_cache_retention", "prompt_cache_options"]) expect(bodies[0]).not.toHaveProperty(field);
     expect(headers[0]?.get("session_id")).toBe("default");
     expect(bodies[1]).not.toHaveProperty("prompt_cache_key");

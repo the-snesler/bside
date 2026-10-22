@@ -109,7 +109,7 @@ describe("OpenAIProvider Pi adapter", () => {
     expect(await options?.onPayload?.({ model: "gpt-5.6-terra", store: true }, MODEL)).toEqual({
       model: "gpt-5.6-terra",
       store: false,
-      parallel_tool_calls: false,
+      parallel_tool_calls: true,
     });
   });
 

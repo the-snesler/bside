@@ -15,7 +15,7 @@ export type JsonValue =
 
 export interface ToolCall {
   id: string;
-  name: "browser_program" | "request_action_confirmation";
+  name: "browser_program" | "request_action_confirmation" | "current_time";
   arguments: JsonValue;
 }
 
@@ -58,7 +58,7 @@ export type PageErrorCode =
 
 export interface ToolResult {
   ok: boolean;
-  code?: PageErrorCode | "ACTION_DENIED" | "LIMIT_EXCEEDED" | "INVALID_TOOL_ARGUMENTS";
+  code?: PageErrorCode | "ACTION_DENIED" | "LIMIT_EXCEEDED" | "INVALID_TOOL_ARGUMENTS" | "SKIPPED";
   summary: string;
   data?: JsonValue;
 }

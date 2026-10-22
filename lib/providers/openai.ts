@@ -229,7 +229,8 @@ export function encodeProviderErrorMessage(error: ProviderStreamError): string {
 
 function enforceRequestPolicy(payload: unknown, method: ProviderAuth["method"]): unknown {
   if (!isRecord(payload)) return payload;
-  const result = { ...payload, store: false, parallel_tool_calls: false };
+  // One response may call several tools; the agent loop still runs them one at a time, in order.
+  const result = { ...payload, store: false, parallel_tool_calls: true };
   if (method === "api-key") return result;
   const subscription: Record<string, unknown> = result;
   for (const field of ["background", "conversation", "max_output_tokens", "max_tool_calls", "metadata", "moderation", "multi_agent",

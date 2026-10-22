@@ -343,6 +343,96 @@ describe("AgentLoop: exactly-once execution", () => {
   });
 });
 
+describe("AgentLoop: several tool calls in one response", () => {
+  const execute = async (rounds: ConstructorParameters<typeof ScriptedProvider>[0], decide?: (loop: AgentLoop) => void) => {
+    const provider = new ScriptedProvider(rounds);
+    const actions: unknown[] = [];
+    const { tabController } = await createTabController({ onExecute: (action) => { actions.push(action); return { result: { ok: true, summary: "Clicked." }, documentId: "doc-1" }; } });
+    const loop = new AgentLoop(provider, tabController, new SidebarHub());
+    const items: ConversationItem[] = [];
+    const running = loop.run({
+      runId: "run1", conversationId: "default", modelId: "gpt-5.6-terra", reasoningEffort: "medium", transcript: baseTranscript, contextArtifact: artifact,
+      auth: AUTH, signal: new AbortController().signal, onDelta: () => {}, onItem: async (item) => { items.push(item); }, onApprovalPending: () => {},
+    });
+    if (decide) {
+      await tick();
+      decide(loop);
+    }
+    const result = await running;
+    const toolResults = provider.requests[1]?.context.messages.filter((m) => m.role === "toolResult").map((m) => ({ id: m.role === "toolResult" ? m.toolCallId : "", text: JSON.stringify(m.content) }));
+    return { result, actions, items, toolResults };
+  };
+  const click = 'await browser.tab("/tabs/1/page.md").ref("e1").click();';
+  const done = () => [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }] as ScriptedProviderEvent[];
+
+  it("runs every call in order and returns each result to the next request", async () => {
+    const { result, actions, items, toolResults } = await execute([
+      () => [toolCallEvent("call_1", "current_time", {}), toolCallEvent("call_2", "browser_program", { source: click }), { type: "turn.completed", replayState: null }],
+      done,
+    ]);
+
+    expect(result.status).toBe("completed");
+    expect(actions).toHaveLength(1);
+    expect(toolResults?.map((entry) => entry.id)).toEqual(["call_1", "call_2"]);
+    expect(items.flatMap((item) => item.kind === "tool-call" ? [`call:${item.call.id}`] : item.kind === "tool-result" ? [`result:${item.callId}`] : []))
+      .toEqual(["call:call_1", "result:call_1", "call:call_2", "result:call_2"]);
+  });
+
+  it("does not run the calls after one that failed", async () => {
+    const { actions, toolResults } = await execute([
+      () => [
+        toolCallEvent("call_1", "browser_program", { source: 'return await fs.read("/workspace/missing.md");' }),
+        toolCallEvent("call_2", "browser_program", { source: click }),
+        { type: "turn.completed", replayState: null },
+      ],
+      done,
+    ]);
+
+    expect(actions).toHaveLength(0);
+    expect(toolResults?.[0]?.text).not.toContain("SKIPPED");
+    expect(toolResults?.[1]?.text).toContain("SKIPPED");
+  });
+
+  it("does not run the action batched after a denied confirmation", async () => {
+    const { actions, items, toolResults } = await execute([
+      () => [
+        toolCallEvent("call_1", "request_action_confirmation", { title: "Submit", message: "Submit it?", artifact: "" }),
+        toolCallEvent("call_2", "browser_program", { source: click }),
+        { type: "turn.completed", replayState: null },
+      ],
+      done,
+    ], (loop) => loop.deny("call_1"));
+
+    expect(actions).toHaveLength(0);
+    expect(toolResults?.[0]?.text).toContain("ACTION_DENIED");
+    expect(toolResults?.[1]?.text).toContain("SKIPPED");
+    expect(items.filter((item) => item.kind === "tool-result").map((item) => item.kind === "tool-result" && item.result.code)).toEqual(["ACTION_DENIED", "SKIPPED"]);
+  });
+
+  it("runs the action batched after an approved confirmation, only once approved", async () => {
+    const { actions } = await execute([
+      () => [
+        toolCallEvent("call_1", "request_action_confirmation", { title: "Submit", message: "Submit it?", artifact: "" }),
+        toolCallEvent("call_2", "browser_program", { source: click }),
+        { type: "turn.completed", replayState: null },
+      ],
+      done,
+    ], (loop) => loop.approve("call_1"));
+
+    expect(actions).toHaveLength(1);
+  });
+
+  it("runs every call of the next response after a failure in the previous one", async () => {
+    const { actions } = await execute([
+      () => [toolCallEvent("call_1", "browser_program", { source: 'return await fs.read("/workspace/missing.md");' }), { type: "turn.completed", replayState: null }],
+      () => [toolCallEvent("call_2", "current_time", {}), toolCallEvent("call_3", "browser_program", { source: click }), { type: "turn.completed", replayState: null }],
+      done,
+    ]);
+
+    expect(actions).toHaveLength(1);
+  });
+});
+
 describe("AgentLoop: stale-ref recovery", () => {
   it("feeds STALE_SNAPSHOT back to the model as a non-terminal result", async () => {
     const provider = new ScriptedProvider([

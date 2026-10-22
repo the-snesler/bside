@@ -40,4 +40,13 @@ describe("trace read labels", () => {
     expect(describeActivity(activity(source, true), false).title).toBe("Read page content");
     expect(describeActivity(activity(source, false), false).title).toBe("Couldn't read page content");
   });
+
+  it("labels the time tool and calls skipped after an earlier failure", () => {
+    const time: Activity = { kind: "activity", id: "time", startedAt: 0, endedAt: null, call: { id: "time", name: "current_time", arguments: {} }, result: null };
+    expect(describeActivity(time, false)).toMatchObject({ title: "Checking the time", status: "running" });
+    expect(describeActivity({ ...time, result: { ok: true, summary: "Local time: …" } }, false).title).toBe("Checked the time");
+    const skipped = describeActivity({ ...activity("page.ref(\"e1\").click();"), result: { ok: false, code: "SKIPPED", summary: "Not run." } }, false);
+    expect(skipped).toMatchObject({ title: "Skipped clicking a page control" });
+    expect(skipped.status).toBeUndefined();
+  });
 });
