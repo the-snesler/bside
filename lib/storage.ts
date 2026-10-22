@@ -11,7 +11,7 @@
  */
 
 import { storage } from "wxt/utils/storage";
-import { isSkillContext } from "@/lib/domain/skills";
+import { isSkill } from "@/lib/domain/skills";
 import { REASONING_EFFORTS, type AppSettingsV1, type ModelListing, type ReasoningEffort } from "@/lib/domain/provider";
 import type { Conversation, ConversationIndexV1, ConversationItem, ConversationSummary, HistorySettingsV1, MessageQueueV1, QueuedMessage } from "@/lib/domain/conversation";
 import { COMPACTION_SUMMARY_MAX_CHARS, HISTORY_RETENTIONS, isTurnStart, MAX_QUEUED_MESSAGES, titleFromPrompt } from "@/lib/domain/conversation";
@@ -140,7 +140,7 @@ function isValidConversationItem(value: unknown): value is ConversationItem {
   if (typeof v.id !== "string" || typeof v.at !== "number") return false;
   if (v.kind === "message") {
     if (typeof v.text !== "string") return false;
-    if (v.role === "user") return (v.context === null || typeof v.context === "object") && (v.delivery === undefined || v.delivery === "steer") && (v.skills === undefined || isSkillContext(v.skills));
+    if (v.role === "user") return (v.context === null || typeof v.context === "object") && (v.delivery === undefined || v.delivery === "steer") && (v.skill === undefined || isSkill(v.skill));
     return v.role === "assistant";
   }
   if (v.kind === "tool-call") return typeof v.call === "object" && v.call !== null;
@@ -810,7 +810,7 @@ function isValidQueuedMessage(value: unknown): value is QueuedMessage {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
   return typeof v.id === "string" && v.id.length > 0 && v.id.length <= 64 && (v.mode === "follow-up" || v.mode === "steer") &&
-    typeof v.text === "string" && validatePromptText(v.text) === v.text && Number.isFinite(v.at) && (v.skills === undefined || isSkillContext(v.skills));
+    typeof v.text === "string" && validatePromptText(v.text) === v.text && Number.isFinite(v.at) && (v.skill === undefined || isSkill(v.skill));
 }
 
 /** A session's queued messages, oldest first. A malformed record is deleted and reads as empty. */

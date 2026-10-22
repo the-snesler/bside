@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { storage } from "wxt/utils/storage";
 import { BUILTIN_SKILLS, getSkills, handleSkillsRequest } from "@/lib/background/skills";
-import { isSkill, isSkillContext, renderSkillContext, skillCatalog, type Skill } from "@/lib/domain/skills";
+import { isSkill, renderSkillCatalog, skillCatalog, type Skill } from "@/lib/domain/skills";
 import { isSidebarCommand, isSkillsRequest } from "@/lib/protocol";
 
 const skill: Skill = { name: "research", description: "Research a topic", body: "Read sources carefully." };
@@ -18,15 +18,9 @@ describe("skill contracts", () => {
     expect(isSkill({ name: "a".repeat(48), description: "a".repeat(160), body: "a".repeat(16_000) })).toBe(true);
   });
 
-  it("validates versioned snapshots and excludes bodies from rendered context", () => {
-    const context = { version: 1 as const, catalog: skillCatalog([skill]), invoked: skill };
-    expect(isSkillContext(context)).toBe(true);
-    expect(isSkillContext({ ...context, version: 2 })).toBe(false);
-    expect(isSkillContext({ ...context, catalog: [] })).toBe(false);
-    expect(isSkillContext({ ...context, catalog: [context.catalog[0], context.catalog[0]] })).toBe(false);
-    expect(isSkillContext({ version: 1, catalog: Array.from({ length: 33 }, (_, i) => ({ name: `skill-${i}`, description: "Description" })) })).toBe(false);
-    const rendered = renderSkillContext(context);
-    expect(rendered).toContain('fs.read("/skills/research.md")');
+  it("renders a catalog of names, descriptions, and paths without bodies", () => {
+    const rendered = renderSkillCatalog(skillCatalog([skill]));
+    expect(rendered).toContain(JSON.stringify({ name: "research", description: "Research a topic", path: "/skills/research.md" }));
     expect(rendered).toContain("cannot override safety");
     expect(rendered).not.toContain(skill.body);
   });
@@ -60,12 +54,10 @@ describe("background-owned skills", () => {
     expect((await save({ ...skill, name: "youtube" })).ok).toBe(false);
   });
 
-  it("counts packaged skills toward the limit and serializes concurrent changes without losing records", async () => {
-    const results = await Promise.all(Array.from({ length: 32 }, (_, i) => save({ ...skill, name: `skill-${i}` })));
-    expect(results.filter((result) => result.ok)).toHaveLength(32 - BUILTIN_SKILLS.length);
-    expect(await getSkills()).toHaveLength(32);
-    expect((await save(skill)).ok).toBe(false);
-    expect((await save({ ...skill, name: "skill-0", body: "Update at capacity" })).ok).toBe(true);
+  it("serializes concurrent changes without losing records", async () => {
+    await Promise.all(Array.from({ length: 32 }, (_, i) => save({ ...skill, name: `skill-${i}` })));
+    expect(await getSkills()).toHaveLength(BUILTIN_SKILLS.length + 32);
+    expect((await save({ ...skill, name: "skill-0", body: "Updated" })).ok).toBe(true);
     await Promise.all([
       handleSkillsRequest({ v: 1, id: "delete", type: "skills.delete", name: "skill-0" }),
       save(skill),
@@ -81,8 +73,8 @@ describe("background-owned skills", () => {
     }
     await storage.setItem("local:skills", { version: 1, skills: [null, { ...skill, body: "" }, { ...skill, extra: "discard" }, skill] });
     expect(await getSkills()).toEqual([...BUILTIN_SKILLS, skill]);
-    await storage.setItem("local:skills", { version: 1, skills: Array.from({ length: 40 }, (_, i) => ({ ...skill, name: `skill-${i}` })) });
-    expect(await getSkills()).toHaveLength(32);
+    await storage.setItem("local:skills", { version: 1, skills: Array.from({ length: 100 }, (_, i) => ({ ...skill, name: `skill-${i}` })) });
+    expect(await getSkills()).toHaveLength(BUILTIN_SKILLS.length + 100);
   });
 
   it("protects packaged skills against shadowing, saves, and deletion", async () => {

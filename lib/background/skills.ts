@@ -1,5 +1,5 @@
 import { storage } from "wxt/utils/storage";
-import { isSkill, MAX_SKILLS, type Skill } from "@/lib/domain/skills";
+import { isSkill, type Skill } from "@/lib/domain/skills";
 import { isSkillsRequest, type SkillsRequest, type SkillsResponse } from "@/lib/protocol";
 import youtubeBody from "@/lib/skills/youtube.md?raw";
 
@@ -17,7 +17,6 @@ async function readSkills(): Promise<Skill[]> {
   const skills = BUILTIN_SKILLS.map(({ name, description, body }) => ({ name, description, body }));
   const names = new Set(skills.map((skill) => skill.name));
   for (const skill of users) {
-    if (skills.length >= MAX_SKILLS) break;
     if (!isSkill(skill) || names.has(skill.name)) continue;
     skills.push({ name: skill.name, description: skill.description, body: skill.body });
     names.add(skill.name);
@@ -42,7 +41,6 @@ export function handleSkillsRequest(request: SkillsRequest): Promise<SkillsRespo
         const name = request.type === "skills.save" ? request.skill.name : request.name;
         if (builtinNames.includes(name)) return invalid("Packaged skills cannot be changed or deleted.");
         if (request.type === "skills.save") {
-          if (!skills.some((skill) => skill.name === name) && skills.length >= MAX_SKILLS) return invalid(`Keep at most ${MAX_SKILLS} skills.`);
           const { description, body } = request.skill;
           const index = skills.findIndex((skill) => skill.name === name);
           if (index < 0) skills.push({ name, description, body });
