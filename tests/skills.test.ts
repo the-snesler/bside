@@ -42,17 +42,27 @@ describe("skill contracts", () => {
 
 describe("background-owned skills", () => {
   it("lists, creates, updates, and deletes skills", async () => {
-    expect(await getSkills()).toEqual([]);
+    expect(await getSkills()).toEqual(BUILTIN_SKILLS);
     expect((await save(skill)).ok).toBe(true);
     expect((await save({ ...skill, body: "Updated" })).ok).toBe(true);
-    expect(await getSkills()).toEqual([{ ...skill, body: "Updated" }]);
-    expect(await handleSkillsRequest({ v: 1, id: "list", type: "skills.list" })).toEqual({ v: 1, id: "list", ok: true, skills: [{ ...skill, body: "Updated" }], builtinNames: [] });
+    expect(await getSkills()).toEqual([...BUILTIN_SKILLS, { ...skill, body: "Updated" }]);
+    expect(await handleSkillsRequest({ v: 1, id: "list", type: "skills.list" })).toEqual({
+      v: 1, id: "list", ok: true, skills: [...BUILTIN_SKILLS, { ...skill, body: "Updated" }], builtinNames: BUILTIN_SKILLS.map((item) => item.name),
+    });
     expect((await handleSkillsRequest({ v: 1, id: "delete", type: "skills.delete", name: skill.name })).ok).toBe(true);
-    expect(await getSkills()).toEqual([]);
+    expect(await getSkills()).toEqual(BUILTIN_SKILLS);
   });
 
-  it("serializes concurrent changes without losing records", async () => {
-    await Promise.all(Array.from({ length: 32 }, (_, i) => save({ ...skill, name: `skill-${i}` })));
+  it("packages a valid, read-only YouTube skill", async () => {
+    const youtube = BUILTIN_SKILLS.find((item) => item.name === "youtube");
+    expect(youtube && isSkill(youtube)).toBe(true);
+    expect(youtube!.body).toContain("youtube.getTranscript(");
+    expect((await save({ ...skill, name: "youtube" })).ok).toBe(false);
+  });
+
+  it("counts packaged skills toward the limit and serializes concurrent changes without losing records", async () => {
+    const results = await Promise.all(Array.from({ length: 32 }, (_, i) => save({ ...skill, name: `skill-${i}` })));
+    expect(results.filter((result) => result.ok)).toHaveLength(32 - BUILTIN_SKILLS.length);
     expect(await getSkills()).toHaveLength(32);
     expect((await save(skill)).ok).toBe(false);
     expect((await save({ ...skill, name: "skill-0", body: "Update at capacity" })).ok).toBe(true);
@@ -67,10 +77,10 @@ describe("background-owned skills", () => {
   it("revalidates corrupt records and strips unknown fields", async () => {
     for (const value of [null, [], "bad", { version: 2, skills: [skill] }, { version: 1, skills: {} }]) {
       await storage.setItem("local:skills", value);
-      expect(await getSkills()).toEqual([]);
+      expect(await getSkills()).toEqual(BUILTIN_SKILLS);
     }
     await storage.setItem("local:skills", { version: 1, skills: [null, { ...skill, body: "" }, { ...skill, extra: "discard" }, skill] });
-    expect(await getSkills()).toEqual([skill]);
+    expect(await getSkills()).toEqual([...BUILTIN_SKILLS, skill]);
     await storage.setItem("local:skills", { version: 1, skills: Array.from({ length: 40 }, (_, i) => ({ ...skill, name: `skill-${i}` })) });
     expect(await getSkills()).toHaveLength(32);
   });
@@ -80,7 +90,7 @@ describe("background-owned skills", () => {
     builtins.push(skill);
     try {
       await storage.setItem("local:skills", { version: 1, skills: [{ ...skill, body: "Shadow" }] });
-      expect(await getSkills()).toEqual([skill]);
+      expect(await getSkills()).toEqual([...builtins]);
       expect((await save(skill)).ok).toBe(false);
       expect((await handleSkillsRequest({ v: 1, id: "delete", type: "skills.delete", name: skill.name })).ok).toBe(false);
     } finally { builtins.pop(); }
@@ -93,7 +103,7 @@ describe("background-owned skills", () => {
       expect(result).toMatchObject({ ok: false, error: { phase: "persistence", retryable: true } });
       expect(JSON.stringify(result)).not.toContain("private storage detail");
       expect((await save(skill)).ok).toBe(true);
-      expect(await getSkills()).toEqual([skill]);
+      expect(await getSkills()).toEqual([...BUILTIN_SKILLS, skill]);
     } finally { write.mockRestore(); }
   });
 });

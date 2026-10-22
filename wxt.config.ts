@@ -3,7 +3,7 @@ import preact from "@preact/preset-vite";
 import Icons from "unplugin-icons/vite";
 
 const CSP =
-  "default-src 'self'; script-src 'self'; object-src 'none'; connect-src 'self' https://api.openai.com https://auth.openai.com; img-src 'self' data:; style-src 'self' 'unsafe-inline'";
+  "default-src 'self'; script-src 'self'; object-src 'none'; connect-src 'self' https://api.openai.com https://auth.openai.com https://www.youtube.com; img-src 'self' data:; style-src 'self' 'unsafe-inline'";
 
 export default defineConfig({
   browser: "firefox",
@@ -16,6 +16,7 @@ export default defineConfig({
     icons: { "32": "icon.svg" },
     permissions: [
       "storage",
+      "cookies",
       "identity",
       "webRequest",
       "webRequestBlocking",

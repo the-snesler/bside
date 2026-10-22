@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Browser } from "wxt/browser";
 import { AGENT_TAB_IDLE_MS, BackgroundRuntime } from "@/lib/background/runtime";
 import { ApprovalBadge } from "@/lib/background/approval-badge";
@@ -20,7 +20,8 @@ import type { PageSnapshot } from "@/lib/domain/tools";
 import type { SidebarCommand, SidebarEvent } from "@/lib/protocol";
 import { splitSystemMessage, TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
 import { buildTurns } from "@/lib/ui/turns";
-import { handleSkillsRequest } from "@/lib/background/skills";
+import { BUILTIN_SKILLS, handleSkillsRequest } from "@/lib/background/skills";
+import type { Skill } from "@/lib/domain/skills";
 
 type ProviderUsage = NonNullable<Extract<ScriptedProviderEvent, { type: "turn.completed" }>["usage"]>;
 
@@ -316,6 +317,10 @@ async function tick(times = 20): Promise<void> {
   }
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
+
+// Runtime expectations render prompts without a packaged catalog; skills.test.ts covers packaged skills.
+const packagedSkills = (BUILTIN_SKILLS as Skill[]).splice(0);
+afterAll(() => { (BUILTIN_SKILLS as Skill[]).push(...packagedSkills); });
 
 beforeEach(() => {
   fakeBrowser.reset();

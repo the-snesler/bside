@@ -2,9 +2,11 @@ import type { DomAction, ElementTarget, JsonValue, PageFindResult, PageSnapshot,
 import type { Skill } from "@/lib/domain/skills";
 import { MAX_SNAPSHOT_CHARS } from "@/lib/protocol";
 import { isWorkspacePath, MAX_UPLOAD_FILE_CHARS, MAX_UPLOAD_FILES, PRESS_KEYS, WORKSPACE_MAX_FILE_CHARS, WORKSPACE_MAX_FILES } from "@/lib/validation";
+import { SITE_APIS } from "@/lib/sites";
+import { SiteError, type SiteEnv } from "@/lib/sites/site-api";
 import { AGENT_TAB_ROLES, DEFAULT_SNAPSHOT_CHARS, TabController } from "./tab-controller";
 
-export const PROGRAM_HELP = `Run a small browser/filesystem program. It is interpreted, not JavaScript: only const/let, await, return, double-quoted strings, numbers, booleans, arrays, objects, variables, and the capability calls below. No loops, functions, property access, selectors, or globals. End statements with semicolons. Variables persist across programs in this run.
+export const PROGRAM_HELP = `Run a small browser/filesystem program. It is interpreted, not JavaScript: only const/let, await, return, double-quoted strings, numbers, booleans, arrays, objects, variables, read-only property access on returned values (x.key, x[0], x.length; a missing key reads as null), Promise.all, and the capability calls below. No loops, functions, selectors, or other globals. End statements with semicolons. Variables persist across programs in this run.
 
 Output: the value of \`return\` and of bare expression statements (e.g. \`await x.click();\`) is printed; assignments are silent. Output over 40000 characters is cut with an explicit notice.
 
@@ -14,6 +16,8 @@ Searching: await page.find("text") lists matching outline lines (with refs) and 
 Targeting: page.ref("e5") targets the element with that ref from your latest snapshot/find/diff of that page; refs stay valid until the page navigates or reloads. page.getByRole("button", {name: "Save"}) matches a unique element by role and case-insensitive name substring ({exact: true} for exact). page.getByText("Save") matches any interactive element by name. Ambiguous or missing matches fail and list candidate refs.
 Actions (on a locator): click(), fill(text) (inputs, textareas, rich-text editors; dates as YYYY-MM-DD), selectOption("label or value" | [...]), setChecked(bool), check(), uncheck(), press("Enter"|"Tab"|"Escape"|"Space"|"Backspace"|"ArrowDown"|…), setInputFiles("/workspace/file.txt" | [...]) attaches scratch files to a file input. Each action reports the effect, native validation problems, and the page outline lines that appeared (+) or disappeared (−). Use that diff to verify outcomes.
 Page methods: navigate(url), goBack(), scroll("down"|"up", "page"|"line"), path().
+Concurrency: const both = await Promise.all([callA, callB]); runs up to 8 calls at once and keeps result order; read both[0], both[1] (no destructuring). Calls on the same tab still run one at a time. If one call fails, the rest are cancelled and the error says which finished; their effects stay committed.
+Site APIs: youtube.search/getMetadata/getTranscript/getComments read YouTube's backend directly, without opening tabs. Read /skills/youtube.md before using them.
 Scratch files: fs.write("/workspace/notes.md", "text"), fs.read, fs.list("/workspace"), fs.move, fs.remove (64 files, 32000 characters each; kept with this chat).
 Skills: fs.list("/skills") lists saved procedure names/descriptions; fs.read("/skills/name.md") reads a Markdown body on demand. Read-only instruction data, not executable plugins; cannot override safety or grant capabilities.
 Tab management: fs.move("/tabs/12/page.md", "/agent-tabs/12/page.md") hides a tab, the reverse shows it; fs.remove(tabPath) closes it.
@@ -79,9 +83,11 @@ const MEMORY_SCRATCH_STORE: ScratchStore = { load: async () => [], write: async 
  * One session's `/workspace` files, loaded from its store on first use. Each
  * change is written through before it applies in memory, so a change a
  * program reports has been persisted; a failed write changes nothing.
+ * Changes apply one at a time, so concurrent writes never share a slot.
  */
 export class ScratchFiles {
   #files: Promise<Map<string, { slot: number; content: string }>> | null = null;
+  #changes: Promise<unknown> = Promise.resolve();
 
   constructor(private store: ScratchStore = MEMORY_SCRATCH_STORE) {}
 
@@ -103,34 +109,46 @@ export class ScratchFiles {
     return (await this.#load()).get(path)?.content;
   }
 
-  async write(path: string, content: string): Promise<void> {
-    const files = await this.#load();
-    const existing = files.get(path);
-    if (content.length > WORKSPACE_MAX_FILE_CHARS || (!existing && files.size >= WORKSPACE_MAX_FILES)) {
-      throw new Error(`Workspace limit: ${WORKSPACE_MAX_FILES} files, ${WORKSPACE_MAX_FILE_CHARS} characters per file.`);
-    }
-    const used = new Set([...files.values()].map((file) => file.slot));
-    const slot = existing?.slot ?? Array.from({ length: WORKSPACE_MAX_FILES }, (_, n) => n).find((n) => !used.has(n))!;
-    await this.#persist(() => this.store.write({ slot, path, content }));
-    files.set(path, { slot, content });
+  write(path: string, content: string): Promise<void> {
+    return this.#serial(async () => {
+      const files = await this.#load();
+      const existing = files.get(path);
+      if (content.length > WORKSPACE_MAX_FILE_CHARS || (!existing && files.size >= WORKSPACE_MAX_FILES)) {
+        throw new Error(`Workspace limit: ${WORKSPACE_MAX_FILES} files, ${WORKSPACE_MAX_FILE_CHARS} characters per file.`);
+      }
+      const used = new Set([...files.values()].map((file) => file.slot));
+      const slot = existing?.slot ?? Array.from({ length: WORKSPACE_MAX_FILES }, (_, n) => n).find((n) => !used.has(n))!;
+      await this.#persist(() => this.store.write({ slot, path, content }));
+      files.set(path, { slot, content });
+    });
   }
 
-  async remove(path: string): Promise<void> {
-    const files = await this.#load();
-    const file = files.get(path);
-    if (!file) return;
-    await this.#persist(() => this.store.remove(file.slot));
-    files.delete(path);
+  remove(path: string): Promise<void> {
+    return this.#serial(async () => {
+      const files = await this.#load();
+      const file = files.get(path);
+      if (!file) return;
+      await this.#persist(() => this.store.remove(file.slot));
+      files.delete(path);
+    });
   }
 
   /** Renames in place: the file keeps its slot, so a move is one write. */
-  async move(from: string, to: string): Promise<void> {
-    const files = await this.#load();
-    const file = files.get(from);
-    if (!file || files.has(to)) throw new Error("Destination must be a new workspace path.");
-    await this.#persist(() => this.store.write({ slot: file.slot, path: to, content: file.content }));
-    files.delete(from);
-    files.set(to, file);
+  move(from: string, to: string): Promise<void> {
+    return this.#serial(async () => {
+      const files = await this.#load();
+      const file = files.get(from);
+      if (!file || files.has(to)) throw new Error("Destination must be a new workspace path.");
+      await this.#persist(() => this.store.write({ slot: file.slot, path: to, content: file.content }));
+      files.delete(from);
+      files.set(to, file);
+    });
+  }
+
+  #serial<T>(change: () => Promise<T>): Promise<T> {
+    const result = this.#changes.then(change);
+    this.#changes = result.catch(() => {});
+    return result;
   }
 
   async #persist(write: () => Promise<void>): Promise<void> {
@@ -145,22 +163,31 @@ export interface ProgramScope {
   sessionId: string;
   files: ScratchFiles;
   skills?: Map<string, Skill>;
+  /** Network and cookie access for site APIs; without it, their calls fail. */
+  sites?: SiteEnv;
 }
 
 type Expr = { type: "literal"; value: JsonValue } | { type: "variable"; name: string } |
   { type: "array"; values: Expr[] } | { type: "object"; entries: [string, Expr][] } |
-  { type: "call"; receiver: Expr; method: string; args: Expr[] };
+  { type: "call"; receiver: Expr; method: string; args: Expr[] } |
+  { type: "property"; receiver: Expr; key: string } | { type: "index"; receiver: Expr; index: Expr };
 type Statement = { name?: string; returns: boolean; expression: Expr };
 type LocatorTarget = { kind: "ref"; ref: string } | { kind: "role"; role: string; name: string | null; exact: boolean };
-type Handle = { kind: "fs" } | { kind: "browser" } | { kind: "json" } | { kind: "web" } | { kind: "page"; tabId: number } |
-  { kind: "locator"; tabId: number; target: LocatorTarget };
+type Handle = { kind: "fs" } | { kind: "browser" } | { kind: "json" } | { kind: "web" } | { kind: "promise" } | { kind: "site"; name: string } |
+  { kind: "page"; tabId: number } | { kind: "locator"; tabId: number; target: LocatorTarget };
+type TabHandle = Extract<Handle, { kind: "page" | "locator" }>;
 type Value = JsonValue | Handle | Value[] | { [key: string]: Value };
 
 const METHODS = new Set([
   "list", "read", "write", "move", "remove", "tab", "open", "search", "stringify",
   "snapshot", "find", "waitFor", "ref", "getByRole", "getByText", "navigate", "goBack", "scroll", "path",
-  "click", "fill", "selectOption", "setChecked", "check", "uncheck", "press", "setInputFiles",
+  "click", "fill", "selectOption", "setChecked", "check", "uncheck", "press", "setInputFiles", "all",
+  ...SITE_APIS.flatMap((site) => Object.keys(site.methods)),
 ]);
+const RESERVED_NAMES = ["fs", "browser", "JSON", "web", "Promise", "await", "return", ...SITE_APIS.map((site) => site.name)];
+const BLOCKED_KEYS = ["__proto__", "constructor", "prototype"];
+/** Calls one Promise.all runs at once. */
+const PARALLEL_CALLS = 8;
 const OUTPUT_LIMIT = 40_000;
 const SEARCH_ENGINES = [
   { name: "DuckDuckGo", url: (query: string) => `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}` },
@@ -190,6 +217,8 @@ function serialize(value: Value, handles: WeakSet<object>, indent?: number): str
 
 function describeHandle(handle: Handle): string {
   if (handle.kind === "page") return `<page tab ${handle.tabId}>`;
+  if (handle.kind === "site") return `<${handle.name}>`;
+  if (handle.kind === "promise") return "<Promise>";
   if (handle.kind === "locator") {
     return handle.target.kind === "ref" ? `<locator ${handle.target.ref}>` : `<locator ${handle.target.role} ${JSON.stringify(handle.target.name)}>`;
   }
@@ -244,7 +273,7 @@ export function parseProgram(source: string): Statement[] {
       while (tokens[index] !== "}") {
         const quoted = tokens[index]?.startsWith('"');
         const key = quoted ? literal() as string : identifier();
-        if (["__proto__", "constructor", "prototype"].includes(key)) throw new Error("Invalid object key.");
+        if (BLOCKED_KEYS.includes(key)) throw new Error("Invalid object key.");
         if (tokens[index] === ":") { index++; entries.push([key, expression(depth + 1)]); }
         else if (!quoted) entries.push([key, { type: "variable", name: key }]);
         else throw new Error("Expected ':' after object key.");
@@ -254,9 +283,20 @@ export function parseProgram(source: string): Statement[] {
       take("}"); expr = { type: "object", entries };
     } else expr = /^(?:"|-?\d|true$|false$|null$)/.test(tokens[index] ?? "")
       ? { type: "literal", value: literal() } : { type: "variable", name: identifier() };
-    while (tokens[index] === ".") {
+    for (;;) {
+      if (tokens[index] === "[") {
+        index++; const key = expression(depth + 1); take("]");
+        expr = { type: "index", receiver: expr, index: key };
+        continue;
+      }
+      if (tokens[index] !== ".") break;
       index++;
       const method = identifier();
+      if (tokens[index] !== "(") {
+        if (BLOCKED_KEYS.includes(method)) throw new Error("Invalid property name.");
+        expr = { type: "property", receiver: expr, key: method };
+        continue;
+      }
       if (!METHODS.has(method)) throw new Error(`Unsupported method ${method}. Locators: page.ref("eN"), page.getByRole(role, {name}), page.getByText(name). Results print automatically; return a value directly.`);
       if (++calls > 64) throw new Error("At most 64 calls per program.");
       take("("); const args: Expr[] = [];
@@ -275,7 +315,7 @@ export function parseProgram(source: string): Statement[] {
     let name: string | undefined;
     if (tokens[index] === "const" || tokens[index] === "let") {
       index++; name = identifier(); take("=");
-      if (["fs", "browser", "JSON", "web", "await", "return"].includes(name)) throw new Error("Reserved variable name.");
+      if (RESERVED_NAMES.includes(name)) throw new Error("Reserved variable name.");
     }
     const returns = tokens[index] === "return";
     if (returns) index++;
@@ -311,19 +351,25 @@ class Output {
 }
 
 export class BrowserProgram {
-  #variables = new Map<string, Value>([["fs", { kind: "fs" }], ["browser", { kind: "browser" }], ["JSON", { kind: "json" }], ["web", { kind: "web" }]]);
+  #variables = new Map<string, Value>([
+    ["fs", { kind: "fs" }], ["browser", { kind: "browser" }], ["JSON", { kind: "json" }], ["web", { kind: "web" }], ["Promise", { kind: "promise" }],
+    ...SITE_APIS.map((site): [string, Value] => [site.name, { kind: "site", name: site.name }]),
+  ]);
   // Handles are capabilities minted here, never objects supplied by the program.
   #handles = new WeakSet<object>();
   /** Page URLs the current program read, opened, or navigated to; returned as `data.visited` for the run digest. */
   #visited: string[] = [];
+  /** Tail of each exclusive section's queue: Promise.all may overlap calls, but one tab (or the search tab) serves one call at a time. */
+  #locks = new Map<string, Promise<void>>();
   private readonly state: WorkspaceState;
   /** The run's session: its agent tabs are this program's `/agent-tabs`, and `files` is its `/workspace`. */
   private readonly sessionId: string;
   private readonly files: ScratchFiles;
   private readonly skills: Map<string, Skill>;
+  private readonly sites: SiteEnv | undefined;
   constructor(private tabs: TabController, scope: ProgramScope, private onEffect: () => void) {
     for (const value of this.#variables.values()) this.#handles.add(value as object);
-    ({ state: this.state, sessionId: this.sessionId, files: this.files } = scope);
+    ({ state: this.state, sessionId: this.sessionId, files: this.files, sites: this.sites } = scope);
     this.skills = scope.skills ?? new Map();
   }
 
@@ -341,32 +387,48 @@ export class BrowserProgram {
       const statements = parseProgram(source);
       parsed = true;
       const printed = statements.filter((statement) => statement.returns || !statement.name).length;
-      const evaluate = async (expr: Expr): Promise<Value> => {
+      // `signal` is the program's, or a Promise.all group's so a failed sibling cancels the rest.
+      const evaluate = async (expr: Expr, signal: AbortSignal): Promise<Value> => {
         signal.throwIfAborted();
         if (expr.type === "literal") return expr.value;
         if (expr.type === "array") {
           const values: Value[] = [];
-          for (const child of expr.values) values.push(await evaluate(child));
+          for (const child of expr.values) values.push(await evaluate(child, signal));
           return values;
         }
         if (expr.type === "object") {
           const entries: [string, Value][] = [];
-          for (const [key, child] of expr.entries) entries.push([key, await evaluate(child)]);
+          for (const [key, child] of expr.entries) entries.push([key, await evaluate(child, signal)]);
           return Object.fromEntries(entries);
         }
         if (expr.type === "variable") {
           if (!this.#variables.has(expr.name)) throw new Error(`Unknown variable: ${expr.name}.`);
           return this.#variables.get(expr.name)!;
         }
-        const receiver = await evaluate(expr.receiver);
+        if (expr.type === "property") return this.#property(await evaluate(expr.receiver, signal), expr.key);
+        if (expr.type === "index") {
+          const receiver = await evaluate(expr.receiver, signal);
+          const key = await evaluate(expr.index, signal);
+          if (typeof key !== "string" && typeof key !== "number") throw new Error("Index with a number or string, e.g. results[0] or item[\"title\"].");
+          return this.#property(receiver, key);
+        }
+        const receiver = await evaluate(expr.receiver, signal);
         if (typeof receiver !== "object" || receiver === null || !this.#handles.has(receiver)) throw new Error(`Only capability handles have methods (called .${expr.method}() on a plain value).`);
+        if ((receiver as Handle).kind === "promise") {
+          if (expr.method !== "all" || expr.args.length !== 1) throw new Error("Promise supports only Promise.all([call, …]).");
+          const [list] = expr.args;
+          if (list!.type === "array") return this.#all(list!.values, evaluate, signal);
+          const values = await evaluate(list!, signal);
+          if (!Array.isArray(values)) throw new Error("Promise.all() expects an array.");
+          return values;
+        }
         const args: Value[] = [];
-        for (const arg of expr.args) args.push(await evaluate(arg));
+        for (const arg of expr.args) args.push(await evaluate(arg, signal));
         signal.throwIfAborted();
         return this.#call(receiver as Handle, expr.method, args, signal);
       };
       for (const statement of statements) {
-        const value = await evaluate(statement.expression);
+        const value = await evaluate(statement.expression, signal);
         signal.throwIfAborted();
         if (statement.name) {
           if (!this.#variables.has(statement.name) && this.#variables.size >= 130) throw new Error("Variable limit reached; reuse an existing name.");
@@ -402,6 +464,77 @@ export class BrowserProgram {
 
   #handle<T extends Handle>(handle: T): T { this.#handles.add(handle); return handle; }
 
+  /** Read-only access to returned data: own object keys, array/string indexes, and length. Missing keys and indexes read as null. */
+  #property(value: Value, key: string | number): Value {
+    const label = JSON.stringify(key);
+    if (value && typeof value === "object" && this.#handles.has(value)) throw new Error(`Capability handles have no properties (read ${label}); call their methods.`);
+    if (typeof value === "string" || Array.isArray(value)) {
+      if (key === "length") return value.length;
+      if (typeof key !== "number" || !Number.isInteger(key)) throw new Error(`Arrays and strings support [index] and .length, not ${label}.`);
+      return value[key] ?? null;
+    }
+    if (value && typeof value === "object") {
+      const name = String(key);
+      if (BLOCKED_KEYS.includes(name)) throw new Error("Invalid property name.");
+      return Object.hasOwn(value, name) ? (value as Record<string, Value>)[name]! : null;
+    }
+    throw new Error(`Cannot read ${label} of ${value === null ? "null" : typeof value}.`);
+  }
+
+  /**
+   * Evaluates items concurrently, at most PARALLEL_CALLS at a time, keeping
+   * their order. The first failure cancels the items still running or
+   * waiting; effects that already committed stay, so the error names which
+   * items finished.
+   */
+  async #all(items: Expr[], evaluate: (expr: Expr, signal: AbortSignal) => Promise<Value>, signal: AbortSignal): Promise<Value[]> {
+    const group = new AbortController();
+    const cancel = () => group.abort(signal.reason);
+    signal.addEventListener("abort", cancel, { once: true });
+    const results: Value[] = new Array(items.length);
+    const finished: number[] = [];
+    /** The first failure, which cancels the group; later ones are its cancellations. */
+    const failures: { index: number; error: unknown }[] = [];
+    let next = 0;
+    const worker = async () => {
+      while (next < items.length && !group.signal.aborted) {
+        const index = next++;
+        try {
+          results[index] = await evaluate(items[index]!, group.signal);
+          finished.push(index + 1);
+        } catch (error) {
+          if (!failures.length && !signal.aborted) { failures.push({ index, error }); group.abort(error); }
+        }
+      }
+    };
+    try { await Promise.all(Array.from({ length: Math.min(PARALLEL_CALLS, items.length) }, worker)); }
+    finally { signal.removeEventListener("abort", cancel); }
+    signal.throwIfAborted();
+    const [failure] = failures;
+    if (failure) {
+      const { index, error } = failure;
+      finished.sort((a, b) => a - b);
+      const message = `Promise.all item ${index + 1} of ${items.length} failed: ${error instanceof Error ? error.message : "operation failed."} ${finished.length ? `Items ${finished.join(", ")} finished; the others were cancelled.` : "No other item finished."}`;
+      throw error instanceof ProgramError ? new ProgramError(message, error.code) : new Error(message);
+    }
+    return results;
+  }
+
+  /** Runs `task` after earlier tasks holding the same key finish. */
+  async #exclusive<T>(key: string, task: () => Promise<T>): Promise<T> {
+    const previous = this.#locks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const tail = previous.then(() => held);
+    this.#locks.set(key, tail);
+    await previous;
+    try { return await task(); }
+    finally {
+      release();
+      if (this.#locks.get(key) === tail) this.#locks.delete(key);
+    }
+  }
+
   async #call(receiver: Handle, method: string, args: Value[], signal: AbortSignal): Promise<Value> {
     const text = (i: number, label = "a string") => {
       if (typeof args[i] !== "string") throw new Error(`${method}() expects ${label} as argument ${i + 1}.`);
@@ -416,10 +549,14 @@ export class BrowserProgram {
       return serialize(args[0]!, this.#handles);
     }
     if (receiver.kind === "fs") return this.#file(method, args, signal);
+    if (receiver.kind === "site") return this.#site(receiver.name, method, args, signal);
+    if (receiver.kind === "promise") throw new Error("Promise supports only Promise.all([call, …]).");
     if (receiver.kind === "web") {
       count(1);
       if (method !== "search") throw new Error("Only web.search(query) is supported.");
-      return this.#search(text(0, "a query string"), signal);
+      const query = text(0, "a query string");
+      // Each session has one search tab, so searches take turns.
+      return this.#exclusive("search", () => this.#search(query, signal));
     }
     if (receiver.kind === "browser") {
       count(1);
@@ -427,6 +564,18 @@ export class BrowserProgram {
       if (method === "open") return this.#handle({ kind: "page", tabId: await this.#openTab(text(0, "a URL"), signal) });
       throw new Error("browser supports tab(path) and open(url).");
     }
+    return this.#exclusive(`tab:${receiver.tabId}`, () => this.#tabCall(receiver, method, args, text, count, signal));
+  }
+
+  async #tabCall(
+    receiver: TabHandle,
+    method: string,
+    args: Value[],
+    text: (i: number, label?: string) => string,
+    count: (min: number, max?: number) => void,
+    signal: AbortSignal,
+  ): Promise<Value> {
+    signal.throwIfAborted();
     const controller = await this.#controller(receiver.tabId);
     signal.throwIfAborted();
     if (receiver.kind === "page") return this.#pageCall(receiver, controller, method, args, text, count, signal);
@@ -652,6 +801,25 @@ export class BrowserProgram {
     throw new Error("Search failed.");
   }
 
+  async #site(name: string, method: string, args: Value[], signal: AbortSignal): Promise<Value> {
+    const site = SITE_APIS.find((candidate) => candidate.name === name)!;
+    const run = Object.hasOwn(site.methods, method) ? site.methods[method] : undefined;
+    if (!run) throw new Error(`${name} supports ${Object.keys(site.methods).join(", ")}.`);
+    if (!this.sites) throw new ProgramError(`${name} is unavailable here.`, "UNSUPPORTED_PAGE");
+    const plain = (value: Value, depth = 0): JsonValue => {
+      if (value && typeof value === "object" && (this.#handles.has(value) || depth > 8)) throw new Error(`${name}.${method}() takes plain strings, numbers, and option objects.`);
+      if (Array.isArray(value)) return value.map((item) => plain(item, depth + 1));
+      if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, plain(item, depth + 1)]));
+      return value as JsonValue;
+    };
+    try {
+      return await run(this.sites, args.map((arg) => plain(arg)), { signal, visit: (url) => this.#visited.push(url) });
+    } catch (error) {
+      if (error instanceof SiteError) throw new ProgramError(`${name}.${method}: ${error.message}`, error.code);
+      throw error;
+    }
+  }
+
   async #controller(tabId: number): Promise<TabController> {
     this.state.touchTab(tabId);
     try {
@@ -722,24 +890,30 @@ export class BrowserProgram {
       }
     } else {
       const id = await this.#tabPath(path);
-      signal.throwIfAborted();
-      if (method === "read") {
-        if (args.length > 2) throw new Error("fs.read(tabPath, {offset, maxChars}) takes at most two arguments.");
-        return this.#snapshot(await this.#controller(id), id, second);
-      }
-      if (method === "remove") {
-        if (args.length !== 1) throw new Error("fs.remove(path) takes one argument.");
-        this.onEffect(); await this.tabs.closeTab(id); this.state.releaseTab(id); this.state.observed.delete(id);
-        return `Closed ${path}.`;
-      }
-      if (method === "move") {
-        const toAgent = !this.#ownsTab(id);
-        if (second !== `/${toAgent ? "agent-tabs" : "tabs"}/${id}/page.md`) throw new Error("Tab moves must preserve the ID and switch /tabs and /agent-tabs.");
-        this.onEffect();
-        if (toAgent) { await this.tabs.hideTab(id); this.state.adoptTab(id, this.sessionId); }
-        else { await this.tabs.showTab(id); this.state.releaseTab(id); }
-        return `Moved to ${second}.`;
-      }
+      return this.#exclusive(`tab:${id}`, () => this.#tabFile(id, path, method, args, signal));
+    }
+    throw new Error("Unsupported filesystem operation. Tab snapshots are read-only.");
+  }
+
+  async #tabFile(id: number, path: string, method: string, args: Value[], signal: AbortSignal): Promise<Value> {
+    const second = args[1];
+    signal.throwIfAborted();
+    if (method === "read") {
+      if (args.length > 2) throw new Error("fs.read(tabPath, {offset, maxChars}) takes at most two arguments.");
+      return this.#snapshot(await this.#controller(id), id, second);
+    }
+    if (method === "remove") {
+      if (args.length !== 1) throw new Error("fs.remove(path) takes one argument.");
+      this.onEffect(); await this.tabs.closeTab(id); this.state.releaseTab(id); this.state.observed.delete(id);
+      return `Closed ${path}.`;
+    }
+    if (method === "move") {
+      const toAgent = !this.#ownsTab(id);
+      if (second !== `/${toAgent ? "agent-tabs" : "tabs"}/${id}/page.md`) throw new Error("Tab moves must preserve the ID and switch /tabs and /agent-tabs.");
+      this.onEffect();
+      if (toAgent) { await this.tabs.hideTab(id); this.state.adoptTab(id, this.sessionId); }
+      else { await this.tabs.showTab(id); this.state.releaseTab(id); }
+      return `Moved to ${second}.`;
     }
     throw new Error("Unsupported filesystem operation. Tab snapshots are read-only.");
   }

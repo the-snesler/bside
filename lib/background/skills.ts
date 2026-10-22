@@ -1,8 +1,12 @@
 import { storage } from "wxt/utils/storage";
 import { isSkill, MAX_SKILLS, type Skill } from "@/lib/domain/skills";
 import { isSkillsRequest, type SkillsRequest, type SkillsResponse } from "@/lib/protocol";
+import youtubeBody from "@/lib/skills/youtube.md?raw";
 
-export const BUILTIN_SKILLS: readonly Skill[] = [];
+/** Packaged skills, listed before saved ones; each guides one site API in `lib/sites`. */
+export const BUILTIN_SKILLS: readonly Skill[] = [
+  { name: "youtube", description: "Search YouTube, read video metadata and transcripts, and inspect comments through youtube.* calls, without opening YouTube pages.", body: youtubeBody },
+];
 
 let mutations: Promise<unknown> = Promise.resolve();
 

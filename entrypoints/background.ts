@@ -4,6 +4,7 @@ import { handleSkillsRequest } from "@/lib/background/skills";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { BackgroundRuntime } from "@/lib/background/runtime";
 import { ApprovalBadge } from "@/lib/background/approval-badge";
+import { registerSiteRequestHeaders } from "@/lib/sites";
 
 export default defineBackground({
   persistent: true,
@@ -15,6 +16,8 @@ export default defineBackground({
     const approvalBadge = new ApprovalBadge(browser.browserAction);
     const runtime = new BackgroundRuntime(sidebarHub, { approvalBadge });
     sidebarHub.delegate = runtime;
+
+    registerSiteRequestHeaders(browser);
 
     browser.runtime.onConnect.addListener((port) => {
       if (port.name !== SIDEBAR_PORT_NAME) return;

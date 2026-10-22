@@ -3,6 +3,7 @@
   "gecko_id": "bside@tsuni.dev",
   "background_persistent": true,
   "permissions": [
+    "cookies",
     "http://*/*",
     "https://*/*",
     "https://api.openai.com/*",
@@ -19,7 +20,7 @@
     "default-src 'self'",
     "script-src 'self'",
     "object-src 'none'",
-    "connect-src 'self' https://api.openai.com https://auth.openai.com",
+    "connect-src 'self' https://api.openai.com https://auth.openai.com https://www.youtube.com",
     "img-src 'self' data:",
     "style-src 'self' 'unsafe-inline'"
   ],

@@ -21,6 +21,8 @@ import { ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
 import type { AgentTab } from "@/lib/background/browser-program";
 import type { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController } from "@/lib/background/tab-controller";
+import { browserSiteEnv } from "@/lib/sites";
+import type { SiteEnv } from "@/lib/sites/site-api";
 import type { AgentTabTagV1, AgentTabTagV2, TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import { decodeProviderError, describeModels, OPENAI_API_KEY_PROVIDER, OpenAIProvider, ProviderStreamError } from "@/lib/providers/openai";
 import { DEFAULT_MODEL_ID } from "@/lib/providers/openai-models";
@@ -131,6 +133,7 @@ export class BackgroundRuntime {
   #chatgpt: ChatGPTAuth;
   #modelCatalog: readonly ModelDefinition[] = OPENAI_API_KEY_PROVIDER.models;
   #tabControllerFactory: () => TabController;
+  #sites: SiteEnv;
   #approvalBadge: ApprovalBadge | null;
   #activeRun: ActiveRun | null = null;
   #notice: string | null = null;
@@ -168,7 +171,7 @@ export class BackgroundRuntime {
 
   constructor(
     sidebarHub: SidebarHub,
-    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController; approvalBadge?: ApprovalBadge; clock?: RuntimeClock } = {},
+    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController; sites?: SiteEnv; approvalBadge?: ApprovalBadge; clock?: RuntimeClock } = {},
   ) {
     this.#sidebarHub = sidebarHub;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
@@ -179,6 +182,7 @@ export class BackgroundRuntime {
       (id) => this.#modelCatalog.find((model) => model.id === id),
     );
     this.#tabControllerFactory = options.tabControllerFactory ?? (() => new TabController(browser as unknown as TabControllerBrowserApi));
+    this.#sites = options.sites ?? browserSiteEnv();
     this.#approvalBadge = options.approvalBadge ?? null;
     this.#workspace.onOwnershipChange = () => void this.#queueAgentTabSync();
   }
@@ -916,7 +920,7 @@ export class BackgroundRuntime {
     const controller = new AbortController();
     const tabController = this.#tabControllerFactory();
     // The session's scratch files load on the first program that uses them.
-    const scope = { state: this.#workspace, sessionId, files: new ScratchFiles(workspaceStore(sessionId)), skills: new Map<string, Skill>() };
+    const scope = { state: this.#workspace, sessionId, files: new ScratchFiles(workspaceStore(sessionId)), skills: new Map<string, Skill>(), sites: this.#sites };
     const agentLoop = new AgentLoop(this.#provider, tabController, this.#sidebarHub, scope);
     const run: ActiveRun = this.#activeRun = {
       runId,
