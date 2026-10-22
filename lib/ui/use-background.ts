@@ -32,6 +32,10 @@ export interface BackgroundActions {
   focusTab(tabId: number): void;
   /** Closes one session's hidden agent tabs. */
   closeAgentTabs(sessionId: string): void;
+  /** Shows one of the open session's agent tabs and switches to it; switching away hides it again. */
+  watchTab(tabId: number): void;
+  /** Goes back to the tab the user watched from, hiding the watched tab again. */
+  unwatchTab(): void;
   saveSettings(settings: AppSettingsV1): void;
   /** Starts a run, or queues a follow-up while this chat's run is working. */
   sendPrompt(prompt: string): void;
@@ -67,7 +71,7 @@ const INITIAL_STATE: BackgroundState = {
   provider: OPENAI_PROVIDER,
   settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
   page: null,
-  agentTabs: {},
+  agentTabs: { bySession: {}, watching: null },
   queue: [],
   activeRun: null,
   lastSeq: 0,
@@ -197,13 +201,19 @@ export function useBackground(): BackgroundState & BackgroundActions {
   const closeAgentTabs = useCallback((sessionId: string) => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "tabs.closeAgentTabs", sessionId } satisfies SidebarCommand);
   }, []);
+  const watchTab = useCallback((tabId: number) => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "tabs.watch", tabId } satisfies SidebarCommand);
+  }, []);
+  const unwatchTab = useCallback(() => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "tabs.unwatch" } satisfies SidebarCommand);
+  }, []);
   const saveSettings = useCallback((settings: AppSettingsV1) => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "settings.save", settings } satisfies SidebarCommand);
   }, []);
 
   return {
     ...state, sendPrompt, steer, removeQueued, sendQueued, retryRun, cancelRun, approveAction, denyAction, newChat, listSessions, openSession, renameSession, pinSession,
-    deleteSession, downloadContext, listTabs, listSkills: () => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "skills.list" } satisfies SidebarCommand), focusTab, closeAgentTabs, saveSettings,
+    deleteSession, downloadContext, listTabs, listSkills: () => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "skills.list" } satisfies SidebarCommand), focusTab, closeAgentTabs, watchTab, unwatchTab, saveSettings,
   };
 }
 
@@ -267,7 +277,7 @@ function applyEvent(
     return;
   }
   if (event.type === "agent-tabs.changed") {
-    setState((prev) => ({ ...prev, agentTabs: event.payload.bySession }));
+    setState((prev) => ({ ...prev, agentTabs: event.payload }));
     return;
   }
   if (event.type === "queue.changed") {

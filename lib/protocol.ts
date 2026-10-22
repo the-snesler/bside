@@ -213,6 +213,13 @@ export type SidebarCommand =
   | { v: 1; id: string; type: "tabs.focus"; tabId: number }
   /** Closes one session's hidden agent tabs (the sidebar sends the open session's); refused while a run is active. */
   | { v: 1; id: string; type: "tabs.closeAgentTabs"; sessionId: string }
+  /**
+   * Shows one of the open session's agent tabs next to the active tab and switches to it, so the user can watch it.
+   * bside keeps the tab: switching to any other tab hides it again. Watching another tab replaces this one.
+   */
+  | { v: 1; id: string; type: "tabs.watch"; tabId: number }
+  /** Ends watching: switches back to the tab the user watched from (or a neighbour if it closed), hiding the watched tab again. */
+  | { v: 1; id: string; type: "tabs.unwatch" }
   | { v: 1; id: string; type: "settings.save"; settings: AppSettingsV1 }
   /** Exports one session with its scratch files; run diagnostics, model input, and tool output are included only for the latest run's session. Answered with `context.exported` to the requesting sidebar only. */
   | { v: 1; id: string; type: "context.export"; sessionId: string }
@@ -267,9 +274,8 @@ export interface RuntimeSnapshot {
   credential: { configured: boolean; maskedSuffix: string | null; chatgpt: ChatGPTStatus };
   provider: ProviderDefinition;
   settings: AppSettingsV1;
-  page: PageArtifactSummary | null;
-  /** Hidden agent tabs (search tabs included) per owning session id; sessions with none are omitted. */
-  agentTabs: Record<string, number>;
+  page: AttachedPage | null;
+  agentTabs: AgentTabsState;
   /** The open session's queued follow-ups and undelivered steers, oldest first. */
   queue: QueuedMessage[];
   /** The single active run, which may belong to a session other than the open one. */
@@ -306,8 +312,8 @@ export type SidebarEvent =
   | EventBase<"context.exported", { requestId: string; markdown: string; filename: string }>
   | EventBase<"state.snapshot", RuntimeSnapshot>
   | EventBase<"session.listed", { sessions: ConversationSummary[] }>
-  | EventBase<"page.attached", PageArtifactSummary | null>
-  | EventBase<"agent-tabs.changed", { bySession: Record<string, number> }>
+  | EventBase<"page.attached", AttachedPage | null>
+  | EventBase<"agent-tabs.changed", AgentTabsState>
   /** A session's queue after it changed; `conversationId` is that session. Not run-sequenced. */
   | EventBase<"queue.changed", { messages: QueuedMessage[] }>
   | EventBase<"run.started", { prompt: string; page: PageArtifactSummary | null; retry: boolean }>
@@ -330,6 +336,8 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (candidate.type === "tabs.list") return true;
   if (candidate.type === "tabs.focus") return Number.isSafeInteger(candidate.tabId);
   if (candidate.type === "tabs.closeAgentTabs") return isSessionId(candidate.sessionId);
+  if (candidate.type === "tabs.watch") return Number.isSafeInteger(candidate.tabId);
+  if (candidate.type === "tabs.unwatch") return true;
   if (candidate.type === "settings.save") return isAppSettings(candidate.settings);
   if (candidate.type === "context.export") return isSessionId(candidate.sessionId);
   if (candidate.type === "session.create" || candidate.type === "session.list") return true;
@@ -439,6 +447,27 @@ export function isSettingsRequest(value: unknown): value is SettingsRequest {
 }
 
 export interface TabMention { id: number; title: string; url: string; path: string }
+
+/** The active tab as the sidebar shows it; `tabId` tells it apart from an agent tab being watched. */
+export interface AttachedPage extends PageArtifactSummary { tabId: number }
+
+/** One agent tab as the sidebar lists it. `favIconUrl` is only ever a `data:image/` URL, so showing it fetches nothing. */
+export interface AgentTabSummary {
+  id: number;
+  role: "agent" | "search";
+  title: string;
+  url: string;
+  favIconUrl: string | null;
+  /** When a program last used the tab; idle auto-close counts from this. */
+  lastUsedAt: number;
+}
+
+export interface AgentTabsState {
+  /** Agent tabs (search tabs included) per owning session id, oldest first; sessions with none are omitted. */
+  bySession: Record<string, AgentTabSummary[]>;
+  /** The agent tab the user is watching (shown and active), if any. */
+  watching: number | null;
+}
 
 export function isAppSettings(value: unknown): value is AppSettingsV1 {
   if (!value || typeof value !== "object") return false;

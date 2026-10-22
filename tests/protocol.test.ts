@@ -48,6 +48,15 @@ describe("isSidebarCommand: accepts every valid variant", () => {
     expect(isSidebarCommand({ v: 1, id: "1", type: "action.deny", runId: "r1", callId: "c1" })).toBe(true);
   });
 
+  it("accepts tabs.watch only for an integer tab id, and tabs.unwatch with no arguments", () => {
+    expect(isSidebarCommand({ v: 1, id: "1", type: "tabs.watch", tabId: 5 })).toBe(true);
+    for (const tabId of [undefined, "5", 1.5, Number.NaN, null]) {
+      expect(isSidebarCommand({ v: 1, id: "1", type: "tabs.watch", tabId })).toBe(false);
+    }
+    expect(isSidebarCommand({ v: 1, id: "1", type: "tabs.unwatch" })).toBe(true);
+    expect(isSidebarCommand({ v: 2, id: "1", type: "tabs.unwatch" })).toBe(false);
+  });
+
   it("accepts tabs.closeAgentTabs only in a v1 envelope naming a session", () => {
     expect(isSidebarCommand({ v: 1, id: "1", type: "tabs.closeAgentTabs", sessionId: "s1" })).toBe(true);
     expect(isSidebarCommand({ v: 1, id: "1", type: "tabs.closeAgentTabs" })).toBe(false);

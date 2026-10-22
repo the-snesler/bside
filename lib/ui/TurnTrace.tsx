@@ -3,7 +3,6 @@ import ArrowsMove from "~icons/tabler/arrows-move";
 import ArrowsVertical from "~icons/tabler/arrows-vertical";
 import BrandYoutube from "~icons/tabler/brand-youtube";
 import Checkbox from "~icons/tabler/checkbox";
-import Clock from "~icons/tabler/clock";
 import ExternalLink from "~icons/tabler/external-link";
 import FilePencil from "~icons/tabler/file-pencil";
 import FileText from "~icons/tabler/file-text";
@@ -20,6 +19,7 @@ import WorldSearch from "~icons/tabler/world-search";
 import { PROMPT_MENTION_PATTERN } from "@/lib/domain/conversation";
 import type { ApprovalRequest } from "@/lib/protocol";
 import { Markdown } from "@/lib/ui/Markdown";
+import { Mascot, type MascotMood } from "@/lib/ui/Mascot";
 import { Trace, TraceLine, type TraceStatus } from "@/lib/ui/Trace";
 import { formatDuration, type Activity, type Turn, type TurnStep } from "@/lib/ui/turns";
 
@@ -128,11 +128,21 @@ function useNow(ticking: boolean): number {
   return now;
 }
 
+/** How a finished turn's header names its outcome. */
+const ENDED: Record<NonNullable<Turn["outcome"]>, string> = {
+  completed: "Worked for",
+  failed: "Failed after",
+  cancelled: "Stopped after",
+  interrupted: "Interrupted after",
+};
+
 /**
- * The work for one turn behind a single "Worked for …" disclosure: tool rows
- * grouped into Trace lists, with interim assistant text and the user's steers
- * between them. It stays
- * open while the turn is active and collapses when the turn completes.
+ * The work for one turn behind a single "Worked for …" disclosure, led by
+ * bside's face: tool rows grouped into Trace lists, with interim assistant
+ * text and the user's steers between them. It stays open while the turn is
+ * active and collapses when the turn completes. Steps that failed along the
+ * way are counted quietly; the face and title change only when the run itself
+ * failed or stopped.
  */
 export function TurnTrace(props: {
   turn: Turn;
@@ -148,16 +158,18 @@ export function TurnTrace(props: {
   const activities = turn.steps.filter((step) => step.kind === "activity");
   const failures = activities.filter(failed).length;
   const elapsed = formatDuration((active ? now : turn.endedAt) - turn.startedAt);
-  const header: { title: string; status?: TraceStatus } = active
+  const ended = turn.outcome ?? "completed";
+  const header: { title: string; status?: TraceStatus; mood: MascotMood } = active
     ? pendingApproval
-      ? { title: "Waiting for your approval", status: "pending" }
-      : { title: `Working for ${elapsed}`, status: "running" }
-    : failures
-      ? { title: `Worked for ${elapsed}, ${failures} failed`, status: "error" }
-      : { title: `Worked for ${elapsed}` };
-  const description = activities.length
-    ? `${activities.length} ${activities.length === 1 ? "step" : "steps"}`
-    : undefined;
+      ? { title: "Waiting for your approval", status: "pending", mood: "needs" }
+      : { title: `Working for ${elapsed}`, status: "running", mood: "working" }
+    : { title: `${ENDED[ended]} ${elapsed}`, mood: ended === "completed" ? "idle" : "failed" };
+  const description = activities.length ? (
+    <>
+      {`${activities.length} ${activities.length === 1 ? "step" : "steps"}`}
+      {failures > 0 && <span class="trace__failed">{` · ${failures} failed`}</span>}
+    </>
+  ) : undefined;
 
   const groups: (Activity[] | Exclude<TurnStep, Activity>)[] = [];
   for (const step of turn.steps) {
@@ -168,9 +180,9 @@ export function TurnTrace(props: {
   }
 
   return (
-    <Trace label="Turn activity">
+    <Trace label="Turn activity" class="trace--turn">
       <TraceLine
-        icon={<Clock />}
+        icon={<Mascot mood={header.mood} size={18} />}
         title={header.title}
         description={description}
         status={header.status}

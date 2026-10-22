@@ -17,7 +17,7 @@ import {
 import type { ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
 import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
 import type { PageSnapshot } from "@/lib/domain/tools";
-import type { SidebarCommand, SidebarEvent } from "@/lib/protocol";
+import type { AgentTabsState, SidebarCommand, SidebarEvent } from "@/lib/protocol";
 import { splitSystemMessage, TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
 import { buildTurns } from "@/lib/ui/turns";
 import { handleSkillsRequest } from "@/lib/background/skills";
@@ -1215,6 +1215,8 @@ type TagRole = "agent" | "search";
 /** The open session at the start of each agent-tab test; tags name it as their owner unless a test says otherwise. */
 let owner = "";
 const tag = (lastUsedAt: number, role: TagRole = "agent", sessionId = owner) => ({ v: 2, role, sessionId, lastUsedAt });
+/** Agent tabs per session, as counts. */
+const tabCounts = (state: AgentTabsState) => Object.fromEntries(Object.entries(state.bySession).map(([id, tabs]) => [id, tabs.length]));
 /** Opens an owner session before the runtime starts, so runs and tags share it. */
 const openOwnerSession = async () => { owner = await ensureOpenSession(); };
 
@@ -1357,7 +1359,7 @@ describe("BackgroundRuntime: agent-tab ownership across restarts", () => {
     const restarted = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: second.factory, clock });
     await restarted.initialize();
 
-    expect((await restarted.getSnapshot()).agentTabs).toEqual({ [owner]: 2 });
+    expect(tabCounts((await restarted.getSnapshot()).agentTabs)).toEqual({ [owner]: 2 });
     expect(await tabPaths(restarted)).toEqual({ 100: "/tabs/100/page.md", 101: "/tabs/101/page.md", 7: "/agent-tabs/7/page.md", 8: "/agent-tabs/8/page.md" });
     // Restored tags are current, so they are not rewritten, and untagged tabs stay untagged.
     expect(second.api.sessions.setTabValue).not.toHaveBeenCalled();
@@ -1388,7 +1390,7 @@ describe("BackgroundRuntime: agent-tab ownership across restarts", () => {
     const runtime = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: factory });
     await runtime.initialize();
 
-    expect((await runtime.getSnapshot()).agentTabs).toEqual({});
+    expect(tabCounts((await runtime.getSnapshot()).agentTabs)).toEqual({});
     expect(await tabPaths(runtime)).toEqual({ 1: "/tabs/1/page.md", 5: "/tabs/5/page.md" });
     expect(tags.size).toBe(0);
     expect(api.tabs.hide).not.toHaveBeenCalled();
@@ -1413,10 +1415,10 @@ describe("BackgroundRuntime: agent-tab ownership across restarts", () => {
     tags.set(20, tag(1)).set(22, tag(1));
     await Promise.all([20, 21, 22].map((id) => runtime.handleTabCreated(id)));
 
-    await vi.waitFor(async () => expect((await runtime.getSnapshot()).agentTabs).toEqual({ [owner]: 1 }));
+    await vi.waitFor(async () => expect(tabCounts((await runtime.getSnapshot()).agentTabs)).toEqual({ [owner]: 1 }));
     expect(await tabPaths(runtime)).toMatchObject({ 20: "/agent-tabs/20/page.md", 21: "/tabs/21/page.md", 22: "/tabs/22/page.md" });
     expect([...tags.keys()]).toEqual([20]);
-    expect(port.received.flatMap((event) => event.type === "agent-tabs.changed" ? [event.payload.bySession] : [])).toEqual([{ [owner]: 1 }]);
+    expect(port.received.flatMap((event) => event.type === "agent-tabs.changed" ? [tabCounts(event.payload)] : [])).toEqual([{ [owner]: 1 }]);
   });
 
   it("keeps a tab it is opening when tabs.onCreated reports it before it is hidden", async () => {
@@ -1504,13 +1506,13 @@ describe("BackgroundRuntime: closing agent tabs", () => {
     const port = fakePort();
     hub.handleConnect(port);
     await runtime.initialize();
-    expect((await runtime.getSnapshot()).agentTabs).toEqual({ [owner]: 2 });
+    expect(tabCounts((await runtime.getSnapshot()).agentTabs)).toEqual({ [owner]: 2 });
 
     await port.send({ v: 1, id: "close", type: "tabs.closeAgentTabs", sessionId: owner });
     expect(tabs.map((tab) => tab.id)).toEqual([1]);
     expect(tags.size).toBe(0);
-    expect((await runtime.getSnapshot()).agentTabs).toEqual({});
-    const counts = port.received.flatMap((event) => event.type === "agent-tabs.changed" ? [event.payload.bySession] : []);
+    expect(tabCounts((await runtime.getSnapshot()).agentTabs)).toEqual({});
+    const counts = port.received.flatMap((event) => event.type === "agent-tabs.changed" ? [tabCounts(event.payload)] : []);
     expect([counts[0], counts.at(-1)]).toEqual([{ [owner]: 2 }, {}]);
   });
 
@@ -1644,10 +1646,10 @@ describe("BackgroundRuntime: Phase 0 integration (regression)", () => {
     await runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Swap tabs" });
     expect(modelInput(provider)).toContain("/agent-tabs/100/page.md");
     await vi.waitFor(() => expect([...tags.keys()]).toEqual([100]));
-    expect((await runtime.getSnapshot()).agentTabs).toEqual({ [owner]: 1 });
+    expect(tabCounts((await runtime.getSnapshot()).agentTabs)).toEqual({ [owner]: 1 });
   });
 
-  it("retries an untag that failed on the next ownership change", async () => {
+  it("retries an untag that failed on a later ownership change", async () => {
     const tabs = [userTab, { id: 5, url: "https://agent-5.test/", title: "", hidden: true }, { id: 6, url: "https://agent-6.test/", title: "", hidden: true }];
     const { api, tags, factory } = fakeTabsApi(tabs, new Map([[5, tag(1)], [6, tag(1)]]));
     await saveOpenAICredential("sk-test");
@@ -1657,11 +1659,12 @@ describe("BackgroundRuntime: Phase 0 integration (regression)", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory });
     hub.delegate = runtime;
     await runtime.initialize();
-    api.sessions.removeTabValue.mockRejectedValueOnce(new Error("Session store busy."));
+    api.sessions.removeTabValue.mockRejectedValue(new Error("Session store busy."));
 
     await runtime.handleCommand({ v: 1, id: "move", type: "run.start", prompt: "Show tab 5" });
     await tick();
     expect([...tags.keys()]).toEqual([5, 6]);
+    api.sessions.removeTabValue.mockReset();
     scripted(provider, programRound('return fs.remove("/agent-tabs/6/page.md");'));
     await runtime.handleCommand({ v: 1, id: "close", type: "run.start", prompt: "Close tab 6" });
     await vi.waitFor(() => expect(tags.size).toBe(0));
@@ -1724,7 +1727,7 @@ describe("BackgroundRuntime: session-scoped workspace and agent tabs", () => {
     await send({ type: "session.create" });
     const beta = (await runtime.getSnapshot()).conversation.id;
     expect(tabs.find((tab) => tab.id === 100)?.hidden).toBe(true);
-    expect((await runtime.getSnapshot()).agentTabs).toEqual({ [owner]: 1 });
+    expect(tabCounts((await runtime.getSnapshot()).agentTabs)).toEqual({ [owner]: 1 });
     expect(await tabPaths(runtime)).toEqual({ 1: "/tabs/1/page.md" });
 
     await program('return [fs.list("/tabs"), fs.list("/agent-tabs")];');
@@ -1735,7 +1738,7 @@ describe("BackgroundRuntime: session-scoped workspace and agent tabs", () => {
 
     await program('return fs.move("/tabs/1/page.md", "/agent-tabs/1/page.md");');
     await vi.waitFor(() => expect(tags.get(1)).toMatchObject({ v: 2, role: "agent", sessionId: beta }));
-    expect((await runtime.getSnapshot()).agentTabs).toEqual({ [owner]: 1, [beta]: 1 });
+    expect(tabCounts((await runtime.getSnapshot()).agentTabs)).toEqual({ [owner]: 1, [beta]: 1 });
     await send({ type: "session.open", sessionId: owner });
     expect(await tabPaths(runtime)).toEqual({ 100: "/agent-tabs/100/page.md" });
   });
@@ -1745,7 +1748,7 @@ describe("BackgroundRuntime: session-scoped workspace and agent tabs", () => {
     const closed = await createSessionWith(prompt("u2", "Closed tabs"));
     const tabs = [userTab(), agentTab(5), agentTab(6), agentTab(7), agentTab(8)];
     const { runtime, send, tags } = await setup(tabs, new Map([[5, tag(1, "agent", kept)], [6, tag(1, "search", kept)], [7, tag(1, "agent", closed)], [8, tag(1)]]));
-    expect((await runtime.getSnapshot()).agentTabs).toEqual({ [kept]: 2, [closed]: 1, [owner]: 1 });
+    expect(tabCounts((await runtime.getSnapshot()).agentTabs)).toEqual({ [kept]: 2, [closed]: 1, [owner]: 1 });
 
     await send({ type: "session.delete", sessionId: kept, closeAgentTabs: false });
     expect(tabs.map((tab) => [tab.id, tab.hidden])).toEqual([[1, false], [5, false], [6, false], [7, true], [8, true]]);
@@ -1754,7 +1757,7 @@ describe("BackgroundRuntime: session-scoped workspace and agent tabs", () => {
 
     await send({ type: "session.delete", sessionId: closed, closeAgentTabs: true });
     expect(tabs.map((tab) => tab.id)).toEqual([1, 5, 6, 8]);
-    expect((await runtime.getSnapshot()).agentTabs).toEqual({ [owner]: 1 });
+    expect(tabCounts((await runtime.getSnapshot()).agentTabs)).toEqual({ [owner]: 1 });
   });
 
   it("closes the agent tabs of chats removed by retention or Delete all history, and of chats that no longer exist", async () => {
@@ -1779,7 +1782,7 @@ describe("BackgroundRuntime: session-scoped workspace and agent tabs", () => {
   it("hands back a hidden tab with a pre-session v1 tag instead of adopting it, and untags a visible one", async () => {
     const tabs = [userTab(), agentTab(5), { ...agentTab(6), hidden: false }, agentTab(7)];
     const { api, runtime, tags } = await setup(tabs, new Map<number, unknown>([[5, { v: 1, role: "agent", lastUsedAt: 1 }], [6, { v: 1, role: "search", lastUsedAt: 1 }], [7, tag(1)]]));
-    expect((await runtime.getSnapshot()).agentTabs).toEqual({ [owner]: 1 });
+    expect(tabCounts((await runtime.getSnapshot()).agentTabs)).toEqual({ [owner]: 1 });
     expect(tabs.map((tab) => [tab.id, tab.hidden])).toEqual([[1, false], [5, false], [6, false], [7, true]]);
     expect([...tags.keys()]).toEqual([7]);
     expect(await tabPaths(runtime)).toMatchObject({ 5: "/tabs/5/page.md", 6: "/tabs/6/page.md", 7: "/agent-tabs/7/page.md" });
@@ -1792,8 +1795,197 @@ describe("BackgroundRuntime: session-scoped workspace and agent tabs", () => {
     api.tabs.show.mockRejectedValueOnce(new Error("Cannot show"));
     const runtime = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: factory });
     await runtime.initialize();
-    expect((await runtime.getSnapshot()).agentTabs).toEqual({});
+    expect(tabCounts((await runtime.getSnapshot()).agentTabs)).toEqual({});
     expect([...tags.keys()]).toEqual([5]);
+  });
+});
+
+describe("BackgroundRuntime: watching an agent tab", () => {
+  type WindowTab = FakeTab & { windowId: number; index: number; active: boolean };
+  beforeEach(openOwnerSession);
+
+  /**
+   * Tabs in windows, each with one active tab, where window 1 is focused.
+   * Like Firefox, switching to a hidden tab shows it, and an active tab cannot be hidden.
+   */
+  async function setup(extra: WindowTab[] = [], extraTags: [number, unknown][] = [], clock?: RuntimeClock) {
+    const tabs: WindowTab[] = [
+      { id: 1, url: "https://user.test/", title: "User", hidden: false, windowId: 1, index: 0, active: true },
+      { id: 2, url: "https://other.test/", title: "Other", hidden: false, windowId: 1, index: 1, active: false },
+      { id: 5, url: "https://agent-5.test/", title: "Agent five", hidden: true, windowId: 1, index: 2, active: false },
+      { id: 6, url: "https://agent-6.test/", title: "Agent six", hidden: true, windowId: 1, index: 3, active: false },
+      ...extra,
+    ];
+    const fake = fakeTabsApi(tabs, new Map<number, unknown>([[5, tag(clock?.now() ?? 1)], [6, tag(clock?.now() ?? 1)], ...extraTags]));
+    const activate = (tabId: number) => {
+      const tab = tabs.find((candidate) => candidate.id === tabId)!;
+      for (const other of tabs) if (other.windowId === tab.windowId) other.active = other === tab;
+      tab.hidden = false;
+    };
+    const api = Object.assign(fake.api.tabs, {
+      query: vi.fn(async (query: { active?: boolean; lastFocusedWindow?: boolean } = {}) => tabs
+        .filter((tab) => (query.active === undefined || tab.active === query.active) && (!query.lastFocusedWindow || tab.windowId === 1))
+        .map((tab) => ({ ...tab }))),
+      update: vi.fn(async (tabId: number, properties: { active?: true; url?: string }) => { if (properties.active) activate(tabId); }),
+      // Firefox reports only the tabs it hid: not an active one, nor one already hidden.
+      hide: vi.fn(async (tabId: number) => {
+        const tab = tabs.find((candidate) => candidate.id === tabId)!;
+        if (tab.active || tab.hidden) return [];
+        tab.hidden = true;
+        return [tabId];
+      }),
+      move: vi.fn(async (tabId: number, { windowId, index }: { windowId: number; index: number }) => {
+        Object.assign(tabs.find((candidate) => candidate.id === tabId)!, { windowId, index });
+      }),
+    });
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const port = fakePort();
+    hub.handleConnect(port);
+    const provider = new FakeProvider();
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: fake.factory, clock });
+    hub.delegate = runtime;
+    await runtime.initialize();
+    const send = (command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+    /** The user clicks a tab in the tab strip. */
+    const switchTo = async (tabId: number) => { activate(tabId); await runtime.handleTabActivated(tabId); };
+    const state = (id: number) => { const tab = tabs.find((candidate) => candidate.id === id)!; return { hidden: tab.hidden, active: tab.active }; };
+    const watching = async () => (await runtime.getSnapshot()).agentTabs.watching;
+    return { ...fake, api, tabs, port, provider, runtime, send, switchTo, state, watching };
+  }
+
+  it("shows the chat's agent tab beside the active tab, switches to it, and hides it again once the user switches away", async () => {
+    const { api, tags, port, send, switchTo, state, watching, runtime } = await setup();
+    await send({ type: "tabs.watch", tabId: 5 });
+    expect(api.move).toHaveBeenCalledWith(5, { windowId: 1, index: 1 });
+    expect(state(5)).toEqual({ hidden: false, active: true });
+    expect(await watching()).toBe(5);
+    expect(port.received.filter((event) => event.type === "agent-tabs.changed").at(-1)?.payload).toMatchObject({ watching: 5 });
+
+    // Switching to the watched tab itself, or a tab in another window, is not leaving it.
+    await runtime.handleTabActivated(5);
+    expect(state(5)).toEqual({ hidden: false, active: true });
+
+    await switchTo(2);
+    expect(state(5)).toEqual({ hidden: true, active: false });
+    expect(await watching()).toBeNull();
+    // bside keeps the tab.
+    expect(tags.get(5)).toMatchObject({ v: 2, sessionId: owner });
+    expect(await tabPaths(runtime)).toMatchObject({ 5: "/agent-tabs/5/page.md" });
+  });
+
+  it("leaves the watched tab on screen when a tab in another window is activated", async () => {
+    const { switchTo, send, state, watching } = await setup([{ id: 9, url: "https://window-2.test/", title: "", hidden: false, windowId: 2, index: 0, active: false }]);
+    await send({ type: "tabs.watch", tabId: 5 });
+    await switchTo(9);
+    expect(state(5)).toEqual({ hidden: false, active: true });
+    expect(await watching()).toBe(5);
+  });
+
+  it("goes back to the tab watched from, and watching another tab hides the first", async () => {
+    const { send, state, watching } = await setup();
+    await send({ type: "tabs.watch", tabId: 5 });
+    await send({ type: "tabs.watch", tabId: 6 });
+    expect(state(5)).toEqual({ hidden: true, active: false });
+    expect(state(6)).toEqual({ hidden: false, active: true });
+    expect(await watching()).toBe(6);
+
+    await send({ type: "tabs.unwatch" });
+    expect(state(1)).toEqual({ hidden: false, active: true });
+    expect(state(6)).toEqual({ hidden: true, active: false });
+    expect(await watching()).toBeNull();
+  });
+
+  it("goes back to the nearest visible tab when the tab watched from was closed", async () => {
+    const { send, state, tabs } = await setup();
+    await send({ type: "tabs.watch", tabId: 5 });
+    tabs.splice(tabs.findIndex((tab) => tab.id === 1), 1);
+    await send({ type: "tabs.unwatch" });
+    expect(state(2)).toEqual({ hidden: false, active: true });
+    expect(state(5)).toEqual({ hidden: true, active: false });
+  });
+
+  it("refuses another chat's agent tab and an ordinary tab", async () => {
+    const other = await createSessionWith(prompt("u1", "Other chat"));
+    await setOpenSessionId(owner);
+    const { api, send, watching } = await setup(
+      [{ id: 7, url: "https://agent-7.test/", title: "", hidden: true, windowId: 1, index: 4, active: false }],
+      [[7, tag(1, "agent", other)]],
+    );
+    await send({ type: "tabs.watch", tabId: 7 });
+    await send({ type: "tabs.watch", tabId: 2 });
+    expect(api.show).not.toHaveBeenCalled();
+    expect(await watching()).toBeNull();
+  });
+
+  it("hands the user a watched tab Firefox cannot hide again", async () => {
+    const { api, send, switchTo, tags, runtime, state } = await setup();
+    await send({ type: "tabs.watch", tabId: 5 });
+    api.hide.mockRejectedValueOnce(new Error("Pinned tabs cannot be hidden."));
+    await switchTo(1);
+    expect(state(5)).toEqual({ hidden: false, active: false });
+    await vi.waitFor(() => expect(tags.has(5)).toBe(false));
+    expect(await tabPaths(runtime)).toMatchObject({ 5: "/tabs/5/page.md" });
+  });
+
+  it("keeps a tab it could not show, still hidden and owned", async () => {
+    const { api, send, tags, state, watching } = await setup();
+    api.show.mockRejectedValueOnce(new Error("Cannot show"));
+    await send({ type: "tabs.watch", tabId: 5 });
+    expect(state(5)).toEqual({ hidden: true, active: false });
+    expect(await watching()).toBeNull();
+    expect(tags.get(5)).toMatchObject({ v: 2, sessionId: owner });
+  });
+
+  it("never idle-closes the tab being watched", async () => {
+    const { clock, advance, sweep } = manualClock();
+    const { send, switchTo, tabs } = await setup([], [], clock);
+    await send({ type: "tabs.watch", tabId: 5 });
+    advance(AGENT_TAB_IDLE_MS + 60_000);
+    await sweep();
+    expect(tabs.map((tab) => tab.id)).toEqual([1, 2, 5]);
+
+    await switchTo(1);
+    await sweep();
+    expect(tabs.map((tab) => tab.id)).toEqual([1, 2]);
+  });
+
+  it("attaches the watched tab to a message under /agent-tabs, and never another chat's", async () => {
+    const other = await createSessionWith(prompt("u1", "Other chat"));
+    await setOpenSessionId(owner);
+    const { api, send, provider, switchTo } = await setup(
+      [{ id: 7, url: "https://agent-7.test/", title: "", hidden: true, windowId: 1, index: 4, active: false }],
+      [[7, tag(1, "agent", other)]],
+    );
+    api.sendMessage.mockImplementation((async (tabId: number, message: unknown) => {
+      const request = message as { id: string; type: string };
+      const text = `Page of tab ${tabId}`;
+      return { v: 1, id: request.id, ok: true, type: "page.snapshot", snapshot: {
+        version: 2, tabId, documentId: `doc-${tabId}`, url: `https://agent-${tabId}.test/`, title: `Tab ${tabId}`, text, offset: 0, end: text.length, totalChars: text.length, selectionText: "",
+      } };
+    }) as never);
+    scripted(provider, [[{ type: "text.delta", delta: "Seen." }, { type: "turn.completed", replayState: null }]]);
+    await send({ type: "tabs.watch", tabId: 5 });
+    await send({ type: "run.start", prompt: "What is this?" });
+    expect(modelInput(provider)).toContain("The user is looking at tab /agent-tabs/5/page.md");
+
+    // Another chat's agent tab, made active some other way, stays invisible to this chat's runs.
+    await switchTo(7);
+    scripted(provider, [[{ type: "text.delta", delta: "Nothing attached." }, { type: "turn.completed", replayState: null }]]);
+    await send({ type: "run.start", prompt: "And now?" });
+    expect(modelInput(provider)).not.toContain("Page of tab 7");
+    expect(modelInput(provider)).not.toContain("/7/page.md");
+  });
+
+  it("publishes each agent tab's title, site, and data-URL icon, never a remote icon", async () => {
+    const { tabs, runtime } = await setup();
+    Object.assign(tabs.find((tab) => tab.id === 5)!, { favIconUrl: "data:image/png;base64,AAAA" });
+    Object.assign(tabs.find((tab) => tab.id === 6)!, { favIconUrl: "https://agent-6.test/favicon.ico", title: "Renamed" });
+    runtime.handleTabUpdated(6, { title: "Renamed" });
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).agentTabs.bySession[owner]).toEqual([
+      { id: 5, role: "agent", title: "Agent five", url: "https://agent-5.test/", favIconUrl: "data:image/png;base64,AAAA", lastUsedAt: 1 },
+      { id: 6, role: "agent", title: "Renamed", url: "https://agent-6.test/", favIconUrl: null, lastUsedAt: 1 },
+    ]));
   });
 });
 

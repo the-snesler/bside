@@ -1,22 +1,31 @@
 /**
  * Shared design tokens for every extension surface (sidebar + options).
- * Restrained, system-adaptive baseline: system UI sans by default,
- * monospace reserved for tool-call/code content only.
+ * Colors come from the cassette mascot: periwinkle body, navy eyes, and the
+ * cream label. Dark is the primary design and is tinted navy; light follows
+ * the system. System UI sans by default, monospace for tool-call/code only.
  */
 
 :root {
   color-scheme: light dark;
 
   /* Light tokens */
-  --bg: oklch(1 0 0);
-  --surface: oklch(0.965 0 0);
-  --ink: oklch(0.18 0.01 28.3);
-  --muted: oklch(0.45 0.02 28.3);
-  --primary: oklch(0.49 0.19 28.3);
-  --on-primary: oklch(1 0 0);
-  --accent: oklch(0.55 0.13 250);
-  --error: oklch(0.5 0.2 25);
+  --bg: #ffffff;
+  --surface: #f5f5ee;
+  --raised: #e9ebf5;
+  --ink: #15172a;
+  --muted: #5d6180;
+  --faint: rgb(93 97 128 / 0.2);
+  --primary: #15204f;
+  --on-primary: #fafcda;
+  --accent: #3f57be;
+  --user-bubble: #eceefa;
+  --error: #bc4636;
   --success: oklch(0.55 0.14 145);
+
+  /* The mascot's own colors, the same in both themes. */
+  --mascot-body: #6b82db;
+  --mascot-eye: #011773;
+  --mascot-badge: #fafcda;
 
   --space-1: 4px;
   --space-2: 8px;
@@ -37,14 +46,17 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: oklch(0.12 0 0);
-    --surface: oklch(0.18 0.01 28.3);
-    --ink: oklch(0.95 0 0);
-    --muted: oklch(0.72 0.02 28.3);
-    --primary: oklch(0.68 0.16 28.3);
-    --on-primary: oklch(0.12 0 0);
-    --accent: oklch(0.73 0.11 250);
-    --error: oklch(0.7 0.18 25);
+    --bg: #0e0f18;
+    --surface: #171926;
+    --raised: #21243a;
+    --ink: #f1f2e3;
+    --muted: #9295ae;
+    --faint: rgb(146 149 174 / 0.2);
+    --primary: #fafcda;
+    --on-primary: #0b1446;
+    --accent: #97a8f2;
+    --user-bubble: #1e2238;
+    --error: #ee8e82;
     --success: oklch(0.75 0.14 145);
   }
 }

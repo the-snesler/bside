@@ -108,7 +108,8 @@ export interface PageArtifactSummary {
 
 /** Full run-local artifact, including the bounded snapshot; never persisted as-is. */
 export interface PageContextArtifact extends PageArtifactSummary {
-  target: { kind: "tab"; tabId: number };
+  /** `agent-tabs` when the user sent the message while watching one of the run's agent tabs. */
+  target: { kind: "tab"; tabId: number; mount: "tabs" | "agent-tabs" };
   snapshot: PageSnapshot;
 }
 

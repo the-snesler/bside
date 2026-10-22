@@ -30,10 +30,10 @@ lib/
   background/
     skills.ts          Background-owned bounded saved skills, options CRUD, and packaged-skill seam.
     skill-context.ts   Captures explicit /name invocations and renders the invocation note on a user message.
-    runtime.ts         Sole owner of runs, the open session and session commands, persistence, cancellation, retry, terminal transitions, agent-tab ownership.
+    runtime.ts         Sole owner of runs, the open session and session commands, persistence, cancellation, retry, terminal transitions, agent-tab ownership and watching.
     agent-loop.ts      Pi Agent orchestration, system policy, run budgets, approvals, exactly-once tool ledger.
     browser-program.ts browser_program parser/interpreter, tab mounts, /workspace, web.search, agent-tab state.
-    tab-controller.ts  Bound-tab capture, page RPC, navigation settlement, tab hide/close, agent-tab session tags.
+    tab-controller.ts  Bound-tab capture, page RPC, navigation settlement, tab hide/reveal/close, agent-tab session tags.
     sidebar-hub.ts     Sidebar Port transport, snapshots, sequencing, replay buffer.
     approval-badge.ts  Toolbar "!" badge while a run awaits confirmation.
     chatgpt-auth.ts    Sign in with ChatGPT: OAuth, token refresh, device-key-sealed credential.
@@ -54,9 +54,11 @@ lib/
     page-executor.ts   Pure DOM snapshot/action semantics used by the content script.
   ui/
     use-background.ts  Preact hook consuming the sidebar Port; renders background state.
-    turns.ts           Groups conversation items into turns and activities; sums each turn's run usage.
+    turns.ts           Groups conversation items into turns and activities; sums each turn's run usage; reads each turn's outcome from its digest.
     usage.ts           Compact token/cost labels for turn footers and history rows.
-    TurnTrace.tsx      Per-turn work trace (built on Trace.tsx).
+    Mascot.tsx         bside's face (the cassette icon close up): reels spin while working, "!" when it needs the user, droops on failure.
+    TurnTrace.tsx      Per-turn work trace led by the mascot (built on Trace.tsx).
+    AgentTabsTray.tsx  The open chat's agent tabs on the composer's top edge: list, watch/back, close all.
     Composer.tsx       Slate prompt editor with tab mentions.
     Markdown.tsx       Model-text Markdown without raw HTML, remote images, or unsafe links.
     HistoryDrawer.tsx  Sidebar chat history: title search, inline rename, pin, export, two-step delete.
@@ -64,7 +66,7 @@ lib/
   validation.ts        Runtime validators for prompts and tool arguments.
   storage.ts           Versioned `storage.local` records: settings, sealed credentials, chunked conversation sessions, per-session message queues, history retention, legacy migration, interrupted-run recovery.
 
-styles/theme.css       Shared system-adaptive design tokens.
+styles/theme.css       Shared design tokens from the mascot's palette: navy-tinted dark first, light following the system.
 public/                Packaged static extension assets.
 tests/                 Vitest contract tests; helpers/pi-provider.ts fakes Pi streams; fixtures hold deterministic test pages.
 scripts/
@@ -100,7 +102,8 @@ wxt.config.ts          Firefox MV2 manifest, permissions, CSP, and Preact Vite s
 - Browser programs are parsed and interpreted, never evaluated as JavaScript. Locators resolve uniquely against a fresh snapshot before each effect. Stop on the first failure and retain earlier effects. Property and index reads work only on returned plain values (own keys, array/string indexes, `length`; prototype keys rejected; missing reads as null), never on capability handles. `Promise.all([...])` evaluates its items concurrently (at most 8 at once, results in order); calls on one tab, `web.search` (one search tab per session), and `/workspace` changes still run one at a time. The first failure cancels the rest, and the error names which items finished.
 - Site APIs (`lib/sites`) expose a closed set of read-only methods over one site's backend as program globals (`youtube.*`), each documented by a packaged skill. The background fetches only the API's `origin`, which is its own `connect-src` entry; adding a site means a new origin in `wxt.config.ts` and the manifest snapshot. Web requests carry the user's cookies and, when signed in, an InnerTube SAPISIDHASH header; a rejected signed-in request is retried anonymously. Results are untrusted data, list the URLs they read for the run digest, and are not page effects, so they never block retry. Responses are size-capped and time out; failures become safe `SiteError` messages, never raw bodies.
 - `/tabs/<id>/page.md` and `/agent-tabs/<id>/page.md` are live read-only snapshots. Explicit cross-mount moves hide/show tabs; removal closes them. `/workspace` is bounded per-session scratch storage (64 files × 32k chars), persisted as one `local:workspace:<sessionId>:<slot>` record per file, written through before a program reports the change, revalidated on read, and deleted with its session; never host filesystem access.
-- Agent-tab ownership lives on the tabs themselves as a versioned `sessions` tab value (`AGENT_TAB_TAG_KEY`, v2: role `agent`/`search`, owning `sessionId`, and `lastUsedAt`), which Firefox keeps across browser restarts, session restore, and undo-close even though it reassigns tab IDs. Every agent tab, search tabs included, belongs to one chat session; a run sees and reaches only its own session's agent tabs (others are absent from both mounts), and each session gets its own search tab. Opening, adopting, and moving a tab into `/agent-tabs` tags it with the run's session. Moving it to `/tabs` untags it, and so does closing it, before the tab is removed. At startup and on `tabs.onCreated`, a tab is adopted only if it carries a valid v2 tag and is hidden; a tagged tab that is visible is untagged and left to the user, never re-hidden. A legacy v1 tag names no session and is never adopted: its hidden tab is shown and untagged. Never adopt an untagged tab by ID or URL. Switching sessions leaves agent tabs alone. Deleting a session closes its agent tabs, or shows and untags them if the user keeps them; retention and "Delete all history" close them, and the retention sweep also closes tabs whose session no longer exists. Agent tabs unused for 30 minutes are auto-closed. Idle close and the sidebar's "Close agent tabs" (the open session's only) are refused while a run is active.
+- Agent-tab ownership lives on the tabs themselves as a versioned `sessions` tab value (`AGENT_TAB_TAG_KEY`, v2: role `agent`/`search`, owning `sessionId`, and `lastUsedAt`), which Firefox keeps across browser restarts, session restore, and undo-close even though it reassigns tab IDs. Every agent tab, search tabs included, belongs to one chat session; a run sees and reaches only its own session's agent tabs (others are absent from both mounts), and each session gets its own search tab. Opening, adopting, and moving a tab into `/agent-tabs` tags it with the run's session. Moving it to `/tabs` untags it, and so does closing it, before the tab is removed. At startup and on `tabs.onCreated`, a tab is adopted only if it carries a valid v2 tag and is hidden; a tagged tab that is visible is untagged and left to the user, never re-hidden. A legacy v1 tag names no session and is never adopted: its hidden tab is shown and untagged. Never adopt an untagged tab by ID or URL. Switching sessions leaves agent tabs alone. Deleting a session closes its agent tabs, or shows and untags them if the user keeps them; retention and "Delete all history" close them, and the retention sweep also closes tabs whose session no longer exists. Agent tabs unused for 30 minutes are auto-closed. Idle close and the sidebar's "Close all" (the open session's only) are refused while a run is active.
+- Watching an agent tab: the sidebar lists the open session's agent tabs on the composer (`agent-tabs.changed` carries every session's tabs with title, URL, `lastUsedAt`, and a favicon only when it is a `data:image/` URL, plus the watched tab). `tabs.watch` (the open session's tabs only) moves the tab beside the active tab, shows it, and switches to it. bside keeps it and its runs keep using it; switching to another tab in its window, or `tabs.unwatch` (back to the tab watched from, else the nearest visible one), hides it again. Watching is in memory only, so a tab still visible at a restart is released like any visible tagged tab, and one Firefox cannot hide again (pinned, or alone in its window) is released to the user. Idle close never closes the watched tab. A message sent while watching attaches that tab as `/agent-tabs/<id>/page.md`; another session's agent tab is never attached or shown as the page.
 
 ## Security and privacy boundaries
 

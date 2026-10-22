@@ -23,7 +23,7 @@ import type { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController } from "@/lib/background/tab-controller";
 import { browserSiteEnv } from "@/lib/sites";
 import type { SiteEnv } from "@/lib/sites/site-api";
-import type { AgentTabTagV1, AgentTabTagV2, TabControllerBrowserApi } from "@/lib/background/tab-controller";
+import type { AgentTabTagV1, AgentTabTagV2, TabControllerBrowserApi, TabSnapshot } from "@/lib/background/tab-controller";
 import { decodeProviderError, describeModels, OPENAI_API_KEY_PROVIDER, OpenAIProvider, ProviderStreamError } from "@/lib/providers/openai";
 import { DEFAULT_MODEL_ID } from "@/lib/providers/openai-models";
 import {
@@ -67,6 +67,8 @@ import { buildRunDigest } from "@/lib/domain/run-digest";
 import { hasTokens, newRunUsage, type RunUsageV1 } from "@/lib/domain/usage";
 import type { AppSettingsV1, ModelDefinition, ProviderAdapter, ProviderAuth, ProviderDefinition } from "@/lib/domain/provider";
 import type {
+  AgentTabsState,
+  AgentTabSummary,
   ApprovalRequest,
   CredentialRequest,
   CredentialResponse,
@@ -86,6 +88,9 @@ const DELTA_COALESCE_BYTES = 1024;
 /** Agent tabs no run has used for this long are closed. */
 export const AGENT_TAB_IDLE_MS = 30 * 60_000;
 const AGENT_TAB_SWEEP_MS = 60_000;
+const MAX_TAB_TITLE_CHARS = 300;
+/** Larger icons are left out of sidebar events; the sidebar shows a letter instead. */
+const MAX_FAVICON_CHARS = 16_384;
 /** History retention is enforced at startup, when it changes, and on the first sweep after this long. */
 const RETENTION_SWEEP_MS = 60 * 60_000;
 
@@ -164,8 +169,15 @@ export class BackgroundRuntime {
   #agentTabSyncQueued = false;
   /** Serialized tag last read from or written to each owned tab, so unchanged tags are not rewritten. */
   #agentTabTags = new Map<number, string>();
-  /** Serialized per-session counts last published. */
-  #publishedAgentTabs = "{}";
+  /** Agent tabs as last published to sidebars. */
+  #agentTabsState: AgentTabsState = { bySession: {}, watching: null };
+  #publishedAgentTabs = JSON.stringify(this.#agentTabsState);
+  /**
+   * The agent tab the user is watching, shown and active, and the tab they
+   * watched from. In memory only: after a restart a visible tagged tab is
+   * released to the user like any other.
+   */
+  #watching: { tabId: number; returnTabId: number | null } | null = null;
   /** Each session's message queue once loaded; this cache is authoritative and written through to storage. */
   #queues = new Map<string, QueuedMessage[]>();
 
@@ -234,11 +246,96 @@ export class BackgroundRuntime {
     if (tab && (await this.#claimTaggedTab(tabController, tabId, tag, tab.hidden ?? false))) await this.#queueAgentTabSync();
   }
 
-  /** Idle auto-close. Skipped entirely while a run is active, so a tab a run may be using is never closed under it. */
+  /** Republishes an agent tab whose title, URL, or icon changed, so the sidebar's list stays current. */
+  handleTabUpdated(tabId: number, changeInfo: { title?: string; url?: string; favIconUrl?: string }): void {
+    if (!this.#workspace.agentTabs.has(tabId)) return;
+    if (changeInfo.title === undefined && changeInfo.url === undefined && changeInfo.favIconUrl === undefined) return;
+    void this.#queueAgentTabSync();
+  }
+
+  /**
+   * Hides the watched agent tab again once the user switches to another tab
+   * in its window. Activations in other windows leave it on screen.
+   */
+  async handleTabActivated(tabId: number): Promise<void> {
+    await this.#ready;
+    const watching = this.#watching;
+    if (!watching || watching.tabId === tabId) return;
+    const tabController = this.#tabControllerFactory();
+    const watched = (await tabController.allTabs()).find((tab) => tab.id === watching.tabId);
+    if (this.#watching !== watching || watched?.active) return;
+    this.#watching = null;
+    if (watched) await this.#rehide(tabController, watching.tabId);
+    await this.#queueAgentTabSync();
+  }
+
+  /**
+   * Shows one of the open session's agent tabs next to the active tab and
+   * switches to it. The tab stays bside's, and runs keep using it;
+   * `handleTabActivated` hides it again once the user switches away. Watching
+   * another tab hides the previous one and keeps the tab to go back to.
+   */
+  async #watchAgentTab(tabId: number): Promise<void> {
+    const tab = this.#workspace.agentTabs.get(tabId);
+    if (!tab || tab.sessionId !== await this.#openSession()) return;
+    const tabController = this.#tabControllerFactory();
+    const previous = this.#watching;
+    if (previous?.tabId === tabId) {
+      await tabController.activateTab(tabId).catch(() => {});
+      return;
+    }
+    // Set first, so switching to the tab is not taken for the user leaving it.
+    const watching = { tabId, returnTabId: previous?.returnTabId ?? null };
+    this.#watching = watching;
+    try {
+      const before = await tabController.revealTab(tabId);
+      if (!previous) watching.returnTabId = before;
+    } catch {
+      if (this.#watching === watching) this.#watching = previous;
+      await this.#rehide(tabController, tabId);
+      await this.#queueAgentTabSync();
+      return;
+    }
+    if (previous) await this.#rehide(tabController, previous.tabId);
+    await this.#queueAgentTabSync();
+  }
+
+  /**
+   * Switches back to the tab the user watched from, or else the watched
+   * tab's nearest visible neighbour in its window, and hides the watched tab again.
+   */
+  async #stopWatching(): Promise<void> {
+    const watching = this.#watching;
+    if (!watching) return;
+    const tabController = this.#tabControllerFactory();
+    const tabs = await tabController.allTabs();
+    const watched = tabs.find((tab) => tab.id === watching.tabId);
+    const distance = (tab: TabSnapshot) => Math.abs((tab.index ?? 0) - (watched?.index ?? 0));
+    const candidates = tabs.filter((tab) => !tab.hidden && tab.id !== watching.tabId && tab.windowId === watched?.windowId);
+    const back = candidates.find((tab) => tab.id === watching.returnTabId) ?? candidates.toSorted((a, b) => distance(a) - distance(b))[0];
+    if (this.#watching !== watching) return;
+    this.#watching = null;
+    if (back) await tabController.activateTab(back.id!).catch(() => {});
+    if (watched) await this.#rehide(tabController, watching.tabId);
+    await this.#queueAgentTabSync();
+  }
+
+  /** Hides a tab the user was watching. One Firefox cannot hide (pinned, or the only tab in its window) becomes the user's. */
+  async #rehide(tabController: TabController, tabId: number): Promise<void> {
+    if (!this.#workspace.agentTabs.has(tabId)) return;
+    if (await tabController.hideTab(tabId).then(() => true, () => false)) return;
+    // Firefox reports only the tabs it hid, so a tab still hidden (or already closed) needs nothing.
+    const tab = (await tabController.allTabs()).find((candidate) => candidate.id === tabId);
+    if (!tab || tab.hidden) return;
+    this.#workspace.observed.delete(tabId);
+    this.#workspace.releaseTab(tabId);
+  }
+
+  /** Idle auto-close. Skipped entirely while a run is active, so a tab a run may be using is never closed under it, and never closes the watched tab. */
   async #closeIdleAgentTabs(): Promise<void> {
     if (this.#activeRun) return;
     const cutoff = this.#clock.now() - AGENT_TAB_IDLE_MS;
-    await this.#closeAgentTabs((tab) => tab.lastUsedAt <= cutoff);
+    await this.#closeAgentTabs((tab, id) => id !== this.#watching?.tabId && tab.lastUsedAt <= cutoff);
   }
 
   /**
@@ -246,13 +343,13 @@ export class BackgroundRuntime {
    * as soon as a run starts; without it, the caller guarantees `shouldClose`
    * never matches the active run's session.
    */
-  async #closeAgentTabs(shouldClose: (tab: AgentTab) => boolean, stopForRun = true): Promise<void> {
+  async #closeAgentTabs(shouldClose: (tab: AgentTab, id: number) => boolean, stopForRun = true): Promise<void> {
     const tabController = this.#tabControllerFactory();
     for (const id of [...this.#workspace.agentTabs.keys()]) {
       // Re-read after every await: a run may have started or used the tab meanwhile.
       const tab = this.#workspace.agentTabs.get(id);
       if (stopForRun && this.#activeRun) break;
-      if (tab === undefined || !shouldClose(tab)) continue;
+      if (tab === undefined || !shouldClose(tab, id)) continue;
       try {
         await tabController.closeTab(id);
       } catch {
@@ -322,7 +419,7 @@ export class BackgroundRuntime {
     // closed; adoption queued another sync that will see it.
     const listed = new Set(this.#workspace.agentTabs.keys());
     const tabController = this.#tabControllerFactory();
-    const open = new Set((await tabController.allTabs()).map((tab) => tab.id!));
+    const open = new Map((await tabController.allTabs()).map((tab) => [tab.id!, tab]));
     for (const id of listed) if (!open.has(id)) this.#workspace.agentTabs.delete(id);
     const writes: Promise<void>[] = [];
     for (const id of this.#agentTabTags.keys()) {
@@ -340,19 +437,18 @@ export class BackgroundRuntime {
     }
     // A failed write leaves its cached tag stale, so the next sync retries it.
     await Promise.allSettled(writes);
-    const counts = this.#agentTabCounts();
-    const serialized = JSON.stringify(counts);
+    if (this.#watching && !this.#workspace.agentTabs.has(this.#watching.tabId)) this.#watching = null;
+    const bySession: Record<string, AgentTabSummary[]> = {};
+    for (const [id, tab] of this.#workspace.agentTabs) {
+      if (open.has(id)) (bySession[tab.sessionId] ??= []).push(toAgentTabSummary(id, tab, open.get(id)!));
+    }
+    const state: AgentTabsState = { bySession, watching: this.#watching?.tabId ?? null };
+    const serialized = JSON.stringify(state);
     if (serialized !== this.#publishedAgentTabs) {
       this.#publishedAgentTabs = serialized;
-      this.#sidebarHub.publishAgentTabs(counts);
+      this.#agentTabsState = state;
+      this.#sidebarHub.publishAgentTabs(state);
     }
-  }
-
-  /** Owned agent tabs per session, for the sidebar header and the history drawer. */
-  #agentTabCounts(): Record<string, number> {
-    const counts: Record<string, number> = {};
-    for (const { sessionId } of this.#workspace.agentTabs.values()) counts[sessionId] = (counts[sessionId] ?? 0) + 1;
-    return counts;
   }
 
   /** The open session's id, resolved once and kept in step with `local:openConversation`. */
@@ -386,7 +482,7 @@ export class BackgroundRuntime {
       settings,
       skills: skillCatalog(await getSkills()),
       page: this.#sidebarHub.currentAttachment(),
-      agentTabs: this.#agentTabCounts(),
+      agentTabs: this.#agentTabsState,
       queue: [...await this.#queue(conversation.id)],
       activeRun: this.#activeRun
         ? {
@@ -419,6 +515,14 @@ export class BackgroundRuntime {
     if (command.type === "tabs.focus") {
       // Agent tabs are hidden workspace tabs; activating one would unhide it.
       if (!this.#workspace.agentTabs.has(command.tabId)) await this.#tabControllerFactory().focusTab(command.tabId);
+      return;
+    }
+    if (command.type === "tabs.watch") {
+      await this.#watchAgentTab(command.tabId);
+      return;
+    }
+    if (command.type === "tabs.unwatch") {
+      await this.#stopWatching();
       return;
     }
     if (command.type === "tabs.closeAgentTabs") {
@@ -965,9 +1069,13 @@ export class BackgroundRuntime {
     this.#debugOutputChars = 0;
     this.#debugOutputTruncated = false;
 
+    // The active tab is an agent tab while the user watches one. The run's
+    // own is attached under /agent-tabs; another session's stays invisible to it.
     const captureOutcome = await tabController.captureActivePage();
-    const artifact: ContextArtifact | null = captureOutcome.ok
-      ? { ...captureOutcome.value.artifact, target: { kind: "tab", tabId: captureOutcome.value.snapshot.tabId }, snapshot: captureOutcome.value.snapshot }
+    const captured = captureOutcome.ok ? captureOutcome.value : null;
+    const capturedOwner = captured ? this.#workspace.agentTabs.get(captured.snapshot.tabId)?.sessionId : undefined;
+    const artifact: ContextArtifact | null = captured && (capturedOwner === undefined || capturedOwner === sessionId)
+      ? { ...captured.artifact, target: { kind: "tab", tabId: captured.snapshot.tabId, mount: capturedOwner ? "agent-tabs" : "tabs" }, snapshot: captured.snapshot }
       : null;
 
     let items = conversation.items;
@@ -1070,6 +1178,8 @@ export class BackgroundRuntime {
         this.#sidebarHub.publishRunEvent(runId, "run.usage", { usage: run.usage });
       },
       onToolOutput: (call, result, timing) => {
+        // Programs open, navigate, and use agent tabs; the sidebar lists them with their titles and last use.
+        if (this.#workspace.agentTabs.size > 0) void this.#queueAgentTabSync();
         record.toolCalls.push({
           callId: call.id, name: call.name, startedAt: new Date(timing.startedAt).toISOString(), durationMs: timing.endedAt - timing.startedAt,
           ok: result.ok, code: result.code ?? null, outputChars: result.summary.length, truncatedOutput: result.summary.includes("[Output truncated:"),
@@ -1235,6 +1345,18 @@ type SessionCommand = Extract<SidebarCommand, { type: "session.create" | "sessio
  */
 function lastTurnRanProgram(items: readonly ConversationItem[]): boolean {
   return items.slice(items.findLastIndex(isTurnStart) + 1).some((item) => item.kind === "tool-call" && item.call.name === "browser_program");
+}
+
+function toAgentTabSummary(id: number, tab: AgentTab, snapshot: TabSnapshot): AgentTabSummary {
+  const icon = snapshot.favIconUrl;
+  return {
+    id,
+    role: tab.role,
+    title: (snapshot.title ?? "").slice(0, MAX_TAB_TITLE_CHARS),
+    url: snapshot.url ?? "",
+    favIconUrl: icon?.startsWith("data:image/") && icon.length <= MAX_FAVICON_CHARS ? icon : null,
+    lastUsedAt: tab.lastUsedAt,
+  };
 }
 
 function extensionVersion(): string {
