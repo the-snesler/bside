@@ -1,260 +1,153 @@
-import { useEffect, useState } from "preact/hooks";
-import { SkillsEditor } from "@/lib/ui/SkillsEditor";
-import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
-import type { AppSettingsV1, ChatGPTStatus, ProviderDefinition, ReasoningEffort } from "@/lib/domain/provider";
-import type { HistoryRetention, HistorySettingsV1 } from "@/lib/domain/conversation";
-import type { CredentialRequest, CredentialResponse, HistoryRequest, HistoryResponse, SettingsRequest, SettingsResponse } from "@/lib/protocol";
+import { useEffect, useRef, useState } from "preact/hooks";
+import Menu from "~icons/tabler/menu-2";
+import Search from "~icons/tabler/search";
+import X from "~icons/tabler/x";
+import { SETTINGS_GROUPS, SETTINGS_PAGES, type SettingsPage } from "./pages";
+import { hrefFor, routeFromHash, searchPages } from "./navigation";
+import { isConnected, useOptionsApp } from "./state";
 
-interface CredentialState {
-  configured: boolean;
-  maskedSuffix: string | null;
-  chatgpt: ChatGPTStatus;
-}
+const findPage = (id: string | null): SettingsPage | undefined => SETTINGS_PAGES.find((page) => page.id === id);
 
-type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
-
-async function sendCredentialRequest(request: DistributiveOmit<CredentialRequest, "v" | "id">): Promise<CredentialResponse> {
-  const full = { v: 1, id: crypto.randomUUID(), ...request } as CredentialRequest;
-  return (await browser.runtime.sendMessage(full)) as CredentialResponse;
-}
-
-async function sendSettingsRequest(request: DistributiveOmit<SettingsRequest, "v" | "id">): Promise<SettingsResponse> {
-  const full = { v: 1, id: crypto.randomUUID(), ...request } as SettingsRequest;
-  return (await browser.runtime.sendMessage(full)) as SettingsResponse;
-}
-
-async function sendHistoryRequest(request: DistributiveOmit<HistoryRequest, "v" | "id">): Promise<HistoryResponse> {
-  const full = { v: 1, id: crypto.randomUUID(), ...request } as HistoryRequest;
-  return (await browser.runtime.sendMessage(full)) as HistoryResponse;
-}
-
-const RETENTION_LABELS: Record<HistoryRetention, string> = { forever: "Forever", "30d": "30 days", "7d": "7 days" };
-
-const chatCount = (count: number) => `${count} ${count === 1 ? "chat" : "chats"}`;
-
+/**
+ * The settings app: a searchable, grouped sidebar of the pages in
+ * `SETTINGS_PAGES` and the selected page, routed by `#/<id>`. Without a
+ * route it opens Account until an account is connected, else General.
+ */
 export function App() {
-  const [credential, setCredential] = useState<CredentialState | null>(null);
-  const [settings, setSettings] = useState<AppSettingsV1 | null>(null);
-  const [provider, setProvider] = useState<ProviderDefinition>(OPENAI_PROVIDER);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [apiKeyInput, setApiKeyInput] = useState("");
-  const [credentialNotice, setCredentialNotice] = useState<string | null>(null);
-  const [saveError, setSaveError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [history, setHistory] = useState<{ settings: HistorySettingsV1; sessionCount: number } | null>(null);
-  const [historyNotice, setHistoryNotice] = useState<string | null>(null);
-  const [historyError, setHistoryError] = useState<string | null>(null);
-  const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
+  const app = useOptionsApp();
+  const [route, setRoute] = useState(() => routeFromHash(location.hash));
+  const [query, setQuery] = useState("");
+  const [menuOpen, setMenuOpen] = useState(false);
+  const search = useRef<HTMLInputElement>(null);
+  const page = findPage(route);
 
   useEffect(() => {
-    const refresh = async () => {
-      const [credentialResponse, settingsResponse, historyResponse] = await Promise.all([
-        sendCredentialRequest({ type: "credentials.openai.status" }),
-        sendSettingsRequest({ type: "settings.get" }),
-        sendHistoryRequest({ type: "history.get" }),
-      ]);
-      if (credentialResponse.ok) setCredential(credentialResponse);
-      if (historyResponse.ok) setHistory(historyResponse);
-      if (settingsResponse.ok) {
-        setSettings(settingsResponse.settings);
-        setProvider(settingsResponse.provider);
-        if (settingsResponse.notice) setNotice(settingsResponse.notice);
-      }
+    const onHashChange = () => {
+      setRoute(routeFromHash(location.hash));
+      setMenuOpen(false);
+      window.scrollTo?.(0, 0);
     };
-    // Re-read background-owned state when returning to this tab (e.g. after
-    // changing the model in the sidebar). storage.onChanged is avoided on
-    // purpose: its payload would carry the raw key into this page.
-    const onFocus = () => void refresh();
-    void refresh();
-    window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
 
-  const performCredentialAction = async (request: DistributiveOmit<CredentialRequest, "v" | "id">) => {
-    setSaving(true);
-    setSaveError(null);
-    setCredentialNotice(null);
-    try {
-      const response = await sendCredentialRequest(request);
-      if (!response.ok) { setSaveError(response.error.message); return; }
-      setCredential(response);
-      setCredentialNotice(response.notice);
-      const refreshed = await sendSettingsRequest({ type: "settings.get" });
-      if (refreshed.ok) { setSettings(refreshed.settings); setProvider(refreshed.provider); }
-    } catch { setSaveError("The background could not complete this request. Try again."); }
-    finally { setSaving(false); }
+  // Resolve the default page once, after the first status reply, and record
+  // it in the URL so connecting an account does not move the page.
+  useEffect(() => {
+    if (page || !app.loaded) return;
+    const fallback = findPage(app.credential && !isConnected(app.credential) ? "account" : "general")!;
+    history.replaceState(null, "", hrefFor(fallback));
+    setRoute(fallback.id);
+  }, [page, app.loaded]);
+
+  useEffect(() => {
+    document.title = page ? `${page.label} · bside settings` : "bside settings";
+  }, [page]);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    search.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") setMenuOpen(false); };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [menuOpen]);
+
+  const results = searchPages(SETTINGS_PAGES, query);
+
+  const onSearchKeyDown = (event: KeyboardEvent) => {
+    if (event.key === "Enter" && results[0]) {
+      event.preventDefault();
+      location.hash = hrefFor(results[0].page);
+    } else if (event.key === "Escape" && query) {
+      event.stopPropagation();
+      setQuery("");
+    }
   };
 
-  const performHistoryAction = async (request: DistributiveOmit<HistoryRequest, "v" | "id">) => {
-    setHistoryNotice(null);
-    setHistoryError(null);
-    setConfirmDeleteAll(false);
-    try {
-      const response = await sendHistoryRequest(request);
-      if (!response.ok) { setHistoryError(response.error.message); return; }
-      setHistory(response);
-      setHistoryNotice(response.notice);
-    } catch { setHistoryError("The background could not complete this request. Try again."); }
-  };
-
-  const handleSaveKey = async (event: Event) => {
-    event.preventDefault();
-    const action = performCredentialAction({ type: "credentials.openai.save", apiKey: apiKeyInput });
-    setApiKeyInput("");
-    await action;
-  };
-
-  const handleModelChange = async (event: Event) => {
-    if (!settings) return;
-    const modelId = (event.target as HTMLSelectElement).value;
-    const model = provider.models.find((candidate) => candidate.id === modelId);
-    if (!model) return;
-    const reasoningEffort = (model.reasoningEfforts as readonly ReasoningEffort[]).includes(settings.reasoningEffort)
-      ? settings.reasoningEffort
-      : model.defaultReasoningEffort;
-    const next: AppSettingsV1 = { ...settings, modelId, reasoningEffort };
-    setSettings(next);
-    await sendSettingsRequest({ type: "settings.save", settings: next });
-  };
-
-  const handleEffortChange = async (event: Event) => {
-    if (!settings) return;
-    const reasoningEffort = (event.target as HTMLSelectElement).value as ReasoningEffort;
-    const next: AppSettingsV1 = { ...settings, reasoningEffort };
-    setSettings(next);
-    await sendSettingsRequest({ type: "settings.save", settings: next });
-  };
-
-  const currentModel = settings ? provider.models.find((model) => model.id === settings.modelId) : undefined;
-  const chatgpt = credential?.chatgpt;
+  const Icon = page?.icon;
+  const PageComponent = page?.component;
 
   return (
-    <div class="options">
-      <h1 class="options__title">bside settings</h1>
+    <div class={menuOpen ? "settings settings--menu-open" : "settings"}>
+      <header class="settings-topbar">
+        <button
+          type="button"
+          class="settings-topbar__menu"
+          aria-label="Settings menu"
+          aria-expanded={menuOpen}
+          aria-controls="settings-sidebar"
+          onClick={() => setMenuOpen(!menuOpen)}
+        >
+          {menuOpen ? <X aria-hidden="true" /> : <Menu aria-hidden="true" />}
+        </button>
+        {Icon && <Icon class="settings-topbar__icon" aria-hidden="true" />}
+        <span class="settings-topbar__title">{page?.label ?? "Settings"}</span>
+      </header>
 
-      <section class="options__section">
-        <h2 class="options__heading">ChatGPT subscription</h2>
-        <p class="options__disclosure">Use your ChatGPT plan. The saved connection is encrypted in this Firefox profile. While connected, ChatGPT takes priority over an API key.</p>
-        <p class="options__status" role="status">
-          {chatgpt?.connected ? `Connected${chatgpt.email ? ` as ${chatgpt.email}` : ""}.` : "Not connected."}
-        </p>
-        {chatgpt?.signInAgain && (
-          <p class="options__notice" role="status">
-            Sign in with ChatGPT again. bside no longer uses a PIN, so your earlier connection was removed.{" "}
-            <button type="button" disabled={saving} onClick={() => void performCredentialAction({ type: "credentials.chatgpt.notice.dismiss" })}>Dismiss</button>
-          </p>
-        )}
-        <div class="options__form options__form--wrap">
-          {chatgpt?.connected ? <>
-            <button type="button" disabled={saving} onClick={() => void performCredentialAction({ type: "credentials.chatgpt.test" })}>Test connection</button>
-            <button type="button" disabled={saving} onClick={() => void performCredentialAction({ type: "credentials.chatgpt.disconnect" })}>Disconnect</button>
-          </> : (
-            <button type="button" disabled={saving || !credential} onClick={() => void performCredentialAction({ type: "credentials.chatgpt.login" })}>Continue with ChatGPT</button>
-          )}
+      <aside id="settings-sidebar" class="settings-sidebar">
+        <div class="settings-brand">
+          <img src="/icon.svg" alt="" width={22} height={22} />
+          <span>bside settings</span>
         </div>
-        {saving && <p class="options__status" role="status">Working… Complete the sign-in window if it opened.</p>}
-        {credentialNotice && <p class="options__status" role="status">{credentialNotice}</p>}
-        {saveError && <p class="options__error" role="alert">{saveError}</p>}
-      </section>
-
-      <section class="options__section">
-        <h2 class="options__heading">OpenAI API key</h2>
-        <p class="options__disclosure">Encrypted in this Firefox profile with a key that never leaves it. Never shared with page scripts.</p>
-        {credential?.configured ? (
-          <p class="options__status">
-            Configured (ending in {credential.maskedSuffix}).{" "}
-            <button type="button" onClick={() => void performCredentialAction({ type: "credentials.openai.delete" })} disabled={saving}>
-              Delete key
-            </button>
-          </p>
-        ) : (
-          <p class="options__status">Not configured.</p>
-        )}
-        <form class="options__form" onSubmit={(event) => void handleSaveKey(event)}>
+        <div class="settings-search">
+          <Search class="settings-search__icon" aria-hidden="true" />
           <input
-            type="password"
-            autocomplete="off"
-            placeholder={credential?.configured ? "Replace with a new key" : "sk-..."}
-            value={apiKeyInput}
-            onInput={(event) => setApiKeyInput((event.target as HTMLInputElement).value)}
+            ref={search}
+            type="search"
+            class="settings-search__input"
+            placeholder="Search…"
+            aria-label="Search settings"
+            aria-controls="settings-nav"
+            value={query}
+            onInput={(event) => setQuery(event.currentTarget.value)}
+            onKeyDown={onSearchKeyDown}
           />
-          <button type="submit" disabled={saving || apiKeyInput.trim().length === 0}>
-            {credential?.configured ? "Replace" : "Test & save"}
-          </button>
-        </form>
-      </section>
-
-      <section class="options__section">
-        <h2 class="options__heading">Model</h2>
-        {notice && <p class="options__notice">{notice}</p>}
-        {settings && (
-          <>
-            <label class="options__field">
-              Model
-              <select value={settings.modelId} onChange={(event) => void handleModelChange(event)}>
-                {provider.models.map((model) => (
-                  <option key={model.id} value={model.id}>
-                    {model.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label class="options__field">
-              Reasoning effort
-              <select value={settings.reasoningEffort} onChange={(event) => void handleEffortChange(event)}>
-                {(currentModel?.reasoningEfforts ?? []).map((effort) => (
-                  <option key={effort} value={effort}>
-                    {effort}
-                  </option>
-                ))}
-              </select>
-            </label>
-          </>
-        )}
-      </section>
-
-      <SkillsEditor />
-
-      <section class="options__section">
-        <h2 class="options__heading">History</h2>
-        <p class="options__disclosure">
-          Chats are saved only in this Firefox profile and are never synced. They contain your prompts, bside's answers, and text
-          from pages bside read for you, such as page titles, addresses, and excerpts.
-        </p>
-        {history && (
-          <>
-            <label class="options__field">
-              Keep chats
-              <select
-                value={history.settings.retention}
-                onChange={(event) => void performHistoryAction({ type: "history.retention.save", retention: (event.target as HTMLSelectElement).value as HistoryRetention })}
-              >
-                {(Object.keys(RETENTION_LABELS) as HistoryRetention[]).map((retention) => (
-                  <option key={retention} value={retention}>{RETENTION_LABELS[retention]}</option>
-                ))}
-              </select>
-            </label>
-            <p class="options__disclosure">
-              Chats not updated within this period are deleted, starting immediately. Pinned chats, the open chat, and a chat with a
-              running task are kept.
-            </p>
-            <p class="options__status">{chatCount(history.sessionCount)} saved.</p>
-            {confirmDeleteAll ? (
-              <div class="options__form options__form--wrap" role="group" aria-label="Confirm deleting all history">
-                <p class="options__confirm">Delete {chatCount(history.sessionCount)}, including pinned ones? This cannot be undone.</p>
-                <button type="button" class="options__secondary" onClick={() => setConfirmDeleteAll(false)}>Cancel</button>
-                <button type="button" class="options__danger" onClick={() => void performHistoryAction({ type: "history.deleteAll" })}>Delete all</button>
+        </div>
+        <nav id="settings-nav" class="settings-nav" aria-label="Settings">
+          {SETTINGS_GROUPS.map((group) => {
+            const items = results.filter((result) => result.page.group === group);
+            if (!items.length) return null;
+            const headingId = `settings-nav-${group.toLowerCase()}`;
+            return (
+              <div key={group} class="settings-nav__group">
+                <h2 id={headingId} class="settings-nav__heading">{group}</h2>
+                <ul class="settings-nav__list" aria-labelledby={headingId}>
+                  {items.map(({ page: item, hint }) => {
+                    const ItemIcon = item.icon;
+                    return (
+                      <li key={item.id}>
+                        <a
+                          class="settings-nav__item"
+                          href={hrefFor(item)}
+                          aria-current={item === page ? "page" : undefined}
+                          onClick={() => setMenuOpen(false)}
+                        >
+                          <ItemIcon class="settings-nav__icon" aria-hidden="true" />
+                          <span class="settings-nav__text">
+                            <span class="settings-nav__label">{item.label}</span>
+                            {hint && <span class="settings-nav__hint">{hint}</span>}
+                          </span>
+                        </a>
+                      </li>
+                    );
+                  })}
+                </ul>
               </div>
-            ) : (
-              <div class="options__form">
-                <button type="button" class="options__danger" onClick={() => setConfirmDeleteAll(true)}>Delete all history</button>
-              </div>
-            )}
-          </>
+            );
+          })}
+          {!results.length && <p class="settings-nav__empty" role="status">No settings match “{query.trim()}”.</p>}
+        </nav>
+      </aside>
+
+      <main class="settings-pane">
+        {page && PageComponent && (
+          <div class="settings-page" key={page.id}>
+            <h1 class="settings-page__title">{page.label}</h1>
+            {page.description && <p class="settings-page__description">{page.description}</p>}
+            <PageComponent app={app} />
+          </div>
         )}
-        {historyNotice && <p class="options__status" role="status">{historyNotice}</p>}
-        {historyError && <p class="options__error" role="alert">{historyError}</p>}
-      </section>
+      </main>
     </div>
   );
 }
