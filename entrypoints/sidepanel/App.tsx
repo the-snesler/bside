@@ -53,6 +53,7 @@ export function App() {
     closeAgentTabs,
     watchTab,
     unwatchTab,
+    takeOverTab,
     saveSettings,
     sendPrompt,
     steer,
@@ -63,6 +64,7 @@ export function App() {
     cancelRun,
     approveAction,
     denyAction,
+    resolveHelp,
     newChat,
     sessions,
     listSessions,
@@ -93,6 +95,7 @@ export function App() {
     provider.models[0];
   const turns = buildTurns(conversation.items, runHere);
   const pendingApproval = runHere ? activeRun.pendingApproval : null;
+  const pendingHelp = runHere ? activeRun.pendingHelp : null;
 
   // This chat's agent tabs ride on the composer. The attached page is one of
   // them while the user watches it; another chat's agent tab is never shown as attached.
@@ -117,6 +120,7 @@ export function App() {
   useEffect(() => {
     if (watchedTab) setTrayOpen(true);
   }, [watchedTab?.id]);
+  const helpTabId = pendingHelp && chatAgentTabs.some((tab) => tab.id === pendingHelp.tabId) ? pendingHelp.tabId : null;
 
   return (
     <div class="sidebar">
@@ -169,7 +173,9 @@ export function App() {
               <p>
                 {activeRun.pendingApproval
                   ? "Another chat is waiting for your confirmation."
-                  : "bside is working in another chat."}
+                  : activeRun.pendingHelp
+                    ? "Another chat needs your help in one of its tabs."
+                    : "bside is working in another chat."}
               </p>
               <button type="button" onClick={() => openSession(activeRun.conversationId)}>
                 Show
@@ -237,6 +243,10 @@ export function App() {
                               pendingApproval={pendingApproval}
                               onApprove={approveAction}
                               onDeny={denyAction}
+                              pendingHelp={pendingHelp}
+                              agentTabs={chatAgentTabs}
+                              onShowTab={watchTab}
+                              onResolveHelp={resolveHelp}
                             />
                           </li>
                         )}
@@ -327,6 +337,7 @@ export function App() {
                 tabs={chatAgentTabs}
                 watching={watchedTab}
                 busy={inUseSince !== null && chatAgentTabs.some((tab) => tab.lastUsedAt >= inUseSince)}
+                needsYou={helpTabId !== null}
                 open={trayOpen}
                 onToggle={() => setTrayOpen(!trayOpen)}
               />
@@ -338,9 +349,12 @@ export function App() {
                   watching={watchedTab}
                   inUseSince={inUseSince}
                   canClose={activeRun === null}
+                  helpTabId={helpTabId}
+                  takenOver={agentTabs.takenOver}
                   now={Date.now()}
                   onWatch={watchTab}
                   onUnwatch={unwatchTab}
+                  onTakeOver={takeOverTab}
                   onCloseAll={() => closeAgentTabs(conversation.id)}
                 />
               )}
@@ -430,7 +444,7 @@ export function App() {
           <HistoryDrawer
             sessions={sessions}
             openId={conversation.id}
-            run={activeRun && { conversationId: activeRun.conversationId, awaitingApproval: activeRun.pendingApproval !== null }}
+            run={activeRun && { conversationId: activeRun.conversationId, waitingFor: activeRun.pendingApproval ? "confirmation" : activeRun.pendingHelp ? "help" : null }}
             agentTabs={agentTabCounts}
             now={Date.now()}
             onOpen={(sessionId) => {

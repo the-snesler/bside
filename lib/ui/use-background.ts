@@ -12,7 +12,7 @@
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import type { Browser } from "wxt/browser";
 import { RUN_CANCELLED_SUFFIX, SIDEBAR_PORT_NAME } from "@/lib/protocol";
-import type { NormalizedError, RuntimeSnapshot, SidebarCommand, SidebarEvent } from "@/lib/protocol";
+import type { HelpOutcome, NormalizedError, RuntimeSnapshot, SidebarCommand, SidebarEvent } from "@/lib/protocol";
 import type { Conversation, ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
 import type { AppSettingsV1 } from "@/lib/domain/provider";
 import type { TabMention } from "@/lib/protocol";
@@ -50,6 +50,8 @@ export interface BackgroundActions {
   watchTab(tabId: number): void;
   /** Goes back to the tab the user watched from, hiding the watched tab again. */
   unwatchTab(): void;
+  /** Removes the page shield from the watched agent tab until watching ends. */
+  takeOverTab(tabId: number): void;
   saveSettings(settings: AppSettingsV1): void;
   /** Starts a run, or queues a follow-up while this chat's run is working. */
   sendPrompt(prompt: string): void;
@@ -61,6 +63,8 @@ export interface BackgroundActions {
   cancelRun(): void;
   approveAction(callId: string): void;
   denyAction(callId: string): void;
+  /** Answers the run's pending help request; `note` is optional (empty for none). */
+  resolveHelp(callId: string, outcome: HelpOutcome, note: string): void;
   newChat(): void;
   listSessions(): void;
   openSession(sessionId: string): void;
@@ -90,7 +94,7 @@ const INITIAL_STATE: BackgroundState = {
   provider: OPENAI_PROVIDER,
   settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
   page: null,
-  agentTabs: { bySession: {}, watching: null },
+  agentTabs: { bySession: {}, watching: null, takenOver: false },
   queue: [],
   activeRun: null,
   lastSeq: 0,
@@ -198,6 +202,12 @@ export function useBackground(): BackgroundState & BackgroundActions {
     portRef.current?.postMessage(command);
   }, []);
 
+  const resolveHelp = useCallback((callId: string, outcome: HelpOutcome, note: string) => {
+    const runId = activeRunIdRef.current;
+    if (!runId) return;
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "help.resolve", runId, callId, outcome, note } satisfies SidebarCommand);
+  }, []);
+
   const newChat = useCallback(() => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.create" } satisfies SidebarCommand);
   }, []);
@@ -255,13 +265,16 @@ export function useBackground(): BackgroundState & BackgroundActions {
   const unwatchTab = useCallback(() => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "tabs.unwatch" } satisfies SidebarCommand);
   }, []);
+  const takeOverTab = useCallback((tabId: number) => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "tabs.takeOver", tabId } satisfies SidebarCommand);
+  }, []);
   const saveSettings = useCallback((settings: AppSettingsV1) => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "settings.save", settings } satisfies SidebarCommand);
   }, []);
 
   return {
-    ...state, sendPrompt, steer, removeQueued, sendQueued, retryRun, cancelRun, approveAction, denyAction, newChat, listSessions, openSession, renameSession, pinSession,
-    deleteSession, downloadContext, rememberSite, saveSiteNote, closeSiteNote, listTabs, listSkills: () => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "skills.list" } satisfies SidebarCommand), focusTab, closeAgentTabs, watchTab, unwatchTab, saveSettings,
+    ...state, sendPrompt, steer, removeQueued, sendQueued, retryRun, cancelRun, approveAction, denyAction, resolveHelp, newChat, listSessions, openSession, renameSession, pinSession,
+    deleteSession, downloadContext, rememberSite, saveSiteNote, closeSiteNote, listTabs, listSkills: () => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "skills.list" } satisfies SidebarCommand), focusTab, closeAgentTabs, watchTab, unwatchTab, takeOverTab, saveSettings,
   };
 }
 
@@ -364,7 +377,7 @@ function applyEvent(
       return {
         ...prev,
         lastError: null,
-        activeRun: { runId: event.runId as string, conversationId, status: "running", partialAssistantText: "", pendingApproval: null, usage: null },
+        activeRun: { runId: event.runId as string, conversationId, status: "running", partialAssistantText: "", pendingApproval: null, pendingHelp: null, usage: null },
         // A retry re-runs the turn's existing user message rather than adding one.
         conversation: event.payload.retry ? prev.conversation : appendItem(prev, conversationId, userItem, event.at),
       };
@@ -401,6 +414,19 @@ function applyEvent(
     });
     return;
   }
+  if (event.type === "help.requested") {
+    setState((prev) => {
+      const committed = commitPendingText(prev, event.conversationId);
+      if (!committed.activeRun) return committed;
+      const callItem: ConversationItem = { id: `${event.payload.call.id}-call`, kind: "tool-call", call: event.payload.call, at: event.at };
+      return {
+        ...committed,
+        activeRun: { ...committed.activeRun, status: "awaiting-help", pendingHelp: event.payload },
+        conversation: appendItem(committed, event.conversationId, callItem),
+      };
+    });
+    return;
+  }
   if (event.type === "tool.result") {
     setState((prev) => {
       if (!prev.activeRun) return prev;
@@ -412,12 +438,14 @@ function applyEvent(
         at: event.at,
       };
       const stillPending = prev.activeRun.pendingApproval?.call.id === event.payload.callId ? null : prev.activeRun.pendingApproval;
+      const helpPending = prev.activeRun.pendingHelp?.call.id === event.payload.callId ? null : prev.activeRun.pendingHelp;
       return {
         ...prev,
         activeRun: {
           ...prev.activeRun,
-          status: stillPending ? "awaiting-approval" : "running",
+          status: stillPending ? "awaiting-approval" : helpPending ? "awaiting-help" : "running",
           pendingApproval: stillPending,
+          pendingHelp: helpPending,
         },
         conversation: appendItem(prev, event.conversationId, resultItem),
       };

@@ -3,6 +3,7 @@ import Browser from "~icons/tabler/browser";
 import ChevronDown from "~icons/tabler/chevron-down";
 import ChevronUp from "~icons/tabler/chevron-up";
 import Eye from "~icons/tabler/eye";
+import HandStop from "~icons/tabler/hand-stop";
 import type { AgentTabSummary } from "@/lib/protocol";
 import { formatRelativeTime } from "@/lib/ui/HistoryDrawer";
 
@@ -23,12 +24,18 @@ function TabIcon(props: { tab: AgentTabSummary }) {
   return <span class="agent-tab__icon agent-tab__icon--letter" aria-hidden="true">{(hostname(tab.url)[0] ?? "?").toUpperCase()}</span>;
 }
 
+/** The "needs you" marker on a tab with an open help request. */
+function NeedsYou() {
+  return <span class="needs-you">Needs you</span>;
+}
+
 /**
  * The tab on the composer's top edge that opens the list of the open chat's
  * agent tabs. While the user watches one, it names that tab's site instead.
  * `busy`: the chat's run has used one of them since its turn started.
+ * `needsYou`: the run is waiting for the user's help in one of them.
  */
-export function AgentTabsToggle(props: { tabs: readonly AgentTabSummary[]; watching: AgentTabSummary | null; busy: boolean; open: boolean; onToggle(): void }) {
+export function AgentTabsToggle(props: { tabs: readonly AgentTabSummary[]; watching: AgentTabSummary | null; busy: boolean; needsYou?: boolean; open: boolean; onToggle(): void }) {
   const { tabs, watching } = props;
   const count = `${tabs.length} background ${tabs.length === 1 ? "tab" : "tabs"}`;
   const Chevron = props.open ? ChevronDown : ChevronUp;
@@ -43,7 +50,8 @@ export function AgentTabsToggle(props: { tabs: readonly AgentTabSummary[]; watch
     >
       {watching ? <Eye aria-hidden="true" /> : <Browser aria-hidden="true" />}
       <span>{watching ? `Watching ${hostname(watching.url)}` : count}</span>
-      {props.busy && (
+      {props.needsYou && <NeedsYou />}
+      {props.busy && !props.needsYou && (
         <>
           <span class="live-dot" aria-hidden="true" />
           <span class="visually-hidden">, in use</span>
@@ -58,8 +66,10 @@ export function AgentTabsToggle(props: { tabs: readonly AgentTabSummary[]; watch
  * The open chat's agent tabs, inside the composer above the attached page.
  * Each can be watched: Firefox shows it in the tab strip and switches to it,
  * while bside keeps it and its run keeps working there. Switching to any
- * other tab, or Back, hides it again. `inUseSince`: when the chat's running
- * turn started, so tabs it has used since read as in use; `null` when idle.
+ * other tab, or Back, hides it again. While watched, the page shield pauses
+ * the user's input to the tab until they take over (or bside asks for their
+ * help there). `inUseSince`: when the chat's running turn started, so tabs it
+ * has used since read as in use; `null` when idle.
  */
 export function AgentTabsPanel(props: {
   tabs: readonly AgentTabSummary[];
@@ -67,12 +77,20 @@ export function AgentTabsPanel(props: {
   inUseSince: number | null;
   /** Closing is refused while any run is active. */
   canClose: boolean;
+  /** The tab the chat's run is waiting for the user's help in, if any. */
+  helpTabId?: number | null;
+  /** The user took over the watched tab, so its page shield is off. */
+  takenOver?: boolean;
   now: number;
   onWatch(tabId: number): void;
   onUnwatch(): void;
+  onTakeOver?(tabId: number): void;
   onCloseAll(): void;
 }) {
   const { watching, inUseSince } = props;
+  const helpTabId = props.helpTabId ?? null;
+  /** Whether the watched tab's page shield is up. */
+  const shielded = watching !== null && !props.takenOver && watching.id !== helpTabId;
   const inUse = (tab: AgentTabSummary) => inUseSince !== null && tab.lastUsedAt >= inUseSince;
   return (
     <section class="agent-tabs" id={AGENT_TABS_PANEL_ID} aria-label="bside's background tabs">
@@ -81,19 +99,29 @@ export function AgentTabsPanel(props: {
           const watched = tab.id === watching?.id;
           const host = hostname(tab.url);
           const title = tab.title || host;
+          const needsYou = tab.id === helpTabId;
           const status = watched
-            ? inUse(tab) ? "bside is working here" : "You're watching"
+            ? needsYou ? "bside needs you here" : props.takenOver ? "You took over" : `${inUse(tab) ? "bside is working here" : "You're watching"} · your input is paused`
+            : needsYou ? `${host} · bside needs you here`
             : `${host} · ${inUse(tab) ? "in use now" : `used ${formatRelativeTime(tab.lastUsedAt, props.now).toLowerCase()}`}`;
           return (
-            <li key={tab.id} class={watched ? "agent-tab agent-tab--watched" : "agent-tab"}>
+            <li key={tab.id} class={[
+              "agent-tab", watched && "agent-tab--watched", needsYou && "agent-tab--needs-you",
+            ].filter(Boolean).join(" ")}>
               <TabIcon tab={tab} />
               <span class="agent-tab__meta">
                 <strong title={tab.url}>{title}</strong>
                 <small>
-                  {inUse(tab) && <span class="live-dot" aria-hidden="true" />}
+                  {needsYou ? <NeedsYou /> : inUse(tab) && <span class="live-dot" aria-hidden="true" />}
                   {status}
                 </small>
               </span>
+              {watched && shielded && props.onTakeOver && (
+                <button type="button" class="agent-tab__action" onClick={() => props.onTakeOver!(tab.id)} title="Use this tab yourself until you stop watching it">
+                  <HandStop aria-hidden="true" />
+                  Take over
+                </button>
+              )}
               {watched ? (
                 <button type="button" class="agent-tab__action agent-tab__action--primary" onClick={props.onUnwatch} title="Hide this tab again and go back to yours">
                   <ArrowBackUp aria-hidden="true" />
@@ -110,7 +138,11 @@ export function AgentTabsPanel(props: {
         })}
       </ul>
       {watching ? (
-        <p class="agent-tabs__note">Switch to any other tab to hide it again.</p>
+        <p class="agent-tabs__note">
+          {shielded
+            ? "Your clicks and typing there are paused so they don't get in bside's way. Switch to any other tab to hide it again."
+            : "Switch to any other tab to hide it again."}
+        </p>
       ) : (
         <p class="agent-tabs__note">
           <span>Unused tabs close after 30 min</span>

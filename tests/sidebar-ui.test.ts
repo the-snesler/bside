@@ -34,7 +34,7 @@ function snapshotFor(id: string): RuntimeSnapshot {
     credential: { configured: true, maskedSuffix: null, chatgpt: { connected: false, email: null, signInAgain: false } },
     provider: OPENAI_API_KEY_PROVIDER,
     settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
-    page: null, agentTabs: { bySession: {}, watching: null }, queue: [], activeRun: null, lastSeq: 0, notice: null,
+    page: null, agentTabs: { bySession: {}, watching: null, takenOver: false }, queue: [], activeRun: null, lastSeq: 0, notice: null,
   };
 }
 
@@ -603,7 +603,7 @@ describe("history drawer", () => {
     const props: HistoryDrawerProps = {
       sessions: [summary("p", "Pinned trip", { pinned: true }), summary("a", "Alpha <b>bold</b>"), summary("b", "Beta", { updatedAt: now - 3 * 86_400_000 }), summary("e", "")],
       openId: "a",
-      run: { conversationId: "b", awaitingApproval: false },
+      run: { conversationId: "b", waitingFor: null },
       agentTabs: {},
       now,
       onOpen: vi.fn(), onRename: vi.fn(), onPin: vi.fn(), onExport: vi.fn(), onDelete: vi.fn(), onClose: vi.fn(),
@@ -820,10 +820,10 @@ describe("history drawer", () => {
     });
     const attached = (tabId: number) => ({ tabId, artifactId: `page:${tabId}`, kind: "page" as const, title: `Tab <i>${tabId}</i>`, url: `https://www.site-${tabId}.test/page`, capturedAt: 1 });
     const bySession = { a: [tab(5), tab(6, { favIconUrl: "data:image/png;base64,AAAA" })], b: [tab(9)] };
-    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), agentTabs: { bySession: { b: [tab(9)] }, watching: null } } });
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), agentTabs: { bySession: { b: [tab(9)] }, watching: null, takenOver: false } } });
     expect(root.querySelector(".agent-tabs-toggle")).toBeNull();
 
-    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession, watching: null } });
+    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession, watching: null, takenOver: false } });
     const toggle = root.querySelector<HTMLButtonElement>(".agent-tabs-toggle")!;
     expect(toggle.textContent).toBe("2 background tabs");
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
@@ -840,11 +840,11 @@ describe("history drawer", () => {
     expect(isSidebarCommand(posted.at(-1))).toBe(true);
 
     // Watching: the background reports the tab watched, and it is the attached page.
-    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession, watching: 5 } });
+    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession, watching: 5, takenOver: false } });
     await emit({ runId: null, conversationId: null, type: "page.attached", payload: attached(5) });
     expect(toggle.textContent).toBe("Watching site-5.test");
     expect(root.querySelector(".composer--watching")).not.toBeNull();
-    expect(root.querySelector(".agent-tab--watched small")?.textContent).toBe("You're watching");
+    expect(root.querySelector(".agent-tab--watched small")?.textContent).toBe("You're watching · your input is paused");
     expect(root.querySelector(".context-chip--agent")?.textContent).toBe("Tab <i>5</i>bside's tab");
     expect(root.textContent).not.toContain("Close all");
     await act(() => root.querySelector<HTMLButtonElement>(".agent-tab__action--primary")!.click());
@@ -857,9 +857,79 @@ describe("history drawer", () => {
     await emit({ runId: null, conversationId: null, type: "page.attached", payload: attached(1) });
     expect(root.querySelector(".context-chip")?.textContent).toBe("Tab <i>1</i>www.site-1.test");
 
-    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession, watching: null } });
+    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession, watching: null, takenOver: false } });
     await act(() => [...root.querySelectorAll<HTMLButtonElement>(".agent-tabs__close")][0]!.click());
     expect(posted.at(-1)).toEqual(expect.objectContaining({ type: "tabs.closeAgentTabs", sessionId: "a" }));
     expect(isSidebarCommand(posted.at(-1))).toBe(true);
+  });
+
+  /** Renders the sidebar for chat "a" with agent tabs 5 and 6, returning an event emitter and the commands it posts. */
+  async function mountApp() {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    const posted: Array<Record<string, unknown> & { type: string }> = [];
+    const listeners: Array<(message: unknown) => void> = [];
+    vi.spyOn(browser.runtime, "connect").mockReturnValue({
+      postMessage: (message: { type: string }) => posted.push(message),
+      onMessage: { addListener: (listener: (message: unknown) => void) => listeners.push(listener), removeListener: () => {} },
+      disconnect: () => {},
+    } as never);
+    root = document.createElement("div");
+    document.body.append(root);
+    await act(() => render(h(App, {}), root));
+    const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) => act(() => listeners.forEach((listener) => listener({ v: 1, seq: 0, at: 1, ...event })));
+    const tab = (id: number): AgentTabSummary => ({ id, role: id === 6 ? "search" : "agent", title: `Tab ${id}`, url: `https://site-${id}.test/`, favIconUrl: null, lastUsedAt: 0 });
+    const bySession = { a: [tab(5), tab(6)] };
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), agentTabs: { bySession, watching: null, takenOver: false } } });
+    return { posted, emit, bySession };
+  }
+  const button = (text: string) => [...root.querySelectorAll<HTMLButtonElement>("button")].find((candidate) => candidate.textContent?.trim() === text);
+
+  it("shows a help request as a card in the turn: reason as text, Show tab, Done, and Can't help with a note", async () => {
+    const { posted, emit } = await mountApp();
+    await emit({ runId: "r1", conversationId: "a", type: "run.started", payload: { prompt: "Order my groceries", page: null, retry: false } });
+    const call = { id: "help-1", name: "request_user_help" as const, arguments: { tab: "/agent-tabs/6/page.md", kind: "login", reason: "Sign in to <b>Grocer</b> with your account." } };
+    await emit({ runId: "r1", conversationId: "a", type: "help.requested", payload: { call, tabId: 6, kind: "login", reason: "Sign in to <b>Grocer</b> with your account." } });
+
+    expect(root.textContent).toContain("Waiting for your help");
+    expect(root.textContent).toContain("Needs your help: sign in");
+    expect(root.querySelector(".help__reason")?.textContent).toBe("Sign in to <b>Grocer</b> with your account.");
+    expect(root.querySelector(".help__reason b")).toBeNull();
+    expect(root.querySelector(".help__tab")?.textContent).toBe("In bside's tab: Tab 6 · site-6.test");
+    expect(root.querySelector('.mascot[data-mood="needs"]')).not.toBeNull();
+    // The tray marks the tab bside needs the user in.
+    expect(root.querySelector(".agent-tabs-toggle")?.textContent).toContain("Needs you");
+
+    await act(() => button("Show tab")!.click());
+    expect(posted.at(-1)).toMatchObject({ type: "tabs.watch", tabId: 6 });
+    await act(() => button("Done")!.click());
+    expect(posted.at(-1)).toMatchObject({ type: "help.resolve", runId: "r1", callId: "help-1", outcome: "done", note: "" });
+    expect(isSidebarCommand(posted.at(-1))).toBe(true);
+
+    await act(() => button("Can't help")!.click());
+    const note = root.querySelector<HTMLInputElement>(".help__note")!;
+    await act(() => { note.value = "  I don't have an account there. "; note.dispatchEvent(new Event("input", { bubbles: true })); });
+    await act(() => button("Send")!.click());
+    expect(posted.at(-1)).toMatchObject({ type: "help.resolve", callId: "help-1", outcome: "unable", note: "I don't have an account there." });
+    expect(isSidebarCommand(posted.at(-1))).toBe(true);
+
+    await emit({ runId: "r1", conversationId: "a", type: "tool.result", payload: { callId: "help-1", result: { ok: true, summary: "The user reports they are done helping." } } });
+    expect(root.textContent).toContain("You helped: sign in");
+    expect(button("Done")).toBeUndefined();
+    expect(root.textContent).not.toContain("Needs you");
+  });
+
+  it("states the watched tab's shield in the tray and offers Take over until the user takes over", async () => {
+    const { posted, emit, bySession } = await mountApp();
+    await act(() => root.querySelector<HTMLButtonElement>(".agent-tabs-toggle")!.click());
+    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession, watching: 5, takenOver: false } });
+    expect(root.querySelector(".agent-tab--watched small")?.textContent).toBe("You're watching · your input is paused");
+    expect(root.querySelector(".agent-tabs__note")?.textContent).toContain("paused");
+    await act(() => button("Take over")!.click());
+    expect(posted.at(-1)).toMatchObject({ type: "tabs.takeOver", tabId: 5 });
+    expect(isSidebarCommand(posted.at(-1))).toBe(true);
+
+    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession, watching: 5, takenOver: true } });
+    expect(root.querySelector(".agent-tab--watched small")?.textContent).toBe("You took over");
+    expect(button("Take over")).toBeUndefined();
   });
 });
