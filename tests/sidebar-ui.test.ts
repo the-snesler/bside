@@ -483,6 +483,68 @@ describe("sidebar UI contracts", () => {
     render(null, root);
   });
 
+  it("remembers something about the attached page's site through validated background requests", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    const posted: Record<string, unknown>[] = [];
+    const listeners: Array<(message: unknown) => void> = [];
+    vi.spyOn(browser.runtime, "connect").mockReturnValue({
+      postMessage: (message: Record<string, unknown>) => posted.push(message),
+      onMessage: { addListener: (listener: (message: unknown) => void) => listeners.push(listener), removeListener: () => {} },
+      disconnect: () => {},
+    } as never);
+    const root = document.createElement("div");
+    document.body.append(root);
+    await act(() => render(h(App, {}), root));
+    const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) =>
+      act(() => listeners.forEach((listener) => listener({ v: 1, seq: 1, at: 1, ...event })));
+    const page = { artifactId: "p", kind: "page" as const, title: "Issues", url: "https://gist.github.com/the-snesler/1", capturedAt: 1, tabId: 4 };
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), page } });
+    const remember = root.querySelector<HTMLButtonElement>('[aria-label="Remember something about this site"]')!;
+    await act(() => remember.click());
+    const lookup = posted.at(-1)!;
+    expect(lookup).toMatchObject({ type: "siteNote.get", url: page.url });
+    expect(isSidebarCommand(lookup)).toBe(true);
+    expect(root.querySelector(".site-note")?.textContent).toContain("Loading");
+
+    // A reply to some other request is ignored; the matching one prefills the covering parent note.
+    const parent = { origin: "https://github.com", includeSubdomains: true, text: "Use <b>gh</b> syntax." };
+    await emit({ runId: null, conversationId: null, type: "siteNote.loaded", payload: { requestId: "stale", origin: "https://gist.github.com", note: null } });
+    expect(root.querySelector(".site-note textarea")).toBeNull();
+    await emit({ runId: null, conversationId: null, type: "siteNote.loaded", payload: { requestId: lookup.id as string, origin: "https://gist.github.com", note: parent } });
+    const textarea = root.querySelector<HTMLTextAreaElement>(".site-note textarea")!;
+    expect(textarea.value).toBe(parent.text);
+    expect(root.querySelector(".site-note b")).toBeNull();
+    expect(root.querySelector(".site-note__title")?.textContent).toBe("Remember about github.com");
+    expect(root.querySelector<HTMLInputElement>(".site-note input[type=checkbox]")!.checked).toBe(true);
+
+    await act(() => {
+      textarea.value = "a".repeat(1_001);
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const save = () => [...root.querySelectorAll<HTMLButtonElement>(".site-note button")].find((button) => button.textContent === "Save")!;
+    expect(save().disabled).toBe(true);
+    await act(() => {
+      textarea.value = "Prefer CLI-style search.";
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(() => save().click());
+    const saved = posted.at(-1)!;
+    expect(saved).toMatchObject({ type: "siteNote.save", note: { origin: "https://github.com", includeSubdomains: true, text: "Prefer CLI-style search." } });
+    expect(isSidebarCommand(saved)).toBe(true);
+
+    // A refusal keeps the draft and shows the background's safe message.
+    await emit({ runId: null, conversationId: null, type: "siteNote.saved", payload: { requestId: saved.id as string, note: null, error: "Up to 200 site notes can be saved." } });
+    expect(root.querySelector('.site-note [role="alert"]')?.textContent).toBe("Up to 200 site notes can be saved.");
+    expect(root.querySelector<HTMLTextAreaElement>(".site-note textarea")!.value).toBe("Prefer CLI-style search.");
+    await act(() => save().click());
+    const retried = posted.at(-1)!;
+    await emit({ runId: null, conversationId: null, type: "siteNote.saved", payload: { requestId: retried.id as string, note: (retried as { note: never }).note, error: null } });
+    expect(root.querySelector(".site-note")?.textContent).toContain("Saved. bside will read this when it works on https://github.com or its subdomains.");
+    await act(() => root.querySelector<HTMLButtonElement>('.site-note [aria-label="Close"]')!.click());
+    expect(root.querySelector(".site-note")).toBeNull();
+    render(null, root);
+  });
+
   it("follows content growth only while pinned, and resumes after jumping to latest", async () => {
     let resize = () => {};
     vi.stubGlobal(

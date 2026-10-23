@@ -416,6 +416,123 @@ summary.trace__line:focus-visible .trace__chevron,
   color: var(--muted);
   white-space: nowrap;
 }
+.context-chip__action {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin: -3px -6px -3px 0;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.context-chip__action:hover,
+.context-chip__action[aria-expanded="true"] {
+  background: var(--surface);
+  color: var(--ink);
+}
+.context-chip .context-chip__action svg {
+  width: 14px;
+  height: 14px;
+  color: inherit;
+}
+
+/* "Remember something about this site": a compact note editor above the attached-page chip. */
+.site-note {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 6px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: var(--raised);
+  font-size: 12px;
+}
+.site-note--saved,
+.site-note[role="status"] {
+  flex-direction: row;
+  align-items: center;
+  gap: 7px;
+}
+.site-note svg {
+  flex-shrink: 0;
+  width: 15px;
+  height: 15px;
+  color: var(--muted);
+}
+.site-note__header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.site-note__title {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.site-note__title strong {
+  font-weight: 600;
+}
+.site-note__close {
+  width: 24px;
+  height: 24px;
+  margin: -4px -6px -4px 0;
+}
+.site-note__text {
+  width: 100%;
+  min-height: 56px;
+  padding: 6px 8px;
+  border: 1px solid var(--faint);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  line-height: 1.45;
+  resize: vertical;
+}
+.site-note__footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.site-note__check {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+}
+.site-note__count {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.site-note__count--over,
+.site-note__error {
+  color: var(--error);
+}
+.site-note__error {
+  margin: 0;
+}
+.site-note__save {
+  padding: 4px 12px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--primary);
+  color: var(--on-primary);
+  font-weight: 600;
+  cursor: pointer;
+}
+.site-note__hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
 
 /* bside's hidden tabs: a tab on the composer's top edge that opens a list inside it. */
 .agent-tabs-toggle {

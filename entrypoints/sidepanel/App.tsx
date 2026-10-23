@@ -8,6 +8,7 @@ import Eye from "~icons/tabler/eye";
 import ArrowDown from "~icons/tabler/arrow-down";
 import ArrowUp from "~icons/tabler/arrow-up";
 import X from "~icons/tabler/x";
+import NotePlus from "~icons/tabler/pencil-plus";
 import { Markdown } from "@/lib/ui/Markdown";
 import { Composer, parsePromptMentions } from "@/lib/ui/Composer";
 import { useBottomScroll } from "@/lib/ui/use-bottom-scroll";
@@ -20,6 +21,7 @@ import { describeTurnUsage } from "@/lib/ui/usage";
 import { HistoryDrawer } from "@/lib/ui/HistoryDrawer";
 import { Mascot } from "@/lib/ui/Mascot";
 import { AgentTabsPanel, AgentTabsToggle } from "@/lib/ui/AgentTabsTray";
+import { SiteNoteEditor } from "@/lib/ui/SiteNoteEditor";
 import { PROMPT_MENTION_PATTERN } from "@/lib/domain/conversation";
 
 function describeAttachment(page: PageArtifactSummary): string {
@@ -69,6 +71,10 @@ export function App() {
     pinSession,
     deleteSession,
     downloadContext,
+    siteNote,
+    rememberSite,
+    saveSiteNote,
+    closeSiteNote,
   } = useBackground();
   const scroll = useBottomScroll();
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -96,6 +102,18 @@ export function App() {
   const pageOwner = page ? Object.keys(agentTabs.bySession).find((id) => agentTabs.bySession[id]!.some((tab) => tab.id === page.tabId)) : undefined;
   const inUseSince = runHere ? turns.at(-1)?.startedAt ?? null : null;
   const [trayOpen, setTrayOpen] = useState(false);
+  const rememberButton = page && (
+    <button
+      type="button"
+      class="context-chip__action"
+      aria-label="Remember something about this site"
+      title="Remember something about this site"
+      aria-expanded={siteNote !== null}
+      onClick={() => siteNote ? closeSiteNote() : rememberSite(page.url)}
+    >
+      <NotePlus />
+    </button>
+  );
   useEffect(() => {
     if (watchedTab) setTrayOpen(true);
   }, [watchedTab?.id]);
@@ -326,17 +344,20 @@ export function App() {
                   onCloseAll={() => closeAgentTabs(conversation.id)}
                 />
               )}
+              {siteNote && <SiteNoteEditor state={siteNote} onSave={saveSiteNote} onClose={closeSiteNote} />}
               {page && pageOwner === conversation.id ? (
                 <div class="context-chip context-chip--agent" title={describeAttachment(page)}>
                   <Eye />
                   <strong>{page.title || "bside's tab"}</strong>
                   <small>bside's tab</small>
+                  {rememberButton}
                 </div>
               ) : page && pageOwner === undefined && (
                 <div class="context-chip" title={describeAttachment(page)}>
                   <Globe />
                   <strong>{page.title || "Current tab"}</strong>
                   <small>{new URL(page.url).hostname}</small>
+                  {rememberButton}
                 </div>
               )}
               <Composer

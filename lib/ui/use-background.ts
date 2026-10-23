@@ -18,12 +18,26 @@ import type { AppSettingsV1 } from "@/lib/domain/provider";
 import type { TabMention } from "@/lib/protocol";
 import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
 import { EMPTY_USAGE } from "@/lib/domain/usage";
+import type { SiteNote } from "@/lib/domain/instructions";
+
+/** The sidebar's "Remember something about this site" editor, for one page's site. */
+export interface SiteNoteEditorState {
+  /** The page's origin; `null` when its site cannot have a note. */
+  origin: string | null;
+  /** The note covering the page: its own origin's, or a parent's that includes subdomains. */
+  note: SiteNote | null;
+  status: "loading" | "ready" | "saving" | "saved";
+  /** Why the last save was refused. */
+  error: string | null;
+}
 
 export interface BackgroundState extends RuntimeSnapshot {
   tabs: TabMention[];
   /** The session index, pinned first, then most recent. Requested on connect and pushed by the background whenever it changes. */
   sessions: ConversationSummary[];
   lastError: NormalizedError | null;
+  /** The open "Remember something about this site" editor, if any. */
+  siteNote: SiteNoteEditorState | null;
 }
 
 export interface BackgroundActions {
@@ -56,6 +70,11 @@ export interface BackgroundActions {
   deleteSession(sessionId: string, closeAgentTabs: boolean): void;
   /** Downloads one session's context export. */
   downloadContext(sessionId: string): void;
+  /** Opens the site-note editor for a page, loading the note that covers it. */
+  rememberSite(pageUrl: string): void;
+  /** Saves the open editor's note; the background revalidates it. */
+  saveSiteNote(note: SiteNote): void;
+  closeSiteNote(): void;
 }
 
 const EMPTY_CONVERSATION: Conversation = {
@@ -77,6 +96,7 @@ const INITIAL_STATE: BackgroundState = {
   lastSeq: 0,
   notice: null,
   lastError: null,
+  siteNote: null,
 };
 
 type Port = Browser.runtime.Port;
@@ -86,6 +106,8 @@ export function useBackground(): BackgroundState & BackgroundActions {
   const portRef = useRef<Port | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
   const exportRequestRef = useRef<string | null>(null);
+  /** The site-note request awaiting its reply; replies to an older or closed editor are dropped. */
+  const siteNoteRequestRef = useRef<string | null>(null);
   const conversationIdRef = useRef("");
   conversationIdRef.current = state.conversation.id;
 
@@ -106,6 +128,15 @@ export function useBackground(): BackgroundState & BackgroundActions {
         link.click();
         link.remove();
         setTimeout(() => URL.revokeObjectURL(url), 60_000);
+        return;
+      }
+      if (event.type === "siteNote.loaded" || event.type === "siteNote.saved") {
+        if (event.payload.requestId !== siteNoteRequestRef.current) return;
+        siteNoteRequestRef.current = null;
+        const reply = event.payload;
+        setState((prev) => !prev.siteNote ? prev : { ...prev, siteNote: "origin" in reply
+          ? { origin: reply.origin, note: reply.note, status: "ready", error: null }
+          : reply.note ? { ...prev.siteNote, note: reply.note, status: "saved", error: null } : { ...prev.siteNote, status: "ready", error: reply.error } });
         return;
       }
       applyEvent(message as SidebarEvent, setState, activeRunIdRef);
@@ -192,6 +223,23 @@ export function useBackground(): BackgroundState & BackgroundActions {
     portRef.current?.postMessage({ v: 1, id, type: "context.export", sessionId } satisfies SidebarCommand);
   }, []);
 
+  const rememberSite = useCallback((url: string) => {
+    const id = crypto.randomUUID();
+    siteNoteRequestRef.current = id;
+    setState((prev) => ({ ...prev, siteNote: { origin: null, note: null, status: "loading", error: null } }));
+    portRef.current?.postMessage({ v: 1, id, type: "siteNote.get", url } satisfies SidebarCommand);
+  }, []);
+  const saveSiteNote = useCallback((note: SiteNote) => {
+    const id = crypto.randomUUID();
+    siteNoteRequestRef.current = id;
+    setState((prev) => prev.siteNote ? { ...prev, siteNote: { ...prev.siteNote, status: "saving", error: null } } : prev);
+    portRef.current?.postMessage({ v: 1, id, type: "siteNote.save", note } satisfies SidebarCommand);
+  }, []);
+  const closeSiteNote = useCallback(() => {
+    siteNoteRequestRef.current = null;
+    setState((prev) => ({ ...prev, siteNote: null }));
+  }, []);
+
   const listTabs = useCallback(() => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "tabs.list" } satisfies SidebarCommand);
   }, []);
@@ -213,7 +261,7 @@ export function useBackground(): BackgroundState & BackgroundActions {
 
   return {
     ...state, sendPrompt, steer, removeQueued, sendQueued, retryRun, cancelRun, approveAction, denyAction, newChat, listSessions, openSession, renameSession, pinSession,
-    deleteSession, downloadContext, listTabs, listSkills: () => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "skills.list" } satisfies SidebarCommand), focusTab, closeAgentTabs, watchTab, unwatchTab, saveSettings,
+    deleteSession, downloadContext, rememberSite, saveSiteNote, closeSiteNote, listTabs, listSkills: () => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "skills.list" } satisfies SidebarCommand), focusTab, closeAgentTabs, watchTab, unwatchTab, saveSettings,
   };
 }
 
