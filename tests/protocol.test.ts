@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { validateDomAction } from "@/lib/validation";
 import {
+  isContentMessage,
+  isContentMessageResponse,
   isCredentialRequest,
   isHistoryRequest,
   isPageExecuteRequest,
   isPageFindRequest,
   isPageHealthRequest,
+  isPageShieldRequest,
   isPageSnapshotRequest,
   isSettingsRequest,
   isSidebarCommand,
@@ -55,6 +58,24 @@ describe("isSidebarCommand: accepts every valid variant", () => {
     }
     expect(isSidebarCommand({ v: 1, id: "1", type: "tabs.unwatch" })).toBe(true);
     expect(isSidebarCommand({ v: 2, id: "1", type: "tabs.unwatch" })).toBe(false);
+  });
+
+  it("accepts tabs.takeOver only for an integer tab id", () => {
+    expect(isSidebarCommand({ v: 1, id: "1", type: "tabs.takeOver", tabId: 5 })).toBe(true);
+    for (const tabId of [undefined, "5", 1.5, null]) {
+      expect(isSidebarCommand({ v: 1, id: "1", type: "tabs.takeOver", tabId })).toBe(false);
+    }
+  });
+
+  it("accepts help.resolve only with a known outcome and a bounded note", () => {
+    const resolve = { v: 1, id: "1", type: "help.resolve", runId: "r1", callId: "c1", outcome: "done", note: "" };
+    expect(isSidebarCommand(resolve)).toBe(true);
+    expect(isSidebarCommand({ ...resolve, outcome: "unable", note: "No account here." })).toBe(true);
+    expect(isSidebarCommand({ ...resolve, outcome: "approved" })).toBe(false);
+    expect(isSidebarCommand({ ...resolve, note: "x".repeat(501) })).toBe(false);
+    expect(isSidebarCommand({ ...resolve, note: undefined })).toBe(false);
+    expect(isSidebarCommand({ ...resolve, callId: undefined })).toBe(false);
+    expect(isSidebarCommand({ ...resolve, runId: 5 })).toBe(false);
   });
 
   it("accepts tabs.closeAgentTabs only in a v1 envelope naming a session", () => {
@@ -305,5 +326,32 @@ describe("isPageExecuteRequest: accepts the closed action union only", () => {
     ]) expect(validateDomAction(action), JSON.stringify(action)).toBeNull();
     expect(isPageExecuteRequest(execute({ kind: "click" }))).toBe(false);
     expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", action: { kind: "click", target: ref } })).toBe(false);
+  });
+});
+
+describe("page shield messages", () => {
+  it("accepts a shield request only with a tab id and a known state", () => {
+    for (const shield of ["off", "working", "idle"]) {
+      expect(isPageShieldRequest({ v: 1, id: "1", type: "page.shield", tabId: 3, shield })).toBe(true);
+    }
+    expect(isPageShieldRequest({ v: 1, id: "1", type: "page.shield", tabId: 3, shield: "on" })).toBe(false);
+    expect(isPageShieldRequest({ v: 1, id: "1", type: "page.shield", shield: "off" })).toBe(false);
+    expect(isPageShieldRequest({ v: 1, id: "1", type: "page.shield", tabId: -1, shield: "off" })).toBe(false);
+    expect(isPageShieldRequest({ v: 2, id: "1", type: "page.shield", tabId: 3, shield: "off" })).toBe(false);
+  });
+
+  it("accepts only the two content-script messages, which name no tab", () => {
+    expect(isContentMessage({ v: 1, id: "1", type: "shield.sync" })).toBe(true);
+    expect(isContentMessage({ v: 1, id: "1", type: "shield.takeover" })).toBe(true);
+    expect(isContentMessage({ v: 1, id: "1", type: "page.shield", tabId: 1, shield: "off" })).toBe(false);
+    expect(isContentMessage({ v: 1, type: "shield.sync" })).toBe(false);
+    expect(isContentMessage({ v: 1, id: "1", type: "credentials.openai.status" })).toBe(false);
+  });
+
+  it("reads a background answer only when it carries a known shield state", () => {
+    expect(isContentMessageResponse({ v: 1, id: "1", ok: true, shield: "working" })).toBe(true);
+    expect(isContentMessageResponse({ v: 1, id: "1", ok: true, shield: "visible" })).toBe(false);
+    expect(isContentMessageResponse({ v: 1, id: "1", ok: false, shield: "off" })).toBe(false);
+    expect(isContentMessageResponse(undefined)).toBe(false);
   });
 });

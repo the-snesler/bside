@@ -11,6 +11,7 @@
 
 import type {
   DomAction,
+  HelpKind,
   PageArtifactSummary,
   PageErrorCode,
   PageFindResult,
@@ -21,6 +22,7 @@ import type {
 } from "@/lib/domain/tools";
 import type { Conversation, ConversationItem, ConversationSummary, HistoryRetention, HistorySettingsV1, QueuedMessage } from "@/lib/domain/conversation";
 import { HISTORY_RETENTIONS } from "@/lib/domain/conversation";
+import { MAX_HELP_NOTE_CHARS } from "@/lib/domain/tools";
 import { REASONING_EFFORTS, type AppSettingsV1, type ChatGPTStatus, type ProviderDefinition } from "@/lib/domain/provider";
 import type { RunUsageV1 } from "@/lib/domain/usage";
 import { isSkill, isSkillName, type Skill, type SkillSummary } from "@/lib/domain/skills";
@@ -72,7 +74,24 @@ export interface PageExecuteRequest {
   action: DomAction;
 }
 
-export type PageRequest = PageHealthRequest | PageSnapshotRequest | PageFindRequest | PageSearchResultsRequest | PageExecuteRequest;
+/**
+ * The page shield over a watched agent tab: `"working"` while the tab's
+ * session has the active run, `"idle"` otherwise, `"off"` when the tab is not
+ * watched, the user took over, or a help request is open for it.
+ */
+export type PageShieldState = "off" | "working" | "idle";
+export const PAGE_SHIELD_STATES: readonly PageShieldState[] = ["off", "working", "idle"];
+
+/** Shows, updates, or removes the page shield. Carries only the state: no page text, selectors, or model output. */
+export interface PageShieldRequest {
+  v: 1;
+  id: string;
+  type: "page.shield";
+  tabId: number;
+  shield: PageShieldState;
+}
+
+export type PageRequest = PageHealthRequest | PageSnapshotRequest | PageFindRequest | PageSearchResultsRequest | PageExecuteRequest | PageShieldRequest;
 
 export interface PageHealthResponse {
   v: 1;
@@ -117,6 +136,13 @@ export interface PageExecuteResponse {
   documentId: string;
 }
 
+export interface PageShieldResponse {
+  v: 1;
+  id: string;
+  ok: true;
+  type: "page.shield";
+}
+
 export interface PageErrorResponse {
   v: 1;
   id: string;
@@ -130,6 +156,7 @@ export type PageResponse =
   | PageFindResponse
   | PageSearchResultsResponse
   | PageExecuteResponse
+  | PageShieldResponse
   | PageErrorResponse;
 
 export function isPageHealthRequest(value: unknown): value is PageHealthRequest {
@@ -161,6 +188,42 @@ export function isPageExecuteRequest(value: unknown): value is PageExecuteReques
   if (!isEnvelope(value) || value.type !== "page.execute") return false;
   const candidate = value as Record<string, unknown>;
   return isTabId(candidate.tabId) && validateDomAction(candidate.action) !== null;
+}
+
+export function isPageShieldRequest(value: unknown): value is PageShieldRequest {
+  if (!isEnvelope(value) || value.type !== "page.shield") return false;
+  const candidate = value as Record<string, unknown>;
+  return isTabId(candidate.tabId) && (PAGE_SHIELD_STATES as readonly unknown[]).includes(candidate.shield);
+}
+
+// ---------------------------------------------------------------------------
+// Content script -> background: ContentMessage (runtime.sendMessage)
+//
+// Accepted only from this extension's top-frame content script in an HTTP(S)
+// tab; the background acts on `sender.tab.id`, never on an id in the message.
+// ---------------------------------------------------------------------------
+
+export type ContentMessage =
+  /** Sent when the content script starts (and on a back/forward cache restore): asks for the shield state of its own tab. */
+  | { v: 1; id: string; type: "shield.sync" }
+  /** The user pressed the shield's "Take over" button (a trusted click). */
+  | { v: 1; id: string; type: "shield.takeover" };
+
+export interface ContentMessageResponse {
+  v: 1;
+  id: string;
+  ok: true;
+  shield: PageShieldState;
+}
+
+export function isContentMessage(value: unknown): value is ContentMessage {
+  return isEnvelope(value) && (value.type === "shield.sync" || value.type === "shield.takeover");
+}
+
+export function isContentMessageResponse(value: unknown): value is ContentMessageResponse {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  return candidate.v === 1 && candidate.ok === true && (PAGE_SHIELD_STATES as readonly unknown[]).includes(candidate.shield);
 }
 
 function isTabId(value: unknown): value is number {
@@ -221,6 +284,8 @@ export type SidebarCommand =
   | { v: 1; id: string; type: "tabs.watch"; tabId: number }
   /** Ends watching: switches back to the tab the user watched from (or a neighbour if it closed), hiding the watched tab again. */
   | { v: 1; id: string; type: "tabs.unwatch" }
+  /** Removes the page shield from the watched agent tab until watching ends, like the shield's own "Take over" button. */
+  | { v: 1; id: string; type: "tabs.takeOver"; tabId: number }
   | { v: 1; id: string; type: "settings.save"; settings: AppSettingsV1 }
   /** Looks up the site note to edit for a page URL. Answered with `siteNote.loaded` to the requesting sidebar only. */
   | { v: 1; id: string; type: "siteNote.get"; url: string }
@@ -267,13 +332,26 @@ export type SidebarCommand =
   | { v: 1; id: string; type: "run.retry" }
   | { v: 1; id: string; type: "run.cancel"; runId: string }
   | { v: 1; id: string; type: "action.approve"; runId: string; callId: string }
-  | { v: 1; id: string; type: "action.deny"; runId: string; callId: string };
+  | { v: 1; id: string; type: "action.deny"; runId: string; callId: string }
+  /** Answers the active run's pending `request_user_help`: `done` (the user finished in the tab) or `unable`, with an optional short note. */
+  | { v: 1; id: string; type: "help.resolve"; runId: string; callId: string; outcome: HelpOutcome; note: string };
+
+export type HelpOutcome = "done" | "unable";
 
 export interface ApprovalRequest {
   call: ToolCall;
   origin: string;
   display: string;
   target: { ref?: string; role?: string; name?: string };
+}
+
+/** A run paused on `request_user_help`. `reason` is untrusted model text: render it as text only. */
+export interface HelpRequest {
+  call: ToolCall;
+  /** One of the run's session's agent tabs (search tabs included). */
+  tabId: number;
+  kind: HelpKind;
+  reason: string;
 }
 
 export interface RuntimeSnapshot {
@@ -291,9 +369,10 @@ export interface RuntimeSnapshot {
   activeRun: {
     runId: string;
     conversationId: string;
-    status: "running" | "awaiting-approval" | "cancelling";
+    status: "running" | "awaiting-approval" | "awaiting-help" | "cancelling";
     partialAssistantText: string;
     pendingApproval: ApprovalRequest | null;
+    pendingHelp: HelpRequest | null;
     /** Usage of the run's provider responses so far; `null` until one reports tokens. */
     usage: RunUsageV1 | null;
   } | null;
@@ -333,6 +412,7 @@ export type SidebarEvent =
   | EventBase<"assistant.delta", { delta: string }>
   | EventBase<"tool.requested", { call: ToolCall; display: string }>
   | EventBase<"action.approval-required", ApprovalRequest>
+  | EventBase<"help.requested", HelpRequest>
   | EventBase<"tool.result", { callId: string; result: ToolResult }>
   /** A steer reached the model; `item` is the persisted user message (`delivery: "steer"`), whose id is the queued message's. */
   | EventBase<"steer.delivered", { item: ConversationItem }>
@@ -351,6 +431,7 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (candidate.type === "tabs.closeAgentTabs") return isSessionId(candidate.sessionId);
   if (candidate.type === "tabs.watch") return Number.isSafeInteger(candidate.tabId);
   if (candidate.type === "tabs.unwatch") return true;
+  if (candidate.type === "tabs.takeOver") return Number.isSafeInteger(candidate.tabId);
   if (candidate.type === "settings.save") return isAppSettings(candidate.settings);
   if (candidate.type === "siteNote.get") return typeof candidate.url === "string" && candidate.url.length <= 8_192;
   if (candidate.type === "siteNote.save") return isSiteNote(candidate.note);
@@ -374,6 +455,11 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (candidate.type === "run.cancel") return typeof candidate.runId === "string";
   if (candidate.type === "action.approve" || candidate.type === "action.deny") {
     return typeof candidate.runId === "string" && typeof candidate.callId === "string";
+  }
+  if (candidate.type === "help.resolve") {
+    return typeof candidate.runId === "string" && typeof candidate.callId === "string" &&
+      (candidate.outcome === "done" || candidate.outcome === "unable") &&
+      typeof candidate.note === "string" && candidate.note.length <= MAX_HELP_NOTE_CHARS;
   }
   return false;
 }
@@ -519,6 +605,8 @@ export interface AgentTabsState {
   bySession: Record<string, AgentTabSummary[]>;
   /** The agent tab the user is watching (shown and active), if any. */
   watching: number | null;
+  /** The user took over the watched tab: its page shield is gone until watching ends. */
+  takenOver: boolean;
 }
 
 export function isAppSettings(value: unknown): value is AppSettingsV1 {

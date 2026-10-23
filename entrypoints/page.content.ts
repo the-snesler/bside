@@ -1,11 +1,13 @@
 import {
+  isContentMessageResponse,
   isPageExecuteRequest,
   isPageFindRequest,
   isPageHealthRequest,
   isPageSearchResultsRequest,
+  isPageShieldRequest,
   isPageSnapshotRequest,
 } from "@/lib/protocol";
-import type { PageResponse } from "@/lib/protocol";
+import type { ContentMessage, PageResponse } from "@/lib/protocol";
 import {
   createElementRefRegistry,
   executeDomAction,
@@ -13,6 +15,7 @@ import {
   extractSnapshot,
   findInPage,
 } from "@/lib/tools/page-executor";
+import { createPageShield } from "@/lib/tools/page-shield";
 
 export default defineContentScript({
   matches: ["http://*/*", "https://*/*"],
@@ -21,6 +24,19 @@ export default defineContentScript({
     // One ref registry per document lifetime; a navigation reloads this
     // content script and starts a fresh registry with a new document id.
     const registry = createElementRefRegistry();
+
+    // The background owns the shield's state; a new document (or one restored
+    // from the back/forward cache) asks for it, since a push may have missed it.
+    let messageCount = 0;
+    const tellBackground = (type: ContentMessage["type"]) => {
+      const message: ContentMessage = { v: 1, id: `content-${++messageCount}`, type };
+      browser.runtime.sendMessage(message).then((response: unknown) => {
+        if (isContentMessageResponse(response)) shield.set(response.shield);
+      }, () => {});
+    };
+    const shield = createPageShield(document, () => tellBackground("shield.takeover"));
+    tellBackground("shield.sync");
+    window.addEventListener("pageshow", (event) => { if (event.persisted) tellBackground("shield.sync"); });
 
     browser.runtime.onMessage.addListener((message: unknown): Promise<PageResponse> | undefined => {
       if (isPageHealthRequest(message)) {
@@ -41,6 +57,10 @@ export default defineContentScript({
         return executeDomAction(document, registry, message.action).then((result) => (
           { v: 1, id: message.id, ok: true, type: "page.execute", result, documentId: registry.documentId }
         ));
+      }
+      if (isPageShieldRequest(message)) {
+        shield.set(message.shield);
+        return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.shield" });
       }
       return undefined;
     });

@@ -15,9 +15,16 @@ export type JsonValue =
 
 export interface ToolCall {
   id: string;
-  name: "browser_program" | "request_action_confirmation" | "current_time";
+  name: "browser_program" | "request_action_confirmation" | "request_user_help" | "current_time";
   arguments: JsonValue;
 }
+
+/** What `request_user_help` asks the user to do in an agent tab. */
+export const HELP_KINDS = ["login", "verification", "information", "permission", "other"] as const;
+export type HelpKind = (typeof HELP_KINDS)[number];
+export const MAX_HELP_REASON_CHARS = 1000;
+/** The optional note the user may send back with "Can't help". */
+export const MAX_HELP_NOTE_CHARS = 500;
 
 /**
  * Identifies one element for a DOM action. A ref is only meaningful inside the

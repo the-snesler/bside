@@ -10,6 +10,11 @@
  * and file inputs with a visible label are exposed and operated through that
  * label; other hidden elements are never targetable.
  *
+ * Elements registered with `excludeFromOutline` (bside's own page shield) are
+ * skipped entirely. Effects are dispatched straight to the resolved element;
+ * nothing here hit-tests by coordinates (no `elementFromPoint`), so an overlay
+ * never redirects or blocks an agent action.
+ *
  * This file never touches `browser.*` APIs and never receives credentials or
  * generated JavaScript — it only ever sees a `Document`, opaque refs, and
  * validated actions. Element checks use tag names rather than `instanceof` so
@@ -42,6 +47,14 @@ function randomId(): string {
 }
 
 const MAX_REGISTERED_REFS = 20_000;
+
+/** Extension-owned elements left out of every outline, find, and change diff. */
+const OUTLINE_EXCLUDED = new WeakSet<Element>();
+
+/** Keeps an element bside itself put on the page (the page shield) out of what the agent observes. */
+export function excludeFromOutline(element: Element): void {
+  OUTLINE_EXCLUDED.add(element);
+}
 
 function refFor(registry: ElementRefRegistry, element: Element): string {
   const existing = registry.byElement.get(element);
@@ -403,6 +416,7 @@ class OutlineBuilder {
   }
 
   #element(element: Element, context: WalkContext): void {
+    if (OUTLINE_EXCLUDED.has(element)) return;
     const tag = tagOf(element);
     if (tag === "slot") {
       for (const child of composedChildren(element)) this.walk(child, context);
