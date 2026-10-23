@@ -446,6 +446,8 @@ export class BrowserProgram {
   #handles = new WeakSet<object>();
   /** Page URLs the current program read, opened, or navigated to; returned as `data.visited` for the run digest. */
   #visited: string[] = [];
+  /** URLs of the tabs the current program read, acted on, navigated, or opened; returned as `data.pages` to match the user's site notes. */
+  #pages = new Set<string>();
   /** Tail of each exclusive section's queue: Promise.all may overlap calls, but one tab (or the search tab) serves one call at a time. */
   #locks = new Map<string, Promise<void>>();
   private readonly state: WorkspaceState;
@@ -480,6 +482,7 @@ export class BrowserProgram {
     let completed = 0;
     let parsed = false;
     this.#visited = [];
+    this.#pages = new Set();
     try {
       const statements = parseProgram(source);
       parsed = true;
@@ -583,7 +586,7 @@ export class BrowserProgram {
         summary:
           output.render() ||
           `Program completed (${completed} statements, nothing returned).`,
-        data: { visited: this.#visited },
+        data: { visited: this.#visited, pages: [...this.#pages] },
       };
     } catch (error) {
       const diagnostic = `${parsed ? `${completed} statements completed. Stopped in statement ${completed + 1}; earlier effects may have committed. Do not replay completed steps.` : "Program rejected before execution; no statements ran."} ${error instanceof Error ? error.message.slice(0, 2400) : "Browser operation failed."}`;
@@ -598,7 +601,7 @@ export class BrowserProgram {
         summary: printed
           ? `${diagnostic}\nOutput before the failure:\n${printed}`
           : diagnostic,
-        data: { diagnostic, visited: this.#visited },
+        data: { diagnostic, visited: this.#visited, pages: [...this.#pages] },
       };
     }
   }
@@ -898,6 +901,7 @@ export class BrowserProgram {
     // A lost response can follow a committed effect; disable automatic retry before dispatch.
     this.onEffect();
     const outcome = await controller.act(action);
+    this.#usedPage(controller);
     if (outcome.documentId)
       this.state.observed.set(receiver.tabId, outcome.documentId);
     else this.state.observed.delete(receiver.tabId);
@@ -1039,6 +1043,7 @@ export class BrowserProgram {
         method === "navigate"
           ? await controller.navigate(text(0, "an absolute URL"))
           : await controller.goBack();
+      this.#usedPage(controller);
       this.state.observed.delete(tabId);
       if (!result.ok)
         throw this.#pageError(
@@ -1198,6 +1203,7 @@ export class BrowserProgram {
     role: AgentTabRole = "agent",
   ): Promise<number> {
     this.#visited.push(url);
+    if (role === "agent") this.#pages.add(url);
     this.onEffect();
     const tabId = await this.tabs.createTab(url);
     this.state.adoptTab(tabId, this.sessionId, role);
@@ -1327,13 +1333,21 @@ export class BrowserProgram {
   async #controller(tabId: number): Promise<TabController> {
     this.state.touchTab(tabId);
     try {
-      return await this.tabs.forTab(tabId);
+      const controller = await this.tabs.forTab(tabId);
+      this.#usedPage(controller);
+      return controller;
     } catch {
       throw new ProgramError(
         `${this.#path(tabId)} is closed or unsupported; list tabs again.`,
         "TARGET_MISSING",
       );
     }
+  }
+
+  /** Records the page a tab is on when a call reaches it, and again after one that may move it. The search tab is not a site the user chose. */
+  #usedPage(controller: TabController): void {
+    const url = controller.tabId !== null && this.state.agentTabs.get(controller.tabId)?.role !== "search" ? controller.currentAttachment()?.url : undefined;
+    if (url) this.#pages.add(url);
   }
 
   #path(tabId: number): string {

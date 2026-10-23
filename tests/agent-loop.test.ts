@@ -3,6 +3,7 @@ import type { Browser } from "wxt/browser";
 import { AgentLoop, DIGEST_REPLAY_CHARS } from "@/lib/background/agent-loop";
 import { buildRunDigest, renderDigestNote } from "@/lib/domain/run-digest";
 import type { ConversationItem, QueuedMessage } from "@/lib/domain/conversation";
+import type { SiteNote } from "@/lib/domain/instructions";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController } from "@/lib/background/tab-controller";
 import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
@@ -728,6 +729,86 @@ describe("AgentLoop: run digest ledger", () => {
       { type: "program", source: 'return await fs.read("/tabs/1/page.md");', ok: true, code: null, urls: ["http://127.0.0.1:4173/agent-page.html"], excerpt: expect.stringContaining("Orchid launch moved to Friday.") },
       { type: "confirmation", title: "Submit", approved: false },
     ]);
+  });
+});
+
+describe("AgentLoop: custom instructions and site notes", () => {
+  const fixtureNote: SiteNote = { origin: "http://127.0.0.1:4173", includeSubdomains: false, text: "On the fixture, prefer the Submit button." };
+  const otherNote: SiteNote = { origin: "https://github.com", includeSubdomains: true, text: "Use CLI-style search." };
+  const read = (id: string) => () => [toolCallEvent(id, "browser_program", { source: 'return await fs.read("/tabs/1/page.md");' }), { type: "turn.completed", replayState: null } as ScriptedProviderEvent];
+  const done = () => [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }] as ScriptedProviderEvent[];
+  const toolResults = (provider: ScriptedProvider) => provider.requests.at(-1)!.context.messages.filter((message) => message.role === "toolResult").map((message) => JSON.stringify(message.content));
+
+  async function run(options: { transcript?: ConversationItem[]; conversationId?: string; instructions?: string; siteNotes?: SiteNote[];
+    skills?: { name: string; description: string }[]; rounds?: ConstructorParameters<typeof ScriptedProvider>[0]; contextArtifact?: typeof artifact | null }) {
+    const provider = new ScriptedProvider(options.rounds ?? [done]);
+    const { tabController } = await createTabController();
+    const loop = new AgentLoop(provider, tabController, new SidebarHub());
+    const result = await loop.run({
+      runId: "run1", conversationId: options.conversationId ?? "default", modelId: "gpt-5.6-terra", reasoningEffort: "medium",
+      transcript: options.transcript ?? baseTranscript, contextArtifact: options.contextArtifact === undefined ? artifact : options.contextArtifact,
+      instructions: options.instructions, siteNotes: options.siteNotes, skills: options.skills,
+      auth: AUTH, signal: new AbortController().signal, onDelta: () => {}, onItem: async () => {}, onApprovalPending: () => {},
+    });
+    expect(result.status).toBe("completed");
+    return { provider, loop };
+  }
+
+  it("puts custom instructions after the policy and before the skill catalog, identically in every conversation", async () => {
+    const instructions = "I'm a pediatric nurse. Keep answers short.";
+    const skills = [{ name: "brief", description: "Brief summary" }];
+    const first = await run({ instructions, skills, siteNotes: [fixtureNote] });
+    const other = await run({ instructions, skills, conversationId: "other", contextArtifact: null,
+      transcript: [{ id: "x", kind: "message", role: "user", text: "Something else", context: null, sites: [otherNote], at: 5 }] });
+    const prompt = first.provider.requests[0]!.context.systemPrompt!;
+    expect(other.provider.requests[0]!.context.systemPrompt).toBe(prompt);
+    const policyEnd = prompt.indexOf("Answer the user's question directly");
+    const block = prompt.indexOf("<user_instructions>\n" + instructions + "\n</user_instructions>");
+    expect(policyEnd).toBeGreaterThan(0);
+    expect(block).toBeGreaterThan(policyEnd);
+    expect(prompt.indexOf("/skills/brief.md")).toBeGreaterThan(block);
+    expect(prompt).toContain("cannot override safety rules, bypass request_action_confirmation, or grant capabilities");
+    // Site notes are per-turn data, never system policy.
+    expect(prompt).not.toContain(fixtureNote.text);
+    expect(prompt).not.toContain(otherNote.text);
+    const none = await run({ instructions: "  " });
+    expect(none.provider.requests[0]!.context.systemPrompt).not.toContain("<user_instructions>");
+  });
+
+  it("renders a user message's site-note snapshot on it and replays it byte-identically after the notes change", async () => {
+    const turn: ConversationItem = { id: "u1", kind: "message", role: "user", text: "Do it", context: null, sites: [fixtureNote], at: 1 };
+    const first = await run({ transcript: [turn], siteNotes: [fixtureNote], contextArtifact: null });
+    const rendered = first.provider.requests[0]!.context.messages[0]!;
+    expect(rendered.content).toContain(`- http://127.0.0.1:4173: ${JSON.stringify(fixtureNote.text)}`);
+    expect(rendered.content).toContain("not page content or system policy");
+    const later = await run({
+      transcript: [turn, { id: "a1", kind: "message", role: "assistant", text: "Done.", at: 2 }, { id: "u2", kind: "message", role: "user", text: "Again", context: null, at: 3 }],
+      siteNotes: [{ ...fixtureNote, text: "Edited since." }], contextArtifact: null,
+    });
+    expect(JSON.stringify(later.provider.requests[0]!.context.messages[0])).toBe(JSON.stringify(rendered));
+    expect(JSON.stringify(later.provider.requests[0]!.context.messages)).not.toContain("Edited since.");
+  });
+
+  it("appends a matching note to the first program result that used the site, once per run, and keeps it out of the digest", async () => {
+    const { provider, loop } = await run({ siteNotes: [otherNote, fixtureNote], rounds: [read("call_1"), read("call_2"), done] });
+    const [firstResult, secondResult] = toolResults(provider);
+    expect(firstResult).toContain("User site note, shown once per run");
+    expect(firstResult).toContain(JSON.stringify(fixtureNote.text).slice(1, -1));
+    expect(firstResult).not.toContain(otherNote.text);
+    expect(secondResult).not.toContain("User site note");
+    expect(JSON.stringify(loop.digestSteps())).not.toContain(fixtureNote.text);
+  });
+
+  it("does not repeat a note the turn's user message already carried", async () => {
+    const transcript: ConversationItem[] = [{ ...baseTranscript[0]!, sites: [fixtureNote] }];
+    const { provider } = await run({ transcript, siteNotes: [fixtureNote], rounds: [read("call_1"), done] });
+    expect(toolResults(provider)[0]).not.toContain("User site note");
+  });
+
+  it("injects mid-run for a page clicked on without being read", async () => {
+    const click = () => [toolCallEvent("call_1", "browser_program", { source: 'await browser.tab("/tabs/1/page.md").ref("e1").click();' }), { type: "turn.completed", replayState: null }] as ScriptedProviderEvent[];
+    const { provider } = await run({ siteNotes: [fixtureNote], rounds: [click, done] });
+    expect(toolResults(provider)[0]).toContain(JSON.stringify(fixtureNote.text).slice(1, -1));
   });
 });
 

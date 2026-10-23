@@ -15,6 +15,8 @@ import { AgentLoop } from "@/lib/background/agent-loop";
 import { getSkills } from "@/lib/background/skills";
 import { captureInvokedSkill } from "@/lib/background/skill-context";
 import { skillCatalog, type Skill, type SkillSummary } from "@/lib/domain/skills";
+import { readInstructions, saveSiteNoteFromSidebar } from "@/lib/background/instructions";
+import { matchSiteNotes, pageOrigin, siteNoteForPage, type SiteNote } from "@/lib/domain/instructions";
 import type { ApprovalBadge } from "@/lib/background/approval-badge";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
@@ -62,7 +64,7 @@ import type { RunStatus } from "@/lib/storage";
 import { validatePromptText, validateSessionTitle } from "@/lib/validation";
 import type { ContextArtifact } from "@/lib/domain/tools";
 import type { Conversation, ConversationItem, ConversationSummary, QueuedMessage, UserMessageItem } from "@/lib/domain/conversation";
-import { isTurnStart, MAX_QUEUED_MESSAGES, retentionCutoff } from "@/lib/domain/conversation";
+import { isTurnStart, MAX_QUEUED_MESSAGES, PROMPT_MENTION_PATTERN, retentionCutoff } from "@/lib/domain/conversation";
 import { buildRunDigest } from "@/lib/domain/run-digest";
 import { hasTokens, newRunUsage, type RunUsageV1 } from "@/lib/domain/usage";
 import type { AppSettingsV1, ModelDefinition, ProviderAdapter, ProviderAuth, ProviderDefinition } from "@/lib/domain/provider";
@@ -537,6 +539,11 @@ export class BackgroundRuntime {
       await this.handleSettingsRequest(command);
       return;
     }
+    if (command.type === "siteNote.get") {
+      const origin = pageOrigin(command.url);
+      return { origin, note: origin ? siteNoteForPage((await readInstructions()).siteNotes, command.url) : null };
+    }
+    if (command.type === "siteNote.save") return saveSiteNoteFromSidebar(command.note);
     if (command.type === "session.list") return { sessions: await listSessions() };
     if (command.type === "session.create" || command.type === "session.open" || command.type === "session.delete" ||
       command.type === "session.rename" || command.type === "session.pin") {
@@ -1042,7 +1049,10 @@ export class BackgroundRuntime {
     let conversation: Conversation | null;
     let skill: Skill | undefined;
     let catalog: SkillSummary[];
+    // Like skills, the run uses the custom instructions and site notes as they are now.
+    let personal: { instructions: string; siteNotes: SiteNote[] };
     try {
+      personal = await readInstructions();
       const available = await getSkills();
       catalog = skillCatalog(available);
       for (const skill of available) scope.skills.set(skill.name, skill);
@@ -1080,12 +1090,15 @@ export class BackgroundRuntime {
 
     let items = conversation.items;
     if (!retry) {
+      // Notes for the attached page and mentioned tabs ride on the message as a snapshot, so replay never changes.
+      const sites = matchSiteNotes(personal.siteNotes, [...(artifact ? [artifact.url] : []), ...[...prompt!.matchAll(PROMPT_MENTION_PATTERN)].map((match) => match[4]!)]);
       const item: UserMessageItem = {
         id: queuedId ?? crypto.randomUUID(),
         kind: "message",
         role: "user",
         text: prompt!,
         skill,
+        ...(sites.length ? { sites } : {}),
         context: artifact ? { artifactId: artifact.artifactId, kind: "page", title: artifact.title, url: artifact.url, capturedAt: artifact.capturedAt } : null,
         at: Date.now(),
       };
@@ -1114,10 +1127,11 @@ export class BackgroundRuntime {
     for (const item of transcript.slice(userIndex)) {
       if (item.kind === "message" && item.role === "user" && item.skill) scope.skills.set(item.skill.name, item.skill);
     }
-    await this.#runAgentLoop(runId, transcript, catalog, artifact, auth);
+    await this.#runAgentLoop(runId, transcript, catalog, personal, artifact, auth);
   }
 
-  async #runAgentLoop(runId: string, transcript: ConversationItem[], catalog: SkillSummary[], artifact: ContextArtifact | null, auth: ProviderAuth): Promise<void> {
+  async #runAgentLoop(runId: string, transcript: ConversationItem[], catalog: SkillSummary[], personal: { instructions: string; siteNotes: SiteNote[] },
+    artifact: ContextArtifact | null, auth: ProviderAuth): Promise<void> {
     const run = this.#activeRun;
     if (!run || run.runId !== runId) return;
 
@@ -1155,6 +1169,8 @@ export class BackgroundRuntime {
       reasoningEffort: settings.reasoningEffort,
       transcript,
       skills: catalog,
+      instructions: personal.instructions,
+      siteNotes: personal.siteNotes,
       contextArtifact: artifact,
       auth,
       onContext: (context) => { this.#latestContext = context; },

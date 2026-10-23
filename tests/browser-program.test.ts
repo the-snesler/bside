@@ -361,6 +361,21 @@ describe("browser program tabs, files, and search", () => {
     expect(api.tabs.create).toHaveBeenCalledTimes(2);
     expect(state.searchTab("s2")).not.toBe(state.searchTab("s1"));
   });
+
+  it("reports the pages a program read, acted on, navigated, or opened, but not the search tab, for site notes", async () => {
+    const { run } = setup({ searchResults: () => [{ title: "R", url: "https://r.example/", snippet: "" }] });
+    const pages = async (source: string) => {
+      const result = await run(source);
+      expect(result.ok, result.summary).toBe(true);
+      return (result.data as { pages: string[] }).pages;
+    };
+    expect(await pages('return await fs.read("/tabs/1/page.md");')).toEqual(["https://example.com"]);
+    expect(await pages('await browser.tab("/tabs/1/page.md").ref("e1").click();')).toEqual(["https://example.com"]);
+    expect(await pages('await browser.tab("/tabs/1/page.md").navigate("https://docs.example/a");')).toEqual(["https://example.com", "https://docs.example/a"]);
+    expect(await pages('await browser.open("https://news.example/");')).toEqual(["https://news.example/"]);
+    expect(await pages('return web.search("anything");')).toEqual([]);
+    expect(await pages('return 1;')).toEqual([]);
+  });
 });
 
 /** A YouTube player backend whose responses wait `delay` ms, abort with their signal, and count overlapping requests. */

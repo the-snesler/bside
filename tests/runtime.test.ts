@@ -12,7 +12,7 @@ import { ProviderStreamError } from "@/lib/providers/openai";
 import {
   saveOpenAICredential, appendConversationItem, createSession, ensureOpenSession, getConversation, getOpenAICredential, getOpenSessionId,
   listSessions, loadMessageQueue, saveHistorySettings, saveMessageQueue, saveRunCheckpoint, setOpenSessionId, updateSession,
-  getAppSettings, saveAppSettings,
+  getAppSettings, saveAppSettings, getSiteNotes,
 } from "@/lib/storage";
 import type { ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
 import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
@@ -21,6 +21,7 @@ import type { AgentTabsState, SidebarCommand, SidebarEvent } from "@/lib/protoco
 import { splitSystemMessage, TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
 import { buildTurns } from "@/lib/ui/turns";
 import { handleSkillsRequest } from "@/lib/background/skills";
+import { handleInstructionsRequest, handleSiteNotesRequest } from "@/lib/background/instructions";
 
 type ProviderUsage = NonNullable<Extract<ScriptedProviderEvent, { type: "turn.completed" }>["usage"]>;
 
@@ -270,6 +271,78 @@ describe("BackgroundRuntime: saved skills", () => {
     expect(systemPrompt).not.toContain(skill.body);
     expect(messages[0]).toEqual(provider.requests[0]!.context.messages[0]);
     expect(messages.at(-1)?.content).toBe("Queued without skills");
+  });
+});
+
+describe("BackgroundRuntime: custom instructions and site notes", () => {
+  const fixture = { origin: "http://127.0.0.1:4173", includeSubdomains: false, text: "FIXTURE_NOTE" };
+  const github = { origin: "https://github.com", includeSubdomains: true, text: "GITHUB_NOTE" };
+  const unrelated = { origin: "https://unrelated.example", includeSubdomains: false, text: "UNRELATED_NOTE" };
+  const answer: ScriptedProviderEvent[] = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
+  const send = (runtime: BackgroundRuntime, command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+
+  it("snapshots instructions at run start and notes for the attached page and mentioned tabs onto the user message", async () => {
+    await saveOpenAICredential("sk-test");
+    await handleInstructionsRequest({ v: 1, id: "i", type: "instructions.save", text: "CUSTOM_INSTRUCTIONS" });
+    for (const note of [fixture, github, unrelated]) await handleSiteNotesRequest({ v: 1, id: note.origin, type: "siteNotes.save", note });
+    const provider = new FakeProvider();
+    provider.script = answer;
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: supportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    await send(runtime, { type: "run.start", prompt: "Compare with @PR (tab 7, /tabs/7/page.md, https://gist.github.com/x)" });
+    const user = (await openConversation()).items.find((item) => item.kind === "message" && item.role === "user");
+    expect(user).toMatchObject({ sites: [fixture, github] });
+    const { systemPrompt, messages } = provider.requests[0]!.context;
+    expect(systemPrompt).toContain("<user_instructions>\nCUSTOM_INSTRUCTIONS\n</user_instructions>");
+    expect(systemPrompt).not.toContain("FIXTURE_NOTE");
+    const turn = JSON.stringify(messages.at(-1));
+    expect(turn).toContain("FIXTURE_NOTE");
+    expect(turn).toContain("GITHUB_NOTE");
+    expect(turn).not.toContain("UNRELATED_NOTE");
+    // The notes the run used are in that session's export, inside the model input.
+    const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export", sessionId: (await getOpenSessionId())! });
+    expect(exported?.markdown.split("## Latest model input")[1]).toContain("FIXTURE_NOTE");
+    expect(exported?.markdown).toContain("CUSTOM_INSTRUCTIONS");
+    expect(exported?.markdown).not.toContain("UNRELATED_NOTE");
+
+    // A later run picks up edited instructions, but the earlier message keeps its snapshot.
+    await handleInstructionsRequest({ v: 1, id: "i", type: "instructions.save", text: "EDITED_INSTRUCTIONS" });
+    await handleSiteNotesRequest({ v: 1, id: "e", type: "siteNotes.save", note: { ...fixture, text: "EDITED_NOTE" } });
+    await send(runtime, { type: "run.start", prompt: "Again" });
+    const later = provider.requests[1]!.context;
+    expect(later.systemPrompt).toContain("EDITED_INSTRUCTIONS");
+    expect(JSON.stringify(later.messages[0])).toBe(JSON.stringify({ ...messages.at(-1)!, content: (messages.at(-1)!.content as { text: string }[])[0]!.text }));
+    expect(JSON.stringify(later.messages.at(-1))).toContain("EDITED_NOTE");
+  });
+
+  it("answers the sidebar's site-note lookup and save", async () => {
+    await handleSiteNotesRequest({ v: 1, id: "g", type: "siteNotes.save", note: github });
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
+    expect(await send(runtime, { type: "siteNote.get", url: "https://gist.github.com/abc" })).toEqual({ origin: "https://gist.github.com", note: github });
+    expect(await send(runtime, { type: "siteNote.get", url: "https://example.com/" })).toEqual({ origin: "https://example.com", note: null });
+    expect(await send(runtime, { type: "siteNote.get", url: "about:addons" })).toEqual({ origin: null, note: null });
+    const note = { origin: "https://example.com", includeSubdomains: false, text: "Remember me" };
+    expect(await send(runtime, { type: "siteNote.save", note })).toEqual({ note, error: null });
+    expect(await getSiteNotes()).toEqual([github, note]);
+  });
+
+  it("posts lookup and save replies only to the requesting sidebar", async () => {
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const [asking, other] = [fakePort(), fakePort()];
+    hub.handleConnect(asking);
+    hub.handleConnect(other);
+    await asking.send({ v: 1, id: "get", type: "siteNote.get", url: "https://example.com/a" });
+    await asking.send({ v: 1, id: "save", type: "siteNote.save", note: { origin: "https://example.com", includeSubdomains: true, text: "Hi" } });
+    await asking.send({ v: 1, id: "bad", type: "siteNote.save", note: { origin: "https://example.com/", includeSubdomains: true, text: "Hi" } });
+    await vi.waitFor(() => expect(asking.received.filter((event) => event.type.startsWith("siteNote."))).toHaveLength(2));
+    expect(asking.received.find((event) => event.type === "siteNote.loaded")?.payload).toEqual({ requestId: "get", origin: "https://example.com", note: null });
+    expect(asking.received.find((event) => event.type === "siteNote.saved")?.payload).toEqual({
+      requestId: "save", note: { origin: "https://example.com", includeSubdomains: true, text: "Hi" }, error: null,
+    });
+    expect(other.received.some((event) => event.type.startsWith("siteNote."))).toBe(false);
   });
 });
 
