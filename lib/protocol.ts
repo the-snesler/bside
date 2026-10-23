@@ -24,6 +24,7 @@ import { HISTORY_RETENTIONS } from "@/lib/domain/conversation";
 import { REASONING_EFFORTS, type AppSettingsV1, type ChatGPTStatus, type ProviderDefinition } from "@/lib/domain/provider";
 import type { RunUsageV1 } from "@/lib/domain/usage";
 import { isSkill, isSkillName, type Skill, type SkillSummary } from "@/lib/domain/skills";
+import { isCustomInstructionsText, isSiteNote, isSiteOrigin, type SiteNote } from "@/lib/domain/instructions";
 import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction } from "@/lib/validation";
 
 // ---------------------------------------------------------------------------
@@ -221,6 +222,14 @@ export type SidebarCommand =
   /** Ends watching: switches back to the tab the user watched from (or a neighbour if it closed), hiding the watched tab again. */
   | { v: 1; id: string; type: "tabs.unwatch" }
   | { v: 1; id: string; type: "settings.save"; settings: AppSettingsV1 }
+  /** Looks up the site note to edit for a page URL. Answered with `siteNote.loaded` to the requesting sidebar only. */
+  | { v: 1; id: string; type: "siteNote.get"; url: string }
+  /**
+   * "Remember something about this site": adds or replaces the note for one
+   * origin. The sidebar's only write to user-authored data; the background
+   * revalidates it. Answered with `siteNote.saved` to the requesting sidebar only.
+   */
+  | { v: 1; id: string; type: "siteNote.save"; note: SiteNote }
   /** Exports one session with its scratch files; run diagnostics, model input, and tool output are included only for the latest run's session. Answered with `context.exported` to the requesting sidebar only. */
   | { v: 1; id: string; type: "context.export"; sessionId: string }
   | { v: 1; id: string; type: "state.subscribe"; lastSeq: number | null }
@@ -310,6 +319,10 @@ export type SidebarEvent =
   | EventBase<"skills.listed", { skills: SkillSummary[] }>
   | EventBase<"tabs.listed", { tabs: TabMention[] }>
   | EventBase<"context.exported", { requestId: string; markdown: string; filename: string }>
+  /** `origin` is the page URL's origin, `null` for a page that cannot have a note; `note` is the one covering it, if any. */
+  | EventBase<"siteNote.loaded", { requestId: string; origin: string | null; note: SiteNote | null }>
+  /** `note` as saved, or `null` with a safe `error`. */
+  | EventBase<"siteNote.saved", { requestId: string; note: SiteNote | null; error: string | null }>
   | EventBase<"state.snapshot", RuntimeSnapshot>
   | EventBase<"session.listed", { sessions: ConversationSummary[] }>
   | EventBase<"page.attached", AttachedPage | null>
@@ -339,6 +352,8 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (candidate.type === "tabs.watch") return Number.isSafeInteger(candidate.tabId);
   if (candidate.type === "tabs.unwatch") return true;
   if (candidate.type === "settings.save") return isAppSettings(candidate.settings);
+  if (candidate.type === "siteNote.get") return typeof candidate.url === "string" && candidate.url.length <= 8_192;
+  if (candidate.type === "siteNote.save") return isSiteNote(candidate.note);
   if (candidate.type === "context.export") return isSessionId(candidate.sessionId);
   if (candidate.type === "session.create" || candidate.type === "session.list") return true;
   if (candidate.type === "session.open") return isSessionId(candidate.sessionId);
@@ -386,6 +401,43 @@ export function isSkillsRequest(value: unknown): value is SkillsRequest {
   if (candidate.type === "skills.list") return true;
   if (candidate.type === "skills.save") return isSkill(candidate.skill);
   if (candidate.type === "skills.delete") return isSkillName(candidate.name);
+  return false;
+}
+
+/** Custom instructions; options page only. Saving blank text clears them. */
+export type InstructionsRequest =
+  | { v: 1; id: string; type: "instructions.get" }
+  | { v: 1; id: string; type: "instructions.save"; text: string };
+
+export type InstructionsResponse =
+  | { v: 1; id: string; ok: true; text: string }
+  | { v: 1; id: string; ok: false; error: NormalizedError };
+
+export function isInstructionsRequest(value: unknown): value is InstructionsRequest {
+  if (!isEnvelope(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.type === "instructions.get") return true;
+  if (candidate.type === "instructions.save") return isCustomInstructionsText(candidate.text);
+  return false;
+}
+
+/** Site notes; options page only (the sidebar's single-note `siteNote.save` is the one exception). */
+export type SiteNotesRequest =
+  | { v: 1; id: string; type: "siteNotes.list" }
+  /** Adds a note, or replaces the note with the same origin. */
+  | { v: 1; id: string; type: "siteNotes.save"; note: SiteNote }
+  | { v: 1; id: string; type: "siteNotes.delete"; origin: string };
+
+export type SiteNotesResponse =
+  | { v: 1; id: string; ok: true; notes: SiteNote[] }
+  | { v: 1; id: string; ok: false; error: NormalizedError };
+
+export function isSiteNotesRequest(value: unknown): value is SiteNotesRequest {
+  if (!isEnvelope(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.type === "siteNotes.list") return true;
+  if (candidate.type === "siteNotes.save") return isSiteNote(candidate.note);
+  if (candidate.type === "siteNotes.delete") return isSiteOrigin(candidate.origin);
   return false;
 }
 

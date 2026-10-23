@@ -7,6 +7,7 @@
 import type { PageArtifactSummary, ToolCall, ToolResult } from "@/lib/domain/tools";
 import type { RunUsageV1, UsageTotals } from "@/lib/domain/usage";
 import type { Skill } from "@/lib/domain/skills";
+import type { SiteNote } from "@/lib/domain/instructions";
 
 export type ConversationItem =
   | {
@@ -17,6 +18,12 @@ export type ConversationItem =
       context: PageArtifactSummary | null;
       /** The skill a leading `/name` invoked, as it was when the message was accepted. */
       skill?: Skill;
+      /**
+       * The user's site notes covering the pages attached to a turn-start
+       * message (its page outline and tab mentions), as they were when the
+       * message was accepted. Rendered on the message, so replay stays byte-identical.
+       */
+      sites?: SiteNote[];
       /**
        * `"steer"`: guidance sent while the turn's run was working, persisted
        * where the model received it (after a tool round). It belongs to the

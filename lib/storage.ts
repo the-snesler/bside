@@ -12,6 +12,7 @@
 
 import { storage } from "wxt/utils/storage";
 import { isSkill } from "@/lib/domain/skills";
+import { isCustomInstructionsText, isSiteNote, MAX_SITE_NOTES, type CustomInstructionsV1, type SiteNote, type SiteNotesV1 } from "@/lib/domain/instructions";
 import { REASONING_EFFORTS, type AppSettingsV1, type ModelListing, type ReasoningEffort } from "@/lib/domain/provider";
 import type { Conversation, ConversationIndexV1, ConversationItem, ConversationSummary, HistorySettingsV1, MessageQueueV1, QueuedMessage } from "@/lib/domain/conversation";
 import { COMPACTION_SUMMARY_MAX_CHARS, HISTORY_RETENTIONS, isTurnStart, MAX_QUEUED_MESSAGES, titleFromPrompt } from "@/lib/domain/conversation";
@@ -140,7 +141,8 @@ function isValidConversationItem(value: unknown): value is ConversationItem {
   if (typeof v.id !== "string" || typeof v.at !== "number") return false;
   if (v.kind === "message") {
     if (typeof v.text !== "string") return false;
-    if (v.role === "user") return (v.context === null || typeof v.context === "object") && (v.delivery === undefined || v.delivery === "steer") && (v.skill === undefined || isSkill(v.skill));
+    if (v.role === "user") return (v.context === null || typeof v.context === "object") && (v.delivery === undefined || v.delivery === "steer") && (v.skill === undefined || isSkill(v.skill)) &&
+      (v.sites === undefined || (Array.isArray(v.sites) && v.sites.length <= MAX_SITE_NOTES && v.sites.every(isSiteNote)));
     return v.role === "assistant";
   }
   if (v.kind === "tool-call") return typeof v.call === "object" && v.call !== null;
@@ -198,6 +200,59 @@ export async function getHistorySettings(): Promise<HistorySettingsV1> {
 
 export async function saveHistorySettings(settings: HistorySettingsV1): Promise<void> {
   await historySettingsItem.setValue(settings);
+}
+
+// ---------------------------------------------------------------------------
+// Custom instructions and site notes — user-authored, written only through
+// `lib/background/instructions.ts` (options requests, and the sidebar's
+// "Remember something about this site").
+// ---------------------------------------------------------------------------
+
+const customInstructionsItem = storage.defineItem<CustomInstructionsV1>("local:customInstructions", { version: 1 });
+const siteNotesItem = storage.defineItem<SiteNotesV1>("local:siteNotes", { version: 1 });
+
+/** The custom instructions, or `""`. A malformed record is deleted. */
+export async function getCustomInstructions(): Promise<string> {
+  const raw: unknown = await customInstructionsItem.getValue();
+  const record = raw as { version?: unknown; text?: unknown } | null;
+  if (record?.version === 1 && isCustomInstructionsText(record.text) && record.text.trim()) return record.text;
+  if (raw !== null) await customInstructionsItem.removeValue();
+  return "";
+}
+
+/** Saves the text; blank text removes the record. */
+export async function saveCustomInstructions(text: string): Promise<void> {
+  if (!text.trim()) await customInstructionsItem.removeValue();
+  else await customInstructionsItem.setValue({ version: 1, text });
+}
+
+/**
+ * Site notes in stored order. Invalid entries, later duplicates of an origin,
+ * and entries past `MAX_SITE_NOTES` are dropped and the record rewritten; a
+ * malformed record is deleted.
+ */
+export async function getSiteNotes(): Promise<SiteNote[]> {
+  const raw: unknown = await siteNotesItem.getValue();
+  if (raw === null) return [];
+  const record = raw as { version?: unknown; notes?: unknown };
+  if (record.version !== 1 || !Array.isArray(record.notes)) {
+    await siteNotesItem.removeValue();
+    return [];
+  }
+  const notes: SiteNote[] = [];
+  for (const note of record.notes as unknown[]) {
+    if (notes.length < MAX_SITE_NOTES && isSiteNote(note) && !notes.some((other) => other.origin === note.origin)) {
+      notes.push({ origin: note.origin, includeSubdomains: note.includeSubdomains, text: note.text });
+    }
+  }
+  if (notes.length !== record.notes.length) await saveSiteNotes(notes);
+  return notes;
+}
+
+/** Replaces every site note; no notes removes the record. */
+export async function saveSiteNotes(notes: readonly SiteNote[]): Promise<void> {
+  if (notes.length === 0) await siteNotesItem.removeValue();
+  else await siteNotesItem.setValue({ version: 1, notes: [...notes] });
 }
 
 // ---------------------------------------------------------------------------

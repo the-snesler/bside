@@ -16,16 +16,18 @@ import { isSidebarCommand, SIDEBAR_PORT_NAME } from "@/lib/protocol";
 import type { AgentTabsState, AttachedPage, RuntimeSnapshot, SidebarCommand, SidebarEvent, TabMention } from "@/lib/protocol";
 import type { ConversationSummary, QueuedMessage } from "@/lib/domain/conversation";
 import type { SkillSummary } from "@/lib/domain/skills";
+import type { SiteNote } from "@/lib/domain/instructions";
 
 const MAX_REPLAY_EVENTS = 512;
 const UNSUPPORTED_HOSTNAME_SUFFIXES = [".mozilla.org", ".mozilla.com"];
 
 export interface SidebarHubDelegate {
   getSnapshot(): Promise<RuntimeSnapshot>;
-  handleCommand(command: SidebarCommand): Promise<{ markdown: string; filename: string } | { tabs: TabMention[] } | { skills: SkillSummary[] } | { sessions: ConversationSummary[] } | void>;
+  handleCommand(command: SidebarCommand): Promise<{ markdown: string; filename: string } | { tabs: TabMention[] } | { skills: SkillSummary[] } | { sessions: ConversationSummary[] } |
+    { origin: string | null; note: SiteNote | null } | { note: SiteNote | null; error: string | null } | void>;
 }
 
-type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" | "agent-tabs.changed" | "queue.changed" | "context.exported" | "tabs.listed" | "skills.listed" | "session.listed" }>;
+type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" | "agent-tabs.changed" | "queue.changed" | "context.exported" | "tabs.listed" | "skills.listed" | "session.listed" | "siteNote.loaded" | "siteNote.saved" }>;
 
 export class SidebarHub {
   delegate: SidebarHubDelegate | null = null;
@@ -159,6 +161,12 @@ export class SidebarHub {
     } satisfies SidebarEvent);
     if (message.type === "session.list" && result && "sessions" in result) port.postMessage({
       v: 1, type: "session.listed", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: result,
+    } satisfies SidebarEvent);
+    if (message.type === "siteNote.get" && result && "origin" in result) port.postMessage({
+      v: 1, type: "siteNote.loaded", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: { requestId: message.id, ...result },
+    } satisfies SidebarEvent);
+    if (message.type === "siteNote.save" && result && "error" in result) port.postMessage({
+      v: 1, type: "siteNote.saved", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: { requestId: message.id, ...result },
     } satisfies SidebarEvent);
     if (message.type === "context.export" && result && "markdown" in result) port.postMessage({
       v: 1, type: "context.exported", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(),

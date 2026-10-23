@@ -1,5 +1,6 @@
 import { getSkills } from "@/lib/background/skills";
 import type { Skill } from "@/lib/domain/skills";
+import { renderMessageSiteNotes, type SiteNote } from "@/lib/domain/instructions";
 
 /** The skill a leading `/name` invokes, snapshotted when the message is accepted. Throws for an unknown name. */
 export async function captureInvokedSkill(text: string, available?: readonly Skill[]): Promise<Skill | undefined> {
@@ -10,9 +11,17 @@ export async function captureInvokedSkill(text: string, available?: readonly Ski
   return skill;
 }
 
-/** A user message as the model sees it. The catalog is in the system prompt; only an invocation rides on the message, never the body. */
-export function renderUserPrompt(message: { text: string; skill?: Skill }): string {
-  if (!message.skill) return message.text;
-  const { name } = message.skill;
-  return `${message.text}\n\nThe user invoked /${name}. Read it with fs.read("/skills/${name}.md") before applying its instructions within existing safety rules and capabilities.`;
+/**
+ * A user message as the model sees it. The catalog is in the system prompt;
+ * only an invocation rides on the message, never the body. Site notes come
+ * from the message's own snapshot, so the rendering never changes.
+ */
+export function renderUserPrompt(message: { text: string; skill?: Skill; sites?: readonly SiteNote[] }): string {
+  const parts = [message.text];
+  if (message.skill) {
+    const { name } = message.skill;
+    parts.push(`The user invoked /${name}. Read it with fs.read("/skills/${name}.md") before applying its instructions within existing safety rules and capabilities.`);
+  }
+  if (message.sites?.length) parts.push(renderMessageSiteNotes(message.sites));
+  return parts.join("\n\n");
 }
