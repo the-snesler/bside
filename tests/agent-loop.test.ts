@@ -10,7 +10,8 @@ import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import { ProviderStreamError } from "@/lib/providers/openai";
 import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
 import type { PageSnapshot, ToolCall } from "@/lib/domain/tools";
-import type { ApprovalRequest, SidebarEvent } from "@/lib/protocol";
+import type { ApprovalRequest, HelpRequest, SidebarEvent } from "@/lib/protocol";
+import { ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
 import { splitSystemMessage, TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
 
 function buildSnapshot(overrides: Partial<PageSnapshot> = {}): PageSnapshot {
@@ -706,6 +707,135 @@ describe("AgentLoop: run budgets", () => {
     ]);
     const { result } = await runWith(provider, { maxRounds: 2, maxOutputTokens: 600 });
     expect(result.status).toBe("completed");
+  });
+});
+
+describe("AgentLoop: help requests", () => {
+  /** Session s1 owns agent tab 5 and its search tab 6; tab 7 is another chat's, tab 1 is the user's. */
+  function scope() {
+    const state = new WorkspaceState(() => 0);
+    state.agentTabs.set(5, { sessionId: "s1", role: "agent", lastUsedAt: 0 });
+    state.agentTabs.set(6, { sessionId: "s1", role: "search", lastUsedAt: 0 });
+    state.agentTabs.set(7, { sessionId: "s2", role: "agent", lastUsedAt: 0 });
+    return { state, sessionId: "s1", files: new ScratchFiles() };
+  }
+
+  const help = (tab: string, extra: Record<string, unknown> = {}) => ({ tab, kind: "verification", reason: "Solve the CAPTCHA on the search page.", ...extra });
+  const finalAnswer = () => [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }] as ScriptedProviderEvent[];
+
+  async function runHelp(rounds: ConstructorParameters<typeof ScriptedProvider>[0], onHelp: (request: HelpRequest | null, loop: AgentLoop) => void = () => {}, extra: { limits?: ConstructorParameters<typeof AgentLoop>[4]; userNotes?: () => string[]; signal?: AbortSignal } = {}) {
+    const provider = new ScriptedProvider(rounds);
+    const { tabController, sendMessageMock } = await createTabController();
+    const hub = new SidebarHub();
+    const port = fakePort();
+    hub.handleConnect(port);
+    const loop = new AgentLoop(provider, tabController, hub, scope(), extra.limits);
+    const helpEvents: (HelpRequest | null)[] = [];
+    const result = await loop.run({
+      runId: "run1", conversationId: "s1", modelId: "gpt-5.6-terra", reasoningEffort: "medium", transcript: baseTranscript, contextArtifact: artifact,
+      auth: AUTH, signal: extra.signal ?? new AbortController().signal, onDelta: () => {}, onItem: async () => {}, onApprovalPending: () => {},
+      onHelpPending: (request) => { helpEvents.push(request); onHelp(request, loop); },
+      userNotes: extra.userNotes,
+    });
+    const toolResults = (round: number) => JSON.stringify(provider.requests[round]?.context.messages.filter((message) => message.role === "toolResult"));
+    return { result, loop, port, provider, helpEvents, toolResults, sendMessageMock };
+  }
+
+  it("pauses for the user's help in the chat's search tab and tells the model to re-read the page when they are done", async () => {
+    const { result, loop, port, helpEvents, toolResults, sendMessageMock } = await runHelp([
+      () => [toolCallEvent("help_1", "request_user_help", help("/agent-tabs/6")), { type: "turn.completed", replayState: null }],
+      finalAnswer,
+    ], (request, loop) => { if (request) queueMicrotask(() => loop.resolveHelp(request.call.id, "done", "")); });
+    expect(result).toEqual({ status: "completed", finalMessageId: expect.any(String) });
+    const requested = port.received.find((event) => event.type === "help.requested");
+    expect(requested?.payload).toMatchObject({ tabId: 6, kind: "verification", reason: "Solve the CAPTCHA on the search page." });
+    expect(helpEvents.map((request) => request?.tabId ?? null)).toEqual([6, null]);
+    expect(toolResults(1)).toContain("done helping in /agent-tabs/6/page.md");
+    expect(toolResults(1)).toContain("read a fresh snapshot");
+    // Asking for help is not a page effect.
+    expect(sendMessageMock.mock.calls.some((call) => (call[1] as { type?: string }).type === "page.execute")).toBe(false);
+    expect(buildRunDigest(loop.digestSteps(), "completed")!.entries).toEqual([
+      { type: "help", kind: "verification", reason: "Solve the CAPTCHA on the search page.", outcome: "done" },
+    ]);
+  });
+
+  it("refuses another chat's agent tab and the user's own tab without pausing", async () => {
+    for (const tab of ["/agent-tabs/7/page.md", "/tabs/1/page.md", "1", "/agent-tabs/abc"]) {
+      const { result, helpEvents, toolResults, loop } = await runHelp([
+        () => [toolCallEvent("help_1", "request_user_help", help(tab)), { type: "turn.completed", replayState: null }],
+        finalAnswer,
+      ]);
+      expect(result.status).toBe("completed");
+      expect(helpEvents).toEqual([]);
+      expect(toolResults(1)).toContain("INVALID_TOOL_ARGUMENTS");
+      expect(toolResults(1)).toContain("is not one of this chat's agent tabs");
+      expect(buildRunDigest(loop.digestSteps(), "completed")!.entries[0]).toMatchObject({ type: "help", outcome: "failed" });
+    }
+  });
+
+  it("passes on the user's note when they can't help, and skips the calls batched after it", async () => {
+    const { toolResults, sendMessageMock, loop } = await runHelp([
+      () => [
+        toolCallEvent("help_1", "request_user_help", help("/agent-tabs/5/page.md", { kind: "login", reason: "Sign in to Grocer." })),
+        toolCallEvent("click_1", "browser_program", { source: 'await browser.tab("/tabs/1/page.md").ref("e1").click();' }),
+        { type: "turn.completed", replayState: null },
+      ],
+      finalAnswer,
+    ], (request, loop) => { if (request) queueMicrotask(() => loop.resolveHelp(request.call.id, "unable", "  No account there. ")); });
+    expect(toolResults(1)).toContain("could not help in /agent-tabs/5/page.md");
+    expect(toolResults(1)).toContain('Their note: \\"No account there.\\"');
+    expect(toolResults(1)).toContain("SKIPPED");
+    expect(sendMessageMock.mock.calls.some((call) => (call[1] as { type?: string }).type === "page.execute")).toBe(false);
+    expect(buildRunDigest(loop.digestSteps(), "completed")!.entries[0]).toMatchObject({ type: "help", kind: "login", outcome: "unable" });
+  });
+
+  it("ends as cancelled when cancelled while waiting for help", async () => {
+    const controller = new AbortController();
+    const { result, helpEvents } = await runHelp([
+      () => [toolCallEvent("help_1", "request_user_help", help("5")), { type: "turn.completed", replayState: null }],
+      finalAnswer,
+    ], (request) => { if (request) queueMicrotask(() => controller.abort()); }, { signal: controller.signal });
+    expect(result.status).toBe("cancelled");
+    expect(helpEvents.at(-1)).toBeNull();
+  });
+
+  it("does not count time waiting for help toward the wall-clock budget", async () => {
+    let clock = 0;
+    let round = 0;
+    const next = () => {
+      round += 1;
+      clock += 60_000;
+      return round === 1
+        ? [toolCallEvent("help_1", "request_user_help", help("/agent-tabs/5/page.md")), { type: "turn.completed", replayState: null } as ScriptedProviderEvent]
+        : [toolCallEvent(`read_${round}`, "browser_program", { source: "return 1;" }), { type: "turn.completed", replayState: null } as ScriptedProviderEvent];
+    };
+    const { result, provider } = await runHelp(Array.from({ length: 20 }, () => next), (request, loop) => {
+      if (!request) return;
+      clock += 60 * 60_000; // The user takes an hour to sign in.
+      loop.resolveHelp(request.call.id, "done", "");
+    }, { limits: { maxActiveMs: 5 * 60_000, now: () => clock } });
+    expect(result).toMatchObject({ status: "failed", error: { code: "LIMIT_EXCEEDED", message: "Stopped after 5 minutes of work; ask me to continue." } });
+    expect(provider.requests).toHaveLength(5);
+  });
+
+  it("appends notes about the user's takeover to the next browser program result", async () => {
+    let notes = ["Note: the user took over /agent-tabs/5/page.md while watching it."];
+    const { toolResults } = await runHelp([
+      () => [toolCallEvent("read_1", "browser_program", { source: "return 1;" }), { type: "turn.completed", replayState: null }],
+      () => [toolCallEvent("read_2", "browser_program", { source: "return 2;" }), { type: "turn.completed", replayState: null }],
+      finalAnswer,
+    ], undefined, { userNotes: () => { const drained = notes; notes = []; return drained; } });
+    expect(toolResults(1)).toContain("took over /agent-tabs/5/page.md");
+    // Delivered once: the second result adds no note of its own.
+    expect(toolResults(2).match(/took over/g)).toEqual(toolResults(1).match(/took over/g));
+  });
+
+  it("lists the tool and the policy in the cacheable prefix, telling the model never to ask for secrets in chat", async () => {
+    const { provider } = await runHelp([finalAnswer]);
+    const request = provider.requests[0]!;
+    expect(request.context.tools?.map((tool) => tool.name)).toContain("request_user_help");
+    expect(request.context.systemPrompt).toContain("request_user_help(tab, kind, reason)");
+    expect(request.context.systemPrompt).toContain("Never ask the user to paste passwords, codes, or payment details into the chat");
   });
 });
 

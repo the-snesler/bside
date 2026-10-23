@@ -1,5 +1,5 @@
-import { isCredentialRequest, isHistoryRequest, isInstructionsRequest, isSettingsRequest, isSiteNotesRequest, isSkillsRequest, SIDEBAR_PORT_NAME } from "@/lib/protocol";
-import type { CredentialResponse, HistoryResponse, InstructionsResponse, SettingsResponse, SiteNotesResponse, SkillsResponse } from "@/lib/protocol";
+import { isContentMessage, isCredentialRequest, isHistoryRequest, isInstructionsRequest, isSettingsRequest, isSiteNotesRequest, isSkillsRequest, SIDEBAR_PORT_NAME } from "@/lib/protocol";
+import type { ContentMessageResponse, CredentialResponse, HistoryResponse, InstructionsResponse, SettingsResponse, SiteNotesResponse, SkillsResponse } from "@/lib/protocol";
 import { handleSkillsRequest } from "@/lib/background/skills";
 import { handleInstructionsRequest, handleSiteNotesRequest } from "@/lib/background/instructions";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
@@ -31,7 +31,7 @@ export default defineBackground({
         "sidebarAction",
       );
       // Both calls stay synchronous in the click handler to keep the user
-      // gesture; a pending approval opens the sidebar rather than closing it.
+      // gesture; a pending approval or help request opens the sidebar rather than closing it.
       void (approvalBadge.pending ? sidebarAction.open() : sidebarAction.toggle());
     });
 
@@ -55,10 +55,17 @@ export default defineBackground({
     // settings, history retention, skills, or custom instructions; the sidebar
     // Port never exposes these methods. Its one user-authored write is a single
     // site note (`siteNote.save`), revalidated like these.
+    // The top-frame content script in an HTTP(S) tab may only ask for its own
+    // tab's page shield or report "Take over"; the tab is the sender's.
     const optionsUrl = browser.runtime.getURL("/options.html");
     browser.runtime.onMessage.addListener((message: unknown, sender):
-      Promise<CredentialResponse | SettingsResponse | HistoryResponse | SkillsResponse | InstructionsResponse | SiteNotesResponse> | undefined => {
-      if (sender.id !== browser.runtime.id || sender.url !== optionsUrl) return undefined;
+      Promise<CredentialResponse | SettingsResponse | HistoryResponse | SkillsResponse | InstructionsResponse | SiteNotesResponse | ContentMessageResponse> | undefined => {
+      if (sender.id !== browser.runtime.id) return undefined;
+      if (sender.url !== optionsUrl) {
+        const tabId = sender.tab?.id;
+        if (tabId === undefined || sender.frameId !== 0 || !/^https?:/.test(sender.url ?? "") || !isContentMessage(message)) return undefined;
+        return runtime.handleContentMessage(tabId, message);
+      }
       if (isCredentialRequest(message)) return runtime.handleCredentialRequest(message);
       if (isSettingsRequest(message)) return runtime.handleSettingsRequest(message);
       if (isHistoryRequest(message)) return runtime.handleHistoryRequest(message);

@@ -12,7 +12,7 @@ import { ProviderStreamError } from "@/lib/providers/openai";
 import {
   saveOpenAICredential, appendConversationItem, createSession, ensureOpenSession, getConversation, getOpenAICredential, getOpenSessionId,
   listSessions, loadMessageQueue, saveHistorySettings, saveMessageQueue, saveRunCheckpoint, setOpenSessionId, updateSession,
-  getAppSettings, saveAppSettings, getSiteNotes,
+  getAppSettings, saveAppSettings, getSiteNotes, getRunCheckpoint,
 } from "@/lib/storage";
 import type { ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
 import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
@@ -1134,6 +1134,26 @@ describe("BackgroundRuntime: approval badge", () => {
     expect(texts).toEqual([""]);
   });
 
+  it("recovers a run interrupted while waiting for the user's help as interrupted and retryable, with a cleared badge", async () => {
+    await saveOpenAICredential("sk-test");
+    const sessionId = await ensureOpenSession();
+    await appendConversationItem(sessionId, { id: "u1", kind: "message", role: "user", text: "Order my groceries", context: null, at: 1 });
+    await appendConversationItem(sessionId, { id: "c1", kind: "tool-call", call: { id: "help_1", name: "request_user_help", arguments: { tab: "/agent-tabs/5/page.md", kind: "login", reason: "Sign in." } }, at: 2 });
+    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId, status: "awaiting-help", partialAssistantText: "", usage: null, lastSeq: 3, updatedAt: 1 });
+    const { badge, texts } = fakeBadge();
+    const provider = new FakeProvider();
+    provider.script = [{ type: "text.delta", delta: "Retried." }, { type: "turn.completed", replayState: null }];
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider, tabControllerFactory: unsupportedPageTabControllerFactory, approvalBadge: badge });
+    await runtime.initialize();
+    expect(texts).toEqual([""]);
+    const items = (await openConversation()).items;
+    expect(items.find((item) => item.id === "interrupted-r1")).toMatchObject({ role: "assistant" });
+    expect(items.find((item) => item.id === "digest-r1")).toMatchObject({ digest: { status: "interrupted", entries: [{ type: "help", kind: "login", reason: "Sign in.", outcome: null }] } });
+    // Asking for help is not a page effect, so the turn can be retried.
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    expect(provider.requests).toHaveLength(1);
+  });
+
   it("clears a stale badge at startup while recovering an interrupted approval", async () => {
     await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "awaiting-approval", partialAssistantText: "", usage: null, lastSeq: 3, updatedAt: 1 });
     const { badge, texts } = fakeBadge();
@@ -1881,7 +1901,7 @@ describe("BackgroundRuntime: watching an agent tab", () => {
    * Tabs in windows, each with one active tab, where window 1 is focused.
    * Like Firefox, switching to a hidden tab shows it, and an active tab cannot be hidden.
    */
-  async function setup(extra: WindowTab[] = [], extraTags: [number, unknown][] = [], clock?: RuntimeClock) {
+  async function setup(extra: WindowTab[] = [], extraTags: [number, unknown][] = [], clock?: RuntimeClock, approvalBadge?: ApprovalBadge) {
     const tabs: WindowTab[] = [
       { id: 1, url: "https://user.test/", title: "User", hidden: false, windowId: 1, index: 0, active: true },
       { id: 2, url: "https://other.test/", title: "Other", hidden: false, windowId: 1, index: 1, active: false },
@@ -1916,7 +1936,7 @@ describe("BackgroundRuntime: watching an agent tab", () => {
     const port = fakePort();
     hub.handleConnect(port);
     const provider = new FakeProvider();
-    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: fake.factory, clock });
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: fake.factory, clock, approvalBadge });
     hub.delegate = runtime;
     await runtime.initialize();
     const send = (command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
@@ -2048,6 +2068,138 @@ describe("BackgroundRuntime: watching an agent tab", () => {
     await send({ type: "run.start", prompt: "And now?" });
     expect(modelInput(provider)).not.toContain("Page of tab 7");
     expect(modelInput(provider)).not.toContain("/7/page.md");
+  });
+
+  /** Every page shield state sent to a content script, as [tabId, state]. */
+  const shields = (api: { sendMessage: { mock: { calls: unknown[][] } } }) => api.sendMessage.mock.calls.flatMap(([tabId, message]) =>
+    (message as { type: string }).type === "page.shield" ? [[tabId, (message as { shield: string }).shield]] : []);
+  const contentSays = async (runtime: BackgroundRuntime, tabId: number, type: "shield.sync" | "shield.takeover" = "shield.sync") =>
+    (await runtime.handleContentMessage(tabId, { v: 1, id: "content-1", type })).shield;
+
+  it("shields the watched tab from the user's input and removes the shield once watching ends", async () => {
+    const { api, send, switchTo, runtime } = await setup();
+    await send({ type: "tabs.watch", tabId: 5 });
+    expect(shields(api)).toEqual([[5, "idle"]]);
+    // A content script that loads (or reloads after a navigation) asks for its own tab's state.
+    expect(await contentSays(runtime, 5)).toBe("idle");
+    expect(await contentSays(runtime, 6)).toBe("off");
+    expect(await contentSays(runtime, 1)).toBe("off");
+
+    await switchTo(2);
+    expect(shields(api).at(-1)).toEqual([5, "off"]);
+    expect(await contentSays(runtime, 5)).toBe("off");
+  });
+
+  it("drops the shield for the rest of the watch when the user takes over, from the page or the sidebar", async () => {
+    const { api, send, runtime } = await setup();
+    await send({ type: "tabs.watch", tabId: 5 });
+    // Only the watched tab's content script can take over; the tab is always the sender's own.
+    expect(await contentSays(runtime, 6, "shield.takeover")).toBe("off");
+    expect((await runtime.getSnapshot()).agentTabs.takenOver).toBe(false);
+    expect(await contentSays(runtime, 5, "shield.takeover")).toBe("off");
+    expect(shields(api).at(-1)).toEqual([5, "off"]);
+    expect((await runtime.getSnapshot()).agentTabs).toMatchObject({ watching: 5, takenOver: true });
+    expect(await contentSays(runtime, 5)).toBe("off");
+
+    // A new watch starts shielded again.
+    await send({ type: "tabs.watch", tabId: 6 });
+    expect(shields(api).at(-1)).toEqual([6, "idle"]);
+    expect((await runtime.getSnapshot()).agentTabs).toMatchObject({ watching: 6, takenOver: false });
+    await send({ type: "tabs.takeOver", tabId: 6 });
+    expect(shields(api).at(-1)).toEqual([6, "off"]);
+    expect((await runtime.getSnapshot()).agentTabs.takenOver).toBe(true);
+  });
+
+  /** The run asks for help in `tab` first; then runs `program` if given, then answers. */
+  function helpRun(provider: FakeProvider, tab: string, program?: string) {
+    scripted(provider, [
+      [{ type: "tool.call", call: { id: "help_1", name: "request_user_help", arguments: { tab, kind: "login", reason: "Sign in to Grocer." } } }, { type: "turn.completed", replayState: null }],
+      ...(program ? [[{ type: "tool.call", call: { id: "program", name: "browser_program", arguments: { source: program } } }, { type: "turn.completed", replayState: null }] as ScriptedProviderEvent[]] : []),
+      [{ type: "text.delta", delta: "Ordered." }, { type: "turn.completed", replayState: null }],
+    ]);
+  }
+
+  function helpBadge() {
+    const texts: string[] = [];
+    return { texts, badge: new ApprovalBadge({ setBadgeText: async ({ text }) => { texts.push(text); }, setBadgeBackgroundColor: async () => {} }) };
+  }
+
+  it("pauses the run on a help request: badge, card state, the help tab unshielded while watched, and a digest entry", async () => {
+    const { badge, texts } = helpBadge();
+    const { api, send, runtime, provider, port } = await setup([], [], undefined, badge);
+    helpRun(provider, "/agent-tabs/5/page.md");
+    const run = send({ type: "run.start", prompt: "Order my groceries" });
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun?.status).toBe("awaiting-help"));
+    const snapshot = await runtime.getSnapshot();
+    expect(snapshot.activeRun?.pendingHelp).toMatchObject({ tabId: 5, kind: "login", reason: "Sign in to Grocer.", call: { id: "help_1" } });
+    expect(port.received.some((event) => event.type === "help.requested")).toBe(true);
+    expect(badge.pending).toBe(true);
+    expect(texts.at(-1)).toBe("!");
+    expect((await getRunCheckpoint())?.status).toBe("awaiting-help");
+
+    // Another watched tab of the run says bside is working; Show tab watches the help tab with no shield.
+    await send({ type: "tabs.watch", tabId: 6 });
+    expect(shields(api).at(-1)).toEqual([6, "working"]);
+    await send({ type: "tabs.watch", tabId: 5 });
+    expect(shields(api).at(-1)).toEqual([5, "off"]);
+    expect(await contentSays(runtime, 5)).toBe("off");
+
+    await send({ type: "help.resolve", runId: snapshot.activeRun!.runId, callId: "help_1", outcome: "done", note: "" });
+    await run;
+    expect(modelInput(provider)).toContain("done helping in /agent-tabs/5/page.md");
+    expect((await runtime.getSnapshot()).activeRun).toBeNull();
+    expect(badge.pending).toBe(false);
+    expect(texts.at(-1)).toBe("");
+    // Still watched once the run ends: shielded again, and idle.
+    await vi.waitFor(() => expect(shields(api).at(-1)).toEqual([5, "idle"]));
+    const digest = (await openConversation()).items.findLast((item) => item.kind === "run-digest");
+    expect(digest).toMatchObject({ digest: { entries: [{ type: "help", kind: "login", reason: "Sign in to Grocer.", outcome: "done" }] } });
+  });
+
+  it("keeps a help request open when the user switches away from its tab, and clears it on cancel", async () => {
+    const { badge } = helpBadge();
+    const { send, runtime, provider, switchTo } = await setup([], [], undefined, badge);
+    helpRun(provider, "/agent-tabs/5/page.md");
+    const run = send({ type: "run.start", prompt: "Order my groceries" });
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun?.status).toBe("awaiting-help"));
+    await send({ type: "tabs.watch", tabId: 5 });
+    await switchTo(1);
+    const snapshot = await runtime.getSnapshot();
+    expect(snapshot.agentTabs.watching).toBeNull();
+    expect(snapshot.activeRun?.pendingHelp?.tabId).toBe(5);
+
+    await send({ type: "run.cancel", runId: snapshot.activeRun!.runId });
+    await run;
+    expect((await runtime.getSnapshot()).activeRun).toBeNull();
+    expect(badge.pending).toBe(false);
+  });
+
+  it("ignores a help answer for another call or run, and passes on the user's note", async () => {
+    const { send, runtime, provider } = await setup();
+    helpRun(provider, "5");
+    const run = send({ type: "run.start", prompt: "Order my groceries" });
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun?.status).toBe("awaiting-help"));
+    const runId = (await runtime.getSnapshot()).activeRun!.runId;
+    await send({ type: "help.resolve", runId, callId: "other", outcome: "done", note: "" });
+    await send({ type: "help.resolve", runId: "other-run", callId: "help_1", outcome: "done", note: "" });
+    await tick();
+    expect((await runtime.getSnapshot()).activeRun?.status).toBe("awaiting-help");
+    await send({ type: "help.resolve", runId, callId: "help_1", outcome: "unable", note: "No account." });
+    await run;
+    expect(modelInput(provider)).toContain("could not help");
+    expect(modelInput(provider)).toContain("No account.");
+  });
+
+  it("tells the run's next program that the user took over one of its tabs", async () => {
+    const { send, runtime, provider } = await setup();
+    helpRun(provider, "/agent-tabs/5/page.md", "return 1;");
+    const run = send({ type: "run.start", prompt: "Order my groceries" });
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun?.status).toBe("awaiting-help"));
+    await send({ type: "tabs.watch", tabId: 6 });
+    expect(await contentSays(runtime, 6, "shield.takeover")).toBe("off");
+    await send({ type: "help.resolve", runId: (await runtime.getSnapshot()).activeRun!.runId, callId: "help_1", outcome: "done", note: "" });
+    await run;
+    expect(modelInput(provider)).toContain("the user took over /agent-tabs/6/page.md");
   });
 
   it("publishes each agent tab's title, site, and data-URL icon, never a remote icon", async () => {
@@ -2561,9 +2713,8 @@ describe("BackgroundRuntime: run digests and context continuity", () => {
     expect(compaction).toMatchObject({ summary: "Summary of orchids.", firstKeptItemId: expect.any(String) });
     // Every item stays stored; only the model's view is summarized.
     expect(items.filter((item) => item.kind === "message")).toHaveLength(14);
-    await tick();
-    const snapshots = port.received.filter((event) => event.type === "state.snapshot");
-    expect(snapshots.some((event) => event.type === "state.snapshot" && event.payload.conversation.items.some((item) => item.kind === "compaction"))).toBe(true);
+    // The snapshot is broadcast without blocking the run, so it may land just after the run ends.
+    await vi.waitFor(() => expect(port.received.some((event) => event.type === "state.snapshot" && event.payload.conversation.items.some((item) => item.kind === "compaction"))).toBe(true));
     expect(provider.requests[1]!.context.messages[0]!.content).toContain("Summary of orchids.");
     const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export", sessionId: (await getOpenSessionId())! });
     expect(exported?.markdown).toContain("Summary of orchids.");

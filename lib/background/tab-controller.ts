@@ -15,6 +15,8 @@ import type {
   PageHealthRequest,
   PageResponse,
   PageSearchResultsRequest,
+  PageShieldRequest,
+  PageShieldState,
   PageSnapshotRequest,
 } from "@/lib/protocol";
 import type { DomAction, PageArtifactSummary, PageErrorCode, PageFindResult, PageSnapshot, SearchResult, ToolResult } from "@/lib/domain/tools";
@@ -188,6 +190,20 @@ export class TabController {
   async untagAgentTab(tabId: number): Promise<void> {
     if (!this.#browserApi.sessions) throw new Error("Session tab values are unavailable.");
     await this.#browserApi.sessions.removeTabValue(tabId, AGENT_TAB_TAG_KEY);
+  }
+
+  /**
+   * Shows, updates, or removes the page shield in a tab. Returns whether its
+   * content script applied it; one that is not loaded yet asks for the state itself when it starts.
+   */
+  async setShield(tabId: number, shield: PageShieldState): Promise<boolean> {
+    const request: PageShieldRequest = { v: 1, id: crypto.randomUUID(), type: "page.shield", tabId, shield };
+    try {
+      const response = (await this.#browserApi.tabs.sendMessage(tabId, request)) as PageResponse | undefined;
+      return response?.ok === true && response.type === "page.shield";
+    } catch {
+      return false;
+    }
   }
 
   async waitUntilReady(tabId: number, signal: AbortSignal): Promise<void> {

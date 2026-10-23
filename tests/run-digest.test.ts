@@ -95,4 +95,32 @@ describe("run digests", () => {
     expect(isValidRunDigest({ ...valid, entries: [{ type: "program", source: "x".repeat(DIGEST_SOURCE_CHARS + 1), ok: true, code: null, urls: [], excerpt: "" }] })).toBe(false);
     expect(isValidRunDigest({ ...valid, entries: [{ type: "shell", command: "rm" }] })).toBe(false);
   });
+
+  it("records help requests and the user's answer, not page effects, and renders them as untrusted notes", () => {
+    const help = (id: string, result: DigestStep["result"], kind = "login"): DigestStep =>
+      ({ call: { id, name: "request_user_help", arguments: { tab: "/agent-tabs/5/page.md", kind, reason: "  Sign in to Grocer.  " } }, result });
+    const digest = buildRunDigest([
+      help("h1", { ok: true, summary: "done" }),
+      help("h2", { ok: false, code: "ACTION_DENIED", summary: "could not help" }, "permission"),
+      help("h3", { ok: false, code: "INVALID_TOOL_ARGUMENTS", summary: "not one of this chat's agent tabs" }),
+      help("h4", { ok: false, summary: "Cancelled before the user answered." }, "nonsense"),
+      help("h5", null),
+    ], "completed")!;
+    expect(digest.entries).toEqual([
+      { type: "help", kind: "login", reason: "Sign in to Grocer.", outcome: "done" },
+      { type: "help", kind: "permission", reason: "Sign in to Grocer.", outcome: "unable" },
+      { type: "help", kind: "login", reason: "Sign in to Grocer.", outcome: "failed" },
+      { type: "help", kind: "other", reason: "Sign in to Grocer.", outcome: null },
+      { type: "help", kind: "login", reason: "Sign in to Grocer.", outcome: null },
+    ]);
+    expect(isValidRunDigest(digest)).toBe(true);
+    const note = renderDigestNote(digest);
+    expect(note).toContain('1. asked the user for help (login) "Sign in to Grocer.": the user reported done');
+    expect(note).toContain("2. asked the user for help (permission)");
+    expect(note).toContain(": the user could not help");
+    expect(note).toContain("no answer recorded");
+    expect(note.indexOf("BEGIN_UNTRUSTED_RUN_NOTES")).toBeLessThan(note.indexOf("asked the user"));
+    expect(isValidRunDigest({ ...digest, entries: [{ type: "help", kind: "bribe", reason: "x", outcome: "done" }] })).toBe(false);
+    expect(isValidRunDigest({ ...digest, entries: [{ type: "help", kind: "login", reason: "x", outcome: "maybe" }] })).toBe(false);
+  });
 });

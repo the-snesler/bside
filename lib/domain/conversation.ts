@@ -4,7 +4,7 @@
  * `Conversation` is the materialized view the sidebar renders.
  */
 
-import type { PageArtifactSummary, ToolCall, ToolResult } from "@/lib/domain/tools";
+import type { HelpKind, PageArtifactSummary, ToolCall, ToolResult } from "@/lib/domain/tools";
 import type { RunUsageV1, UsageTotals } from "@/lib/domain/usage";
 import type { Skill } from "@/lib/domain/skills";
 import type { SiteNote } from "@/lib/domain/instructions";
@@ -87,10 +87,12 @@ export const COMPACTION_SUMMARY_MAX_CHARS = 60_000;
 
 export type RunDigestStatus = "completed" | "failed" | "cancelled" | "interrupted";
 
-/** One tool call of a run. `ok`/`approved` are `null` when an interruption left no result. */
+/** One tool call of a run. `ok`/`approved`/`outcome` are `null` when an interruption left no result. */
 export type RunDigestEntry =
   | { type: "program"; source: string; ok: boolean | null; code: string | null; urls: string[]; excerpt: string }
-  | { type: "confirmation"; title: string; approved: boolean | null };
+  | { type: "confirmation"; title: string; approved: boolean | null }
+  /** A `request_user_help` pause: `outcome` is the user's answer, `"failed"` when the call was refused (not one of the chat's agent tabs). */
+  | { type: "help"; kind: HelpKind; reason: string; outcome: "done" | "unable" | "failed" | null };
 
 export interface RunDigestV1 {
   version: 1;

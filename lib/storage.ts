@@ -65,7 +65,7 @@ export interface ChatGPTRegistrationV1 {
   redirectUri: string;
 }
 
-export type RunStatus = "running" | "awaiting-approval" | "cancelled" | "failed" | "completed";
+export type RunStatus = "running" | "awaiting-approval" | "awaiting-help" | "cancelled" | "failed" | "completed";
 
 export interface RunCheckpointV2 {
   version: 2;
@@ -80,7 +80,7 @@ export interface RunCheckpointV2 {
   updatedAt: number;
 }
 
-const RUN_STATUSES: readonly RunStatus[] = ["running", "awaiting-approval", "cancelled", "failed", "completed"];
+const RUN_STATUSES: readonly RunStatus[] = ["running", "awaiting-approval", "awaiting-help", "cancelled", "failed", "completed"];
 
 const DEFAULT_APP_SETTINGS: AppSettingsV1 = {
   version: 1,
@@ -910,7 +910,7 @@ export async function clearRunCheckpoint(): Promise<void> {
 const INTERRUPTED_SUFFIX ="\n\n[Interrupted: the extension restarted before this response finished.]";
 
 /**
- * Startup recovery: a checkpoint left "running"/"awaiting-approval" means the
+ * Startup recovery: a checkpoint left "running"/"awaiting-approval"/"awaiting-help" means the
  * background died mid-run. Convert it into a visible interrupted assistant
  * message in the run's session rather than silently dropping it or claiming
  * stream resumption, followed by a digest of the calls it had started and
@@ -920,7 +920,7 @@ const INTERRUPTED_SUFFIX ="\n\n[Interrupted: the extension restarted before this
 export async function recoverInterruptedRun(): Promise<string | null> {
   const checkpoint = await getRunCheckpoint();
   if (!checkpoint) return null;
-  if (checkpoint.status !== "running" && checkpoint.status !== "awaiting-approval") {
+  if (checkpoint.status !== "running" && checkpoint.status !== "awaiting-approval" && checkpoint.status !== "awaiting-help") {
     await clearRunCheckpoint();
     return null;
   }

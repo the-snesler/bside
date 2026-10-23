@@ -72,11 +72,16 @@ import type {
   AgentTabsState,
   AgentTabSummary,
   ApprovalRequest,
+  ContentMessage,
+  ContentMessageResponse,
   CredentialRequest,
   CredentialResponse,
+  HelpOutcome,
+  HelpRequest,
   HistoryRequest,
   HistoryResponse,
   NormalizedError,
+  PageShieldState,
   RuntimeSnapshot,
   SettingsRequest,
   SettingsResponse,
@@ -104,7 +109,7 @@ export interface RuntimeClock {
 
 const SYSTEM_CLOCK: RuntimeClock = { now: () => Date.now(), setInterval: (callback, ms) => setInterval(callback, ms) };
 
-type RunLifecycleStatus = "running" | "awaiting-approval" | "cancelling";
+type RunLifecycleStatus = "running" | "awaiting-approval" | "awaiting-help" | "cancelling";
 
 /** Run-level diagnostics for context export; held in memory only. */
 interface RunRecord {
@@ -129,6 +134,9 @@ interface ActiveRun {
   status: RunLifecycleStatus;
   partialAssistantText: string;
   pendingApproval: ApprovalRequest | null;
+  pendingHelp: HelpRequest | null;
+  /** The run's agent tabs the user took over since the run's last browser program; its next result says so. */
+  takeovers: Set<number>;
   /** Published and checkpointed once a provider response reports tokens. */
   usage: RunUsageV1 | null;
   lastCheckpointAt: number;
@@ -172,14 +180,17 @@ export class BackgroundRuntime {
   /** Serialized tag last read from or written to each owned tab, so unchanged tags are not rewritten. */
   #agentTabTags = new Map<number, string>();
   /** Agent tabs as last published to sidebars. */
-  #agentTabsState: AgentTabsState = { bySession: {}, watching: null };
+  #agentTabsState: AgentTabsState = { bySession: {}, watching: null, takenOver: false };
   #publishedAgentTabs = JSON.stringify(this.#agentTabsState);
   /**
    * The agent tab the user is watching, shown and active, and the tab they
-   * watched from. In memory only: after a restart a visible tagged tab is
-   * released to the user like any other.
+   * watched from. `takenOver`: the user pressed "Take over", which removes the
+   * page shield until watching ends. In memory only: after a restart a visible
+   * tagged tab is released to the user like any other.
    */
-  #watching: { tabId: number; returnTabId: number | null } | null = null;
+  #watching: { tabId: number; returnTabId: number | null; takenOver: boolean } | null = null;
+  /** The page shield state last sent to a tab's content script. */
+  #shieldSent: { tabId: number; shield: PageShieldState } | null = null;
   /** Each session's message queue once loaded; this cache is authoritative and written through to storage. */
   #queues = new Map<string, QueuedMessage[]>();
 
@@ -287,7 +298,7 @@ export class BackgroundRuntime {
       return;
     }
     // Set first, so switching to the tab is not taken for the user leaving it.
-    const watching = { tabId, returnTabId: previous?.returnTabId ?? null };
+    const watching = { tabId, returnTabId: previous?.returnTabId ?? null, takenOver: false };
     this.#watching = watching;
     try {
       const before = await tabController.revealTab(tabId);
@@ -320,6 +331,70 @@ export class BackgroundRuntime {
     if (back) await tabController.activateTab(back.id!).catch(() => {});
     if (watched) await this.#rehide(tabController, watching.tabId);
     await this.#queueAgentTabSync();
+  }
+
+  /**
+   * "Take over" (from the shield in the page, or the sidebar): removes the
+   * page shield from the watched tab until watching ends. If the tab belongs
+   * to the active run's session, the run's next browser program result says
+   * the user may have changed the page (not while the run waits on a help
+   * request for that tab: answering it says as much).
+   */
+  async #takeOver(tabId: number): Promise<void> {
+    const watching = this.#watching;
+    if (!watching || watching.tabId !== tabId || watching.takenOver) return;
+    watching.takenOver = true;
+    const run = this.#activeRun;
+    if (run && run.sessionId === this.#workspace.agentTabs.get(tabId)?.sessionId && run.pendingHelp?.tabId !== tabId) run.takeovers.add(tabId);
+    await this.#queueAgentTabSync();
+  }
+
+  /**
+   * The page shield a tab should show: only the watched agent tab has one,
+   * unless the user took over or a help request is open for it. It says
+   * bside is working while the tab's session has the active run.
+   */
+  #shieldFor(tabId: number): PageShieldState {
+    const watching = this.#watching;
+    const tab = this.#workspace.agentTabs.get(tabId);
+    if (!tab || watching?.tabId !== tabId || watching.takenOver) return "off";
+    const run = this.#activeRun;
+    if (run?.pendingHelp?.tabId === tabId) return "off";
+    return run?.sessionId === tab.sessionId ? "working" : "idle";
+  }
+
+  /**
+   * Sends the watched tab its shield state when it changed, and removes the
+   * shield from a tab no longer watched. A content script that is not loaded
+   * yet (the tab is navigating) asks for its state when it starts.
+   */
+  async #syncShield(tabController: TabController): Promise<void> {
+    const tabId = this.#watching?.tabId ?? null;
+    const sent = this.#shieldSent;
+    if (sent && sent.tabId !== tabId) {
+      this.#shieldSent = null;
+      if (sent.shield !== "off") await tabController.setShield(sent.tabId, "off");
+    }
+    if (tabId === null) return;
+    const shield = this.#shieldFor(tabId);
+    if (this.#shieldSent?.shield === shield) return;
+    this.#shieldSent = { tabId, shield };
+    await tabController.setShield(tabId, shield);
+  }
+
+  /** Resyncs the shield after a run or help request changed what it shows; a no-op unless a tab is (or was just) watched. */
+  #refreshShield(): void {
+    if (this.#watching || this.#shieldSent) void this.#queueAgentTabSync();
+  }
+
+  /**
+   * A message from the content script in `tabId` (the sender's own tab, never
+   * an id the page could choose): its shield state, after a takeover if asked.
+   */
+  async handleContentMessage(tabId: number, message: ContentMessage): Promise<ContentMessageResponse> {
+    await this.#ready;
+    if (message.type === "shield.takeover") await this.#takeOver(tabId);
+    return { v: 1, id: message.id, ok: true, shield: this.#shieldFor(tabId) };
   }
 
   /** Hides a tab the user was watching. One Firefox cannot hide (pinned, or the only tab in its window) becomes the user's. */
@@ -440,11 +515,12 @@ export class BackgroundRuntime {
     // A failed write leaves its cached tag stale, so the next sync retries it.
     await Promise.allSettled(writes);
     if (this.#watching && !this.#workspace.agentTabs.has(this.#watching.tabId)) this.#watching = null;
+    await this.#syncShield(tabController);
     const bySession: Record<string, AgentTabSummary[]> = {};
     for (const [id, tab] of this.#workspace.agentTabs) {
       if (open.has(id)) (bySession[tab.sessionId] ??= []).push(toAgentTabSummary(id, tab, open.get(id)!));
     }
-    const state: AgentTabsState = { bySession, watching: this.#watching?.tabId ?? null };
+    const state: AgentTabsState = { bySession, watching: this.#watching?.tabId ?? null, takenOver: this.#watching?.takenOver ?? false };
     const serialized = JSON.stringify(state);
     if (serialized !== this.#publishedAgentTabs) {
       this.#publishedAgentTabs = serialized;
@@ -493,6 +569,7 @@ export class BackgroundRuntime {
             status: this.#activeRun.status,
             partialAssistantText: this.#activeRun.partialAssistantText,
             pendingApproval: this.#activeRun.pendingApproval,
+            pendingHelp: this.#activeRun.pendingHelp,
             usage: this.#activeRun.usage,
           }
         : null,
@@ -525,6 +602,10 @@ export class BackgroundRuntime {
     }
     if (command.type === "tabs.unwatch") {
       await this.#stopWatching();
+      return;
+    }
+    if (command.type === "tabs.takeOver") {
+      await this.#takeOver(command.tabId);
       return;
     }
     if (command.type === "tabs.closeAgentTabs") {
@@ -585,6 +666,10 @@ export class BackgroundRuntime {
     }
     if (command.type === "action.deny") {
       this.#resolveApproval(command.runId, command.callId, false);
+      return;
+    }
+    if (command.type === "help.resolve") {
+      this.#resolveHelp(command.runId, command.callId, command.outcome, command.note);
     }
   }
 
@@ -1041,6 +1126,8 @@ export class BackgroundRuntime {
       status: "running",
       partialAssistantText: "",
       pendingApproval: null,
+      pendingHelp: null,
+      takeovers: new Set(),
       usage: null,
       lastCheckpointAt: 0,
     };
@@ -1073,6 +1160,8 @@ export class BackgroundRuntime {
     }
 
     this.#sidebarHub.startRun(sessionId);
+    // A watched tab of this session now says bside is working in it.
+    this.#refreshShield();
 
     this.#latestContext = null;
     this.#debugOutputs = [];
@@ -1237,6 +1326,23 @@ export class BackgroundRuntime {
         this.#approvalBadge?.set(request !== null);
         void this.#sidebarHub.broadcastSnapshot();
       },
+      onHelpPending: (request) => {
+        if (this.#activeRun?.runId !== runId) return;
+        flushDelta();
+        run.pendingHelp = request;
+        if (run.status !== "cancelling") run.status = request ? "awaiting-help" : "running";
+        this.#approvalBadge?.set(request !== null);
+        // The help tab's shield comes off while the request is open.
+        this.#refreshShield();
+        // Recorded when the pause opens; the run's next item records it running again.
+        if (request) void this.#writeCheckpoint(run, run.status, run.partialAssistantText);
+        void this.#sidebarHub.broadcastSnapshot();
+      },
+      userNotes: () => {
+        const notes = [...run.takeovers].map((id) => `Note: the user took over /agent-tabs/${id}/page.md while watching it, so they may have changed that page. Read a fresh snapshot of it before relying on earlier observations.`);
+        run.takeovers.clear();
+        return notes;
+      },
     });
 
     this.#keepRunTabsAlive(runStartedAt);
@@ -1261,6 +1367,7 @@ export class BackgroundRuntime {
       await clearRunCheckpoint();
       await touchSession(run.sessionId, { usage: run.usage ?? undefined }).catch(() => {});
       this.#activeRun = null;
+      this.#refreshShield();
       // After the run slot is released, so no steer can be accepted for this run any more.
       await this.#settleSteers(run.sessionId);
       await this.#publishSessions();
@@ -1343,6 +1450,12 @@ export class BackgroundRuntime {
     if (!this.#activeRun || this.#activeRun.runId !== runId || this.#activeRun.status === "cancelling") return;
     this.#activeRun.status = "cancelling";
     this.#activeRun.controller.abort();
+  }
+
+  #resolveHelp(runId: string, callId: string, outcome: HelpOutcome, note: string): void {
+    if (!this.#activeRun || this.#activeRun.runId !== runId) return;
+    if (this.#activeRun.pendingHelp?.call.id !== callId) return;
+    this.#activeRun.agentLoop.resolveHelp(callId, outcome, note);
   }
 
   #resolveApproval(runId: string, callId: string, approved: boolean): void {
