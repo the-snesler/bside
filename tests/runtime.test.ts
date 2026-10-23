@@ -2809,7 +2809,12 @@ describe("BackgroundRuntime: usage visibility", () => {
     await saveOpenAICredential("sk-test");
     const { runtime } = setup([round([toolCall], { input: 700, output: 70, cost: cost(0.002) }), "hang"]);
     void runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Long" });
-    await tick();
+    // Wait for the checkpoint itself, not a fixed number of ticks: on a slow
+    // machine the first round's usage lands after `tick()` returns.
+    await vi.waitFor(async () => {
+      const { runCheckpoint } = await fakeBrowser.storage.local.get("runCheckpoint") as { runCheckpoint?: { usage: unknown } };
+      expect(runCheckpoint?.usage).toMatchObject({ input: 700, responses: 1 });
+    });
     const snapshot = await runtime.getSnapshot();
     expect(snapshot.activeRun?.usage).toMatchObject({ input: 700, responses: 1 });
     const { runCheckpoint } = await fakeBrowser.storage.local.get("runCheckpoint") as { runCheckpoint: { usage: unknown } };
