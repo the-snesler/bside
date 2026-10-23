@@ -1,9 +1,10 @@
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { isSkill, MAX_SKILL_BODY, MAX_SKILL_DESCRIPTION, type Skill } from "@/lib/domain/skills";
-import type { SkillsRequest, SkillsResponse } from "@/lib/protocol";
+import type { SkillsRequest } from "@/lib/protocol";
+import { Card, Feedback, Note, Row, SettingsSection } from "@/lib/ui/settings/primitives";
+import { BACKGROUND_FAILURE, sendSkillsRequest, type RequestBody } from "@/lib/ui/settings/requests";
 
 const emptySkill = (): Skill => ({ name: "", description: "", body: "" });
-type Request = SkillsRequest extends infer T ? T extends SkillsRequest ? Omit<T, "v" | "id"> : never : never;
 
 export function SkillsEditor() {
   const [skills, setSkills] = useState<Skill[]>([]);
@@ -15,13 +16,15 @@ export function SkillsEditor() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
+  const editor = useRef<HTMLDivElement>(null);
+  const cancelDelete = useRef<HTMLButtonElement>(null);
 
-  const request = async (action: Request) => {
+  const request = async (action: RequestBody<SkillsRequest>) => {
     setBusy(true);
     setError(null);
     setNotice(null);
     try {
-      const response = await browser.runtime.sendMessage({ v: 1, id: crypto.randomUUID(), ...action }) as SkillsResponse;
+      const response = await sendSkillsRequest(action);
       if (!response.ok) { setError(response.error.message); return; }
       setSkills(response.skills);
       setBuiltins(response.builtinNames);
@@ -32,51 +35,88 @@ export function SkillsEditor() {
         setDeleting(null);
         setNotice(action.type === "skills.save" ? "Skill saved." : "Skill deleted.");
       }
-    } catch { setError("The background could not complete this request. Try again."); }
+    } catch { setError(BACKGROUND_FAILURE); }
     finally { setBusy(false); }
   };
 
   useEffect(() => { void request({ type: "skills.list" }); }, []);
+  useEffect(() => { if (deleting) cancelDelete.current?.focus(); }, [deleting]);
   const readonly = builtins.includes(draft.name);
   const duplicate = !editing && skills.some((skill) => skill.name === draft.name);
 
-  return <section class="options__section">
-    <h2 class="options__heading">Skills</h2>
-    <p class="options__disclosure">Save reusable Markdown instructions and invoke one with /name in chat. Skills cannot grant browser capabilities or bypass safety rules.</p>
-    <p class="options__disclosure">Stored only in this Firefox profile, not encrypted or synced. Names and descriptions are shared with the model; bodies are sent when read. Invoked skills are also saved with chat history. Do not include secrets.</p>
-    <ul class="skills__list">
-      {skills.map((skill) => <li key={skill.name}>
-        <div class="options__form options__form--wrap">
-          <button type="button" disabled={busy} onClick={() => { setDraft({ ...skill }); setEditing(true); setDeleting(null); setNotice(null); }}>/{skill.name}{builtins.includes(skill.name) ? " (packaged)" : ""}</button>
-          {!builtins.includes(skill.name) && <button class="options__secondary" type="button" disabled={busy} onClick={() => setDeleting(skill.name)}>Delete</button>}
-        </div>
-        <p class="options__disclosure">{skill.description}</p>
-        {deleting === skill.name && <div class="options__form options__form--wrap">
-          <p class="options__confirm">Delete /{skill.name}? This cannot be undone.</p>
-          <button type="button" disabled={busy} class="options__secondary" onClick={() => setDeleting(null)}>Cancel</button>
-          <button type="button" disabled={busy} class="options__danger" onClick={() => void request({ type: "skills.delete", name: skill.name })}>Confirm delete</button>
-        </div>}
-      </li>)}
-    </ul>
-    {loaded && !skills.length && <p class="options__status">No skills yet.</p>}
-    <form onSubmit={(event) => { event.preventDefault(); if (isSkill(draft) && !duplicate && !readonly) void request({ type: "skills.save", skill: draft }); }}>
-      <label class="options__field">Name
-        <input value={draft.name} maxLength={48} pattern="[a-z][a-z0-9-]{0,47}" required disabled={busy || editing} placeholder="research-summary" onInput={(event) => setDraft({ ...draft, name: event.currentTarget.value })} />
-      </label>
-      <p class="options__disclosure">Lowercase letters, numbers, and hyphens; start with a letter. Every skill's name and description is sent with each request.</p>
-      <label class="options__field">Description
-        <input value={draft.description} maxLength={MAX_SKILL_DESCRIPTION} required disabled={busy || readonly} onInput={(event) => setDraft({ ...draft, description: event.currentTarget.value })} />
-      </label>
-      <label class="options__field">Instructions (Markdown)
-        <textarea value={draft.body} maxLength={MAX_SKILL_BODY} rows={10} required disabled={busy || readonly} onInput={(event) => setDraft({ ...draft, body: event.currentTarget.value })} />
-      </label>
-      {duplicate && <p class="options__error">That name already exists. Select it above to edit.</p>}
-      <div class="options__form options__form--wrap">
-        <button type="submit" disabled={!loaded || busy || readonly || duplicate || !isSkill(draft)}>{editing ? "Save changes" : "Create skill"}</button>
-        {editing && <button type="button" class="options__secondary" disabled={busy} onClick={() => { setDraft(emptySkill()); setEditing(false); }}>New skill</button>}
-      </div>
-    </form>
-    {error && <p class="options__error" role="alert">{error}</p>}
-    {notice && <p class="options__status" role="status">{notice}</p>}
-  </section>;
+  const open = (skill: Skill) => {
+    setDraft({ ...skill });
+    setEditing(true);
+    setDeleting(null);
+    setNotice(null);
+    editor.current?.scrollIntoView?.({ block: "start", behavior: "smooth" });
+  };
+
+  return <>
+    {error && <Feedback error>{error}</Feedback>}
+    {notice && <Feedback>{notice}</Feedback>}
+
+    <SettingsSection label="Your skills">
+      <Card>
+        {skills.map((skill) => {
+          const packaged = builtins.includes(skill.name);
+          return deleting === skill.name ? (
+            <div key={skill.name} role="group" aria-label={`Confirm deleting /${skill.name}`}>
+              <Row
+                title={`Delete /${skill.name}?`}
+                description="This cannot be undone."
+                control={<>
+                  <button ref={cancelDelete} type="button" class="settings-button" disabled={busy} onClick={() => setDeleting(null)}>Cancel</button>
+                  <button type="button" class="settings-button settings-button--danger" disabled={busy} onClick={() => void request({ type: "skills.delete", name: skill.name })}>Confirm delete</button>
+                </>}
+              />
+            </div>
+          ) : (
+            <Row
+              key={skill.name}
+              title={<><span class="settings-skill__name">/{skill.name}</span>{packaged && <span class="settings-badge">Packaged</span>}</>}
+              description={skill.description}
+              control={<>
+                <button type="button" class="settings-button" disabled={busy} aria-label={`${packaged ? "View" : "Edit"} /${skill.name}`} onClick={() => open(skill)}>{packaged ? "View" : "Edit"}</button>
+                {!packaged && <button type="button" class="settings-button" disabled={busy} aria-label={`Delete /${skill.name}`} onClick={() => setDeleting(skill.name)}>Delete</button>}
+              </>}
+            />
+          );
+        })}
+        {loaded && !skills.length && <Row title="No skills yet." description="Create one below, then type /name in the sidebar to use it." />}
+      </Card>
+      <Note>Skills cannot grant browser capabilities or bypass safety rules.</Note>
+    </SettingsSection>
+
+    <div ref={editor} class="settings-anchor">
+      <SettingsSection label={editing ? `${readonly ? "View" : "Edit"} /${draft.name}` : "New skill"}>
+        <Card>
+          <form
+            class="settings-form"
+            onSubmit={(event) => { event.preventDefault(); if (isSkill(draft) && !duplicate && !readonly) void request({ type: "skills.save", skill: draft }); }}
+          >
+            <div class="settings-field">
+              <label class="settings-field__label" for="skill-name">Name</label>
+              <input id="skill-name" class="settings-input" value={draft.name} maxLength={48} pattern="[a-z][a-z0-9-]{0,47}" required disabled={busy || editing} placeholder="research-summary" aria-describedby="skill-name-hint" onInput={(event) => setDraft({ ...draft, name: event.currentTarget.value })} />
+              <span id="skill-name-hint" class="settings-field__hint">Lowercase letters, numbers, and hyphens; start with a letter. Every skill's name and description is sent with each request.</span>
+            </div>
+            <div class="settings-field">
+              <label class="settings-field__label" for="skill-description">Description</label>
+              <input id="skill-description" class="settings-input" value={draft.description} maxLength={MAX_SKILL_DESCRIPTION} required disabled={busy || readonly} onInput={(event) => setDraft({ ...draft, description: event.currentTarget.value })} />
+            </div>
+            <div class="settings-field">
+              <label class="settings-field__label" for="skill-body">Instructions (Markdown)</label>
+              <textarea id="skill-body" class="settings-input settings-input--code" value={draft.body} maxLength={MAX_SKILL_BODY} rows={12} required disabled={busy || readonly} onInput={(event) => setDraft({ ...draft, body: event.currentTarget.value })} />
+            </div>
+            {duplicate && <p class="settings-feedback settings-feedback--error">That name already exists. Select it above to edit.</p>}
+            <div class="settings-form__actions">
+              {editing && <button type="button" class="settings-button" disabled={busy} onClick={() => { setDraft(emptySkill()); setEditing(false); }}>New skill</button>}
+              <button type="submit" class="settings-button settings-button--primary" disabled={!loaded || busy || readonly || duplicate || !isSkill(draft)}>{editing ? "Save changes" : "Create skill"}</button>
+            </div>
+          </form>
+        </Card>
+        <Note>Stored only in this Firefox profile, not encrypted or synced. Names and descriptions are shared with the model; bodies are sent when read. Invoked skills are also saved with chat history. Do not include secrets.</Note>
+      </SettingsSection>
+    </div>
+  </>;
 }
