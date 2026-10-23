@@ -108,6 +108,16 @@ export function Switch(props: Omit<JSX.InputHTMLAttributes<HTMLInputElement>, "t
   );
 }
 
+/** A text field's length against its limit, for the field's hint line. */
+export function CharacterCount(props: { id?: string; length: number; max: number }) {
+  const over = props.length > props.max;
+  return (
+    <span id={props.id} class={over ? "settings-count settings-count--over" : "settings-count"}>
+      {props.length.toLocaleString("en-US")} / {props.max.toLocaleString("en-US")}
+    </span>
+  );
+}
+
 /** Feedback from the last action: `error` interrupts, anything else is polite. */
 export function Feedback(props: { error?: boolean; children: ComponentChildren }) {
   return props.error

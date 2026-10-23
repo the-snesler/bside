@@ -3,11 +3,15 @@ import Settings from "~icons/tabler/settings";
 import UserCircle from "~icons/tabler/user-circle";
 import Sparkles from "~icons/tabler/sparkles";
 import ShieldLock from "~icons/tabler/shield-lock";
+import MessageUser from "~icons/tabler/message-user";
+import WorldPin from "~icons/tabler/world-pin";
 import { SkillsEditor } from "@/lib/ui/SkillsEditor";
 import type { OptionsApp } from "../state";
 import { GeneralPage } from "./General";
 import { AccountPage } from "./Account";
 import { HistoryPage } from "./History";
+import { InstructionsPage } from "./Instructions";
+import { SiteNotesPage } from "./SiteNotes";
 
 export interface SettingsPageProps {
   app: OptionsApp;
@@ -54,6 +58,15 @@ export const SETTINGS_PAGES: readonly SettingsPage[] = [
     component: AccountPage,
   },
   {
+    id: "instructions",
+    label: "Instructions",
+    group: "Personal",
+    icon: MessageUser,
+    description: "Tell bside about yourself and how you like answers. Sent with every message.",
+    keywords: ["Custom instructions", "About me", "How to respond", "Preferences", "Personalization", "Tone", "System prompt"],
+    component: InstructionsPage,
+  },
+  {
     id: "skills",
     label: "Skills",
     group: "Agent",
@@ -61,6 +74,15 @@ export const SETTINGS_PAGES: readonly SettingsPage[] = [
     description: "Reusable Markdown instructions you invoke with /name in chat.",
     keywords: ["Your skills", "New skill", "Edit skill", "Delete skill", "Slash commands", "Instructions", "Markdown", "Packaged skills", "YouTube", "Prompts"],
     component: SkillsEditor,
+  },
+  {
+    id: "site-notes",
+    label: "Site notes",
+    group: "Agent",
+    icon: WorldPin,
+    description: "Notes bside reads when it works on a particular site.",
+    keywords: ["Site instructions", "Per-site", "Websites", "Domains", "Origins", "Subdomains", "Remember this site", "Memory"],
+    component: SiteNotesPage,
   },
   {
     id: "history",

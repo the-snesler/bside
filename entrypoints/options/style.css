@@ -304,6 +304,19 @@ svg {
   font-size: 13px;
 }
 
+.settings-site-note__text {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.settings-search--page {
+  margin-bottom: var(--space-2);
+}
+
 /* Banner ----------------------------------------------------------------- */
 
 .settings-banner {
@@ -451,6 +464,11 @@ svg {
   opacity: 0.6;
 }
 
+.settings-input--text {
+  resize: vertical;
+  line-height: 1.5;
+}
+
 .settings-input--code {
   resize: vertical;
   font-family: var(--font-mono);
@@ -522,6 +540,35 @@ svg {
 .settings-field__hint {
   color: var(--muted);
   font-size: 12px;
+}
+
+.settings-field__hint--split {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.settings-count {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.settings-count--over {
+  color: var(--error);
+}
+
+.settings-check {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.settings-form--inline {
+  padding: 0;
 }
 
 .settings-form__actions {
