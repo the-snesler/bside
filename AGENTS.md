@@ -24,7 +24,11 @@ entrypoints/
   background.ts        Persistent MV2 background-page entrypoint and listener registration.
   page.content.ts      Top-frame HTTP(S) content-script message adapter.
   sidepanel/           Native Firefox sidebar Preact surface.
-  options/             Options-page Preact surface for credentials/settings.
+  options/             Options-page settings app: searchable grouped sidebar, `#/<id>` hash routes, one page per registry entry.
+    pages/index.ts     `SETTINGS_PAGES` registry (id, label, group, icon, keywords, component); adding a page is one entry.
+    pages/*.tsx        General (model, effort), Account (ChatGPT, API key), History & privacy; Skills is `lib/ui/SkillsEditor.tsx`.
+    state.ts           Shared credential/settings state for pages, refreshed on focus.
+    navigation.ts      Hash route parsing and sidebar search over labels and keywords.
 
 lib/
   background/
@@ -62,6 +66,8 @@ lib/
     Composer.tsx       Slate prompt editor with tab mentions.
     Markdown.tsx       Model-text Markdown without raw HTML, remote images, or unsafe links.
     HistoryDrawer.tsx  Sidebar chat history: title search, inline rename, pin, export, two-step delete.
+    SkillsEditor.tsx   Options Skills page: list, create, edit, two-step delete; packaged skills read-only.
+    settings/          Options-page building blocks: section labels, cards of rows, banners, select, switch (`primitives.tsx`), and the only background-request helpers (`requests.ts`).
   protocol.ts          Versioned cross-context request/event unions and type guards.
   validation.ts        Runtime validators for prompts and tool arguments.
   storage.ts           Versioned `storage.local` records: settings, sealed credentials, chunked conversation sessions, per-session message queues, history retention, legacy migration, interrupted-run recovery.
