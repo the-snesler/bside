@@ -118,7 +118,7 @@ describe("settings navigation", () => {
     await vi.waitFor(() => expect(title()).toBe("Account"));
     expect(location.hash).toBe("#/account");
     expect(navLink("Account")!.getAttribute("aria-current")).toBe("page");
-    expect(document.title).toBe("Account · bside settings");
+    await vi.waitFor(() => expect(document.title).toBe("Account · bside settings"));
   });
 
   it("opens General by default when connected, and for an unknown route", async () => {
