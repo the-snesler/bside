@@ -152,6 +152,8 @@ export interface CaptureOptions {
 export interface ScreenshotRequest {
   area: "viewport" | "full";
   target: ElementTarget | null;
+  /** The frame `target` is in: 0 for the top document, else the frame's name number (`f3` is 3). */
+  frame: number;
   format: "jpeg" | "png";
 }
 
@@ -492,6 +494,7 @@ export class TabController {
     if (tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
     const capture = this.#browserApi.tabs.captureTab?.bind(this.#browserApi.tabs);
     if (!capture) return pageError("UNSUPPORTED_PAGE", "Screenshots are unavailable in this browser.");
+    if (request.frame !== 0) return pageError("NOT_INTERACTABLE", "Elements inside frames cannot be captured on their own; take a viewport screenshot instead.");
     const measured = await this.#request<CaptureGeometry>(tabId, { type: "page.capture-prepare", frameId: TOP_FRAME, tabId, refPrefix: "", target: request.target }, "page.capture-prepare");
     if (!measured.ok) return measured;
     try {
@@ -544,16 +547,23 @@ export class TabController {
     }
   }
 
-  /** Forwards one DOM action. A click/press that tears down the document settles like a navigation instead of repeating. */
-  async act(action: DomAction): Promise<ActionOutcome> {
+  /**
+   * Forwards one DOM action to the top document (`frame` 0) or to the frame
+   * of that name. A click/press that tears down the document settles like a
+   * navigation instead of repeating.
+   */
+  async act(action: DomAction, frame = 0): Promise<ActionOutcome> {
     const tabId = this.#tabId;
     if (tabId === null) return { result: { ok: false, code: "UNSUPPORTED_PAGE", summary: "No page is attached." }, documentId: null };
-    const request: PageExecuteRequest = { v: 1, id: crypto.randomUUID(), type: "page.execute", frameId: TOP_FRAME, tabId, refPrefix: "", action };
+    const route = this.#route(tabId, frame);
+    if (!route) return { result: { ok: false, code: "TARGET_MISSING", summary: `Frame f${frame} is not on this page. Read a fresh snapshot.` }, documentId: null };
+    const request: PageExecuteRequest = { v: 1, id: crypto.randomUUID(), type: "page.execute", frameId: route.frameId, tabId, refPrefix: route.refPrefix, action };
 
     let response: PageResponse | undefined;
     try {
-      response = (await this.#browserApi.tabs.sendMessage(tabId, request, { frameId: TOP_FRAME })) as PageResponse | undefined;
+      response = (await this.#browserApi.tabs.sendMessage(tabId, request, { frameId: route.frameId })) as PageResponse | undefined;
     } catch {
+      if (frame !== 0) return this.#lostFrame(tabId, route.frameId, frame, action);
       if (action.kind !== "click" && action.kind !== "press") {
         return { result: { ok: false, code: "TAB_CHANGED", summary: "Lost contact with the page." }, documentId: null };
       }
@@ -571,7 +581,38 @@ export class TabController {
     if (!response) return { result: { ok: false, code: "TAB_CHANGED", summary: "The page did not respond." }, documentId: null };
     if (!response.ok) return { result: { ok: false, code: toToolResultCode(response.error.code), summary: response.error.message }, documentId: null };
     if (response.type !== "page.execute") return { result: { ok: false, code: "TARGET_MISSING", summary: "Unexpected response from the page." }, documentId: null };
-    return { result: response.result, documentId: response.documentId };
+    // A frame's diff covers only that frame; what its click did to the page around it needs a fresh read.
+    const outside = frame !== 0 && response.result.ok && (action.kind === "click" || action.kind === "press")
+      ? `\nThe diff covers frame f${frame} only; read a snapshot to see changes elsewhere on the page.`
+      : "";
+    return { result: { ...response.result, summary: `${response.result.summary}${outside}` }, documentId: response.documentId };
+  }
+
+  /** Firefox's id and the ref prefix for a named frame (0 is the top document); null for a name no outline of this tab gave out. */
+  #route(tabId: number, frame: number): { frameId: number; refPrefix: string } | null {
+    if (frame === 0) return { frameId: TOP_FRAME, refPrefix: "" };
+    const known = this.#frames.lookup(tabId, frame);
+    return known ? { frameId: known.frameId, refPrefix: `f${frame}:` } : null;
+  }
+
+  /**
+   * A frame stopped answering during an action. After a click or press it is
+   * probed for a while: a frame that answers again navigated or reloaded;
+   * one that never does is gone, and the action may or may not have happened.
+   */
+  async #lostFrame(tabId: number, frameId: number, frame: number, action: DomAction): Promise<ActionOutcome> {
+    const lost = `Lost contact with frame f${frame}`;
+    if (action.kind === "click" || action.kind === "press") {
+      for (const delay of PROBE_DELAYS_MS.slice(0, 4)) {
+        await sleep(delay);
+        const health = await this.#probeHealth(tabId, frameId);
+        if (health) {
+          const verb = action.kind === "click" ? "Clicked" : `Pressed ${action.key}`;
+          return { result: { ok: true, summary: `${verb}; frame f${frame} navigated to ${health.url}. Its earlier refs are invalid; read a snapshot.` }, documentId: null };
+        }
+      }
+    }
+    return { result: { ok: false, code: "TAB_CHANGED", summary: `${lost}: it navigated, reloaded, or was removed${action.kind === "click" || action.kind === "press" ? ", and the action may have taken effect" : ""}. Read a fresh snapshot.` }, documentId: null };
   }
 
   async navigate(url: string): Promise<ToolResult> {
@@ -657,10 +698,10 @@ export class TabController {
     return promise;
   }
 
-  async #probeHealth(tabId: number): Promise<{ url: string } | null> {
-    const request: PageHealthRequest = { v: 1, id: crypto.randomUUID(), type: "page.health", frameId: TOP_FRAME };
+  async #probeHealth(tabId: number, frameId = TOP_FRAME): Promise<{ url: string } | null> {
+    const request: PageHealthRequest = { v: 1, id: crypto.randomUUID(), type: "page.health", frameId };
     try {
-      const response = (await this.#browserApi.tabs.sendMessage(tabId, request, { frameId: TOP_FRAME })) as PageResponse | undefined;
+      const response = (await this.#browserApi.tabs.sendMessage(tabId, request, { frameId })) as PageResponse | undefined;
       if (response?.ok && response.type === "page.health") return { url: response.url };
     } catch {
       // Content script not attached yet on the new document; keep probing.

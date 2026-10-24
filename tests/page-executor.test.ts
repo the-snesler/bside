@@ -126,7 +126,7 @@ describe("outline extraction", () => {
     expect(text).not.toContain("dumbledore");
   });
 
-  it("descends into same-origin frames and lists cross-origin frames by URL", async () => {
+  it("descends into same-origin frames and lists unaddressable cross-origin frames by URL", async () => {
     setBody('<h2>Level 1</h2><iframe title="Level 2" srcdoc="<label for=n>Name</label><input id=n><button>Send</button>"></iframe>');
     await new Promise((resolve) => setTimeout(resolve, 20));
     const text = outline();
@@ -140,7 +140,8 @@ describe("outline extraction", () => {
     crossOrigin.setAttribute("src", "about:blank#remote");
     Object.defineProperty(crossOrigin, "contentDocument", { get: () => null });
     document.body.append(crossOrigin);
-    expect(outline()).toContain('[frame "Ad-free widget" cross-origin → about:blank#remote]');
+    // Without a frame id for it (no runtime.getFrameId), a cross-origin frame stays opaque.
+    expect(outline()).toContain('[frame "Ad-free widget" (about:blank#remote) not readable: its content is not available to bside]');
   });
 
   it("leaves a placeholder line for each cross-origin frame Firefox can address, with its frame id", () => {

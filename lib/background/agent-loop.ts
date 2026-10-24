@@ -243,7 +243,7 @@ export class AgentLoop {
     const startedAt = limits.now();
     let rounds = 0;
     let limitError: NormalizedError | null = null;
-    if (params.contextArtifact) this.#program.observe(params.contextArtifact.snapshot.tabId, params.contextArtifact.snapshot.documentId);
+    if (params.contextArtifact) this.#program.observe(params.contextArtifact.snapshot.tabId, params.contextArtifact.snapshot.documentId, params.contextArtifact.snapshot.frames);
     // The attached page, earlier run notes, and a summary carry web content the model reads before any tool runs.
     if (params.contextArtifact || renderHistory(history.transcript, model, { contextArtifact: null }).some((entry) => entry.untrusted)) this.#program.taint();
     for (const note of params.transcript.findLast(isTurnStart)?.sites ?? []) this.#surfacedSites.add(note.origin);

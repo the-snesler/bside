@@ -53,7 +53,7 @@ function setup(options: {
   return { api, log, tab, controller: () => new TabController(api, options.isBlank ?? (async () => false)).forTab(7) };
 }
 
-const VIEWPORT = { area: "viewport", target: null, format: "jpeg" } as const;
+const VIEWPORT = { area: "viewport", target: null, frame: 0, format: "jpeg" } as const;
 
 describe("TabController.screenshot", () => {
   it("captures the scrolled viewport as a JPEG within the size bounds, ending the capture afterwards", async () => {

@@ -114,7 +114,7 @@ describe("page.screenshot()", () => {
     const { run, state, captures } = setupProgram();
     const unread = await run('await browser.tab("/tabs/1/page.md").screenshot({ref: "e1"});');
     expect(unread).toMatchObject({ ok: false, code: "STALE_SNAPSHOT" });
-    state.observed.set(1, "doc-old");
+    state.observed.set(1, { documentId: "doc-old", frames: {} });
     const stale = await run('await browser.tab("/tabs/1/page.md").ref("e1").screenshot();');
     expect(stale).toMatchObject({ ok: false, code: "STALE_SNAPSHOT" });
     expect(captures).toEqual([]);

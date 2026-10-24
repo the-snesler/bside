@@ -19,9 +19,9 @@ export const PROGRAM_HELP = `Run a small browser/filesystem program. It is inter
 Output: bare expression statements (e.g. \`await x.click();\`) are printed, assignments are silent. Output over 40000 characters is cut with an explicit notice.
 
 Tabs: fs.list("/tabs") (user tabs), fs.list("/agent-tabs") (hidden tabs this chat opened). const page = browser.tab("/tabs/12/page.md"); const res = await browser.open("https://…") opens a hidden agent tab.
-Reading: await page.snapshot() returns the page outline: text in document order with interactive elements inlined as [e5 button "Save"], [e7 textbox "Email" type=email required value="…"], [e9 link "Docs" → /docs], [e3 combobox "Country" selected="…" options: …]. Includes open/closed shadow DOM and same-origin iframes; a cross-origin frame appears as [frame cross-origin → url] — open that URL with browser.open() to read or operate it. Long pages are paged: snapshot({offset: 16000, maxChars: 16000}) continues where the notice says (maxChars ≤ 40000). fs.read(tabPath) equals snapshot().
+Reading: await page.snapshot() returns the page outline: text in document order with interactive elements inlined as [e5 button "Save"], [e7 textbox "Email" type=email required value="…"], [e9 link "Docs" → /docs], [e3 combobox "Country" selected="…" options: …]. Includes open/closed shadow DOM and iframes: a cross-origin frame appears in place as [frame f2 "Title" (url)], its lines indented, then [/frame f2], and its refs carry the frame's name (f2:e4); a frame bside cannot read stays one [frame … not readable] line. Long pages are paged: snapshot({offset: 16000, maxChars: 16000}) continues where the notice says (maxChars ≤ 40000). fs.read(tabPath) equals snapshot().
 Searching: await page.find("text") lists matching outline lines (with refs) and their offsets — use it on long pages instead of reading everything. await page.waitFor("text", 8000) waits up to 15000 ms for text to appear. await web.search("query") returns web results (title, URL, snippet) from a hidden search tab; open results with browser.open(url).
-Targeting: page.ref("e5") targets the element with that ref from your latest snapshot/find/diff of that page; refs stay valid until the page navigates or reloads. page.getByRole("button", {name: "Save"}) matches a unique element by role and case-insensitive name substring ({exact: true} for exact). page.getByText("Save") matches any interactive element by name. Ambiguous or missing matches fail and list candidate refs.
+Targeting: page.ref("e5") (or page.ref("f2:e4") inside a frame) targets the element with that ref from your latest snapshot/find/diff of that page; refs stay valid until the page (or, for f2:e4, that frame) navigates or reloads. page.getByRole("button", {name: "Save"}) matches a unique element by role and case-insensitive name substring ({exact: true} for exact). page.getByText("Save") matches any interactive element by name. Both search the top document and its same-origin frames only. Ambiguous or missing matches fail and list candidate refs.
 Actions (on a locator): click(), fill(text) (inputs, textareas, rich-text editors; dates as YYYY-MM-DD), selectOption("label or value" | [...]), setChecked(bool), check(), uncheck(), press("Enter"|"Tab"|"Escape"|"Space"|"Backspace"|"ArrowDown"|…), setInputFiles("/workspace/file.txt" | [...]) attaches scratch files (text or saved images) to a file input. Each action reports the effect, native validation problems, and the page outline lines that appeared (+) or disappeared (−). Use that diff to verify outcomes.
 Page methods: navigate(url), goBack(), scroll("down"|"up", "page"|"line"), path().
 Seeing: await page.screenshot() attaches an image of the visible viewport to this program's result; screenshot({fullPage: true}) covers the whole page (very long pages are cut), screenshot({ref: "e5"}) or page.ref("e5").screenshot() crops to one element from your latest snapshot. Use it for layout, charts, images, canvas, or when the outline is unclear; prefer snapshot() for text. Images are shown to you once, in your next step only, and a task may take only a few: note what you need from them right away.
@@ -42,11 +42,25 @@ export interface AgentTab {
   lastUsedAt: number;
 }
 
+/**
+ * The documents behind the latest outline shown to the model for one tab:
+ * the top document, and each cross-origin frame's by name (`f3`). A ref
+ * resolves against its own frame's document, so it is stale exactly when
+ * that frame (or, for `eN`, the page) has loaded a new document since.
+ */
+export interface ObservedPage {
+  documentId: string;
+  frames: Record<string, string>;
+}
+
+/** A ref as the model writes it: `e12`, or `f3:e12` in the frame named f3. */
+const REF_PATTERN = /^(?:f([1-9]\d{0,5}):)?e[1-9]\d{0,8}$/;
+
 /** Agent-tab ownership and observed documents, shared by every session; the runtime keeps one for the background's lifetime. */
 export class WorkspaceState {
   agentTabs = new Map<number, AgentTab>();
-  /** Document id of the latest outline shown to the model per tab; refs resolve against it. */
-  observed = new Map<number, string>();
+  /** Documents of the latest outline shown to the model per tab; refs resolve against them. */
+  observed = new Map<number, ObservedPage>();
   /** Called after agentTabs ownership changes so the runtime can persist it. */
   onOwnershipChange: () => void = () => {};
 
@@ -548,9 +562,9 @@ export class BrowserProgram {
     return this.#images.splice(0);
   }
 
-  /** Records that the model has seen refs from this document (e.g. the initial page artifact). */
-  observe(tabId: number, documentId: string): void {
-    this.state.observed.set(tabId, documentId);
+  /** Records that the model has seen refs from this document and its frames (e.g. the initial page artifact). */
+  observe(tabId: number, documentId: string, frames: Record<string, string> = {}): void {
+    this.state.observed.set(tabId, { documentId, frames });
   }
 
   /** Marks the run as having read untrusted content (e.g. the page attached to its message). */
@@ -951,10 +965,10 @@ export class BrowserProgram {
       );
 
     let action: DomAction;
-    const target = this.#target(receiver);
+    const { target, frame } = this.#target(receiver);
     if (method === "screenshot") {
       count(0, 1);
-      return this.#screenshot(controller, receiver.tabId, target, args[0], false);
+      return this.#screenshot(controller, receiver.tabId, { target, frame }, args[0], false);
     }
     if (method === "click") {
       count(0);
@@ -1002,11 +1016,9 @@ export class BrowserProgram {
     signal.throwIfAborted();
     // A lost response can follow a committed effect; disable automatic retry before dispatch.
     this.onEffect();
-    const outcome = await controller.act(action);
+    const outcome = await controller.act(action, frame);
     this.#usedPage(controller);
-    if (outcome.documentId)
-      this.state.observed.set(receiver.tabId, outcome.documentId);
-    else this.state.observed.delete(receiver.tabId);
+    this.#observeAction(receiver.tabId, frame, outcome.documentId);
     if (!outcome.result.ok)
       throw this.#pageError(
         {
@@ -1048,7 +1060,7 @@ export class BrowserProgram {
       const found = await controller.find(query);
       if (!found.ok) throw this.#pageError(found.error, tabId);
       this.#visited.push(found.value.url);
-      this.state.observed.set(tabId, found.value.documentId);
+      this.observe(tabId, found.value.documentId, found.value.frames);
       return this.#renderFind(found.value, tabId);
     }
     if (method === "waitFor") {
@@ -1063,7 +1075,7 @@ export class BrowserProgram {
       for (;;) {
         const found = await controller.find(query);
         if (found.ok && found.value.count > 0) {
-          this.state.observed.set(tabId, found.value.documentId);
+          this.observe(tabId, found.value.documentId, found.value.frames);
           return this.#renderFind(found.value, tabId);
         }
         if (Date.now() >= deadline)
@@ -1077,9 +1089,9 @@ export class BrowserProgram {
     if (method === "ref") {
       count(1);
       const ref = text(0, 'a ref like "e12"');
-      if (!/^e[1-9]\d{0,8}$/.test(ref))
+      if (!REF_PATTERN.test(ref))
         throw new Error(
-          `Invalid ref ${JSON.stringify(ref)}; refs look like "e12".`,
+          `Invalid ref ${JSON.stringify(ref)}; refs look like "e12", or "f3:e12" inside a frame.`,
         );
       return this.#handle({
         kind: "locator",
@@ -1242,7 +1254,7 @@ export class BrowserProgram {
     const snapshot = await controller.snapshot({ offset, maxChars });
     if (!snapshot.ok) throw this.#pageError(snapshot.error, tabId);
     this.#visited.push(snapshot.value.url);
-    this.state.observed.set(tabId, snapshot.value.documentId);
+    this.observe(tabId, snapshot.value.documentId, snapshot.value.frames);
     return renderSnapshot(snapshot.value, this.#path(tabId));
   }
 
@@ -1253,7 +1265,7 @@ export class BrowserProgram {
   async #screenshot(
     controller: TabController,
     tabId: number,
-    target: ElementTarget | null,
+    located: { target: ElementTarget; frame: number } | null,
     rawOptions: Value | undefined,
     onPage: boolean,
   ): Promise<string> {
@@ -1266,9 +1278,9 @@ export class BrowserProgram {
     if (extra) throw new Error(`Unsupported screenshot option ${extra}; use ${usage}.`);
     if (options.fullPage !== undefined && typeof options.fullPage !== "boolean") throw new Error("fullPage must be true or false.");
     if (options.ref !== undefined) {
-      if (typeof options.ref !== "string" || !/^e[1-9]\d{0,8}$/.test(options.ref)) throw new Error('ref must look like "e12".');
+      if (typeof options.ref !== "string" || !REF_PATTERN.test(options.ref)) throw new Error('ref must look like "e12", or "f3:e12" inside a frame.');
       if (options.fullPage) throw new Error("Use either fullPage or ref, not both.");
-      target = this.#target({ kind: "locator", tabId, target: { kind: "ref", ref: options.ref } });
+      located = this.#target({ kind: "locator", tabId, target: { kind: "ref", ref: options.ref } });
     }
     let format: "jpeg" | "png" = "jpeg";
     if (options.save !== undefined) {
@@ -1277,7 +1289,7 @@ export class BrowserProgram {
       if (type === "image/png") format = "png";
     }
     this.#checkImageBudget();
-    const shot = await controller.screenshot({ area: options.fullPage ? "full" : "viewport", target, format });
+    const shot = await controller.screenshot({ area: options.fullPage ? "full" : "viewport", target: located?.target ?? null, frame: located?.frame ?? 0, format });
     if (!shot.ok) throw this.#pageError(shot.error, tabId);
     const { value } = shot;
     this.#visited.push(value.url);
@@ -1312,16 +1324,41 @@ export class BrowserProgram {
     ].join("\n");
   }
 
-  #target(locator: Extract<Handle, { kind: "locator" }>): ElementTarget {
-    if (locator.target.kind === "role") return locator.target;
-    const documentId = this.state.observed.get(locator.tabId);
+  /**
+   * The element target and the frame it is in (0 for the top document; a
+   * frame's name number otherwise). Role locators search the top document. A
+   * ref carries the document its frame showed in the latest outline.
+   */
+  #target(locator: Extract<Handle, { kind: "locator" }>): { target: ElementTarget; frame: number } {
+    if (locator.target.kind === "role") return { target: locator.target, frame: 0 };
+    const { ref } = locator.target;
+    const frameName = REF_PATTERN.exec(ref)?.[1];
+    const observed = this.state.observed.get(locator.tabId);
+    const documentId = frameName ? observed?.frames[`f${frameName}`] : observed?.documentId;
     if (!documentId) {
       throw new ProgramError(
-        `${this.#path(locator.tabId)}: no outline of the current page has been read, so ref ${locator.target.ref} cannot be trusted. Read page.snapshot() or page.find() first.`,
+        frameName && observed
+          ? `${this.#path(locator.tabId)}: the latest outline of this page has no frame f${frameName}, so ref ${ref} cannot be trusted. Read page.snapshot() or page.find() first.`
+          : `${this.#path(locator.tabId)}: no outline of the current page has been read, so ref ${ref} cannot be trusted. Read page.snapshot() or page.find() first.`,
         "STALE_SNAPSHOT",
       );
     }
-    return { kind: "ref", ref: locator.target.ref, documentId };
+    return { target: { kind: "ref", ref: frameName ? ref.slice(ref.indexOf(":") + 1) : ref, documentId }, frame: frameName ? Number(frameName) : 0 };
+  }
+
+  /** After an action, the document it ran in is what its refs (and the diff's) resolve against; one that went away is forgotten. */
+  #observeAction(tabId: number, frame: number, documentId: string | null): void {
+    const observed = this.state.observed.get(tabId);
+    if (frame === 0) {
+      if (!documentId) this.state.observed.delete(tabId);
+      else this.observe(tabId, documentId, observed?.documentId === documentId ? observed.frames : {});
+      return;
+    }
+    if (!observed) return;
+    const frames = { ...observed.frames };
+    if (documentId) frames[`f${frame}`] = documentId;
+    else delete frames[`f${frame}`];
+    this.observe(tabId, observed.documentId, frames);
   }
 
   async #uploadFiles(raw: Value): Promise<UploadFile[]> {
@@ -1832,7 +1869,7 @@ export function renderSnapshot(snapshot: PageSnapshot, path: string): string {
   const lines = [
     `# ${snapshot.title || "(untitled)"}`,
     `URL: ${snapshot.url}`,
-    `Tab: ${path} · Document: ${snapshot.documentId} (refs valid until this page navigates or reloads)`,
+    `Tab: ${path} · Document: ${snapshot.documentId} (refs valid until this page navigates or reloads${snapshot.frames && Object.keys(snapshot.frames).length ? "; a frame's refs, like f1:e3, until that frame does" : ""})`,
   ];
   if (snapshot.selectionText) lines.push(`User selection: ${JSON.stringify(snapshot.selectionText)}`);
   lines.push("BEGIN_UNTRUSTED_PAGE", snapshot.text || "(no visible text or controls)", "END_UNTRUSTED_PAGE");

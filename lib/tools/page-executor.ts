@@ -631,7 +631,7 @@ class OutlineBuilder {
       // Its own content script reads it; the background splices that outline in here.
       const frameId = this.options.frameIdOf?.(frame) ?? -1;
       if (frameId > 0) this.segments.push({ t: "frame", frame: { frameId, title, url: clip(src, 500) } });
-      else this.text(`[frame${label} cross-origin → ${clip(src, 200)}]`);
+      else this.text(`[frame${label} (${clip(src, 200)}) not readable: its content is not available to bside]`);
       this.break();
       return;
     }

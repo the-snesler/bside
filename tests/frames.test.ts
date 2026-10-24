@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { BrowserProgram, ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
 import { FRAME_LIMITS, FrameAliases, TabController } from "@/lib/background/tab-controller";
 import { createFramedTab, type FakeFrameSpec } from "./helpers/framed-tab";
 
@@ -134,5 +135,95 @@ describe("composed tab outlines", () => {
     const match = found.value.matches.find((candidate) => candidate.text.includes("f1:e2"))!;
     expect(match.text).toContain('[f1:e2 button "Pay"]');
     expect(whole.value.text.slice(match.offset)).toMatch(/^ {2}Card number/);
+  });
+});
+
+describe("frame refs in browser programs", () => {
+  async function setup() {
+    const tab = checkoutTab();
+    const controller = new TabController(tab.api, undefined, new FrameAliases());
+    const state = new WorkspaceState();
+    const program = new BrowserProgram(controller, { state, sessionId: "s1", files: new ScratchFiles() }, () => {});
+    const signal = new AbortController().signal;
+    const run = (source: string) => program.execute(`const page = browser.tab("/tabs/1/page.md");\n${source}`, signal);
+    return { tab, state, run };
+  }
+
+  it("acts in a frame by its f-prefixed ref, sending the frame its own ref and document", async () => {
+    const { tab, state, run } = await setup();
+    const read = await run("return await page.snapshot();");
+    expect(read.summary).toContain("Document: doc-0 (refs valid until this page navigates or reloads; a frame's refs, like f1:e3, until that frame does)");
+    expect(read.summary).toContain('  Card number [f1:e1 textbox "Card number"] [f1:e2 button "Pay"]');
+    expect(state.observed.get(1)).toEqual({ documentId: "doc-0", frames: { f1: "doc-5", f2: "doc-6" } });
+
+    const filled = await run('return await page.ref("f1:e1").fill("4242 4242");');
+    expect(filled.ok, filled.summary).toBe(true);
+    expect(filled.summary).toContain('Filled [f1:e1 textbox "Card number"].');
+    expect(tab.frames.get(5)!.document.querySelector("input")!.value).toBe("4242 4242");
+    expect(tab.requestsTo(5).at(-1)).toMatchObject({ type: "page.execute", frameId: 5, refPrefix: "f1:", action: { kind: "fill", target: { kind: "ref", ref: "e1", documentId: "doc-5" } } });
+
+    const checked = await run('return await page.ref("f2:e1").check();');
+    expect(checked.ok, checked.summary).toBe(true);
+    expect(tab.frames.get(6)!.document.querySelector<HTMLInputElement>("#robot")!.checked).toBe(true);
+
+    const clicked = await run('return await page.ref("f1:e2").click();');
+    expect(clicked.summary).toContain("The diff covers frame f1 only; read a snapshot to see changes elsewhere on the page.");
+    // A top-document ref still works alongside them.
+    const top = await run('return await page.ref("e1").click();');
+    expect(top.ok, top.summary).toBe(true);
+    expect(state.observed.get(1)!.frames).toEqual({ f1: "doc-5", f2: "doc-6" });
+  });
+
+  it("rejects a frame's refs as stale once that frame loads a new document, and only that frame's", async () => {
+    const { tab, run } = await setup();
+    await run("return await page.snapshot();");
+    tab.navigateFrame({ frameId: 5, url: "https://pay.example/3ds", html: "<button>Confirm</button>" }, "doc-5b");
+    const stale = await run('return await page.ref("f1:e1").fill("4242");');
+    expect(stale).toMatchObject({ ok: false, code: "STALE_SNAPSHOT", summary: expect.stringContaining("Ref f1:e1 came from an earlier page load; frame f1 now shows a different document") });
+    const sibling = await run('return await page.ref("f2:e1").check();');
+    expect(sibling.ok, sibling.summary).toBe(true);
+    const fresh = await run('const read = await page.snapshot(); return await page.ref("f1:e1").click();');
+    expect(fresh.ok, fresh.summary).toBe(true);
+    expect(fresh.summary).toContain('Clicked [f1:e1 button "Confirm"].');
+  });
+
+  it("refuses refs to frames the latest outline did not show, and malformed frame refs", async () => {
+    const { run } = await setup();
+    expect(await run('return await page.ref("f1:e1").click();')).toMatchObject({ ok: false, code: "STALE_SNAPSHOT", summary: expect.stringContaining("no outline of the current page has been read") });
+    await run("return await page.snapshot();");
+    expect(await run('return await page.ref("f9:e1").click();')).toMatchObject({ ok: false, code: "STALE_SNAPSHOT", summary: expect.stringContaining("the latest outline of this page has no frame f9") });
+    for (const ref of ["f0:e1", "f1:x1", "f1e1", "f1:f2:e1", "F1:e1"]) {
+      expect((await run(`return page.ref(${JSON.stringify(ref)});`)).summary).toContain("refs look like");
+    }
+  });
+
+  it("reports a frame that went away during an action without claiming the effect", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      const { tab, run } = await setup();
+      await run("return await page.snapshot();");
+      tab.removeFrame(5);
+      const pending = run('return await page.ref("f1:e2").click();');
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(await pending).toMatchObject({ ok: false, code: "TAB_CHANGED", summary: expect.stringContaining("Lost contact with frame f1: it navigated, reloaded, or was removed, and the action may have taken effect") });
+
+      // A click that navigates the frame tears its content script down mid-answer; the frame answers again from its new document.
+      const { tab: other, run: runOther } = await setup();
+      await runOther("return await page.snapshot();");
+      other.sendMessage.mockImplementationOnce(async () => { throw new Error("Message manager disconnected"); });
+      const navigating = runOther('return await page.ref("f2:e1").click();');
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(await navigating).toMatchObject({ ok: true, summary: `Clicked; frame f2 navigated to ${RECAPTCHA}. Its earlier refs are invalid; read a snapshot.` });
+      expect(other.requestsTo(6).at(-1)).toMatchObject({ type: "page.health", frameId: 6 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("searches only the top document with role locators and points at frame refs", async () => {
+    const { run } = await setup();
+    await run("return await page.snapshot();");
+    const missing = await run('return await page.getByRole("button", {name: "Pay", exact: true}).click();');
+    expect(missing).toMatchObject({ ok: false, code: "TARGET_MISSING", summary: expect.stringContaining('reached only by ref, like page.ref("f1:e3")') });
   });
 });
