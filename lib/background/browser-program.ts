@@ -21,7 +21,7 @@ Output: bare expression statements (e.g. \`await x.click();\`) are printed, assi
 Tabs: fs.list("/tabs") (user tabs), fs.list("/agent-tabs") (hidden tabs this chat opened). const page = browser.tab("/tabs/12/page.md"); const res = await browser.open("https://…") opens a hidden agent tab.
 Reading: await page.snapshot() returns the page outline: text in document order with interactive elements inlined as [e5 button "Save"], [e7 textbox "Email" type=email required value="…"], [e9 link "Docs" → /docs], [e3 combobox "Country" selected="…" options: …]. Includes open/closed shadow DOM and iframes: a cross-origin frame appears in place as [frame f2 "Title" (url)], its lines indented, then [/frame f2], and its refs carry the frame's name (f2:e4); a frame bside cannot read stays one [frame … not readable] line. Long pages are paged: snapshot({offset: 16000, maxChars: 16000}) continues where the notice says (maxChars ≤ 40000). fs.read(tabPath) equals snapshot().
 Tables: a line like [table e12 "Caption" 340 rows × 6 cols] (or [grid …]) marks a data table. await page.table("e12") (or page.ref("f2:e7").table(), page.getByRole("table", {name: "Caption"}).table()) returns {caption, headers, rows, totalRows, offset, nextOffset} as JSON, ${TABLE_LIMITS.defaultRows} rows at a time; page on with table("e12", {offset: 50, limit: 100}) (limit ≤ ${TABLE_LIMITS.maxRows}). Multi-row headers read "Group / Column", a spanned cell repeats in every row and column it covers, and a cell lists the refs of controls in it ("Alice [e14 link]"). Read rankings, cohorts, and comparisons from it rather than from outline text.
-Searching: await page.find("text") lists matching outline lines (with refs) and their offsets — use it on long pages instead of reading everything. await page.waitFor("text", 8000) waits up to 15000 ms for text to appear. await web.search("query") returns web results (title, URL, snippet) from a hidden search tab; open results with browser.open(url).
+Searching: await page.find("text") lists matching outline lines (with refs) and their offsets — use it on long pages instead of reading everything. await page.waitFor("text", 8000) waits up to 15000 ms for text to appear. await web.search("query") runs the user's own search engine in a hidden search tab and returns up to 10 results (title, URL, snippet), plus a short answer box when the engine shows one; open a result with browser.open(url) only when its snippet is not enough. If the engine shows a consent page or CAPTCHA, web.search fails and says so: ask the user with request_user_help on the search tab, then search again.
 Targeting: page.ref("e5") (or page.ref("f2:e4") inside a frame) targets the element with that ref from your latest snapshot/find/diff of that page; refs stay valid until the page (or, for f2:e4, that frame) navigates or reloads. page.getByRole("button", {name: "Save"}) matches a unique element by role and case-insensitive name substring ({exact: true} for exact). page.getByText("Save") matches any interactive element by name. Both search the top document and its same-origin frames only. Ambiguous or missing matches fail and list candidate refs.
 Actions (on a locator): click(), hover() (moves the pointer onto it, e.g. to open a menu that opens on mouseover; leaves the element hovered before), dragTo(page.ref("e9")) (drags it onto another element in the same page or frame: HTML drag and drop for draggable items, pointer events otherwise; items in the outline as [eN draggable …] are drag sources), fill(text) (inputs, textareas, rich-text editors; dates as YYYY-MM-DD), fill(text, {commit: true}) (then Enter and blur, for custom date pickers that accept typed dates in their own format, often their placeholder's; reports the value the field kept), selectOption("label or value" | [...]), choose("option text") (native selects and custom comboboxes/listboxes: opens it, types the text into an editable one to filter, waits up to 5 s for role=option items, clicks the one matching exactly or else the only one containing the text, and reports what the field shows; fails listing the options when none or several match), setChecked(bool), check(), uncheck(), press("Enter"|"Tab"|"Escape"|"Space"|"Backspace"|"Delete"|"ArrowDown"|"Home"|"PageDown"|…, or a chord such as "Control+Enter", "Shift+Tab", "Meta+k": modifiers Control, Alt, Shift, Meta; a letter or digit only with Control, Alt, or Meta; copy/cut/paste are refused. Keys reach the page's own handlers only, so browser shortcuts and Tab focus moves do not happen), setInputFiles("/workspace/file.txt" | [...]) attaches scratch files (text or saved images) to a file input. Each action reports the effect, native validation problems, and the page outline lines that appeared (+) or disappeared (−). Use that diff to verify outcomes.
 Page methods: navigate(url), goBack(), scroll("down"|"up", "page"|"line"), path().
@@ -265,10 +265,6 @@ const PARALLEL_CALLS = 8;
 const OUTPUT_LIMIT = 40_000;
 /** Longest string `+` may build, so repeated `s = s + s` cannot grow without bound. */
 const ADD_LIMIT = 256_000;
-const SEARCH_ENGINES = [
-  { name: "DuckDuckGo", url: (query: string) => `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}` },
-  { name: "Bing", url: (query: string) => `https://www.bing.com/search?q=${encodeURIComponent(query)}` },
-];
 
 class ProgramError extends Error {
   constructor(message: string, readonly code: NonNullable<ToolResult["code"]>) { super(message); }
@@ -1474,16 +1470,12 @@ export class BrowserProgram {
     return files;
   }
 
-  async #openTab(
-    url: string,
-    signal: AbortSignal,
-    role: AgentTabRole = "agent",
-  ): Promise<number> {
+  async #openTab(url: string, signal: AbortSignal): Promise<number> {
     this.#visited.push(url);
-    if (role === "agent") this.#pages.add(url);
+    this.#pages.add(url);
     this.onEffect();
     const tabId = await this.tabs.createTab(url);
-    this.state.adoptTab(tabId, this.sessionId, role);
+    this.state.adoptTab(tabId, this.sessionId);
     // Finish hiding a newly created tab even if cancelled during creation.
     try {
       await this.tabs.hideTab(tabId);
@@ -1507,49 +1499,57 @@ export class BrowserProgram {
     return tabId;
   }
 
+  /**
+   * Searches with the user's default engine (Firefox's `search.query`) in the
+   * session's hidden search tab, opened blank on first use. Returns a compact
+   * result list, never a snapshot. A consent wall or CAPTCHA fails the call
+   * with directions to ask the user for help in that tab; there is no
+   * fallback to another engine.
+   */
   async #search(query: string, signal: AbortSignal): Promise<string> {
     if (!query.trim() || query.length > 400)
       throw new Error("web.search() expects a 1–400 character query.");
     let tabId = this.state.searchTab(this.sessionId);
-    const reusable =
-      tabId !== null &&
-      (await this.tabs.listTabs()).some((tab) => tab.id === tabId);
-    for (const [index, engine] of SEARCH_ENGINES.entries()) {
+    if (tabId === null || !(await this.tabs.allTabs()).some((tab) => tab.id === tabId)) {
       signal.throwIfAborted();
-      const url = engine.url(query);
-      if (index === 0 && !reusable) {
-        tabId = await this.#openTab(url, signal, "search");
-      } else {
-        const navigated = await (await this.#controller(tabId!)).navigate(url);
-        if (!navigated.ok)
-          throw this.#pageError(
-            {
-              code: navigated.code ?? "NAVIGATION_INTERRUPTED",
-              message: navigated.summary,
-            },
-            tabId!,
-          );
-      }
-      this.state.observed.delete(tabId!);
-      const extracted = await (await this.#controller(tabId!)).searchResults();
-      if (!extracted.ok) throw this.#pageError(extracted.error, tabId!);
-      const { results, excerpt } = extracted.value;
-      if (results.length) {
-        return [
-          `Web results for ${JSON.stringify(query)} via ${engine.name} (search tab ${this.#path(tabId!)}). Open a result with browser.open(url).`,
-          "BEGIN_UNTRUSTED_PAGE",
-          ...results.map(
-            (result, position) =>
-              `${position + 1}. ${result.title}\n   ${result.url}${result.snippet ? `\n   ${result.snippet}` : ""}`,
-          ),
-          "END_UNTRUSTED_PAGE",
-        ].join("\n");
-      }
-      if (index === SEARCH_ENGINES.length - 1) {
-        return `No web results could be extracted for ${JSON.stringify(query)} (search tab ${this.#path(tabId!)}). Page excerpt:\nBEGIN_UNTRUSTED_PAGE\n${excerpt}\nEND_UNTRUSTED_PAGE`;
+      this.onEffect();
+      tabId = await this.tabs.createBlankTab();
+      this.state.adoptTab(tabId, this.sessionId, "search");
+      try {
+        await this.tabs.hideTab(tabId);
+      } catch {
+        throw new Error(`Created the search tab ${this.#path(tabId)} but Firefox could not hide it. The tab remains visible.`);
       }
     }
-    throw new Error("Search failed.");
+    signal.throwIfAborted();
+    this.state.touchTab(tabId);
+    // Results are page text.
+    this.#tainted = true;
+    const searched = await this.tabs.search(tabId, query);
+    this.state.observed.delete(tabId);
+    if (!searched.ok) throw this.#pageError(searched.error, tabId);
+    const { engineName, url, results, answer, blocked, excerpt } = searched.value;
+    this.#visited.push(url);
+    const path = this.#path(tabId);
+    if (blocked) {
+      throw new ProgramError(
+        `${engineName} (the user's search engine) is showing ${blocked === "consent" ? "a consent page" : "a CAPTCHA or bot check"} instead of results in the search tab ${path}. Only the user can clear it: call request_user_help with tab "${path}", kind "verification", and a reason such as "${engineName} wants you to ${blocked === "consent" ? "accept or reject its cookie consent" : "prove you are not a robot"} before it shows search results." When they are done, run web.search again. Do not switch to another search engine or site to get around it.`,
+        "UNSUPPORTED_PAGE",
+      );
+    }
+    if (!results.length) {
+      return `No web results could be extracted for ${JSON.stringify(query)} from ${engineName} (search tab ${path}). Page excerpt:\nBEGIN_UNTRUSTED_PAGE\n${excerpt}\nEND_UNTRUSTED_PAGE`;
+    }
+    return [
+      `Web results for ${JSON.stringify(query)} from ${engineName}, the user's search engine (search tab ${path}). Open a result with browser.open(url) only when its snippet is not enough.`,
+      "BEGIN_UNTRUSTED_PAGE",
+      ...(answer ? [`Answer box: ${answer}`] : []),
+      ...results.map(
+        (result, position) =>
+          `${position + 1}. ${result.title}\n   ${result.url}${result.snippet ? `\n   ${result.snippet}` : ""}`,
+      ),
+      "END_UNTRUSTED_PAGE",
+    ].join("\n");
   }
 
   async #site(

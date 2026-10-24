@@ -199,6 +199,31 @@ export interface SearchResult {
   snippet: string;
 }
 
+/** Most organic results one `web.search` returns. */
+export const SEARCH_RESULT_LIMIT = 10;
+
+/** The engines with their own result extractors; any other engine's page is read generically. */
+export type SearchEngineId = "google" | "bing" | "duckduckgo" | "other";
+
+/**
+ * What the search tab shows after a search with the user's default engine:
+ * a compact result list, never a page snapshot. `blocked` is set when the
+ * engine shows a consent wall or a CAPTCHA instead of results; only the user
+ * can clear it.
+ */
+export interface SearchPage {
+  engine: SearchEngineId;
+  /** "Google", "Bing", "DuckDuckGo", or the page's host name. */
+  engineName: string;
+  url: string;
+  results: SearchResult[];
+  /** A featured snippet, direct answer, or knowledge panel, as one short block. */
+  answer: string | null;
+  blocked: "consent" | "captcha" | null;
+  /** The start of the page's text, shown when nothing could be extracted. */
+  excerpt: string;
+}
+
 /** A rectangle in CSS pixels, in document coordinates (relative to the top-left of the page). */
 export interface PageRect {
   x: number;

@@ -29,7 +29,7 @@ import type {
   PageTableRequest,
 } from "@/lib/protocol";
 import { MAX_FRAME_OUTLINE_CHARS } from "@/lib/protocol";
-import type { CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, PageArtifactSummary, PageErrorCode, PageFindResult, PageRect, PageSnapshot, PageTable, SearchResult, ToolResult } from "@/lib/domain/tools";
+import type { CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, PageArtifactSummary, PageErrorCode, PageFindResult, PageRect, PageSnapshot, PageTable, SearchPage, ToolResult } from "@/lib/domain/tools";
 import { findInOutline, lineOffsets, sliceOutline } from "@/lib/domain/outline";
 import { base64Bytes, formatKeyChord, isSessionId, validateHttpUrl, WORKSPACE_MAX_BINARY_BYTES } from "@/lib/validation";
 
@@ -203,6 +203,10 @@ export interface TabControllerBrowserApi {
       removeListener(callback: TabUpdatedListener): void;
     };
   };
+  /** Firefox's `search` API: runs the user's default engine. Needs the `search` permission. */
+  search?: {
+    query(properties: { text: string; tabId: number }): Promise<void>;
+  };
   sessions?: {
     getTabValue(tabId: number, key: string): Promise<unknown>;
     setTabValue(tabId: number, key: string, value: unknown): Promise<void>;
@@ -263,6 +267,14 @@ export class TabController {
     if (!validateHttpUrl(url) || !isSupportedUrl(url)) throw new Error("Expected a supported HTTP(S) URL.");
     if (!this.#browserApi.tabs.create) throw new Error("Tab creation is unavailable.");
     const tab = await this.#browserApi.tabs.create({ url, active: false });
+    if (tab.id === undefined) throw new Error("Tab creation failed.");
+    return tab.id;
+  }
+
+  /** An empty background tab, for a search to load into (see `search`). */
+  async createBlankTab(): Promise<number> {
+    if (!this.#browserApi.tabs.create) throw new Error("Tab creation is unavailable.");
+    const tab = await this.#browserApi.tabs.create({ url: "about:blank", active: false });
     if (tab.id === undefined) throw new Error("Tab creation failed.");
     return tab.id;
   }
@@ -492,9 +504,26 @@ export class TabController {
     return this.#request<PageTable>(tabId, { type: "page.table", frameId: route.frameId, tabId, refPrefix: route.refPrefix, target, ...page }, "page.table");
   }
 
-  async searchResults(): Promise<PageOutcome<{ results: SearchResult[]; url: string; excerpt: string }>> {
-    if (this.#tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
-    return this.#request(this.#tabId, { type: "page.search-results", frameId: TOP_FRAME, tabId: this.#tabId }, "page.search-results");
+  /**
+   * Runs the user's default search engine in a tab with Firefox's
+   * `search.query`, waits for the results page, and reads it as a compact
+   * `SearchPage` (never a snapshot). The tab need not be bound or readable
+   * beforehand: a new search tab starts blank.
+   */
+  async search(tabId: number, text: string): Promise<PageOutcome<SearchPage>> {
+    const search = this.#browserApi.search;
+    if (!search) return pageError("UNSUPPORTED_PAGE", "Firefox's search API is unavailable.");
+    // Listen before searching, so the results page finishing early is not missed.
+    const deadline = Date.now() + NAVIGATION_TIMEOUT_MS;
+    const complete = this.#waitForTabComplete(tabId, deadline);
+    try {
+      await search.query({ text, tabId });
+    } catch {
+      return pageError("NAVIGATION_INTERRUPTED", "Firefox could not run the search in the search tab.");
+    }
+    const settled = await this.#settleNavigation(tabId, deadline, complete);
+    if (!settled.ok) return settled;
+    return this.#request<SearchPage>(tabId, { type: "page.search-results", frameId: TOP_FRAME, tabId }, "page.search-results");
   }
 
   /**
@@ -719,16 +748,15 @@ export class TabController {
     if (response.type === "page.snapshot") return { ok: true, value: { snapshot: response.snapshot, frames: response.frames } as T };
     if (response.type === "page.find") return { ok: true, value: { result: response.result, frames: response.frames } as T };
     if (response.type === "page.outline") return { ok: true, value: response.outline as T };
-    if (response.type === "page.search-results") return { ok: true, value: { results: response.results, url: response.url, excerpt: response.excerpt } as T };
+    if (response.type === "page.search-results") return { ok: true, value: response.page as T };
     if (response.type === "page.capture-prepare") return { ok: true, value: response.geometry as T };
     if (response.type === "page.table") return { ok: true, value: response.table as T };
     return pageError("TAB_CHANGED", "Unexpected response from the page.");
   }
 
   /** Waits for `tabs.onUpdated` completion, then probes `page.health` on a backoff until the deadline. */
-  async #settleNavigation(tabId: number): Promise<PageOutcome<{ url: string }>> {
-    const deadline = Date.now() + NAVIGATION_TIMEOUT_MS;
-    await this.#waitForTabComplete(tabId, deadline);
+  async #settleNavigation(tabId: number, deadline = Date.now() + NAVIGATION_TIMEOUT_MS, complete = this.#waitForTabComplete(tabId, deadline)): Promise<PageOutcome<{ url: string }>> {
+    await complete;
 
     for (const delay of PROBE_DELAYS_MS) {
       const remaining = deadline - Date.now();

@@ -20,7 +20,7 @@ import type {
   PageFindResult,
   PageSnapshot,
   PageTable,
-  SearchResult,
+  SearchPage,
   ToolCall,
   ToolResult,
 } from "@/lib/domain/tools";
@@ -212,9 +212,7 @@ export interface PageSearchResultsResponse {
   id: string;
   ok: true;
   type: "page.search-results";
-  results: SearchResult[];
-  url: string;
-  excerpt: string;
+  page: SearchPage;
 }
 
 export interface PageExecuteResponse {

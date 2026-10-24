@@ -17,7 +17,6 @@ import {
   createElementRefRegistry,
   executeDomAction,
   extractFrameOutline,
-  extractSearchResults,
   extractSnapshot,
   extractTable,
   findInPage,
@@ -26,6 +25,7 @@ import {
   settleDom,
 } from "@/lib/tools/page-executor";
 import { createPageShield } from "@/lib/tools/page-shield";
+import { readSearchPage } from "@/lib/tools/search-results";
 
 /** The shield shows again on its own if the background never ends a capture. */
 const CAPTURE_SHIELD_TIMEOUT_MS = 5_000;
@@ -105,8 +105,7 @@ export default defineContentScript({
         return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.outline", outline });
       }
       if (isPageSearchResultsRequest(message)) {
-        const excerpt = (document.body?.innerText ?? "").replace(/\s+/g, " ").trim().slice(0, 600);
-        return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.search-results", results: extractSearchResults(document), url: location.href, excerpt });
+        return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.search-results", page: readSearchPage(document, location.href) });
       }
       if (isPageExecuteRequest(message)) {
         return executeDomAction(document, registry, message.action, settleDom, { refPrefix: message.refPrefix, frameIdOf }).then((result) => (

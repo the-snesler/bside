@@ -27,7 +27,7 @@
 
 import { TABLE_LIMITS } from "@/lib/domain/tools";
 import type {
-  CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, KeyModifier, PageFindResult, PageRect, PageSnapshot, PageTable, PressKey, SearchResult,
+  CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, KeyModifier, PageFindResult, PageRect, PageSnapshot, PageTable, PressKey,
   TableRole, ToolResult, UploadFile,
 } from "@/lib/domain/tools";
 import { formatKeyChord } from "@/lib/validation";
@@ -166,11 +166,11 @@ function composedParent(element: Element): Element | null {
   }
 }
 
-function trimText(text: string): string {
+export function trimText(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
 
-function clip(text: string, limit: number): string {
+export function clip(text: string, limit: number): string {
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
 }
 
@@ -181,7 +181,7 @@ function isLocallyHidden(element: Element, style: CSSStyleDeclaration | null): b
 }
 
 /** Whether the element is rendered: it and every flat-tree ancestor are displayed and not aria-hidden. */
-function isRendered(element: Element): boolean {
+export function isRendered(element: Element): boolean {
   if (!element.isConnected) return false;
   const style = styleOf(element);
   if (style && (style.visibility === "hidden" || style.visibility === "collapse")) return false;
@@ -208,7 +208,7 @@ function rootLookup(element: Element, id: string): Element | null {
 }
 
 /** Visible text of a subtree in the flat tree, including image alt text, bounded. */
-function composedText(element: Element, limit: number, exclude?: Element): string {
+export function composedText(element: Element, limit: number, exclude?: Element): string {
   const parts: string[] = [];
   let size = 0;
   let budget = 600;
@@ -846,61 +846,6 @@ export function extractFrameOutline(document: Document, registry: ElementRefRegi
   const { lines } = boundOutline(outline.lines, maxChars, "[Frame outline truncated: it exceeds the frame size limit]");
   const frames = outline.frames.filter((frame) => frame.line < lines.length && lines[frame.line] === outline.lines[frame.line]);
   return { documentId: registry.documentId, url: document.location?.href ?? "", title: document.title ?? "", lines, frames, selectionText: selectionText(document) };
-}
-
-const SEARCH_ENGINE_HOSTS = ["duckduckgo.com", "bing.com", "google.com", "search.yahoo.com", "startpage.com"];
-
-function isSearchEngineHost(hostname: string): boolean {
-  return SEARCH_ENGINE_HOSTS.some((host) => hostname === host || hostname.endsWith(`.${host}`));
-}
-
-/** Unwraps a search engine's redirect link into its destination URL. */
-function resultDestination(href: string): string | null {
-  let url: URL;
-  try {
-    url = new URL(href);
-  } catch {
-    return null;
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
-  if (isSearchEngineHost(url.hostname)) {
-    const wrapped = url.searchParams.get("uddg") ?? (url.pathname === "/url" ? url.searchParams.get("q") ?? url.searchParams.get("url") : null);
-    if (wrapped) return resultDestination(wrapped);
-    const bing = url.searchParams.get("u");
-    if (bing?.startsWith("a1")) {
-      try {
-        return resultDestination(atob(bing.slice(2).replace(/-/g, "+").replace(/_/g, "/")));
-      } catch {
-        return null;
-      }
-    }
-    return null;
-  }
-  return url.href;
-}
-
-/** Generic organic-result extraction: external destinations with a title and nearby snippet text. */
-export function extractSearchResults(document: Document, limit = 10): SearchResult[] {
-  const results = new Map<string, SearchResult>();
-  for (const anchor of Array.from(document.querySelectorAll("a[href]"))) {
-    if (results.size >= limit) break;
-    const destination = resultDestination((anchor as HTMLAnchorElement).href);
-    if (!destination || results.has(destination) || !isRendered(anchor)) continue;
-    const title = composedText(anchor, 200);
-    if (title.length < 3 || /^https?:\/\//.test(title)) continue;
-    let snippet = "";
-    let container: Element | null = anchor.parentElement;
-    for (let depth = 0; container && depth < 5; depth++, container = container.parentElement) {
-      if (container.querySelectorAll("a[href]").length > 8) break;
-      const text = composedText(container, 600);
-      if (text.length >= title.length + 40) {
-        snippet = trimText(text.replace(title, ""));
-        break;
-      }
-    }
-    results.set(destination, { title, url: destination, snippet: clip(snippet, 300) });
-  }
-  return [...results.values()];
 }
 
 // ---------------------------------------------------------------------------

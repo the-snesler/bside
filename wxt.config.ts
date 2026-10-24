@@ -22,6 +22,9 @@ export default defineConfig({
       "webRequestBlocking",
       "tabHide",
       "sessions",
+      // web.search runs the user's default engine in the hidden search tab
+      // (search.query); no search service or API of bside's own.
+      "search",
       "https://api.openai.com/*",
       "https://auth.openai.com/*",
       // MCP directory servers (lib/mcp/servers.ts): Notion's MCP and OAuth

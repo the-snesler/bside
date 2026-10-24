@@ -6,7 +6,6 @@ import {
   describeChanges,
   executeDomAction,
   extractFrameOutline,
-  extractSearchResults,
   extractSnapshot,
   findInPage,
   measureForCapture,
@@ -235,21 +234,6 @@ describe("snapshot paging and find", () => {
     expect(result.count).toBe(1);
     expect(result.matches[0]!.text).toContain("## Ratings\nUser Score 76%");
     expect(findInPage(document, createElementRefRegistry("doc"), "search").matches[0]!.text).toContain('[e1 textbox "Search"]');
-  });
-});
-
-describe("search result extraction", () => {
-  it("unwraps redirect links into organic results with snippets and skips engine links", () => {
-    setBody(`
-      <div class="result"><h2><a href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.boxofficemojo.com%2Fyear%2Fworld%2F2020%2F&rut=x">2020 Worldwide Box Office</a></h2>
-        <a href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.boxofficemojo.com%2Fyear%2Fworld%2F2020%2F">The top grossing movies worldwide in 2020, ranked by total gross.</a></div>
-      <div class="result"><h2><a href="https://duckduckgo.com/y.js?ad_domain=ads.example">Sponsored</a></h2></div>
-      <a href="https://duckduckgo.com/settings">Settings</a>`);
-    expect(extractSearchResults(document)).toEqual([{
-      title: "2020 Worldwide Box Office",
-      url: "https://www.boxofficemojo.com/year/world/2020/",
-      snippet: expect.stringContaining("ranked by total gross"),
-    }]);
   });
 });
 

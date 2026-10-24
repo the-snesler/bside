@@ -6,7 +6,7 @@ import { saveMemorySettings } from "@/lib/storage";
 import type { MemoryApproval } from "@/lib/domain/memory";
 import type { ScratchFileEntry, ScratchStore } from "@/lib/background/browser-program";
 import { TabController, type TabControllerBrowserApi } from "@/lib/background/tab-controller";
-import type { DomAction, PageSnapshot, SearchResult } from "@/lib/domain/tools";
+import type { DomAction, PageSnapshot, SearchPage } from "@/lib/domain/tools";
 import type { SiteEnv } from "@/lib/sites/site-api";
 
 /** A scratch store over a slot map, standing in for the session's storage.local records. */
@@ -22,7 +22,12 @@ function memoryStore(initial: ScratchFileEntry[] = []) {
   return { store, slots, files };
 }
 
-function setup(options: { outline?: string; searchResults?: (url: string) => SearchResult[]; sites?: SiteEnv; memory?: boolean } = {}) {
+/** A Google results page for `url`, with `overrides`. */
+function googlePage(url: string, overrides: Partial<SearchPage> = {}): SearchPage {
+  return { engine: "google", engineName: "Google", url, results: [], answer: null, blocked: null, excerpt: "No results.", ...overrides };
+}
+
+function setup(options: { outline?: string; searchPage?: (url: string) => Partial<SearchPage>; sites?: SiteEnv; memory?: boolean } = {}) {
   const tabs = new Map([[1, { id: 1, url: "https://example.com", title: "Example", hidden: false }]]);
   const documents = new Map<number, string>([[1, "doc-1"]]);
   const actions: DomAction[] = [];
@@ -42,7 +47,8 @@ function setup(options: { outline?: string; searchResults?: (url: string) => Sea
       return { ok: true, type: "page.find", result: { documentId: documents.get(id) ?? `doc-${id}`, url: tabs.get(id)!.url, query: request.query, count: 1, matches: [{ offset: 0, text: '[e1 button "Continue"]' }] } };
     }
     if (request.type === "page.search-results") {
-      return { ok: true, type: "page.search-results", results: options.searchResults?.(tabs.get(id)!.url) ?? [], url: tabs.get(id)!.url, excerpt: "No results." };
+      const url = tabs.get(id)!.url;
+      return { ok: true, type: "page.search-results", page: googlePage(url, options.searchPage?.(url)) };
     }
     actions.push(request.action);
     return { ok: true, type: "page.execute", result: { ok: true, summary: "Clicked.\nPage changes (+1 −0 lines):\n+ Done" }, documentId: documents.get(id) ?? `doc-${id}` };
@@ -58,6 +64,13 @@ function setup(options: { outline?: string; searchResults?: (url: string) => Sea
     show: vi.fn(async (id) => { tabs.get(id)!.hidden = false; }),
     remove: vi.fn(async (id) => { tabs.delete(id); }),
     onUpdated: { addListener: vi.fn((listener) => setTimeout(() => listener(lastUpdated, { status: "complete" }, {}), 0)), removeListener: vi.fn() },
+  }, search: {
+    // The user's default engine is Google here.
+    query: vi.fn(async ({ text, tabId }) => {
+      lastUpdated = tabId;
+      tabs.get(tabId)!.url = `https://www.google.com/search?q=${encodeURIComponent(text)}`;
+      documents.set(tabId, `doc-${tabId}-${text}`);
+    }),
   } };
   const effect = vi.fn();
   const state = new WorkspaceState();
@@ -345,30 +358,67 @@ describe("browser program tabs, files, and search", () => {
     expect(state.agentTabs.has(2)).toBe(true);
   });
 
-  it("searches the web in one reusable hidden tab and falls back to a second engine", async () => {
-    const { run, api, state } = setup({
-      searchResults: (url) => url.includes("bing.com") || url.includes("box+office") || url.includes("box%20office")
-        ? [{ title: "2020 Worldwide Box Office", url: "https://www.boxofficemojo.com/year/world/2020/", snippet: "Top grossing" }]
-        : [],
+  it("searches with the user's engine in one reusable hidden search tab per session", async () => {
+    const { run, api, state, program } = setup({
+      searchPage: (url) => url.includes("box%20office")
+        ? { results: [{ title: "2020 Worldwide Box Office", url: "https://www.boxofficemojo.com/year/world/2020/", snippet: "Top grossing" }], answer: "Bad Boys for Life was the top film of 2020." }
+        : {},
     });
     const first = await run('return web.search("box office 2020");');
     expect(first.ok, first.summary).toBe(true);
-    expect(first.summary).toContain("via DuckDuckGo");
-    expect(first.summary).toContain("1. 2020 Worldwide Box Office\n   https://www.boxofficemojo.com/year/world/2020/\n   Top grossing");
-    expect(api.tabs.create).toHaveBeenCalledTimes(1);
-    expect(state.agentTabs.get(state.searchTab("s1")!)).toMatchObject({ sessionId: "s1", role: "search" });
+    expect(program.tainted).toBe(true);
+    // The tab starts blank, hidden, and tagged; Firefox's search API loads the user's engine into it.
+    expect(api.tabs.create).toHaveBeenCalledWith({ url: "about:blank", active: false });
+    const tabId = state.searchTab("s1")!;
+    expect(api.tabs.hide).toHaveBeenCalledWith(tabId);
+    expect(state.agentTabs.get(tabId)).toMatchObject({ sessionId: "s1", role: "search" });
+    expect(api.search!.query).toHaveBeenCalledWith({ text: "box office 2020", tabId });
+    expect(first.summary).toContain(`from Google, the user's search engine (search tab /agent-tabs/${tabId}/page.md)`);
+    expect(first.summary).toContain("BEGIN_UNTRUSTED_PAGE\nAnswer box: Bad Boys for Life was the top film of 2020.\n1. 2020 Worldwide Box Office\n   https://www.boxofficemojo.com/year/world/2020/\n   Top grossing\nEND_UNTRUSTED_PAGE");
+    expect((first.data as { visited: string[] }).visited).toEqual(["https://www.google.com/search?q=box%20office%202020"]);
+
     const second = await run('return web.search("obscure query");');
     expect(api.tabs.create).toHaveBeenCalledTimes(1);
-    expect(second.summary).toContain("via Bing");
+    expect(api.search!.query).toHaveBeenLastCalledWith({ text: "obscure query", tabId });
+    expect(second.summary).toContain("No web results could be extracted");
+    // No other engine is tried, and the tab is never navigated directly.
+    expect(api.search!.query).toHaveBeenCalledTimes(2);
+    expect(api.tabs.update).not.toHaveBeenCalled();
+
     // Another session gets its own search tab rather than seeing this one.
     const other = new BrowserProgram(new TabController(api), { state, sessionId: "s2", files: new ScratchFiles() }, () => {});
     expect((await other.execute('return web.search("box office 2020");', new AbortController().signal)).ok).toBe(true);
     expect(api.tabs.create).toHaveBeenCalledTimes(2);
-    expect(state.searchTab("s2")).not.toBe(state.searchTab("s1"));
+    expect(state.searchTab("s2")).not.toBe(tabId);
+  });
+
+  it.each([
+    ["consent", "a consent page", "accept or reject its cookie consent"],
+    ["captcha", "a CAPTCHA or bot check", "prove you are not a robot"],
+  ] as const)("fails a search the engine blocks with a %s page and points the model at request_user_help on the search tab", async (blocked, shown, reason) => {
+    const { run, api, state } = setup({ searchPage: () => ({ blocked, excerpt: "Before you continue" }) });
+    const result = await run('const r = await web.search("orchids"); return r;');
+    const path = `/agent-tabs/${state.searchTab("s1")}/page.md`;
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe("UNSUPPORTED_PAGE");
+    expect(result.summary).toContain(`Google (the user's search engine) is showing ${shown} instead of results in the search tab ${path}.`);
+    expect(result.summary).toContain(`call request_user_help with tab "${path}", kind "verification"`);
+    expect(result.summary).toContain(reason);
+    expect(result.summary).toContain("Do not switch to another search engine");
+    expect(api.search!.query).toHaveBeenCalledTimes(1);
+    expect(api.tabs.update).not.toHaveBeenCalled();
+  });
+
+  it("says so when Firefox's search API is unavailable", async () => {
+    const { run, api } = setup();
+    delete api.search;
+    const result = await run('return web.search("orchids");');
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain("Firefox's search API is unavailable");
   });
 
   it("reports the pages a program read, acted on, navigated, or opened, but not the search tab, for site notes", async () => {
-    const { run } = setup({ searchResults: () => [{ title: "R", url: "https://r.example/", snippet: "" }] });
+    const { run } = setup({ searchPage: () => ({ results: [{ title: "R", url: "https://r.example/", snippet: "" }] }) });
     const pages = async (source: string) => {
       const result = await run(source);
       expect(result.ok, result.summary).toBe(true);
