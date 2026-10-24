@@ -47,7 +47,7 @@ export function MemoryNotice(props: { changes: readonly MemoryChange[]; undo: Me
             </button>
           </>
         )}
-        {undo?.status === "undone" && <span class="memory-notice__done">· Undone</span>}
+        {undo?.status === "undone" && <><span aria-hidden="true">·</span><span class="memory-notice__done">Undone</span></>}
       </p>
       {undo?.error && <p class="memory-notice__error" role="status">{undo.error}</p>}
     </div>

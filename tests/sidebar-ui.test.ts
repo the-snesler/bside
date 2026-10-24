@@ -958,7 +958,7 @@ describe("history drawer", () => {
     await emit({ runId: null, conversationId: null, type: "memory.undone", payload: { requestId: "other", undone: [], error: "No." } });
     expect(button("Undoing…")).toBeDefined();
     await emit({ runId: null, conversationId: null, type: "memory.undone", payload: { requestId: command.id as string, undone: ["m2", "m1"], error: null } });
-    expect(root.querySelector(".memory-notice__done")?.textContent).toBe("· Undone");
+    expect(root.querySelector(".memory-notice__done")?.textContent).toBe("Undone");
     expect(button("Undo")).toBeUndefined();
   });
 
