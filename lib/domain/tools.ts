@@ -85,6 +85,11 @@ export interface PageSnapshot {
   end: number;
   totalChars: number;
   selectionText: string;
+  /**
+   * Document id of each cross-origin frame composed into the outline, by its
+   * name (`f3`); their refs (`f3:e12`) resolve against these. Absent when there are none.
+   */
+  frames?: Record<string, string>;
 }
 
 /**
@@ -118,6 +123,8 @@ export interface PageFindResult {
   /** Total matching outline lines; `matches` may be capped. */
   count: number;
   matches: { offset: number; text: string }[];
+  /** As `PageSnapshot.frames`. */
+  frames?: Record<string, string>;
 }
 
 export interface SearchResult {

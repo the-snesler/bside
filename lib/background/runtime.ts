@@ -23,7 +23,7 @@ import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
 import type { AgentTab } from "@/lib/background/browser-program";
 import type { SidebarHub } from "@/lib/background/sidebar-hub";
-import { TabController } from "@/lib/background/tab-controller";
+import { FrameAliases, TabController } from "@/lib/background/tab-controller";
 import { browserSiteEnv } from "@/lib/sites";
 import type { SiteEnv } from "@/lib/sites/site-api";
 import type { AgentTabTagV1, AgentTabTagV2, TabControllerBrowserApi, TabSnapshot } from "@/lib/background/tab-controller";
@@ -214,7 +214,9 @@ export class BackgroundRuntime {
       async (auth, signal) => auth.method === "chatgpt" ? this.#chatgpt.getAuth(signal) : auth,
       (id) => this.#modelCatalog.find((model) => model.id === id),
     );
-    this.#tabControllerFactory = options.tabControllerFactory ?? (() => new TabController(browser as unknown as TabControllerBrowserApi));
+    // One set of frame names for the background's lifetime, so `f3:e12` names the same frame in every run.
+    const frameAliases = new FrameAliases();
+    this.#tabControllerFactory = options.tabControllerFactory ?? (() => new TabController(browser as unknown as TabControllerBrowserApi, undefined, frameAliases));
     this.#sites = options.sites ?? browserSiteEnv();
     this.#approvalBadge = options.approvalBadge ?? null;
     this.#workspace.onOwnershipChange = () => void this.#queueAgentTabSync();

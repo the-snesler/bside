@@ -7,6 +7,10 @@
  * controller for an explicitly selected workspace tab. Agent-tab ownership is
  * recorded as a session tab value (`AGENT_TAB_TAG_KEY`) on the tab itself.
  * Screenshots go through `tabs.captureTab`, bounded here (see `screenshot`).
+ *
+ * A tab's outline is its top frame's, with each cross-origin frame's own
+ * outline spliced in at the frame's position (see `#composedOutline`). Frames
+ * get short names (`f3`, see `FrameAliases`) that prefix their refs.
  */
 
 import type {
@@ -16,13 +20,16 @@ import type {
   PageExecuteRequest,
   PageFindRequest,
   PageHealthRequest,
+  PageOutlineRequest,
   PageResponse,
   PageSearchResultsRequest,
   PageShieldRequest,
   PageShieldState,
   PageSnapshotRequest,
 } from "@/lib/protocol";
-import type { CaptureGeometry, DomAction, ElementTarget, PageArtifactSummary, PageErrorCode, PageFindResult, PageRect, PageSnapshot, SearchResult, ToolResult } from "@/lib/domain/tools";
+import { MAX_FRAME_OUTLINE_CHARS } from "@/lib/protocol";
+import type { CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, PageArtifactSummary, PageErrorCode, PageFindResult, PageRect, PageSnapshot, SearchResult, ToolResult } from "@/lib/domain/tools";
+import { findInOutline, lineOffsets, sliceOutline } from "@/lib/domain/outline";
 import { base64Bytes, isSessionId, validateHttpUrl, WORKSPACE_MAX_BINARY_BYTES } from "@/lib/validation";
 
 const NAVIGATION_TIMEOUT_MS = 10_000;
@@ -42,6 +49,61 @@ const CAPTURE_ATTEMPTS = [{ scale: 1, quality: 70 }, { scale: 0.7, quality: 55 }
 
 /** Firefox's frame id for a tab's top-level document. */
 const TOP_FRAME = 0;
+
+/**
+ * Bounds on the cross-origin frames composed into one tab outline: nesting
+ * depth (a frame in the top document is depth 1), how many are read, the
+ * characters each may add, and the characters all of them may add.
+ */
+export const FRAME_LIMITS = { depth: 3, frames: 20, charsPerFrame: 30_000, totalChars: 150_000 };
+/** How long a frame's content script may take to answer before the frame is shown as not readable. */
+const FRAME_TIMEOUT_MS = 3_000;
+/** The largest frame name (`f999999`), as refs allow. */
+const MAX_FRAME_ALIAS = 999_999;
+
+/**
+ * Short names for a tab's cross-origin frames: `f1`, `f2`, … in the order
+ * bside first sees them, never reused while the background runs, so a frame
+ * keeps its name (and a ref like `f3:e12` its frame) across snapshots. A
+ * frame's own document id then decides whether its refs are current.
+ */
+export class FrameAliases {
+  #tabs = new Map<number, { next: number; byFrame: Map<number, number>; byAlias: Map<number, { frameId: number; parentFrameId: number }> }>();
+
+  /** The frame's name number, assigning the next one on first sight; null once a tab has used them all. */
+  name(tabId: number, frameId: number, parentFrameId: number): number | null {
+    let tab = this.#tabs.get(tabId);
+    if (!tab) this.#tabs.set(tabId, tab = { next: 1, byFrame: new Map(), byAlias: new Map() });
+    let alias = tab.byFrame.get(frameId);
+    if (alias === undefined) {
+      if (tab.next > MAX_FRAME_ALIAS) return null;
+      alias = tab.next++;
+      tab.byFrame.set(frameId, alias);
+    }
+    tab.byAlias.set(alias, { frameId, parentFrameId });
+    return alias;
+  }
+
+  /** Firefox's id for a named frame and for the frame it was last seen in. */
+  lookup(tabId: number, alias: number): { frameId: number; parentFrameId: number } | null {
+    return this.#tabs.get(tabId)?.byAlias.get(alias) ?? null;
+  }
+
+  /** Drops a closed tab's names. */
+  forget(tabId: number): void {
+    this.#tabs.delete(tabId);
+  }
+}
+
+/** A tab's outline, composed from its top frame and the cross-origin frames in it. */
+interface ComposedOutline {
+  documentId: string;
+  url: string;
+  title: string;
+  lines: string[];
+  selectionText: string;
+  frames: Record<string, string>;
+}
 
 export const AGENT_TAB_TAG_KEY = "bside.agentTab";
 export const AGENT_TAB_ROLES = ["agent", "search"] as const;
@@ -144,13 +206,20 @@ export type BlankImageCheck = (dataUrl: string) => Promise<boolean>;
 export class TabController {
   #browserApi: TabControllerBrowserApi;
   #isBlank: BlankImageCheck;
+  #frames: FrameAliases;
   #tabId: number | null = null;
   #url: string | null = null;
   #title: string | null = null;
 
-  constructor(browserApi: TabControllerBrowserApi, isBlank: BlankImageCheck = isBlankImage) {
+  /** Pass the background's one `FrameAliases` so every controller names a tab's frames the same way. */
+  constructor(browserApi: TabControllerBrowserApi, isBlank: BlankImageCheck = isBlankImage, frames: FrameAliases = new FrameAliases()) {
     this.#browserApi = browserApi;
     this.#isBlank = isBlank;
+    this.#frames = frames;
+  }
+
+  get frames(): FrameAliases {
+    return this.#frames;
   }
 
   get tabId(): number | null {
@@ -169,7 +238,7 @@ export class TabController {
   async forTab(tabId: number): Promise<TabController> {
     const tab = (await this.listTabs()).find((tab) => tab.id === tabId);
     if (!tab) throw new Error("Tab is closed or unsupported.");
-    const controller = new TabController(this.#browserApi, this.#isBlank);
+    const controller = new TabController(this.#browserApi, this.#isBlank, this.#frames);
     controller.#tabId = tabId;
     controller.#url = tab.url!;
     controller.#title = tab.title ?? "";
@@ -227,6 +296,7 @@ export class TabController {
     if (!this.#browserApi.tabs.remove) throw new Error("Closing tabs is unavailable.");
     await this.untagAgentTab(tabId).catch(() => {});
     await this.#browserApi.tabs.remove(tabId);
+    this.#frames.forget(tabId);
   }
 
   /** The tab's agent tag (current or legacy), or null when it has none or holds anything malformed. */
@@ -294,7 +364,7 @@ export class TabController {
       return pageError("UNSUPPORTED_PAGE", "This page cannot be attached.");
     }
 
-    const outcome = await this.#request<PageSnapshot>(tab.id, { type: "page.snapshot", frameId: TOP_FRAME, tabId: tab.id, offset: 0, maxChars: ARTIFACT_SNAPSHOT_CHARS }, "page.snapshot");
+    const outcome = await this.#snapshotOf(tab.id, { offset: 0, maxChars: ARTIFACT_SNAPSHOT_CHARS });
     if (!outcome.ok) return outcome;
 
     this.#tabId = tab.id;
@@ -313,12 +383,90 @@ export class TabController {
 
   async snapshot(options: { offset: number; maxChars: number } = { offset: 0, maxChars: DEFAULT_SNAPSHOT_CHARS }): Promise<PageOutcome<PageSnapshot>> {
     if (this.#tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
-    return this.#request<PageSnapshot>(this.#tabId, { type: "page.snapshot", frameId: TOP_FRAME, tabId: this.#tabId, ...options }, "page.snapshot");
+    return this.#snapshotOf(this.#tabId, options);
+  }
+
+  /** The top frame slices its own outline; a page with cross-origin frames is composed and sliced here instead. */
+  async #snapshotOf(tabId: number, options: { offset: number; maxChars: number }): Promise<PageOutcome<PageSnapshot>> {
+    const top = await this.#request<{ snapshot: PageSnapshot; frames: number }>(tabId, { type: "page.snapshot", frameId: TOP_FRAME, tabId, ...options }, "page.snapshot");
+    if (!top.ok || !(top.value.frames > 0)) return top.ok ? { ok: true, value: top.value.snapshot } : top;
+    const composed = await this.#composedOutline(tabId);
+    if (!composed.ok) return composed;
+    const { documentId, url, title, lines, selectionText, frames } = composed.value;
+    const text = lines.join("\n");
+    const { start, end } = sliceOutline(text, options.offset, options.maxChars);
+    return { ok: true, value: { version: 2, tabId, documentId, url, title, text: text.slice(start, end), offset: start, end, totalChars: text.length, selectionText, frames } };
   }
 
   async find(query: string): Promise<PageOutcome<PageFindResult>> {
-    if (this.#tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
-    return this.#request<PageFindResult>(this.#tabId, { type: "page.find", frameId: TOP_FRAME, tabId: this.#tabId, query }, "page.find");
+    const tabId = this.#tabId;
+    if (tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
+    const top = await this.#request<{ result: PageFindResult; frames: number }>(tabId, { type: "page.find", frameId: TOP_FRAME, tabId, query }, "page.find");
+    if (!top.ok || !(top.value.frames > 0)) return top.ok ? { ok: true, value: top.value.result } : top;
+    const composed = await this.#composedOutline(tabId);
+    if (!composed.ok) return composed;
+    const { documentId, url, lines, frames } = composed.value;
+    return { ok: true, value: { documentId, url, query, ...findInOutline(lines, lineOffsets(lines), query), frames } };
+  }
+
+  /**
+   * The top frame's whole outline with each cross-origin frame's outline in
+   * place of its placeholder line: a `[frame f3 "Title" (url)]` header, the
+   * frame's lines indented, and `[/frame f3]`. Frames are read in document
+   * order within `FRAME_LIMITS`; one past a limit, or whose content script
+   * does not answer (still loading, sandboxed, or not a web page), stays a
+   * one-line placeholder with its URL.
+   */
+  async #composedOutline(tabId: number): Promise<PageOutcome<ComposedOutline>> {
+    const top = await this.#frameOutline(tabId, TOP_FRAME, "", MAX_FRAME_OUTLINE_CHARS);
+    if (!top.ok) return top;
+    const budget = { frames: FRAME_LIMITS.frames, chars: FRAME_LIMITS.totalChars };
+    const frames: Record<string, string> = {};
+    const lines = await this.#spliceFrames(tabId, TOP_FRAME, top.value, 1, budget, frames);
+    const { documentId, url, title, selectionText } = top.value;
+    return { ok: true, value: { documentId, url, title, lines, selectionText, frames } };
+  }
+
+  async #spliceFrames(tabId: number, frameId: number, outline: FrameOutline, depth: number, budget: { frames: number; chars: number }, documents: Record<string, string>): Promise<string[]> {
+    const lines: string[] = [];
+    let next = 0;
+    for (const child of outline.frames.toSorted((a, b) => a.line - b.line)) {
+      if (child.line < next || child.line >= outline.lines.length) continue;
+      lines.push(...outline.lines.slice(next, child.line));
+      next = child.line + 1;
+      lines.push(...await this.#childFrame(tabId, frameId, child, depth, budget, documents));
+    }
+    lines.push(...outline.lines.slice(next));
+    return lines;
+  }
+
+  async #childFrame(tabId: number, parentFrameId: number, child: ChildFrame, depth: number, budget: { frames: number; chars: number }, documents: Record<string, string>): Promise<string[]> {
+    const alias = this.#frames.name(tabId, child.frameId, parentFrameId);
+    const name = alias === null ? "" : ` f${alias}`;
+    const header = (url: string) => `[frame${name}${child.title ? ` ${JSON.stringify(child.title)}` : ""} (${clipUrl(url)})`;
+    if (alias === null) return [`${header(child.url)} not shown: too many frames]`];
+    if (depth > FRAME_LIMITS.depth) return [`${header(child.url)} not shown: nested too deeply]`];
+    if (budget.frames <= 0 || budget.chars < 500) return [`${header(child.url)} not shown: frame limit for one page reached]`];
+    budget.frames -= 1;
+    const outline = await this.#frameOutline(tabId, child.frameId, `f${alias}:`, Math.min(FRAME_LIMITS.charsPerFrame, budget.chars));
+    if (!outline.ok) return [`${header(child.url)} not readable: its content is not available to bside]`];
+    budget.chars -= outline.value.lines.reduce((total, line) => total + line.length + 1, 0);
+    documents[`f${alias}`] = outline.value.documentId;
+    const inner = await this.#spliceFrames(tabId, child.frameId, outline.value, depth + 1, budget, documents);
+    return [`${header(outline.value.url)}]`, ...inner.map((line) => `  ${line}`), `[/frame f${alias}]`];
+  }
+
+  /** One frame's whole outline, or an error when its content script does not answer in time. */
+  async #frameOutline(tabId: number, frameId: number, refPrefix: string, maxChars: number): Promise<PageOutcome<FrameOutline>> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<PageOutcome<FrameOutline>>((resolve) => {
+      timer = setTimeout(() => resolve(pageError("TAB_CHANGED", "The frame did not answer.")), FRAME_TIMEOUT_MS);
+    });
+    try {
+      return await Promise.race([this.#request<FrameOutline>(tabId, { type: "page.outline", frameId, tabId, refPrefix, maxChars }, "page.outline"), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async searchResults(): Promise<PageOutcome<{ results: SearchResult[]; url: string; excerpt: string }>> {
@@ -344,7 +492,7 @@ export class TabController {
     if (tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
     const capture = this.#browserApi.tabs.captureTab?.bind(this.#browserApi.tabs);
     if (!capture) return pageError("UNSUPPORTED_PAGE", "Screenshots are unavailable in this browser.");
-    const measured = await this.#request<CaptureGeometry>(tabId, { type: "page.capture-prepare", frameId: TOP_FRAME, tabId, target: request.target }, "page.capture-prepare");
+    const measured = await this.#request<CaptureGeometry>(tabId, { type: "page.capture-prepare", frameId: TOP_FRAME, tabId, refPrefix: "", target: request.target }, "page.capture-prepare");
     if (!measured.ok) return measured;
     try {
       const geometry = measured.value;
@@ -400,7 +548,7 @@ export class TabController {
   async act(action: DomAction): Promise<ActionOutcome> {
     const tabId = this.#tabId;
     if (tabId === null) return { result: { ok: false, code: "UNSUPPORTED_PAGE", summary: "No page is attached." }, documentId: null };
-    const request: PageExecuteRequest = { v: 1, id: crypto.randomUUID(), type: "page.execute", frameId: TOP_FRAME, tabId, action };
+    const request: PageExecuteRequest = { v: 1, id: crypto.randomUUID(), type: "page.execute", frameId: TOP_FRAME, tabId, refPrefix: "", action };
 
     let response: PageResponse | undefined;
     try {
@@ -455,8 +603,9 @@ export class TabController {
 
   async #request<T>(
     tabId: number,
-    body: Omit<PageSnapshotRequest, "v" | "id"> | Omit<PageFindRequest, "v" | "id"> | Omit<PageSearchResultsRequest, "v" | "id"> | Omit<PageCapturePrepareRequest, "v" | "id">,
-    type: "page.snapshot" | "page.find" | "page.search-results" | "page.capture-prepare",
+    body: Omit<PageSnapshotRequest, "v" | "id"> | Omit<PageFindRequest, "v" | "id"> | Omit<PageOutlineRequest, "v" | "id"> | Omit<PageSearchResultsRequest, "v" | "id"> |
+      Omit<PageCapturePrepareRequest, "v" | "id">,
+    type: "page.snapshot" | "page.find" | "page.outline" | "page.search-results" | "page.capture-prepare",
   ): Promise<PageOutcome<T>> {
     const request = { v: 1, id: crypto.randomUUID(), ...body };
     let response: PageResponse | undefined;
@@ -468,8 +617,9 @@ export class TabController {
     if (!response) return pageError("TAB_CHANGED", "The page did not respond.");
     if (!response.ok) return { ok: false, error: response.error };
     if (response.type !== type) return pageError("TAB_CHANGED", "Unexpected response from the page.");
-    if (response.type === "page.snapshot") return { ok: true, value: response.snapshot as T };
-    if (response.type === "page.find") return { ok: true, value: response.result as T };
+    if (response.type === "page.snapshot") return { ok: true, value: { snapshot: response.snapshot, frames: response.frames } as T };
+    if (response.type === "page.find") return { ok: true, value: { result: response.result, frames: response.frames } as T };
+    if (response.type === "page.outline") return { ok: true, value: response.outline as T };
     if (response.type === "page.search-results") return { ok: true, value: { results: response.results, url: response.url, excerpt: response.excerpt } as T };
     if (response.type === "page.capture-prepare") return { ok: true, value: response.geometry as T };
     return pageError("TAB_CHANGED", "Unexpected response from the page.");
@@ -604,6 +754,10 @@ function isSupportedUrl(url: string | undefined): boolean {
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
   return !UNSUPPORTED_HOSTNAME_SUFFIXES.some((suffix) => parsed.hostname.endsWith(suffix));
+}
+
+function clipUrl(url: string): string {
+  return url.length > 200 ? `${url.slice(0, 199)}…` : url;
 }
 
 function sleep(ms: number): Promise<void> {

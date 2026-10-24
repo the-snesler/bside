@@ -5,18 +5,22 @@ import {
   isPageExecuteRequest,
   isPageFindRequest,
   isPageHealthRequest,
+  isPageOutlineRequest,
   isPageSearchResultsRequest,
   isPageShieldRequest,
   isPageSnapshotRequest,
 } from "@/lib/protocol";
 import type { ContentMessage, PageResponse } from "@/lib/protocol";
 import {
+  buildOutline,
   createElementRefRegistry,
   executeDomAction,
+  extractFrameOutline,
   extractSearchResults,
   extractSnapshot,
   findInPage,
   measureForCapture,
+  settleDom,
 } from "@/lib/tools/page-executor";
 import { createPageShield } from "@/lib/tools/page-shield";
 
@@ -83,24 +87,31 @@ export default defineContentScript({
       if (isPageHealthRequest(message)) {
         return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.health", url: location.href });
       }
+      // Cross-origin frames are listed with Firefox's frame id, so the background can read them through their own instance.
       if (isPageSnapshotRequest(message)) {
-        const snapshot = extractSnapshot(document, message.tabId, registry, { offset: message.offset, maxChars: message.maxChars });
-        return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.snapshot", snapshot });
+        const outline = buildOutline(document, registry, { frameIdOf });
+        const snapshot = extractSnapshot(document, message.tabId, registry, { offset: message.offset, maxChars: message.maxChars }, outline);
+        return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.snapshot", snapshot, frames: outline.frames.length });
       }
       if (isPageFindRequest(message)) {
-        return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.find", result: findInPage(document, registry, message.query) });
+        const outline = buildOutline(document, registry, { frameIdOf });
+        return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.find", result: findInPage(document, registry, message.query, outline), frames: outline.frames.length });
+      }
+      if (isPageOutlineRequest(message)) {
+        const outline = extractFrameOutline(document, registry, message.maxChars, { refPrefix: message.refPrefix, frameIdOf });
+        return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.outline", outline });
       }
       if (isPageSearchResultsRequest(message)) {
         const excerpt = (document.body?.innerText ?? "").replace(/\s+/g, " ").trim().slice(0, 600);
         return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.search-results", results: extractSearchResults(document), url: location.href, excerpt });
       }
       if (isPageExecuteRequest(message)) {
-        return executeDomAction(document, registry, message.action).then((result) => (
+        return executeDomAction(document, registry, message.action, settleDom, { refPrefix: message.refPrefix, frameIdOf }).then((result) => (
           { v: 1, id: message.id, ok: true, type: "page.execute", result, documentId: registry.documentId }
         ));
       }
       if (isPageCapturePrepareRequest(message)) {
-        const measured = measureForCapture(document, registry, message.target);
+        const measured = measureForCapture(document, registry, message.target, { refPrefix: message.refPrefix, frameIdOf });
         if (!measured.ok) {
           const { code, summary } = measured.result;
           return Promise.resolve({ v: 1, id: message.id, ok: false, error: { code: code === "STALE_SNAPSHOT" || code === "TARGET_MISSING" ? code : "NOT_INTERACTABLE", message: summary, retryable: false, phase: "page" } });

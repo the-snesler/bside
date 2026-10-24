@@ -8,6 +8,7 @@ import {
   isPageExecuteRequest,
   isPageFindRequest,
   isPageHealthRequest,
+  isPageOutlineRequest,
   isPageCaptureDoneRequest,
   isPageCapturePrepareRequest,
   isPageSearchResultsRequest,
@@ -311,9 +312,34 @@ describe("isPageFindRequest", () => {
   });
 });
 
+describe("frame-scoped requests", () => {
+  const outline = { v: 1, id: "1", type: "page.outline", frameId: 21474836481, tabId: 1, refPrefix: "f3:", maxChars: 30000 };
+
+  it("accepts an outline request for any frame, bounded, with that frame's ref prefix", () => {
+    expect(isPageOutlineRequest(outline)).toBe(true);
+    expect(isPageOutlineRequest({ ...outline, frameId: 0, refPrefix: "", maxChars: 2_000_000 })).toBe(true);
+    expect(isPageOutlineRequest({ ...outline, maxChars: 2_000_001 })).toBe(false);
+    expect(isPageOutlineRequest({ ...outline, maxChars: 10 })).toBe(false);
+    expect(isPageOutlineRequest({ ...outline, frameId: -1 })).toBe(false);
+  });
+
+  it("gives the top frame no ref prefix and every other frame exactly one frame name", () => {
+    expect(isPageOutlineRequest({ ...outline, frameId: 0 })).toBe(false);
+    for (const refPrefix of ["", "f0:", "f3", "f3:e", "x3:", "f1234567:", "f3:f4:", 3]) {
+      expect(isPageOutlineRequest({ ...outline, refPrefix }), String(refPrefix)).toBe(false);
+    }
+    const click = { kind: "click", target: { kind: "ref", ref: "e1", documentId: "doc" } };
+    expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", frameId: 9, tabId: 1, refPrefix: "f2:", action: click })).toBe(true);
+    expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", frameId: 9, tabId: 1, action: click })).toBe(false);
+    expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", frameId: 0, tabId: 1, refPrefix: "f2:", action: click })).toBe(false);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 9, tabId: 1, refPrefix: "f2:", target: null })).toBe(true);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 9, tabId: 1, refPrefix: "", target: null })).toBe(false);
+  });
+});
+
 describe("isPageExecuteRequest: accepts the closed action union only", () => {
   const ref = { kind: "ref", ref: "e1", documentId: "doc-1" };
-  const execute = (action: unknown) => ({ v: 1, id: "1", type: "page.execute", frameId: 0, tabId: 1, action });
+  const execute = (action: unknown) => ({ v: 1, id: "1", type: "page.execute", frameId: 0, tabId: 1, refPrefix: "", action });
 
   it("accepts every action kind with ref and role targets", () => {
     for (const action of [
@@ -329,7 +355,7 @@ describe("isPageExecuteRequest: accepts the closed action union only", () => {
       { kind: "scroll", target: null, direction: "down", amount: "page" },
     ]) expect(validateDomAction(action), JSON.stringify(action)).not.toBeNull();
     expect(isPageExecuteRequest(execute({ kind: "click", target: ref }))).toBe(true);
-    expect(isPageExecuteRequest({ ...execute({ kind: "click", target: ref }), frameId: 21474836481 })).toBe(true);
+    expect(isPageExecuteRequest({ ...execute({ kind: "click", target: ref }), frameId: 21474836481, refPrefix: "f3:" })).toBe(true);
     expect(isPageExecuteRequest({ ...execute({ kind: "click", target: ref }), frameId: undefined })).toBe(false);
   });
 
@@ -352,7 +378,7 @@ describe("isPageExecuteRequest: accepts the closed action union only", () => {
       { kind: "fill", target: ref, text: "x".repeat(16_001) },
     ]) expect(validateDomAction(action), JSON.stringify(action)).toBeNull();
     expect(isPageExecuteRequest(execute({ kind: "click" }))).toBe(false);
-    expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", frameId: 0, action: { kind: "click", target: ref } })).toBe(false);
+    expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", frameId: 0, refPrefix: "", action: { kind: "click", target: ref } })).toBe(false);
   });
 });
 
@@ -369,11 +395,11 @@ describe("page shield messages", () => {
 
   it("accepts capture requests only with a tab id and a valid target or none", () => {
     const ref = { kind: "ref", ref: "e5", documentId: "doc" };
-    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, tabId: 3, target: null })).toBe(true);
-    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, tabId: 3, target: ref })).toBe(true);
-    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, tabId: 3, target: { kind: "css", selector: "#x" } })).toBe(false);
-    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, tabId: 3 })).toBe(false);
-    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, target: null })).toBe(false);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, refPrefix: "", tabId: 3, target: null })).toBe(true);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, refPrefix: "", tabId: 3, target: ref })).toBe(true);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, refPrefix: "", tabId: 3, target: { kind: "css", selector: "#x" } })).toBe(false);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, refPrefix: "", tabId: 3 })).toBe(false);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, refPrefix: "", target: null })).toBe(false);
     expect(isPageCaptureDoneRequest({ v: 1, id: "1", type: "page.capture-done", frameId: 0, tabId: 3 })).toBe(true);
     expect(isPageCaptureDoneRequest({ v: 1, id: "1", type: "page.capture-done", frameId: 0 })).toBe(false);
   });

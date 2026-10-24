@@ -13,6 +13,7 @@ import type {
   CaptureGeometry,
   DomAction,
   ElementTarget,
+  FrameOutline,
   HelpKind,
   PageArtifactSummary,
   PageErrorCode,
@@ -40,10 +41,14 @@ import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction, validateElementT
 // `tabs.sendMessage(tabId, request, { frameId })`; a content script answers
 // only requests naming its own frame. Snapshot, find, search results, the
 // shield, and capture-done are top-frame requests (`frameId` 0); health,
-// execute, and capture-prepare may go to any frame.
+// outline, execute, and capture-prepare may go to any frame. A frame other
+// than the top renders its refs with the prefix the background names it by
+// (`refPrefix`, e.g. `f3:`); the top frame's prefix is empty.
 // ---------------------------------------------------------------------------
 
 export const MAX_SNAPSHOT_CHARS = 40_000;
+/** Most characters one `page.outline` may return (the top frame's whole outline). */
+export const MAX_FRAME_OUTLINE_CHARS = 2_000_000;
 export const MAX_FIND_QUERY_LEN = 200;
 
 export interface PageHealthRequest {
@@ -80,12 +85,24 @@ export interface PageSearchResultsRequest {
   tabId: number;
 }
 
+/** One frame's whole outline, at most `maxChars`, with the cross-origin frames in it (`ChildFrame`). */
+export interface PageOutlineRequest {
+  v: 1;
+  id: string;
+  type: "page.outline";
+  frameId: number;
+  tabId: number;
+  refPrefix: string;
+  maxChars: number;
+}
+
 export interface PageExecuteRequest {
   v: 1;
   id: string;
   type: "page.execute";
   frameId: number;
   tabId: number;
+  refPrefix: string;
   action: DomAction;
 }
 
@@ -119,6 +136,7 @@ export interface PageCapturePrepareRequest {
   type: "page.capture-prepare";
   frameId: number;
   tabId: number;
+  refPrefix: string;
   target: ElementTarget | null;
 }
 
@@ -131,8 +149,8 @@ export interface PageCaptureDoneRequest {
   tabId: number;
 }
 
-export type PageRequest = PageHealthRequest | PageSnapshotRequest | PageFindRequest | PageSearchResultsRequest | PageExecuteRequest | PageShieldRequest |
-  PageCapturePrepareRequest | PageCaptureDoneRequest;
+export type PageRequest = PageHealthRequest | PageSnapshotRequest | PageFindRequest | PageOutlineRequest | PageSearchResultsRequest | PageExecuteRequest |
+  PageShieldRequest | PageCapturePrepareRequest | PageCaptureDoneRequest;
 
 export interface PageHealthResponse {
   v: 1;
@@ -148,6 +166,8 @@ export interface PageSnapshotResponse {
   ok: true;
   type: "page.snapshot";
   snapshot: PageSnapshot;
+  /** Cross-origin frames in the outline; when there are any, the background composes the tab's outline instead. */
+  frames: number;
 }
 
 export interface PageFindResponse {
@@ -156,6 +176,16 @@ export interface PageFindResponse {
   ok: true;
   type: "page.find";
   result: PageFindResult;
+  /** Cross-origin frames in the outline; when there are any, the background searches the composed outline instead. */
+  frames: number;
+}
+
+export interface PageOutlineResponse {
+  v: 1;
+  id: string;
+  ok: true;
+  type: "page.outline";
+  outline: FrameOutline;
 }
 
 export interface PageSearchResultsResponse {
@@ -210,6 +240,7 @@ export type PageResponse =
   | PageHealthResponse
   | PageSnapshotResponse
   | PageFindResponse
+  | PageOutlineResponse
   | PageSearchResultsResponse
   | PageExecuteResponse
   | PageShieldResponse
@@ -238,6 +269,13 @@ export function isPageFindRequest(value: unknown): value is PageFindRequest {
     candidate.query.trim().length > 0 && candidate.query.length <= MAX_FIND_QUERY_LEN;
 }
 
+export function isPageOutlineRequest(value: unknown): value is PageOutlineRequest {
+  if (!isEnvelope(value) || value.type !== "page.outline") return false;
+  const candidate = value as Record<string, unknown>;
+  return isFrameId(candidate.frameId) && isRefPrefix(candidate.frameId, candidate.refPrefix) && isTabId(candidate.tabId) &&
+    Number.isSafeInteger(candidate.maxChars) && (candidate.maxChars as number) >= 500 && (candidate.maxChars as number) <= MAX_FRAME_OUTLINE_CHARS;
+}
+
 export function isPageSearchResultsRequest(value: unknown): value is PageSearchResultsRequest {
   if (!isEnvelope(value) || value.type !== "page.search-results") return false;
   const candidate = value as Record<string, unknown>;
@@ -247,7 +285,8 @@ export function isPageSearchResultsRequest(value: unknown): value is PageSearchR
 export function isPageExecuteRequest(value: unknown): value is PageExecuteRequest {
   if (!isEnvelope(value) || value.type !== "page.execute") return false;
   const candidate = value as Record<string, unknown>;
-  return isFrameId(candidate.frameId) && isTabId(candidate.tabId) && validateDomAction(candidate.action) !== null;
+  return isFrameId(candidate.frameId) && isRefPrefix(candidate.frameId, candidate.refPrefix) && isTabId(candidate.tabId) &&
+    validateDomAction(candidate.action) !== null;
 }
 
 export function isPageShieldRequest(value: unknown): value is PageShieldRequest {
@@ -259,7 +298,8 @@ export function isPageShieldRequest(value: unknown): value is PageShieldRequest 
 export function isPageCapturePrepareRequest(value: unknown): value is PageCapturePrepareRequest {
   if (!isEnvelope(value) || value.type !== "page.capture-prepare") return false;
   const candidate = value as Record<string, unknown>;
-  return isFrameId(candidate.frameId) && isTabId(candidate.tabId) && (candidate.target === null || validateElementTarget(candidate.target) !== null);
+  return isFrameId(candidate.frameId) && isRefPrefix(candidate.frameId, candidate.refPrefix) && isTabId(candidate.tabId) &&
+    (candidate.target === null || validateElementTarget(candidate.target) !== null);
 }
 
 export function isPageCaptureDoneRequest(value: unknown): value is PageCaptureDoneRequest {
@@ -301,6 +341,11 @@ export function isContentMessageResponse(value: unknown): value is ContentMessag
 /** Firefox frame ids: 0 for the top frame, a large positive integer for a subframe. */
 export function isFrameId(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+/** The top frame's refs have no prefix; any other frame's name one frame (`f3:`). */
+function isRefPrefix(frameId: unknown, value: unknown): boolean {
+  return frameId === 0 ? value === "" : typeof value === "string" && /^f[1-9]\d{0,5}:$/.test(value);
 }
 
 function isTabId(value: unknown): value is number {

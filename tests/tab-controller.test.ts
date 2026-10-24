@@ -12,7 +12,7 @@ function buildSnapshot(url: string, title: string): PageSnapshot {
 }
 
 function snapshotResponse(id: string, url: string, title: string): PageResponse {
-  return { v: 1, id, ok: true, type: "page.snapshot", snapshot: buildSnapshot(url, title) };
+  return { v: 1, id, ok: true, type: "page.snapshot", snapshot: buildSnapshot(url, title), frames: 0 };
 }
 
 function healthResponse(id: string, url: string): PageResponse {
