@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Widgets Fixture</title>
+  </head>
+  <body>
+    <h1>Widgets Fixture</h1>
+
+    <nav aria-label="Main">
+      <a id="products-trigger" href="#products" aria-haspopup="true" aria-expanded="false">Products</a>
+      <ul id="products-menu" hidden>
+        <li><a href="#analytics">Analytics</a></li>
+        <li><a href="#billing">Billing</a></li>
+      </ul>
+      <a href="#pricing">Pricing</a>
+    </nav>
+
+    <h2>Retention by cohort</h2>
+    <table id="cohorts">
+      <caption>Weekly retention, 2026 cohorts</caption>
+      <thead>
+        <tr><th rowspan="2">Cohort</th><th colspan="2">Week 1</th><th colspan="2">Week 4</th></tr>
+        <tr><th>Users</th><th>Retained</th><th>Users</th><th>Retained</th></tr>
+      </thead>
+      <tbody>
+        <tr><th scope="row">January</th><td>1,200</td><td>48%</td><td>610</td><td>24%</td></tr>
+        <tr><th scope="row">February</th><td rowspan="2">980</td><td>51%</td><td colspan="2">not yet measured</td></tr>
+        <tr><th scope="row">March</th><td>45%</td><td>402</td><td>21%</td></tr>
+      </tbody>
+      <tfoot>
+        <tr><th scope="row">All</th><td>3,160</td><td>48%</td><td>1,012</td><td>23%</td></tr>
+      </tfoot>
+    </table>
+
+    <h2>Orders</h2>
+    <div role="grid" aria-label="Orders">
+      <div role="row"><span role="columnheader">Order</span><span role="columnheader">Status</span><span role="columnheader">Action</span></div>
+      <div role="row"><span role="rowheader">#1001</span><span role="gridcell">Shipped</span><span role="gridcell"><button>Track #1001</button></span></div>
+      <div role="row"><span role="rowheader">#1002</span><span role="gridcell">Processing</span><span role="gridcell"><button>Cancel #1002</button></span></div>
+    </div>
+
+    <h2>Priorities</h2>
+    <ol id="priorities">
+      <li draggable="true">Ship tables</li>
+      <li draggable="true">Fix flaky test</li>
+      <li draggable="true">Write docs</li>
+    </ol>
+
+    <h2>Shipping</h2>
+    <div>
+      <label for="country">Country</label>
+      <input id="country" role="combobox" aria-autocomplete="list" aria-controls="country-options" aria-expanded="false" autocomplete="off" />
+      <ul id="country-options" role="listbox" aria-label="Countries" hidden></ul>
+    </div>
+    <div>
+      <label for="ship-date">Ship date</label>
+      <input id="ship-date" placeholder="MM/DD/YYYY" autocomplete="off" />
+    </div>
+    <div>
+      <label for="note">Note (Ctrl+Enter saves)</label>
+      <textarea id="note"></textarea>
+    </div>
+    <p id="status" role="status"></p>
+
+    <script>
+      (function () {
+        var status = document.getElementById("status");
+
+        // Hover menu: opens on mouseenter, closes on mouseleave of the whole nav.
+        var trigger = document.getElementById("products-trigger");
+        var menu = document.getElementById("products-menu");
+        var nav = trigger.parentElement;
+        trigger.addEventListener("mouseenter", function () {
+          menu.hidden = false;
+          trigger.setAttribute("aria-expanded", "true");
+        });
+        nav.addEventListener("mouseleave", function () {
+          menu.hidden = true;
+          trigger.setAttribute("aria-expanded", "false");
+        });
+
+        // Sortable list: HTML drag and drop moves the dragged item before the one it is dropped on.
+        var list = document.getElementById("priorities");
+        var dragged = null;
+        list.addEventListener("dragstart", function (event) {
+          dragged = event.target.closest("li");
+          event.dataTransfer.setData("text/plain", dragged.textContent);
+        });
+        list.addEventListener("dragover", function (event) {
+          event.preventDefault();
+        });
+        list.addEventListener("drop", function (event) {
+          event.preventDefault();
+          var target = event.target.closest("li");
+          if (dragged && target && target !== dragged) list.insertBefore(dragged, target);
+          status.textContent = "Moved: " + event.dataTransfer.getData("text/plain");
+        });
+
+        // Country combobox: options arrive a moment after typing, like a remote search.
+        var countries = ["Cameroon", "Canada", "Chile", "Denmark", "Germany"];
+        var input = document.getElementById("country");
+        var options = document.getElementById("country-options");
+        var pending = null;
+        function render() {
+          var query = input.value.toLowerCase();
+          options.innerHTML = "";
+          countries.filter(function (country) { return country.toLowerCase().indexOf(query) !== -1; }).forEach(function (country) {
+            var option = document.createElement("li");
+            option.setAttribute("role", "option");
+            option.textContent = country;
+            options.appendChild(option);
+          });
+          options.hidden = false;
+          input.setAttribute("aria-expanded", "true");
+        }
+        input.addEventListener("input", function () {
+          clearTimeout(pending);
+          pending = setTimeout(render, 50);
+        });
+        input.addEventListener("click", render);
+        options.addEventListener("click", function (event) {
+          var option = event.target.closest("[role=option]");
+          if (!option) return;
+          input.value = option.textContent;
+          options.hidden = true;
+          input.setAttribute("aria-expanded", "false");
+          status.textContent = "Country: " + input.value;
+        });
+
+        // Ship date: a picker input that takes MM/DD/YYYY on Enter or blur and shows it as "Mon D, YYYY".
+        var shipDate = document.getElementById("ship-date");
+        var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        function commitDate() {
+          var match = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(shipDate.value);
+          if (match) {
+            shipDate.value = months[Number(match[1]) - 1] + " " + Number(match[2]) + ", " + match[3];
+            status.textContent = "Ship date: " + shipDate.value;
+          } else if (!/^[A-Z][a-z]{2} \d/.test(shipDate.value)) {
+            shipDate.value = "";
+          }
+        }
+        shipDate.addEventListener("keydown", function (event) {
+          if (event.key === "Enter") commitDate();
+        });
+        shipDate.addEventListener("blur", commitDate);
+
+        // Note: Ctrl+Enter (or Cmd+Enter) saves it.
+        document.getElementById("note").addEventListener("keydown", function (event) {
+          if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) status.textContent = "Note saved: " + event.target.value;
+        });
+      })();
+    </script>
+  </body>
+</html>
