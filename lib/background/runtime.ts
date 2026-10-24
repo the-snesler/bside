@@ -279,7 +279,8 @@ export class BackgroundRuntime {
   }
 
   /** Republishes an agent tab whose title, URL, or icon changed, so the sidebar's list stays current. */
-  handleTabUpdated(tabId: number, changeInfo: { title?: string; url?: string; favIconUrl?: string }): void {
+  handleTabUpdated(tabId: number, changeInfo: { title?: string; url?: string; favIconUrl?: string; status?: string }): void {
+    if (changeInfo.status === "loading" || changeInfo.url !== undefined) this.#tabControllerFactory().forgetPdf(tabId);
     if (!this.#workspace.agentTabs.has(tabId)) return;
     if (changeInfo.title === undefined && changeInfo.url === undefined && changeInfo.favIconUrl === undefined) return;
     void this.#queueAgentTabSync();

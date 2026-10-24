@@ -48,6 +48,13 @@ export class PdfReader {
     this.#extract = extract;
   }
 
+  /** A tab's document changed, even if its URL stayed the same. */
+  forgetTab(tabId: number): void {
+    for (const key of this.#texts.keys()) {
+      if (key.startsWith(`tab ${tabId} `)) this.#texts.delete(key);
+    }
+  }
+
   /**
    * The text of the PDF `load` yields, cached under `key`. `load` returns
    * null for something that is not a PDF, remembered like a text. A failure

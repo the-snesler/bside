@@ -262,6 +262,11 @@ export class TabController {
     return this.#tabId;
   }
 
+  /** Called on a tab's load/URL change so a viewer reload reads fresh PDF text. */
+  forgetPdf(tabId: number): void {
+    this.#pdfs.forgetTab(tabId);
+  }
+
   async listTabs(): Promise<TabSnapshot[]> {
     return (await this.allTabs()).filter((tab) => isSupportedUrl(tab.url));
   }
@@ -341,6 +346,7 @@ export class TabController {
     await this.untagAgentTab(tabId).catch(() => {});
     await this.#browserApi.tabs.remove(tabId);
     this.#frames.forget(tabId);
+    this.forgetPdf(tabId);
   }
 
   /** The tab's agent tag (current or legacy), or null when it has none or holds anything malformed. */
@@ -833,12 +839,14 @@ export class TabController {
   async navigate(url: string): Promise<ToolResult> {
     if (this.#tabId === null) return { ok: false, code: "UNSUPPORTED_PAGE", summary: "No page is attached." };
     if (!validateHttpUrl(url) || !isSupportedUrl(url)) return { ok: false, code: "INVALID_TOOL_ARGUMENTS", summary: "Expected a supported absolute HTTP(S) URL." };
+    this.forgetPdf(this.#tabId);
     await this.#browserApi.tabs.update(this.#tabId, { url });
     return this.#afterNavigation("Navigated");
   }
 
   async goBack(): Promise<ToolResult> {
     if (this.#tabId === null) return { ok: false, code: "UNSUPPORTED_PAGE", summary: "No page is attached." };
+    this.forgetPdf(this.#tabId);
     await this.#browserApi.tabs.goBack(this.#tabId);
     return this.#afterNavigation("Went back");
   }

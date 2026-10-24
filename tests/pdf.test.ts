@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { BrowserProgram, ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
 import { PdfReader, workerPdfExtractor, type PdfExtractor } from "@/lib/background/pdf";
 import { TabController, type TabControllerBrowserApi, type TabSnapshot } from "@/lib/background/tab-controller";
+import { BackgroundRuntime } from "@/lib/background/runtime";
+import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { bytesToBase64, isPdfHeader, looksLikePdfUrl, PDF_LIMITS, PDF_TIMEOUT_MS, PdfError, renderPdfText, type PdfText } from "@/lib/domain/pdf";
 import { extractPdfText } from "@/lib/pdf/extract";
 import { fetchPdf } from "@/lib/pdf/fetch";
@@ -258,6 +260,17 @@ describe("PDF tabs", () => {
     ]);
     expect((await (await controller.forTab(3)).snapshot()).ok).toBe(true);
     expect(fetches).toEqual([{ tabId: 4, url: REPORT_URL, credentials: "omit" }]);
+  });
+
+  it("refetches a PDF after its tab reloads at the same URL", async () => {
+    const { controller, extract } = pdfSetup();
+    const runtime = new BackgroundRuntime(new SidebarHub(), { tabControllerFactory: () => controller });
+    const tab = await controller.forTab(3);
+    await tab.snapshot();
+    expect(extract).toHaveBeenCalledTimes(1);
+    runtime.handleTabUpdated(3, { status: "loading" });
+    await tab.snapshot();
+    expect(extract).toHaveBeenCalledTimes(2);
   });
 
   it("refuses actions and screenshots on a PDF tab with a clear message", async () => {
