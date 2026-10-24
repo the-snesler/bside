@@ -118,6 +118,11 @@ describe("other engines", () => {
     expect(page.results.map((result) => result.url)).toContain("https://www.rhs.org.uk/plants/orchids");
   });
 
+  it("keeps ads and related questions out of generic fallback when there are no organic results", () => {
+    document.body.innerHTML = `<main id="search"><div id="tads"><a href="https://ads.example/"><h3>Sponsored offer</h3></a></div><section><h2>People also ask</h2><a href="https://questions.example/"><h3>Related question</h3></a></section></main>`;
+    expect(readSearchPage(document, "https://www.google.com/search?q=x").results).toEqual([]);
+  });
+
   it("does not call bot-check wording blocked when the page has results", () => {
     document.body.innerHTML = `${readFileSync("tests/fixtures/serp/generic.html", "utf8")}<p>Verify you are human</p>`;
     expect(readSearchPage(document, "https://www.ecosia.org/search?q=orchids").blocked).toBeNull();

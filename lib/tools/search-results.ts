@@ -145,8 +145,13 @@ function duckDuckGo(document: Document, limit: number): EngineRead {
 function generic(document: Document, url: URL, limit: number): SearchResult[] {
   const root = document.querySelector("main, [role='main'], #main, #results, #search") ?? document.body;
   if (!root) return [];
+  const skipped = [
+    ...Array.from(root.querySelectorAll("#tads, #tadsb, #bottomads, [data-text-ad], [aria-label='Ads'], [aria-label='Sponsored'], .b_ad, .b_adTop, .b_adBottom, [data-testid='ad'], .result--ad, [data-initq], .related-question-pair, g-scrolling-carousel")),
+    ...modulesHeaded(root, SKIPPED_MODULES),
+  ];
   const own = siteOf(url.hostname);
   const anchors = Array.from(root.querySelectorAll("a[href]")).filter((anchor) => {
+    if (skipped.some((module) => module.contains(anchor))) return false;
     const destination = resultDestination((anchor as HTMLAnchorElement).href);
     return destination !== null && siteOf(new URL(destination).hostname) !== own;
   });
