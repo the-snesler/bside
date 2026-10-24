@@ -29,12 +29,13 @@ import { HISTORY_RETENTIONS } from "@/lib/domain/conversation";
 import { MAX_HELP_NOTE_CHARS, TABLE_LIMITS } from "@/lib/domain/tools";
 import { REASONING_EFFORTS, type AppSettingsV1, type ChatGPTStatus, type ProviderDefinition } from "@/lib/domain/provider";
 import type { RunUsageV1 } from "@/lib/domain/usage";
+import type { PdfFetchResult } from "@/lib/domain/pdf";
 import { isSkill, isSkillName, type Skill, type SkillSummary } from "@/lib/domain/skills";
 import { isCustomInstructionsText, isSiteNote, isSiteOrigin, type SiteNote } from "@/lib/domain/instructions";
 import { isMemoryDraft, isMemoryName, MEMORY_WRITE_POLICIES, type MemoryApproval, type MemoryChange, type MemoryDraft, type MemoryEntry, type MemorySettingsV1 } from "@/lib/domain/memory";
 import { isMcpToolName, MCP_TRUST_LEVELS, type McpApproval, type McpServerStatus, type McpTrust } from "@/lib/domain/mcp";
 import { isMcpServerId } from "@/lib/mcp/servers";
-import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction, validateElementTarget } from "@/lib/validation";
+import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction, validateElementTarget, validateHttpUrl } from "@/lib/validation";
 
 // ---------------------------------------------------------------------------
 // Content script <-> background: PageRequest / PageResponse (tabs.sendMessage)
@@ -43,7 +44,7 @@ import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction, validateElementT
 // it is for (`frameId`, Firefox's id: 0 is the top frame) and is sent with
 // `tabs.sendMessage(tabId, request, { frameId })`; a content script answers
 // only requests naming its own frame. Snapshot, find, search results, the
-// shield, and capture-done are top-frame requests (`frameId` 0); health,
+// shield, capture-done, and fetch-pdf are top-frame requests (`frameId` 0); health,
 // outline, execute, table, and capture-prepare may go to any frame. A frame other
 // than the top renders its refs with the prefix the background names it by
 // (`refPrefix`, e.g. `f3:`); the top frame's prefix is empty.
@@ -168,8 +169,23 @@ export interface PageCaptureDoneRequest {
   tabId: number;
 }
 
+/**
+ * Fetches a PDF for another tab, one showing it in Firefox's viewer, where no
+ * content script runs (the background cannot fetch it: `connect-src`). With
+ * `credentials: "include"` only from a page on the PDF's own origin.
+ */
+export interface PageFetchPdfRequest {
+  v: 1;
+  id: string;
+  type: "page.fetch-pdf";
+  frameId: number;
+  tabId: number;
+  url: string;
+  credentials: "include" | "omit";
+}
+
 export type PageRequest = PageHealthRequest | PageSnapshotRequest | PageFindRequest | PageOutlineRequest | PageSearchResultsRequest | PageExecuteRequest |
-  PageTableRequest | PageShieldRequest | PageCapturePrepareRequest | PageCaptureDoneRequest;
+  PageTableRequest | PageShieldRequest | PageCapturePrepareRequest | PageCaptureDoneRequest | PageFetchPdfRequest;
 
 export interface PageHealthResponse {
   v: 1;
@@ -254,6 +270,14 @@ export interface PageCaptureDoneResponse {
   type: "page.capture-done";
 }
 
+export interface PageFetchPdfResponse {
+  v: 1;
+  id: string;
+  ok: true;
+  type: "page.fetch-pdf";
+  result: PdfFetchResult;
+}
+
 export interface PageErrorResponse {
   v: 1;
   id: string;
@@ -272,6 +296,7 @@ export type PageResponse =
   | PageShieldResponse
   | PageCapturePrepareResponse
   | PageCaptureDoneResponse
+  | PageFetchPdfResponse
   | PageErrorResponse;
 
 export function isPageHealthRequest(value: unknown): value is PageHealthRequest {
@@ -343,6 +368,13 @@ export function isPageCaptureDoneRequest(value: unknown): value is PageCaptureDo
   if (!isEnvelope(value) || value.type !== "page.capture-done") return false;
   const candidate = value as Record<string, unknown>;
   return candidate.frameId === 0 && isTabId(candidate.tabId);
+}
+
+export function isPageFetchPdfRequest(value: unknown): value is PageFetchPdfRequest {
+  if (!isEnvelope(value) || value.type !== "page.fetch-pdf") return false;
+  const candidate = value as Record<string, unknown>;
+  return candidate.frameId === 0 && isTabId(candidate.tabId) && validateHttpUrl(candidate.url) !== null &&
+    (candidate.credentials === "include" || candidate.credentials === "omit");
 }
 
 // ---------------------------------------------------------------------------

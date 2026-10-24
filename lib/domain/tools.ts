@@ -114,6 +114,8 @@ export interface PageSnapshot {
    * name (`f3`); their refs (`f3:e12`) resolve against these. Absent when there are none.
    */
   frames?: Record<string, string>;
+  /** Set when the tab shows a PDF: the outline is its text, read-only, with no refs. */
+  pdf?: { pages: number };
 }
 
 /**

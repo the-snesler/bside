@@ -26,6 +26,7 @@ import { ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
 import type { AgentTab } from "@/lib/background/browser-program";
 import type { SidebarHub } from "@/lib/background/sidebar-hub";
 import { FrameAliases, TabController } from "@/lib/background/tab-controller";
+import { PdfReader, workerPdfExtractor } from "@/lib/background/pdf";
 import { browserSiteEnv } from "@/lib/sites";
 import type { SiteEnv } from "@/lib/sites/site-api";
 import type { AgentTabTagV1, AgentTabTagV2, TabControllerBrowserApi, TabSnapshot } from "@/lib/background/tab-controller";
@@ -219,9 +220,11 @@ export class BackgroundRuntime {
       async (auth, signal) => auth.method === "chatgpt" ? this.#chatgpt.getAuth(signal) : auth,
       (id) => this.#modelCatalog.find((model) => model.id === id),
     );
-    // One set of frame names for the background's lifetime, so `f3:e12` names the same frame in every run.
+    // One set of frame names for the background's lifetime, so `f3:e12` names the same frame in every run,
+    // and one PDF reader, so a PDF is parsed once (in the bundled pdf-text worker, never in this page).
     const frameAliases = new FrameAliases();
-    this.#tabControllerFactory = options.tabControllerFactory ?? (() => new TabController(browser as unknown as TabControllerBrowserApi, undefined, frameAliases));
+    const pdfs = new PdfReader(workerPdfExtractor(() => new Worker(browser.runtime.getURL("/pdf-text.js"))));
+    this.#tabControllerFactory = options.tabControllerFactory ?? (() => new TabController(browser as unknown as TabControllerBrowserApi, undefined, frameAliases, pdfs));
     this.#sites = options.sites ?? browserSiteEnv();
     this.#approvalBadge = options.approvalBadge ?? null;
     this.#mcp = options.mcp ?? null;

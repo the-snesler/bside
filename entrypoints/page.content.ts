@@ -3,6 +3,7 @@ import {
   isPageCaptureDoneRequest,
   isPageCapturePrepareRequest,
   isPageExecuteRequest,
+  isPageFetchPdfRequest,
   isPageFindRequest,
   isPageHealthRequest,
   isPageOutlineRequest,
@@ -26,6 +27,7 @@ import {
 } from "@/lib/tools/page-executor";
 import { createPageShield } from "@/lib/tools/page-shield";
 import { readSearchPage } from "@/lib/tools/search-results";
+import { fetchPdf } from "@/lib/pdf/fetch";
 
 /** The shield shows again on its own if the background never ends a capture. */
 const CAPTURE_SHIELD_TIMEOUT_MS = 5_000;
@@ -136,6 +138,9 @@ export default defineContentScript({
       if (isPageCaptureDoneRequest(message)) {
         endCapture();
         return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.capture-done" });
+      }
+      if (isPageFetchPdfRequest(message)) {
+        return fetchPdf(message.url, message.credentials).then((result) => ({ v: 1, id: message.id, ok: true, type: "page.fetch-pdf", result }));
       }
       if (isPageShieldRequest(message) && shield) {
         shield.set(message.shield);

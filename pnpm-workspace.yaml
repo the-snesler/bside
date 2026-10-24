@@ -1,3 +1,6 @@
 allowBuilds:
   '@google/genai': false
   protobufjs: false
+# pdf.js renders to canvas only for page images; bside extracts text, so it never loads this native module.
+ignoredOptionalDependencies:
+  - '@napi-rs/canvas'
