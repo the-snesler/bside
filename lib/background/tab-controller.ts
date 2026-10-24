@@ -23,7 +23,7 @@ import type {
   PageSnapshotRequest,
 } from "@/lib/protocol";
 import type { CaptureGeometry, DomAction, ElementTarget, PageArtifactSummary, PageErrorCode, PageFindResult, PageRect, PageSnapshot, SearchResult, ToolResult } from "@/lib/domain/tools";
-import { isSessionId, validateHttpUrl } from "@/lib/validation";
+import { base64Bytes, isSessionId, validateHttpUrl, WORKSPACE_MAX_BINARY_BYTES } from "@/lib/validation";
 
 const NAVIGATION_TIMEOUT_MS = 10_000;
 const PROBE_DELAYS_MS = [100, 200, 400, 800, 1_600, 3_200];
@@ -33,8 +33,8 @@ export const ARTIFACT_SNAPSHOT_CHARS = 8_000;
 
 /** Longest side of a screenshot, in image pixels; larger captures are rendered at a smaller scale. */
 export const SCREENSHOT_MAX_DIMENSION = 1600;
-/** Most bytes one screenshot may have (decoded); a larger one is retaken smaller, then refused. */
-export const SCREENSHOT_MAX_BYTES = 1_500_000;
+/** Most bytes one screenshot may have (decoded), so any screenshot fits in a `/workspace` file; a larger one is retaken smaller, then refused. */
+export const SCREENSHOT_MAX_BYTES = WORKSPACE_MAX_BINARY_BYTES;
 /** A full-page screenshot covers at most this much of the page, in CSS pixels; the rest is cut. */
 export const FULL_PAGE_MAX_CSS = { width: 4_000, height: 12_000 };
 /** JPEG quality, then smaller scales and qualities tried in turn while an image is over the byte cap. */
@@ -534,13 +534,8 @@ function parseImageDataUrl(dataUrl: unknown, format: "jpeg" | "png"): { mimeType
   const prefix = `data:${mimeType};base64,`;
   if (typeof dataUrl !== "string" || !dataUrl.startsWith(prefix)) return null;
   const data = dataUrl.slice(prefix.length);
-  if (!data || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) return null;
-  return { mimeType, data, bytes: base64Bytes(data) };
-}
-
-/** Decoded size of base64 text. */
-export function base64Bytes(data: string): number {
-  return Math.floor((data.length * 3) / 4) - (data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0);
+  const bytes = base64Bytes(data);
+  return bytes ? { mimeType, data, bytes } : null;
 }
 
 /**

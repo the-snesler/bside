@@ -20,7 +20,9 @@ import { digestFromItems, isValidRunDigest } from "@/lib/domain/run-digest";
 import { addRunUsage, EMPTY_USAGE, hasTokens, isValidRunUsage, isValidUsageTotals, type RunUsageV1 } from "@/lib/domain/usage";
 import { DEFAULT_MODEL_ID, DEFAULT_REASONING_EFFORT } from "@/lib/providers/openai-models";
 import { deviceKey, type DeviceKey } from "@/lib/background/device-key";
-import { isSessionId, isWorkspacePath, validatePromptText, WORKSPACE_MAX_FILE_CHARS, WORKSPACE_MAX_FILES } from "@/lib/validation";
+import {
+  base64Bytes, binaryTypeFor, isBinaryFile, isSessionId, isWorkspacePath, validatePromptText, WORKSPACE_MAX_BINARY_TOTAL_BYTES, WORKSPACE_MAX_FILE_CHARS, WORKSPACE_MAX_FILES,
+} from "@/lib/validation";
 import type { ScratchFileEntry, ScratchStore } from "@/lib/background/browser-program";
 
 export type { AppSettingsV1 } from "@/lib/domain/provider";
@@ -401,7 +403,7 @@ export async function migrateCredentials(key: DeviceKey = deviceKey): Promise<vo
 //   local:conversation:<id>            ConversationRecordV2 (item count; the commit point for appends)
 //   local:conversation:<id>:items:<n>  ConversationChunkV1 (items n*CHUNK .. n*CHUNK+CHUNK-1)
 //   local:openConversation             OpenConversationV1 (the session the sidebar shows)
-//   local:workspace:<id>:<slot>        WorkspaceFileV1 (one /workspace file of the session; see below)
+//   local:workspace:<id>:<slot>        WorkspaceFileV2 (one /workspace file of the session; see below)
 //   local:queue:<id>                   MessageQueueV1 (messages typed while a run worked, until delivered)
 //
 // An append writes only the tail chunk and the session record, in one
@@ -811,38 +813,64 @@ export async function migrateConversation(): Promise<void> {
 // Workspace — each session's /workspace scratch files, one key per file slot.
 //
 // A session has WORKSPACE_MAX_FILES fixed slots, so writing, removing, or
-// renaming a file touches one key of at most WORKSPACE_MAX_FILE_CHARS, never
-// the whole workspace, and deleting a session removes a known key set without
+// renaming a file touches one key (at most WORKSPACE_MAX_FILE_CHARS of text or
+// WORKSPACE_MAX_BINARY_BYTES of binary), never the whole workspace, and deleting a session removes a known key set without
 // listing storage. The slot record carries its path; there is no separate
 // manifest that could disagree with the files.
 // ---------------------------------------------------------------------------
 
-export interface WorkspaceFileV1 {
-  version: 1;
-  path: string;
-  content: string;
-}
+/** One `/workspace` file: text, or a binary of an allowed type as base64 whose type its path's extension names. */
+export type WorkspaceFileV2 = { version: 2; path: string } & (
+  | { kind: "text"; content: string }
+  | { kind: "binary"; mimeType: string; data: string; bytes: number }
+);
 
 const workspaceKey = (id: string, slot: number) => `local:workspace:${id}:${slot}` as const;
 const workspaceKeys = (id: string) => Array.from({ length: WORKSPACE_MAX_FILES }, (_, slot) => workspaceKey(id, slot));
 
-function isValidWorkspaceFile(value: unknown): value is WorkspaceFileV1 {
-  if (typeof value !== "object" || value === null) return false;
+/** The file a slot record holds, revalidated; null when it is malformed. A pre-binary (version 1) record is a text file. */
+function readWorkspaceFile(value: unknown): WorkspaceFileV2 | null {
+  if (typeof value !== "object" || value === null) return null;
   const v = value as Record<string, unknown>;
-  return v.version === 1 && isWorkspacePath(v.path) && typeof v.content === "string" && v.content.length <= WORKSPACE_MAX_FILE_CHARS;
+  if (!isWorkspacePath(v.path)) return null;
+  const textType = binaryTypeFor(v.path) === null;
+  if (v.version === 1 && textType && typeof v.content === "string" && v.content.length <= WORKSPACE_MAX_FILE_CHARS) {
+    return { version: 2, path: v.path, kind: "text", content: v.content };
+  }
+  if (v.version !== 2) return null;
+  if (v.kind === "text") return textType && typeof v.content === "string" && v.content.length <= WORKSPACE_MAX_FILE_CHARS ? { version: 2, path: v.path, kind: "text", content: v.content } : null;
+  if (v.kind === "binary" && isBinaryFile(v.path, v.mimeType, v.data) && base64Bytes(v.data) === v.bytes) {
+    return { version: 2, path: v.path, kind: "binary", mimeType: v.mimeType as string, data: v.data as string, bytes: v.bytes as number };
+  }
+  return null;
 }
 
-/** A session's scratch files by slot. Malformed slots and later duplicates of a path are deleted. */
+/**
+ * A session's scratch files by slot. Malformed slots, later duplicates of a
+ * path, and binaries past the session's binary budget are deleted; version 1
+ * text records are rewritten as version 2.
+ */
 export async function loadWorkspaceFiles(sessionId: string): Promise<ScratchFileEntry[]> {
   const slots = await storage.getItems(workspaceKeys(sessionId));
   const files: ScratchFileEntry[] = [];
   const invalid: (typeof slots)[number]["key"][] = [];
+  const upgraded: { key: (typeof slots)[number]["key"]; value: WorkspaceFileV2 }[] = [];
+  let binaryBytes = 0;
   for (const [slot, { key, value }] of slots.entries()) {
     if (value === null || value === undefined) continue;
-    if (isValidWorkspaceFile(value) && !files.some((file) => file.path === value.path)) files.push({ slot, path: value.path, content: value.content });
-    else invalid.push(key);
+    const file = readWorkspaceFile(value);
+    if (!file || files.some((other) => other.path === file.path) ||
+        (file.kind === "binary" && binaryBytes + file.bytes > WORKSPACE_MAX_BINARY_TOTAL_BYTES)) {
+      invalid.push(key);
+      continue;
+    }
+    if (file.kind === "binary") binaryBytes += file.bytes;
+    if ((value as { version?: unknown }).version === 1) upgraded.push({ key, value: file });
+    const { version: _version, ...entry } = file;
+    files.push({ slot, ...entry });
   }
   if (invalid.length > 0) await storage.removeItems(invalid);
+  if (upgraded.length > 0) await storage.setItems(upgraded);
   return files;
 }
 
@@ -850,7 +878,7 @@ export async function loadWorkspaceFiles(sessionId: string): Promise<ScratchFile
 export function workspaceStore(sessionId: string): ScratchStore {
   return {
     load: () => loadWorkspaceFiles(sessionId),
-    write: ({ slot, path, content }) => storage.setItem(workspaceKey(sessionId, slot), { version: 1, path, content } satisfies WorkspaceFileV1),
+    write: ({ slot, ...file }) => storage.setItem(workspaceKey(sessionId, slot), { version: 2, ...file } satisfies WorkspaceFileV2),
     remove: (slot) => storage.removeItem(workspaceKey(sessionId, slot)),
   };
 }

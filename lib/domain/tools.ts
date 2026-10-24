@@ -36,12 +36,10 @@ export type ElementTarget =
   | { kind: "ref"; ref: string; documentId: string }
   | { kind: "role"; role: string; name: string | null; exact: boolean };
 
-/** A text file from `/workspace`, attached to a file input. Never host files. */
-export interface UploadFile {
-  name: string;
-  mimeType: string;
-  text: string;
-}
+/** A `/workspace` file attached to a file input: text, or a binary's base64 bytes. Never host files. */
+export type UploadFile =
+  | { name: string; mimeType: string; text: string }
+  | { name: string; mimeType: string; base64: string };
 
 export type PressKey = "Enter" | "Tab" | "Escape" | "Space" | "Backspace" | "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight";
 

@@ -702,8 +702,8 @@ export class BackgroundRuntime {
       latestRun && this.#debugOutputs.length ? fence(`[\n${this.#debugOutputs.join(",\n")}\n]`) : "No tool output captured for this chat in this background session.",
       "## Conversation log", fence(JSON.stringify(conversation, null, 2)),
       "## Partial response", fence(this.#activeRun?.sessionId === sessionId ? this.#activeRun.partialAssistantText : ""),
-      "## Scratch files", "This chat's /workspace files, kept until the chat is deleted.",
-      files ? fence(JSON.stringify(Object.fromEntries(files.map((file) => [file.path, file.content])), null, 2)) : "The scratch files could not be read.",
+      "## Scratch files", "This chat's /workspace files, kept until the chat is deleted. Binary files (saved screenshots) are listed by type and size, not exported.",
+      files ? fence(JSON.stringify(Object.fromEntries(files.map((file) => [file.path, file.kind === "text" ? file.content : `[binary ${file.mimeType}, ${file.bytes} bytes]`])), null, 2)) : "The scratch files could not be read.",
     ].join("\n\n") };
   }
 

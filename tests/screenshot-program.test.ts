@@ -5,7 +5,8 @@ import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController, type CaptureOptions, type TabControllerBrowserApi, type TabSnapshot } from "@/lib/background/tab-controller";
 import type { ConversationItem } from "@/lib/domain/conversation";
 import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
-import type { CaptureGeometry, ElementTarget } from "@/lib/domain/tools";
+import type { CaptureGeometry, DomAction, ElementTarget } from "@/lib/domain/tools";
+import { WORKSPACE_MAX_BINARY_BYTES, WORKSPACE_MAX_BINARY_TOTAL_BYTES } from "@/lib/validation";
 import { splitSystemMessage, TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
 
 /** Base64 for the fake image; tests assert it never lands anywhere persisted. */
@@ -19,6 +20,7 @@ function fakeTabs() {
   ]);
   const prepared: { tabId: number; target: ElementTarget | null }[] = [];
   const captures: { tabId: number; options: CaptureOptions }[] = [];
+  const executed: DomAction[] = [];
   const api: TabControllerBrowserApi = {
     tabs: {
       query: vi.fn(async () => [...tabs.values()]),
@@ -28,7 +30,7 @@ function fakeTabs() {
       hide: vi.fn(async (id: number) => { tabs.get(id)!.hidden = true; return [id]; }),
       captureTab: vi.fn(async (tabId: number, options: CaptureOptions) => {
         captures.push({ tabId, options });
-        return `data:image/jpeg;base64,${IMAGE_BASE64}`;
+        return `data:image/${options.format};base64,${IMAGE_BASE64}`;
       }),
       sendMessage: vi.fn(async (tabId: number, message: unknown) => {
         const request = message as { id: string; type: string; target?: ElementTarget | null; offset?: number; maxChars?: number };
@@ -50,21 +52,26 @@ function fakeTabs() {
           return { v: 1, id: request.id, ok: true, type: "page.capture-prepare", geometry };
         }
         if (request.type === "page.capture-done") return { v: 1, id: request.id, ok: true, type: "page.capture-done" };
+        if (request.type === "page.execute") {
+          executed.push((message as { action: DomAction }).action);
+          return { v: 1, id: request.id, ok: true, type: "page.execute", result: { ok: true, summary: "Attached." }, documentId };
+        }
         throw new Error(`unexpected ${request.type}`);
       }),
       onUpdated: { addListener: vi.fn(), removeListener: vi.fn() },
     },
   };
-  return { api, tabs, prepared, captures };
+  return { api, tabs, prepared, captures, executed };
 }
 
 function setupProgram(maxImages = 3) {
   const fake = fakeTabs();
   const state = new WorkspaceState();
   state.adoptTab(2, "s1");
-  const program = new BrowserProgram(new TabController(fake.api, async () => false), { state, sessionId: "s1", files: new ScratchFiles(), maxImages }, () => {});
+  const files = new ScratchFiles();
+  const program = new BrowserProgram(new TabController(fake.api, async () => false), { state, sessionId: "s1", files, maxImages }, () => {});
   const run = (source: string) => program.execute(source, new AbortController().signal);
-  return { ...fake, state, program, run };
+  return { ...fake, state, program, run, files };
 }
 
 describe("page.screenshot()", () => {
@@ -148,6 +155,72 @@ describe("page.screenshot()", () => {
     const result = await run('await browser.tab("/agent-tabs/2/page.md").screenshot();');
     expect(result).toMatchObject({ ok: false, code: "TARGET_MISSING" });
     expect(captures).toEqual([]);
+  });
+});
+
+describe("binary /workspace files", () => {
+  const BYTES = IMAGE_BASE64.length / 4 * 3;
+
+  it("saves a screenshot, reads back only its metadata, and views it again as an image", async () => {
+    const { run, program, files, captures } = setupProgram(2);
+    const saved = await run('await browser.tab("/tabs/1/page.md").screenshot({save: "/workspace/shot.jpg"});');
+    expect(saved.summary).toContain(`Saved to /workspace/shot.jpg (${BYTES} bytes).`);
+    expect(captures[0]!.options.format).toBe("jpeg");
+    expect(await files.read("/workspace/shot.jpg")).toEqual({ kind: "binary", mimeType: "image/jpeg", data: IMAGE_BASE64, bytes: BYTES });
+    program.takeImages();
+
+    const read = await run('return fs.read("/workspace/shot.jpg");');
+    expect(JSON.parse(read.summary)).toEqual({ path: "/workspace/shot.jpg", name: "shot.jpg", mimeType: "image/jpeg", bytes: BYTES, binary: true });
+    expect(read.summary).not.toContain(IMAGE_BASE64);
+    expect(program.takeImages()).toEqual([]);
+
+    const viewed = await run('await fs.view("/workspace/shot.jpg");');
+    expect(viewed.summary).toBe(`[image /workspace/shot.jpg, ${BYTES} bytes] (image 1 of this result)`);
+    expect(program.takeImages()).toEqual([{ mimeType: "image/jpeg", data: IMAGE_BASE64, placeholder: `[image /workspace/shot.jpg, ${BYTES} bytes]` }]);
+    expect((await run('await fs.view("/workspace/shot.jpg");')).code).toBe("LIMIT_EXCEEDED");
+  });
+
+  it("captures PNG for a .png path and refuses other save paths before capturing", async () => {
+    const { run, captures } = setupProgram();
+    expect((await run('await browser.tab("/tabs/1/page.md").screenshot({save: "/workspace/shot.png"});')).ok).toBe(true);
+    expect(captures[0]!.options).not.toHaveProperty("quality");
+    expect(captures[0]!.options.format).toBe("png");
+    for (const path of ["/workspace/shot.gif", "/workspace/shot.txt", "/tmp/shot.jpg", "/workspace/../shot.jpg"]) {
+      const result = await run(`await browser.tab("/tabs/1/page.md").screenshot({save: ${JSON.stringify(path)}});`);
+      expect(result.summary).toContain("save must be a /workspace path ending in .jpg, .jpeg, or .png");
+    }
+    expect(captures).toHaveLength(1);
+  });
+
+  it("uploads a saved binary file's bytes to a file input", async () => {
+    const { run, executed, files } = setupProgram();
+    await files.write("/workspace/shot.jpg", { kind: "binary", mimeType: "image/jpeg", data: IMAGE_BASE64, bytes: BYTES });
+    await files.write("/workspace/note.txt", { kind: "text", content: "hi" });
+    const result = await run('await browser.tab("/tabs/1/page.md").getByRole("file").setInputFiles(["/workspace/shot.jpg", "/workspace/note.txt"]);');
+    expect(result.ok, result.summary).toBe(true);
+    expect(executed).toEqual([{ kind: "upload", target: { kind: "role", role: "file", name: null, exact: false }, files: [
+      { name: "shot.jpg", mimeType: "image/jpeg", base64: IMAGE_BASE64 },
+      { name: "note.txt", mimeType: "text/plain", text: "hi" },
+    ] }]);
+  });
+
+  it("keeps binaries within the per-file and per-session caps and their types", async () => {
+    const { run, files } = setupProgram();
+    const big = "A".repeat(WORKSPACE_MAX_BINARY_BYTES / 3 * 4);
+    await expect(files.write("/workspace/huge.jpg", { kind: "binary", mimeType: "image/jpeg", data: `${big}AAAA`, bytes: WORKSPACE_MAX_BINARY_BYTES + 3 })).rejects.toThrow("Workspace limits");
+    const fits = WORKSPACE_MAX_BINARY_TOTAL_BYTES / WORKSPACE_MAX_BINARY_BYTES;
+    for (let n = 0; n < fits; n++) await files.write(`/workspace/p${n}.jpg`, { kind: "binary", mimeType: "image/jpeg", data: big, bytes: WORKSPACE_MAX_BINARY_BYTES });
+    await expect(files.write("/workspace/over.jpg", { kind: "binary", mimeType: "image/jpeg", data: "AAAA", bytes: 3 })).rejects.toThrow("Workspace limits");
+    // Replacing a file counts its new size, not both.
+    await files.write("/workspace/p0.jpg", { kind: "binary", mimeType: "image/jpeg", data: "AAAA", bytes: 3 });
+    await expect(files.write("/workspace/p0.png", { kind: "binary", mimeType: "image/jpeg", data: "AAAA", bytes: 3 })).rejects.toThrow("matching extension");
+
+    expect((await run('await fs.write("/workspace/fake.png", "text");')).summary).toContain("names a binary file type");
+    expect((await run('await fs.move("/workspace/p0.jpg", "/workspace/p0.txt");')).summary).toContain("keeps the file's type");
+    expect((await run('await fs.move("/workspace/p0.jpg", "/workspace/renamed.jpeg");')).ok).toBe(true);
+    expect((await run('await fs.view("/workspace/missing.png");')).summary).toContain("File does not exist");
+    await files.write("/workspace/doc.md", { kind: "text", content: "# Notes" });
+    expect((await run('await fs.view("/workspace/doc.md");')).summary).toContain("fs.view() shows images");
   });
 });
 

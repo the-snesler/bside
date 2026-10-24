@@ -44,7 +44,7 @@ const prompt = (id: string, text: string): ConversationItem => ({ id, kind: "mes
 async function sessionWith(count: number): Promise<string> {
   const { id } = await createSession();
   for (let i = 0; i < count; i += 1) await appendConversationItem(id, message(`m${i}`));
-  await workspaceStore(id).write({ slot: 63, path: "/workspace/notes.md", content: "Scratch" });
+  await workspaceStore(id).write({ slot: 63, path: "/workspace/notes.md", kind: "text", content: "Scratch" });
   return id;
 }
 
@@ -473,30 +473,56 @@ describe("storage: message queue", () => {
 });
 
 describe("storage: session workspace", () => {
+  const PNG = "iVBORw0KGgo=";
+
   it("stores each file in its own slot record and reads back only the session's files", async () => {
     const a = workspaceStore("a");
-    await a.write({ slot: 0, path: "/workspace/x.md", content: "X" });
-    await a.write({ slot: 5, path: "/workspace/dir/y.csv", content: "1,2" });
-    await workspaceStore("b").write({ slot: 0, path: "/workspace/x.md", content: "Other chat" });
-    expect((await browser.storage.local.get("workspace:a:5"))["workspace:a:5"]).toEqual({ version: 1, path: "/workspace/dir/y.csv", content: "1,2" });
-    expect(await loadWorkspaceFiles("a")).toEqual([{ slot: 0, path: "/workspace/x.md", content: "X" }, { slot: 5, path: "/workspace/dir/y.csv", content: "1,2" }]);
+    await a.write({ slot: 0, path: "/workspace/x.md", kind: "text", content: "X" });
+    await a.write({ slot: 5, path: "/workspace/dir/y.csv", kind: "text", content: "1,2" });
+    await workspaceStore("b").write({ slot: 0, path: "/workspace/x.md", kind: "text", content: "Other chat" });
+    expect((await browser.storage.local.get("workspace:a:5"))["workspace:a:5"]).toEqual({ version: 2, path: "/workspace/dir/y.csv", kind: "text", content: "1,2" });
+    expect(await loadWorkspaceFiles("a")).toEqual([{ slot: 0, path: "/workspace/x.md", kind: "text", content: "X" }, { slot: 5, path: "/workspace/dir/y.csv", kind: "text", content: "1,2" }]);
     await a.remove(0);
-    expect(await loadWorkspaceFiles("a")).toEqual([{ slot: 5, path: "/workspace/dir/y.csv", content: "1,2" }]);
+    expect(await loadWorkspaceFiles("a")).toEqual([{ slot: 5, path: "/workspace/dir/y.csv", kind: "text", content: "1,2" }]);
   });
 
-  it("revalidates files on read, deleting malformed, oversized, traversing, and duplicate ones", async () => {
+  it("round-trips a binary file as base64 with its type and size", async () => {
+    await workspaceStore("a").write({ slot: 1, path: "/workspace/shot.png", kind: "binary", mimeType: "image/png", data: PNG, bytes: 8 });
+    expect((await browser.storage.local.get("workspace:a:1"))["workspace:a:1"]).toEqual({ version: 2, path: "/workspace/shot.png", kind: "binary", mimeType: "image/png", data: PNG, bytes: 8 });
+    expect(await loadWorkspaceFiles("a")).toEqual([{ slot: 1, path: "/workspace/shot.png", kind: "binary", mimeType: "image/png", data: PNG, bytes: 8 }]);
+  });
+
+  it("rewrites a version 1 text record as version 2", async () => {
+    await browser.storage.local.set({ "workspace:a:0": { version: 1, path: "/workspace/ok.md", content: "fine" } });
+    expect(await loadWorkspaceFiles("a")).toEqual([{ slot: 0, path: "/workspace/ok.md", kind: "text", content: "fine" }]);
+    expect((await browser.storage.local.get("workspace:a:0"))["workspace:a:0"]).toEqual({ version: 2, path: "/workspace/ok.md", kind: "text", content: "fine" });
+  });
+
+  it("revalidates files on read, deleting malformed, oversized, traversing, mistyped, over-budget, and duplicate ones", async () => {
+    const big = "A".repeat(1_500_000 / 3 * 4);
     await browser.storage.local.set({
-      "workspace:a:0": { version: 1, path: "/workspace/ok.md", content: "fine" },
-      "workspace:a:1": { version: 2, path: "/workspace/v2.md", content: "unknown version" },
-      "workspace:a:2": { version: 1, path: "/workspace/big.md", content: "x".repeat(32_001) },
-      "workspace:a:3": { version: 1, path: "/workspace/../etc/passwd", content: "no" },
-      "workspace:a:4": { version: 1, path: "/workspace/ok.md", content: "duplicate" },
+      "workspace:a:0": { version: 2, path: "/workspace/ok.md", kind: "text", content: "fine" },
+      "workspace:a:1": { version: 3, path: "/workspace/v3.md", kind: "text", content: "unknown version" },
+      "workspace:a:2": { version: 2, path: "/workspace/big.md", kind: "text", content: "x".repeat(32_001) },
+      "workspace:a:3": { version: 2, path: "/workspace/../etc/passwd", kind: "text", content: "no" },
+      "workspace:a:4": { version: 2, path: "/workspace/ok.md", kind: "text", content: "duplicate" },
       "workspace:a:5": "corrupt",
-      "workspace:a:6": { version: 1, path: "/workspace/max.md", content: "y".repeat(32_000) },
-      "workspace:a:64": { version: 1, path: "/workspace/out-of-range.md", content: "never read" },
+      "workspace:a:6": { version: 2, path: "/workspace/max.md", kind: "text", content: "y".repeat(32_000) },
+      "workspace:a:7": { version: 2, path: "/workspace/a.png", kind: "binary", mimeType: "image/jpeg", data: PNG, bytes: 8 },
+      "workspace:a:8": { version: 2, path: "/workspace/b.png", kind: "binary", mimeType: "image/png", data: PNG, bytes: 9 },
+      "workspace:a:9": { version: 2, path: "/workspace/c.png", kind: "binary", mimeType: "image/png", data: "not base64!", bytes: 8 },
+      "workspace:a:10": { version: 2, path: "/workspace/d.exe", kind: "binary", mimeType: "application/octet-stream", data: PNG, bytes: 8 },
+      "workspace:a:11": { version: 2, path: "/workspace/e.png", kind: "text", content: "text under an image name" },
+      "workspace:a:12": { version: 2, path: "/workspace/huge.png", kind: "binary", mimeType: "image/png", data: `${big}AAAA`, bytes: 1_500_003 },
+      ...Object.fromEntries([20, 21, 22, 23, 24].map((slot) => [`workspace:a:${slot}`, { version: 2, path: `/workspace/p${slot}.jpg`, kind: "binary", mimeType: "image/jpeg", data: big, bytes: 1_500_000 }])),
+      "workspace:a:64": { version: 2, path: "/workspace/out-of-range.md", kind: "text", content: "never read" },
     });
-    expect((await loadWorkspaceFiles("a")).map((file) => [file.slot, file.path])).toEqual([[0, "/workspace/ok.md"], [6, "/workspace/max.md"]]);
-    expect(Object.keys(await browser.storage.local.get(null)).sort()).toEqual(["workspace:a:0", "workspace:a:6", "workspace:a:64"]);
+    // The 6,000,000-byte binary budget holds four of the five 1.5 MB files.
+    expect((await loadWorkspaceFiles("a")).map((file) => [file.slot, file.path])).toEqual([
+      [0, "/workspace/ok.md"], [6, "/workspace/max.md"], [20, "/workspace/p20.jpg"], [21, "/workspace/p21.jpg"], [22, "/workspace/p22.jpg"], [23, "/workspace/p23.jpg"],
+    ]);
+    expect(Object.keys(await browser.storage.local.get(null)).sort()).toEqual(
+      ["workspace:a:0", "workspace:a:20", "workspace:a:21", "workspace:a:22", "workspace:a:23", "workspace:a:6", "workspace:a:64"]);
   });
 });
 

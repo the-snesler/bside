@@ -14,7 +14,7 @@ function memoryStore(initial: ScratchFileEntry[] = []) {
     remove: vi.fn(async (slot: number) => { slots.delete(slot); }),
   };
   /** Persisted contents by path. */
-  const files = () => Object.fromEntries([...slots.values()].map((entry) => [entry.path, entry.content]));
+  const files = () => Object.fromEntries([...slots.values()].map((entry) => [entry.path, entry.kind === "text" ? entry.content : entry.data]));
   return { store, slots, files };
 }
 
@@ -256,7 +256,7 @@ describe("browser program tabs, files, and search", () => {
   });
 
   it("persists each scratch-file change to one slot before reporting it, loading the session's files on first use", async () => {
-    const scratch = memoryStore([{ slot: 3, path: "/workspace/kept.md", content: "from last week" }]);
+    const scratch = memoryStore([{ slot: 3, path: "/workspace/kept.md", kind: "text", content: "from last week" }]);
     const files = new ScratchFiles(scratch.store);
     const { controller } = setup();
     const program = new BrowserProgram(controller, { state: new WorkspaceState(), sessionId: "s1", files }, () => {});
@@ -265,7 +265,7 @@ describe("browser program tabs, files, and search", () => {
 
     expect((await run('return fs.read("/workspace/kept.md");')).summary).toBe("from last week");
     expect((await run('await fs.write("/workspace/a.md", "A"); await fs.write("/workspace/a.md", "A2"); await fs.move("/workspace/kept.md", "/workspace/old.md");')).ok).toBe(true);
-    expect([...scratch.slots.entries()].map(([slot, entry]) => [slot, entry.path, entry.content])).toEqual([
+    expect([...scratch.slots.entries()].map(([slot, entry]) => [slot, entry.path, entry.kind === "text" && entry.content])).toEqual([
       [3, "/workspace/old.md", "from last week"], [0, "/workspace/a.md", "A2"],
     ]);
     expect(scratch.store.load).toHaveBeenCalledTimes(1);
@@ -277,8 +277,8 @@ describe("browser program tabs, files, and search", () => {
     expect(failed.summary).toContain("Could not save the workspace change");
     expect((await run('return fs.read("/workspace/a.md");')).summary).toBe("A2");
 
-    await expect(files.write("/workspace/big.txt", "x".repeat(32_001))).rejects.toThrow("Workspace limit");
-    for (let n = 2; n < 64; n++) await files.write(`/workspace/f${n}.txt`, "");
+    await expect(files.write("/workspace/big.txt", { kind: "text", content: "x".repeat(32_001) })).rejects.toThrow("Workspace limits");
+    for (let n = 2; n < 64; n++) await files.write(`/workspace/f${n}.txt`, { kind: "text", content: "" });
     expect((await run('return fs.write("/workspace/one-too-many.txt", "x");')).summary).toContain("64 files");
     expect(scratch.slots.size).toBe(64);
   });
@@ -286,7 +286,7 @@ describe("browser program tabs, files, and search", () => {
   it("uploads from the run's own session workspace", async () => {
     const { controller, actions } = setup();
     const state = new WorkspaceState();
-    const mine = new BrowserProgram(controller, { state, sessionId: "a", files: new ScratchFiles(memoryStore([{ slot: 0, path: "/workspace/cv.txt", content: "Mine" }]).store) }, () => {});
+    const mine = new BrowserProgram(controller, { state, sessionId: "a", files: new ScratchFiles(memoryStore([{ slot: 0, path: "/workspace/cv.txt", kind: "text", content: "Mine" }]).store) }, () => {});
     const other = new BrowserProgram(controller, { state, sessionId: "b", files: new ScratchFiles() }, () => {});
     const upload = 'await browser.tab("/tabs/1/page.md").getByRole("file").setInputFiles("/workspace/cv.txt");';
     expect((await other.execute(upload, new AbortController().signal)).summary).toContain("does not exist");

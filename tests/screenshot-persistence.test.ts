@@ -42,13 +42,14 @@ function screenshotTabControllerFactory(): TabController {
 class ScreenshotProvider implements ProviderAdapter {
   readonly definition = { id: "openai" as const, name: "OpenAI", authMethods: [], models: [] };
   requests: ProviderTurnRequest[] = [];
+  constructor(private source = 'await browser.tab("/tabs/1/page.md").screenshot();') {}
   async validateAuth(): Promise<void> {}
   getModel() { return TEST_MODEL; }
   streamTurn(request: ProviderTurnRequest, _auth: ProviderAuth, signal: AbortSignal) {
     this.requests.push(splitSystemMessage(request));
     const first = this.requests.length === 1;
     const events: ScriptedProviderEvent[] = first
-      ? [{ type: "tool.call", call: { id: "shot", name: "browser_program", arguments: { source: 'await browser.tab("/tabs/1/page.md").screenshot();' } } }, { type: "turn.completed", replayState: null }]
+      ? [{ type: "tool.call", call: { id: "shot", name: "browser_program", arguments: { source: this.source } } }, { type: "turn.completed", replayState: null }]
       : [{ type: "text.delta", delta: "Revenue doubled." }, { type: "turn.completed", replayState: null }];
     return toPiStream(events, signal);
   }
@@ -84,5 +85,25 @@ describe("screenshots are never persisted", () => {
     expect(exported).toContain("[image omitted:");
     expect(exported).not.toContain(IMAGE_BASE64);
     expect(exported).not.toContain("data:image");
+  });
+
+  it("keeps a saved screenshot in its workspace slot only, exporting its type and size", async () => {
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const provider = new ScreenshotProvider('await browser.tab("/tabs/1/page.md").screenshot({save: "/workspace/chart.jpg"});');
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: screenshotTabControllerFactory });
+    hub.delegate = runtime;
+    await runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Save the chart" });
+    const sessionId = (await getOpenSessionId())!;
+    await vi.waitFor(async () => expect((await getConversation(sessionId))?.items.some((item) => item.kind === "run-digest")).toBe(true));
+
+    const stored = await browser.storage.local.get(null);
+    const holding = Object.keys(stored).filter((key) => JSON.stringify(stored[key]).includes(IMAGE_BASE64));
+    expect(holding).toEqual([`workspace:${sessionId}:0`]);
+    expect(stored[`workspace:${sessionId}:0`]).toMatchObject({ version: 2, path: "/workspace/chart.jpg", kind: "binary", mimeType: "image/jpeg" });
+
+    const exported = (await runtime.handleCommand({ v: 1, id: "export", type: "context.export", sessionId }))?.markdown ?? "";
+    expect(exported).toContain(`"/workspace/chart.jpg": "[binary image/jpeg, ${IMAGE_BASE64.length / 4 * 3} bytes]"`);
+    expect(exported).not.toContain(IMAGE_BASE64);
   });
 });

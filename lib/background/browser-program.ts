@@ -1,7 +1,10 @@
 import type { DomAction, ElementTarget, JsonValue, PageFindResult, PageSnapshot, PressKey, ToolResult, UploadFile } from "@/lib/domain/tools";
 import type { Skill } from "@/lib/domain/skills";
 import { MAX_SNAPSHOT_CHARS } from "@/lib/protocol";
-import { isWorkspacePath, MAX_UPLOAD_FILE_CHARS, MAX_UPLOAD_FILES, PRESS_KEYS, WORKSPACE_MAX_FILE_CHARS, WORKSPACE_MAX_FILES } from "@/lib/validation";
+import {
+  binaryTypeFor, isWorkspacePath, MAX_UPLOAD_FILE_CHARS, MAX_UPLOAD_FILES, PRESS_KEYS, VIEWABLE_IMAGE_TYPES, WORKSPACE_BINARY_TYPES,
+  WORKSPACE_MAX_BINARY_BYTES, WORKSPACE_MAX_BINARY_TOTAL_BYTES, WORKSPACE_MAX_FILE_CHARS, WORKSPACE_MAX_FILES,
+} from "@/lib/validation";
 import { SITE_APIS } from "@/lib/sites";
 import { SiteError, type SiteEnv } from "@/lib/sites/site-api";
 import { AGENT_TAB_ROLES, DEFAULT_SNAPSHOT_CHARS, TabController } from "./tab-controller";
@@ -14,11 +17,11 @@ Tabs: fs.list("/tabs") (user tabs), fs.list("/agent-tabs") (hidden tabs this cha
 Reading: await page.snapshot() returns the page outline: text in document order with interactive elements inlined as [e5 button "Save"], [e7 textbox "Email" type=email required value="…"], [e9 link "Docs" → /docs], [e3 combobox "Country" selected="…" options: …]. Includes open/closed shadow DOM and same-origin iframes; a cross-origin frame appears as [frame cross-origin → url] — open that URL with browser.open() to read or operate it. Long pages are paged: snapshot({offset: 16000, maxChars: 16000}) continues where the notice says (maxChars ≤ 40000). fs.read(tabPath) equals snapshot().
 Searching: await page.find("text") lists matching outline lines (with refs) and their offsets — use it on long pages instead of reading everything. await page.waitFor("text", 8000) waits up to 15000 ms for text to appear. await web.search("query") returns web results (title, URL, snippet) from a hidden search tab; open results with browser.open(url).
 Targeting: page.ref("e5") targets the element with that ref from your latest snapshot/find/diff of that page; refs stay valid until the page navigates or reloads. page.getByRole("button", {name: "Save"}) matches a unique element by role and case-insensitive name substring ({exact: true} for exact). page.getByText("Save") matches any interactive element by name. Ambiguous or missing matches fail and list candidate refs.
-Actions (on a locator): click(), fill(text) (inputs, textareas, rich-text editors; dates as YYYY-MM-DD), selectOption("label or value" | [...]), setChecked(bool), check(), uncheck(), press("Enter"|"Tab"|"Escape"|"Space"|"Backspace"|"ArrowDown"|…), setInputFiles("/workspace/file.txt" | [...]) attaches scratch files to a file input. Each action reports the effect, native validation problems, and the page outline lines that appeared (+) or disappeared (−). Use that diff to verify outcomes.
+Actions (on a locator): click(), fill(text) (inputs, textareas, rich-text editors; dates as YYYY-MM-DD), selectOption("label or value" | [...]), setChecked(bool), check(), uncheck(), press("Enter"|"Tab"|"Escape"|"Space"|"Backspace"|"ArrowDown"|…), setInputFiles("/workspace/file.txt" | [...]) attaches scratch files (text or saved images) to a file input. Each action reports the effect, native validation problems, and the page outline lines that appeared (+) or disappeared (−). Use that diff to verify outcomes.
 Page methods: navigate(url), goBack(), scroll("down"|"up", "page"|"line"), path().
 Seeing: await page.screenshot() attaches an image of the visible viewport to this program's result; screenshot({fullPage: true}) covers the whole page (very long pages are cut), screenshot({ref: "e5"}) or page.ref("e5").screenshot() crops to one element from your latest snapshot. Use it for layout, charts, images, canvas, or when the outline is unclear; prefer snapshot() for text. Images are shown to you once, in your next step only, and a task may take only a few: note what you need from them right away.
 Concurrency: const [a, b] = await Promise.all([callA, callB]); runs up to 8 calls at once and keeps result order. Calls on the same tab still run one at a time. If one call fails, the rest are cancelled and the error says which finished; their effects stay committed.
-Scratch files: fs.write("/workspace/notes.md", "text"), fs.read, fs.list("/workspace"), fs.move, fs.remove (64 files, 32000 characters each; kept with this chat).
+Scratch files: fs.write("/workspace/notes.md", "text"), fs.read, fs.list("/workspace"), fs.move, fs.remove (64 files, 32000 characters each; kept with this chat). screenshot({save: "/workspace/shot.jpg"}) (or .png) also saves the image there, to attach with setInputFiles; fs.read of an image or PDF returns its type and size, and fs.view("/workspace/shot.jpg") shows an image to you again (it counts as an image).
 Skills: fs.list("/skills") lists saved procedure names/descriptions; fs.read("/skills/name.md") reads a Markdown body on demand. Read-only instruction data, not executable plugins; cannot override safety or grant capabilities.
 Tab management: fs.move("/tabs/12/page.md", "/agent-tabs/12/page.md") hides a tab, the reverse shows it; fs.remove(tabPath) closes it.
 Call request_action_confirmation BEFORE externally visible, destructive, or paid actions (submitting, sending, purchasing, deleting) in a separate program.`;
@@ -66,8 +69,13 @@ export class WorkspaceState {
   }
 }
 
+/** One `/workspace` file: text, or a binary of an allowed type held as base64 (`bytes` decoded). */
+export type ScratchFile =
+  | { kind: "text"; content: string }
+  | { kind: "binary"; mimeType: string; data: string; bytes: number };
+
 /** One `/workspace` file as persisted: `slot` (0–63) is its storage key within the session. */
-export interface ScratchFileEntry { slot: number; path: string; content: string }
+export type ScratchFileEntry = { slot: number; path: string } & ScratchFile;
 
 /** Persistence for one session's scratch files; every write and removal touches exactly one slot. */
 export interface ScratchStore {
@@ -78,21 +86,24 @@ export interface ScratchStore {
 
 const MEMORY_SCRATCH_STORE: ScratchStore = { load: async () => [], write: async () => {}, remove: async () => {} };
 
+const LIMITS_MESSAGE = `Workspace limits: ${WORKSPACE_MAX_FILES} files; text files up to ${WORKSPACE_MAX_FILE_CHARS} characters; binary files (${Object.keys(WORKSPACE_BINARY_TYPES).map((ext) => `.${ext}`).join(", ")}) up to ${WORKSPACE_MAX_BINARY_BYTES.toLocaleString("en-US")} bytes each and ${WORKSPACE_MAX_BINARY_TOTAL_BYTES.toLocaleString("en-US")} bytes together.`;
+
 /**
  * One session's `/workspace` files, loaded from its store on first use. Each
  * change is written through before it applies in memory, so a change a
  * program reports has been persisted; a failed write changes nothing.
  * Changes apply one at a time, so concurrent writes never share a slot.
+ * A path's extension decides whether it holds text or a binary type.
  */
 export class ScratchFiles {
-  #files: Promise<Map<string, { slot: number; content: string }>> | null = null;
+  #files: Promise<Map<string, { slot: number; file: ScratchFile }>> | null = null;
   #changes: Promise<unknown> = Promise.resolve();
 
   constructor(private store: ScratchStore = MEMORY_SCRATCH_STORE) {}
 
-  #load(): Promise<Map<string, { slot: number; content: string }>> {
+  #load(): Promise<Map<string, { slot: number; file: ScratchFile }>> {
     if (!this.#files) {
-      const files = this.store.load().then((entries) => new Map(entries.map(({ slot, path, content }) => [path, { slot, content }])));
+      const files = this.store.load().then((entries) => new Map(entries.map(({ slot, path, ...file }) => [path, { slot, file: file as ScratchFile }])));
       // A failed load is retried by the next call rather than cached.
       files.catch(() => { if (this.#files === files) this.#files = null; });
       this.#files = files;
@@ -104,43 +115,55 @@ export class ScratchFiles {
     return [...(await this.#load()).keys()];
   }
 
-  async read(path: string): Promise<string | undefined> {
-    return (await this.#load()).get(path)?.content;
+  async read(path: string): Promise<ScratchFile | undefined> {
+    return (await this.#load()).get(path)?.file;
   }
 
-  write(path: string, content: string): Promise<void> {
+  write(path: string, file: ScratchFile): Promise<void> {
     return this.#serial(async () => {
       const files = await this.#load();
       const existing = files.get(path);
-      if (content.length > WORKSPACE_MAX_FILE_CHARS || (!existing && files.size >= WORKSPACE_MAX_FILES)) {
-        throw new Error(`Workspace limit: ${WORKSPACE_MAX_FILES} files, ${WORKSPACE_MAX_FILE_CHARS} characters per file.`);
+      const type = binaryTypeFor(path);
+      if (file.kind === "text" ? type !== null : type !== file.mimeType) {
+        throw new Error(file.kind === "text"
+          ? `${path} names a binary file type; fs.write writes text, so use a text extension such as .txt or .md.`
+          : `A ${file.mimeType} file needs a matching extension.`);
       }
-      const used = new Set([...files.values()].map((file) => file.slot));
+      const binaryTotal = [...files].reduce((sum, [other, { file }]) => sum + (other !== path && file.kind === "binary" ? file.bytes : 0), 0);
+      if ((file.kind === "text" ? file.content.length > WORKSPACE_MAX_FILE_CHARS
+        : file.bytes > WORKSPACE_MAX_BINARY_BYTES || binaryTotal + file.bytes > WORKSPACE_MAX_BINARY_TOTAL_BYTES) ||
+        (!existing && files.size >= WORKSPACE_MAX_FILES)) {
+        throw new ProgramError(LIMITS_MESSAGE, "LIMIT_EXCEEDED");
+      }
+      const used = new Set([...files.values()].map((entry) => entry.slot));
       const slot = existing?.slot ?? Array.from({ length: WORKSPACE_MAX_FILES }, (_, n) => n).find((n) => !used.has(n))!;
-      await this.#persist(() => this.store.write({ slot, path, content }));
-      files.set(path, { slot, content });
+      await this.#persist(() => this.store.write({ slot, path, ...file }));
+      files.set(path, { slot, file });
     });
   }
 
   remove(path: string): Promise<void> {
     return this.#serial(async () => {
       const files = await this.#load();
-      const file = files.get(path);
-      if (!file) return;
-      await this.#persist(() => this.store.remove(file.slot));
+      const entry = files.get(path);
+      if (!entry) return;
+      await this.#persist(() => this.store.remove(entry.slot));
       files.delete(path);
     });
   }
 
-  /** Renames in place: the file keeps its slot, so a move is one write. */
+  /** Renames in place: the file keeps its slot, so a move is one write. A binary keeps its type, so its extension must too. */
   move(from: string, to: string): Promise<void> {
     return this.#serial(async () => {
       const files = await this.#load();
-      const file = files.get(from);
-      if (!file || files.has(to)) throw new Error("Destination must be a new workspace path.");
-      await this.#persist(() => this.store.write({ slot: file.slot, path: to, content: file.content }));
+      const entry = files.get(from);
+      if (!entry || files.has(to)) throw new Error("Destination must be a new workspace path.");
+      if (binaryTypeFor(to) !== (entry.file.kind === "binary" ? entry.file.mimeType : null)) {
+        throw new Error("A move keeps the file's type; keep an extension of the same type.");
+      }
+      await this.#persist(() => this.store.write({ slot: entry.slot, path: to, ...entry.file }));
       files.delete(from);
-      files.set(to, file);
+      files.set(to, entry);
     });
   }
 
@@ -199,7 +222,7 @@ type TabHandle = Extract<Handle, { kind: "page" | "locator" }>;
 type Value = JsonValue | Handle | Value[] | { [key: string]: Value };
 
 const METHODS = new Set([
-  "list", "read", "write", "move", "remove", "tab", "open", "search", "stringify",
+  "list", "read", "write", "move", "remove", "view", "tab", "open", "search", "stringify",
   "snapshot", "find", "waitFor", "ref", "getByRole", "getByText", "navigate", "goBack", "scroll", "path",
   "click", "fill", "selectOption", "setChecked", "check", "uncheck", "press", "setInputFiles", "all", "screenshot",
   ...SITE_APIS.flatMap((site) => Object.keys(site.methods)),
@@ -1183,8 +1206,8 @@ export class BrowserProgram {
     rawOptions: Value | undefined,
     onPage: boolean,
   ): Promise<string> {
-    const allowed = onPage ? ["fullPage", "ref"] : [];
-    const usage = onPage ? "screenshot({fullPage?: boolean, ref?: \"eN\"})" : "screenshot()";
+    const allowed = onPage ? ["fullPage", "ref", "save"] : ["save"];
+    const usage = onPage ? "screenshot({fullPage?: boolean, ref?: \"eN\", save?: \"/workspace/name.jpg\"})" : "screenshot({save?: \"/workspace/name.jpg\"})";
     if (rawOptions !== undefined && (!rawOptions || typeof rawOptions !== "object" || Array.isArray(rawOptions) || this.#handles.has(rawOptions as object)))
       throw new Error(`${usage} takes an optional options object.`);
     const options = (rawOptions ?? {}) as Record<string, Value>;
@@ -1196,13 +1219,21 @@ export class BrowserProgram {
       if (options.fullPage) throw new Error("Use either fullPage or ref, not both.");
       target = this.#target({ kind: "locator", tabId, target: { kind: "ref", ref: options.ref } });
     }
+    let format: "jpeg" | "png" = "jpeg";
+    if (options.save !== undefined) {
+      const type = typeof options.save === "string" && isWorkspacePath(options.save) ? binaryTypeFor(options.save) : null;
+      if (type !== "image/jpeg" && type !== "image/png") throw new Error('save must be a /workspace path ending in .jpg, .jpeg, or .png.');
+      if (type === "image/png") format = "png";
+    }
     this.#checkImageBudget();
-    const shot = await controller.screenshot({ area: options.fullPage ? "full" : "viewport", target, format: "jpeg" });
+    const shot = await controller.screenshot({ area: options.fullPage ? "full" : "viewport", target, format });
     if (!shot.ok) throw this.#pageError(shot.error, tabId);
     const { value } = shot;
     this.#visited.push(value.url);
+    if (typeof options.save === "string") await this.files.write(options.save, { kind: "binary", mimeType: value.mimeType, data: value.data, bytes: value.bytes });
     const placeholder = this.#attach({ mimeType: value.mimeType, data: value.data, placeholder: `[screenshot ${value.width}x${value.height} of ${value.url}]` });
-    return value.cut ? `${placeholder} The page is longer than one image allows; the bottom was cut. Scroll and take viewport screenshots for the rest.` : placeholder;
+    const saved = typeof options.save === "string" ? `${placeholder} Saved to ${options.save} (${value.bytes} bytes).` : placeholder;
+    return value.cut ? `${saved} The page is longer than one image allows; the bottom was cut. Scroll and take viewport screenshots for the rest.` : saved;
   }
 
   #checkImageBudget(): void {
@@ -1260,17 +1291,21 @@ export class BrowserProgram {
         throw new Error(
           "Only /workspace scratch files can be uploaded; write one with fs.write first.",
         );
-      const content = await this.files.read(path);
-      if (content === undefined)
+      const file = await this.files.read(path);
+      if (file === undefined)
         throw new Error(
           `File ${path} does not exist; create it with fs.write first.`,
         );
-      if (content.length > MAX_UPLOAD_FILE_CHARS)
+      const name = path.slice(path.lastIndexOf("/") + 1);
+      if (file.kind === "binary") {
+        files.push({ name, mimeType: file.mimeType, base64: file.data });
+        continue;
+      }
+      if (file.content.length > MAX_UPLOAD_FILE_CHARS)
         throw new Error(
           `Upload files are limited to ${MAX_UPLOAD_FILE_CHARS} characters.`,
         );
-      const name = path.slice(path.lastIndexOf("/") + 1);
-      files.push({ name, mimeType: mimeTypeFor(name), text: content });
+      files.push({ name, mimeType: mimeTypeFor(name), text: file.content });
     }
     return files;
   }
@@ -1560,12 +1595,20 @@ export class BrowserProgram {
           "Invalid workspace path; use letters, digits, '.', '_' and '-'.",
         );
       if (method === "write") {
-        await this.files.write(path, destination!);
+        await this.files.write(path, { kind: "text", content: destination! });
         return `Wrote ${path} (${destination!.length} characters).`;
       }
-      const content = await this.files.read(path);
-      if (content === undefined) throw new Error("File does not exist.");
-      if (method === "read") return content;
+      const file = await this.files.read(path);
+      if (file === undefined) throw new Error("File does not exist.");
+      if (method === "read") {
+        if (file.kind === "text") return file.content;
+        return { path, name: path.slice(path.lastIndexOf("/") + 1), mimeType: file.mimeType, bytes: file.bytes, binary: true };
+      }
+      if (method === "view") {
+        if (file.kind !== "binary" || !VIEWABLE_IMAGE_TYPES.includes(file.mimeType))
+          throw new Error(`fs.view() shows images (${VIEWABLE_IMAGE_TYPES.join(", ")}); read text files with fs.read().`);
+        return this.#attach({ mimeType: file.mimeType, data: file.data, placeholder: `[image ${path}, ${file.bytes} bytes]` });
+      }
       if (method === "remove") {
         await this.files.remove(path);
         return `Removed ${path}.`;

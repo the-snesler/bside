@@ -319,6 +319,15 @@ describe("actions and outcome feedback", () => {
     expect(changed).toBe(true);
   });
 
+  it("attaches a binary workspace file's decoded bytes", async () => {
+    setBody('<input type="file" aria-label="Photo" accept="image/png">');
+    const result = await act(createElementRefRegistry("doc"), { kind: "upload", target: role("file", "Photo"), files: [{ name: "shot.png", mimeType: "image/png", base64: "iVBORw0KGgo=" }] });
+    expect(result.ok, result.summary).toBe(true);
+    const file = (document.querySelector("input") as HTMLInputElement).files![0]!;
+    expect(file).toMatchObject({ name: "shot.png", type: "image/png", size: 8 });
+    expect([...new Uint8Array(await file.arrayBuffer())]).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  });
+
   it("submits the form on Enter from a text field", async () => {
     setBody('<form><input aria-label="Query"><button>Go</button></form>');
     let submitted = false;

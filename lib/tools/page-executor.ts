@@ -21,7 +21,7 @@
  * they also hold for elements from same-origin frames (other realms).
  */
 
-import type { CaptureGeometry, DomAction, ElementTarget, PageFindResult, PageRect, PageSnapshot, SearchResult, ToolResult } from "@/lib/domain/tools";
+import type { CaptureGeometry, DomAction, ElementTarget, PageFindResult, PageRect, PageSnapshot, SearchResult, ToolResult, UploadFile } from "@/lib/domain/tools";
 
 // ---------------------------------------------------------------------------
 // Ref registry
@@ -1085,17 +1085,24 @@ function press(control: OutlineControl, key: string, outline: Outline): Effect {
   return { ok: true, message: `Pressed ${key} on ${describe(control)}.`, notes };
 }
 
-function upload(control: OutlineControl, files: { name: string; mimeType: string; text: string }[]): Effect {
+function upload(control: OutlineControl, files: UploadFile[]): Effect {
   const element = control.element;
   if (!isInput(element) || inputType(element) !== "file") return { ok: false, code: "NOT_INTERACTABLE", message: `${describe(control)} is not a file input.` };
   if (files.length > 1 && !element.multiple) return { ok: false, code: "INVALID_TOOL_ARGUMENTS", message: "This file input accepts a single file." };
   const transfer = new DataTransfer();
-  for (const file of files) transfer.items.add(new File([file.text], file.name, { type: file.mimeType }));
+  for (const file of files) transfer.items.add(new File(["text" in file ? file.text : decodeBase64(file.base64)], file.name, { type: file.mimeType }));
   element.files = transfer.files;
   if ((element.files?.length ?? 0) !== files.length) return { ok: false, code: "NOT_INTERACTABLE", message: "The browser did not accept the file assignment." };
   dispatch(element, "input");
   dispatch(element, "change");
   return { ok: true, message: `Attached ${files.map((file) => JSON.stringify(file.name)).join(", ")} to ${describe(control)}.` };
+}
+
+function decodeBase64(base64: string): Uint8Array<ArrayBuffer> {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
 }
 
 function click(control: OutlineControl, outline: Outline): Effect {

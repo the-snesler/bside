@@ -54,8 +54,13 @@ export function validateElementTarget(raw: unknown): ElementTarget | null {
 }
 
 function validateUploadFile(raw: unknown): UploadFile | null {
-  if (!isObject(raw) || !hasExactKeys(raw, ["name", "mimeType", "text"])) return null;
+  if (!isObject(raw)) return null;
   if (!isBoundedString(raw.name, 255) || /[\\/\x00-\x1f]/.test(raw.name)) return null;
+  if (hasExactKeys(raw, ["name", "mimeType", "base64"])) {
+    if (!isBinaryFile(raw.name, raw.mimeType, raw.base64)) return null;
+    return { name: raw.name, mimeType: raw.mimeType as string, base64: raw.base64 as string };
+  }
+  if (!hasExactKeys(raw, ["name", "mimeType", "text"])) return null;
   if (typeof raw.mimeType !== "string" || !/^[a-z]+\/[a-z0-9.+-]+$/i.test(raw.mimeType)) return null;
   if (typeof raw.text !== "string" || raw.text.length > MAX_UPLOAD_FILE_CHARS) return null;
   return { name: raw.name, mimeType: raw.mimeType, text: raw.text };
@@ -160,6 +165,34 @@ export function validateSessionTitle(raw: string): string | null {
 /** `/workspace` scratch-file limits, per session. */
 export const WORKSPACE_MAX_FILES = 64;
 export const WORKSPACE_MAX_FILE_CHARS = 32_000;
+/** Most bytes (decoded) one binary `/workspace` file may hold. */
+export const WORKSPACE_MAX_BINARY_BYTES = 1_500_000;
+/** Most bytes (decoded) all of one session's binary files may hold together. */
+export const WORKSPACE_MAX_BINARY_TOTAL_BYTES = 6_000_000;
+/** The binary file types `/workspace` holds, by extension; the extension decides the type. */
+export const WORKSPACE_BINARY_TYPES: Readonly<Record<string, string>> = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", pdf: "application/pdf",
+};
+/** Binary types the model can look at with `fs.view`. */
+export const VIEWABLE_IMAGE_TYPES: readonly string[] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/** The binary type a file name's extension stands for, or null for a text file. */
+export function binaryTypeFor(name: string): string | null {
+  const dot = name.lastIndexOf(".");
+  return dot < 0 ? null : WORKSPACE_BINARY_TYPES[name.slice(dot + 1).toLowerCase()] ?? null;
+}
+
+/** Decoded size of canonical base64 text, or null if it is not base64. */
+export function base64Bytes(data: unknown): number | null {
+  if (typeof data !== "string" || data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(data)) return null;
+  return (data.length / 4) * 3 - (data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0);
+}
+
+/** A binary file: an allowed type its name's extension stands for, and 1 to `WORKSPACE_MAX_BINARY_BYTES` base64 bytes. */
+export function isBinaryFile(name: string, mimeType: unknown, base64: unknown): boolean {
+  const bytes = base64Bytes(base64);
+  return binaryTypeFor(name) === mimeType && bytes !== null && bytes > 0 && bytes <= WORKSPACE_MAX_BINARY_BYTES;
+}
 
 /** A `/workspace/…` file path: segments of letters, digits, '.', '_' and '-', no traversal, at most 256 characters. */
 export function isWorkspacePath(value: unknown): value is string {

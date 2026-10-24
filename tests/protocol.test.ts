@@ -308,6 +308,7 @@ describe("isPageExecuteRequest: accepts the closed action union only", () => {
       { kind: "check", target: ref, checked: true },
       { kind: "press", target: ref, key: "Enter" },
       { kind: "upload", target: ref, files: [{ name: "a.txt", mimeType: "text/plain", text: "hi" }] },
+      { kind: "upload", target: ref, files: [{ name: "a.png", mimeType: "image/png", base64: "iVBORw0KGgo=" }] },
       { kind: "scroll", target: null, direction: "down", amount: "page" },
     ]) expect(validateDomAction(action), JSON.stringify(action)).not.toBeNull();
     expect(isPageExecuteRequest(execute({ kind: "click", target: ref }))).toBe(true);
@@ -323,6 +324,11 @@ describe("isPageExecuteRequest: accepts the closed action union only", () => {
       { kind: "press", target: ref, key: "F12" },
       { kind: "upload", target: ref, files: [{ name: "../etc/passwd", mimeType: "text/plain", text: "" }] },
       { kind: "upload", target: ref, files: [] },
+      { kind: "upload", target: ref, files: [{ name: "a.png", mimeType: "image/jpeg", base64: "iVBORw0KGgo=" }] },
+      { kind: "upload", target: ref, files: [{ name: "a.exe", mimeType: "application/octet-stream", base64: "iVBORw0KGgo=" }] },
+      { kind: "upload", target: ref, files: [{ name: "a.png", mimeType: "image/png", base64: "not base64" }] },
+      { kind: "upload", target: ref, files: [{ name: "a.png", mimeType: "image/png", base64: "A".repeat(2_000_004) }] },
+      { kind: "upload", target: ref, files: [{ name: "a.png", mimeType: "image/png", base64: "iVBORw0KGgo=", text: "both" }] },
       { kind: "select", target: ref, values: [] },
       { kind: "fill", target: ref, text: "x".repeat(16_001) },
     ]) expect(validateDomAction(action), JSON.stringify(action)).toBeNull();
