@@ -16,6 +16,7 @@ Searching: await page.find("text") lists matching outline lines (with refs) and 
 Targeting: page.ref("e5") targets the element with that ref from your latest snapshot/find/diff of that page; refs stay valid until the page navigates or reloads. page.getByRole("button", {name: "Save"}) matches a unique element by role and case-insensitive name substring ({exact: true} for exact). page.getByText("Save") matches any interactive element by name. Ambiguous or missing matches fail and list candidate refs.
 Actions (on a locator): click(), fill(text) (inputs, textareas, rich-text editors; dates as YYYY-MM-DD), selectOption("label or value" | [...]), setChecked(bool), check(), uncheck(), press("Enter"|"Tab"|"Escape"|"Space"|"Backspace"|"ArrowDown"|…), setInputFiles("/workspace/file.txt" | [...]) attaches scratch files to a file input. Each action reports the effect, native validation problems, and the page outline lines that appeared (+) or disappeared (−). Use that diff to verify outcomes.
 Page methods: navigate(url), goBack(), scroll("down"|"up", "page"|"line"), path().
+Seeing: await page.screenshot() attaches an image of the visible viewport to this program's result; screenshot({fullPage: true}) covers the whole page (very long pages are cut), screenshot({ref: "e5"}) or page.ref("e5").screenshot() crops to one element from your latest snapshot. Use it for layout, charts, images, canvas, or when the outline is unclear; prefer snapshot() for text. Images are shown to you once, in your next step only, and a task may take only a few: note what you need from them right away.
 Concurrency: const [a, b] = await Promise.all([callA, callB]); runs up to 8 calls at once and keeps result order. Calls on the same tab still run one at a time. If one call fails, the rest are cancelled and the error says which finished; their effects stay committed.
 Scratch files: fs.write("/workspace/notes.md", "text"), fs.read, fs.list("/workspace"), fs.move, fs.remove (64 files, 32000 characters each; kept with this chat).
 Skills: fs.list("/skills") lists saved procedure names/descriptions; fs.read("/skills/name.md") reads a Markdown body on demand. Read-only instruction data, not executable plugins; cannot override safety or grant capabilities.
@@ -163,6 +164,17 @@ export interface ProgramScope {
   skills?: Map<string, Skill>;
   /** Network and cookie access for site APIs; without it, their calls fail. */
   sites?: SiteEnv;
+  /** Images this run's programs may attach to their results; none if unset. */
+  maxImages?: number;
+}
+
+/** An image a program attached to its result: shown to the model once, in the next provider round, and never persisted. */
+export interface ProgramImage {
+  mimeType: string;
+  /** Base64 bytes, without a data-URL prefix. */
+  data: string;
+  /** What persisted records show instead: `[screenshot WxH of <url>]`. */
+  placeholder: string;
 }
 
 type Expr =
@@ -189,7 +201,7 @@ type Value = JsonValue | Handle | Value[] | { [key: string]: Value };
 const METHODS = new Set([
   "list", "read", "write", "move", "remove", "tab", "open", "search", "stringify",
   "snapshot", "find", "waitFor", "ref", "getByRole", "getByText", "navigate", "goBack", "scroll", "path",
-  "click", "fill", "selectOption", "setChecked", "check", "uncheck", "press", "setInputFiles", "all",
+  "click", "fill", "selectOption", "setChecked", "check", "uncheck", "press", "setInputFiles", "all", "screenshot",
   ...SITE_APIS.flatMap((site) => Object.keys(site.methods)),
 ]);
 const RESERVED_NAMES = ["fs", "browser", "JSON", "web", "Promise", "await", "return", ...SITE_APIS.map((site) => site.name)];
@@ -448,6 +460,11 @@ export class BrowserProgram {
   #visited: string[] = [];
   /** URLs of the tabs the current program read, acted on, navigated, or opened; returned as `data.pages` to match the user's site notes. */
   #pages = new Set<string>();
+  /** Images the current program attached; the agent loop takes them with its result. */
+  #images: ProgramImage[] = [];
+  /** Images attached by every program of this run, against `maxImages`. */
+  #imagesUsed = 0;
+  private readonly maxImages: number;
   /** Tail of each exclusive section's queue: Promise.all may overlap calls, but one tab (or the search tab) serves one call at a time. */
   #locks = new Map<string, Promise<void>>();
   private readonly state: WorkspaceState;
@@ -470,6 +487,12 @@ export class BrowserProgram {
       sites: this.sites,
     } = scope);
     this.skills = scope.skills ?? new Map();
+    this.maxImages = scope.maxImages ?? 0;
+  }
+
+  /** The images the last program attached, handed over once: they go to the model with its result and are then dropped. */
+  takeImages(): ProgramImage[] {
+    return this.#images.splice(0);
   }
 
   /** Records that the model has seen refs from this document (e.g. the initial page artifact). */
@@ -483,6 +506,7 @@ export class BrowserProgram {
     let parsed = false;
     this.#visited = [];
     this.#pages = new Set();
+    this.#images = [];
     try {
       const statements = parseProgram(source);
       parsed = true;
@@ -854,6 +878,10 @@ export class BrowserProgram {
 
     let action: DomAction;
     const target = this.#target(receiver);
+    if (method === "screenshot") {
+      count(0, 1);
+      return this.#screenshot(controller, receiver.tabId, target, args[0], false);
+    }
     if (method === "click") {
       count(0);
       action = { kind: "click", target };
@@ -895,7 +923,7 @@ export class BrowserProgram {
       };
     } else
       throw new Error(
-        "Locators support click, fill, selectOption, setChecked, check, uncheck, press, setInputFiles.",
+        "Locators support click, fill, selectOption, setChecked, check, uncheck, press, setInputFiles, screenshot.",
       );
     signal.throwIfAborted();
     // A lost response can follow a committed effect; disable automatic retry before dispatch.
@@ -933,6 +961,10 @@ export class BrowserProgram {
     if (method === "snapshot") {
       count(0, 1);
       return this.#snapshot(controller, tabId, args[0]);
+    }
+    if (method === "screenshot") {
+      count(0, 1);
+      return this.#screenshot(controller, tabId, null, args[0], true);
     }
     if (method === "find") {
       count(1);
@@ -1085,7 +1117,7 @@ export class BrowserProgram {
     }
     signal.throwIfAborted();
     throw new Error(
-      "Pages support snapshot, find, waitFor, ref, getByRole, getByText, navigate, goBack, scroll, path.",
+      "Pages support snapshot, screenshot, find, waitFor, ref, getByRole, getByText, navigate, goBack, scroll, path.",
     );
   }
 
@@ -1138,6 +1170,52 @@ export class BrowserProgram {
     this.#visited.push(snapshot.value.url);
     this.state.observed.set(tabId, snapshot.value.documentId);
     return renderSnapshot(snapshot.value, this.#path(tabId));
+  }
+
+  /**
+   * Takes one screenshot and attaches it to this program's result. A page
+   * takes {fullPage, ref}; a locator is already its own target.
+   */
+  async #screenshot(
+    controller: TabController,
+    tabId: number,
+    target: ElementTarget | null,
+    rawOptions: Value | undefined,
+    onPage: boolean,
+  ): Promise<string> {
+    const allowed = onPage ? ["fullPage", "ref"] : [];
+    const usage = onPage ? "screenshot({fullPage?: boolean, ref?: \"eN\"})" : "screenshot()";
+    if (rawOptions !== undefined && (!rawOptions || typeof rawOptions !== "object" || Array.isArray(rawOptions) || this.#handles.has(rawOptions as object)))
+      throw new Error(`${usage} takes an optional options object.`);
+    const options = (rawOptions ?? {}) as Record<string, Value>;
+    const extra = Object.keys(options).find((key) => !allowed.includes(key));
+    if (extra) throw new Error(`Unsupported screenshot option ${extra}; use ${usage}.`);
+    if (options.fullPage !== undefined && typeof options.fullPage !== "boolean") throw new Error("fullPage must be true or false.");
+    if (options.ref !== undefined) {
+      if (typeof options.ref !== "string" || !/^e[1-9]\d{0,8}$/.test(options.ref)) throw new Error('ref must look like "e12".');
+      if (options.fullPage) throw new Error("Use either fullPage or ref, not both.");
+      target = this.#target({ kind: "locator", tabId, target: { kind: "ref", ref: options.ref } });
+    }
+    this.#checkImageBudget();
+    const shot = await controller.screenshot({ area: options.fullPage ? "full" : "viewport", target, format: "jpeg" });
+    if (!shot.ok) throw this.#pageError(shot.error, tabId);
+    const { value } = shot;
+    this.#visited.push(value.url);
+    const placeholder = this.#attach({ mimeType: value.mimeType, data: value.data, placeholder: `[screenshot ${value.width}x${value.height} of ${value.url}]` });
+    return value.cut ? `${placeholder} The page is longer than one image allows; the bottom was cut. Scroll and take viewport screenshots for the rest.` : placeholder;
+  }
+
+  #checkImageBudget(): void {
+    if (this.#imagesUsed >= this.maxImages)
+      throw new ProgramError(`Image limit reached: at most ${this.maxImages} images per task. Use page.snapshot() or page.find() instead.`, "LIMIT_EXCEEDED");
+  }
+
+  /** Attaches an image to this program's result and returns its placeholder, numbered by its position among the result's images. */
+  #attach(image: ProgramImage): string {
+    this.#checkImageBudget();
+    this.#imagesUsed += 1;
+    this.#images.push(image);
+    return `${image.placeholder} (image ${this.#images.length} of this result)`;
   }
 
   #renderFind(result: PageFindResult, tabId: number): string {
