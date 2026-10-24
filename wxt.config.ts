@@ -25,6 +25,9 @@ export default defineConfig({
       // web.search runs the user's default engine in the hidden search tab
       // (search.query); no search service or API of bside's own.
       "search",
+      // "Ask bside about this selection / link / image / page" in the page's
+      // context menu (lib/background/context-menu.ts).
+      "menus",
       "https://api.openai.com/*",
       "https://auth.openai.com/*",
       // MCP directory servers (lib/mcp/servers.ts): Notion's MCP and OAuth
@@ -42,6 +45,16 @@ export default defineConfig({
     browser_action: {
       default_icon: "icon.svg",
       default_title: "Toggle sidebar",
+    },
+    // Ctrl+Shift+Y is Firefox's Downloads on Linux and Cmd+Shift+B its
+    // bookmarks toolbar on macOS; Alt+Shift+B and Control+Shift+B are free.
+    // Users change or clear these in about:addons → Manage Extension Shortcuts.
+    commands: {
+      _execute_sidebar_action: {
+        suggested_key: { default: "Alt+Shift+B", mac: "MacCtrl+Shift+B" },
+        description: "Open or close the bside sidebar",
+      },
+      "new-chat": { description: "Start a new bside chat" },
     },
   },
   hooks: {
