@@ -413,9 +413,10 @@ describe("BackgroundRuntime: single active run", () => {
     hub.handleConnect(port);
 
     void port.send({ v: 1, id: "1", type: "run.start", prompt: "Hello" });
-    await tick();
+    // Wait for the first run to reach the provider, not a fixed tick count.
+    await vi.waitFor(() => expect(provider.requests).toHaveLength(1));
     await port.send({ v: 1, id: "2", type: "run.start", prompt: "Second" });
-    await tick();
+    await vi.waitFor(() => expect(port.received.some((e) => e.type === "queue.changed")).toBe(true));
 
     const snapshot = await runtime.getSnapshot();
     expect(snapshot.activeRun).not.toBeNull();
