@@ -1836,38 +1836,60 @@ const MAX_DIFF_ADDED = 25;
 const MAX_DIFF_REMOVED = 8;
 const MAX_DIFF_LINE = 300;
 
-/** Multiset line diff: what appeared and disappeared in the outline. */
+/**
+ * Multiset line diff: what appeared and disappeared in the outline, then,
+ * if the lines both outlines share now come in another order (a sorted table,
+ * a dragged list item), the span that moved as it reads now.
+ */
 export function describeChanges(before: readonly string[], after: readonly string[]): string {
   const remaining = new Map<string, number>();
   for (const line of before) remaining.set(line, (remaining.get(line) ?? 0) + 1);
   const added: string[] = [];
+  const kept = new Map<string, number>();
   for (const line of after) {
     const count = remaining.get(line) ?? 0;
-    if (count > 0) remaining.set(line, count - 1);
-    else added.push(line);
+    if (count > 0) {
+      remaining.set(line, count - 1);
+      kept.set(line, (kept.get(line) ?? 0) + 1);
+    } else added.push(line);
   }
   const removed = [...remaining.entries()].flatMap(([line, count]) => Array<string>(count).fill(line));
-  if (!added.length && !removed.length) return describeReorder(before, after);
-  const lines = [`Page changes (+${added.length} −${removed.length} lines):`];
-  lines.push(...added.slice(0, MAX_DIFF_ADDED).map((line) => `+ ${clip(line, MAX_DIFF_LINE)}`));
-  if (added.length > MAX_DIFF_ADDED) lines.push(`+ …${added.length - MAX_DIFF_ADDED} more added lines; read a snapshot to see them.`);
-  lines.push(...removed.slice(0, MAX_DIFF_REMOVED).map((line) => `- ${clip(line, MAX_DIFF_LINE)}`));
-  if (removed.length > MAX_DIFF_REMOVED) lines.push(`- …${removed.length - MAX_DIFF_REMOVED} more removed lines.`);
+  const reordered = describeReorder(shared(before, kept), shared(after, kept));
+  if (!added.length && !removed.length && !reordered.length) return "Page outline unchanged.";
+  const lines: string[] = [];
+  if (added.length || removed.length) {
+    lines.push(`Page changes (+${added.length} −${removed.length} lines):`);
+    lines.push(...added.slice(0, MAX_DIFF_ADDED).map((line) => `+ ${clip(line, MAX_DIFF_LINE)}`));
+    if (added.length > MAX_DIFF_ADDED) lines.push(`+ …${added.length - MAX_DIFF_ADDED} more added lines; read a snapshot to see them.`);
+    lines.push(...removed.slice(0, MAX_DIFF_REMOVED).map((line) => `- ${clip(line, MAX_DIFF_LINE)}`));
+    if (removed.length > MAX_DIFF_REMOVED) lines.push(`- …${removed.length - MAX_DIFF_REMOVED} more removed lines.`);
+  }
+  lines.push(...reordered);
   return lines.join("\n");
 }
 
-/** The same lines in a new order (a sorted table, a dragged list item): the span that changed, as it reads now. */
-function describeReorder(before: readonly string[], after: readonly string[]): string {
+/** The lines of `outline` that both outlines have, as many of each as they share, in order. */
+function shared(outline: readonly string[], counts: ReadonlyMap<string, number>): string[] {
+  const left = new Map(counts);
+  return outline.filter((line) => {
+    const count = left.get(line) ?? 0;
+    if (count > 0) left.set(line, count - 1);
+    return count > 0;
+  });
+}
+
+/** Where the same lines now come in another order: the span that changed, as it reads now. Empty if the order is the same. */
+function describeReorder(before: readonly string[], after: readonly string[]): string[] {
   let start = 0;
   while (start < after.length && before[start] === after[start]) start++;
-  if (start === after.length) return "Page outline unchanged.";
+  if (start === after.length) return [];
   let end = after.length - 1;
   while (end > start && before[end] === after[end]) end--;
   const span = after.slice(start, end + 1);
   const lines = [`Page outline reordered (${span.length} lines moved); that part now reads:`];
   lines.push(...span.slice(0, MAX_DIFF_ADDED).map((line) => `~ ${clip(line, MAX_DIFF_LINE)}`));
   if (span.length > MAX_DIFF_ADDED) lines.push(`~ …${span.length - MAX_DIFF_ADDED} more lines; read a snapshot to see them.`);
-  return lines.join("\n");
+  return lines;
 }
 
 /**

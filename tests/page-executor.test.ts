@@ -417,6 +417,8 @@ describe("change descriptions", () => {
   it("reports added and removed lines and an unchanged outline", () => {
     expect(describeChanges(["a", "b"], ["a", "b"])).toBe("Page outline unchanged.");
     expect(describeChanges(["h", "a", "b", "c", "f"], ["h", "c", "a", "b", "f"])).toBe("Page outline reordered (3 lines moved); that part now reads:\n~ c\n~ a\n~ b");
+    expect(describeChanges(["h", "a", "b", "c"], ["h", "c", "a", "b", "Moved"])).toBe("Page changes (+1 −0 lines):\n+ Moved\nPage outline reordered (3 lines moved); that part now reads:\n~ c\n~ a\n~ b");
+    expect(describeChanges(["a", "b", "c"], ["a", "c", "new"])).toBe("Page changes (+1 −1 lines):\n+ new\n- b");
     expect(describeChanges(["a", "b"], ["a", "c", "c"])).toBe("Page changes (+2 −1 lines):\n+ c\n+ c\n- b");
   });
 });
