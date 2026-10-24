@@ -3,6 +3,7 @@ import { AgentLoop, MAX_RUN_IMAGES } from "@/lib/background/agent-loop";
 import { BrowserProgram, ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
 import { listMemories, runMemory } from "@/lib/background/memory";
 import type { MemoryApproval } from "@/lib/domain/memory";
+import { buildRunDigest } from "@/lib/domain/run-digest";
 import { saveMemorySettings } from "@/lib/storage";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController, type CaptureOptions, type TabControllerBrowserApi, type TabSnapshot } from "@/lib/background/tab-controller";
@@ -303,12 +304,13 @@ const program = (id: string, source: string): ScriptedProviderEvent[] => [
   { type: "turn.completed", replayState: null },
 ];
 
-async function runLoop(provider: ScriptedProvider) {
+async function runLoop(provider: ScriptedProvider, options: { memory?: boolean } = {}) {
   const fake = fakeTabs();
   const items: ConversationItem[] = [];
   const contexts: string[] = [];
   const outputs: string[] = [];
-  const loop = new AgentLoop(provider, new TabController(fake.api, async () => false), new SidebarHub());
+  const scope = options.memory ? { state: new WorkspaceState(), sessionId: "s1", files: new ScratchFiles(), memory: runMemory("s1", "run1") } : undefined;
+  const loop = new AgentLoop(provider, new TabController(fake.api, async () => false), new SidebarHub(), scope);
   const result = await loop.run({
     runId: "run1", conversationId: "s1", modelId: TEST_MODEL.id, reasoningEffort: "medium",
     transcript: [{ id: "u1", kind: "message", role: "user", text: "What does the chart show?", context: null, at: 1 }],
@@ -344,6 +346,25 @@ describe("AgentLoop: screenshot results", () => {
     expect(JSON.stringify(digest)).toContain("[screenshot 1280x800 of https://example.com/]");
     expect(contexts[1]).toContain('"type": "image"');
     expect(contexts[1]).toContain("[image omitted:");
+  });
+
+  it("carries a program's image to the next round and its tainted memory change on the persisted result", async () => {
+    fakeBrowser.reset();
+    const provider = new ScriptedProvider([
+      program("call_1", 'await browser.tab("/tabs/1/page.md").screenshot({save: "/workspace/chart.jpg"}); fs.write("/memory/chart-style.md", "Chart style\\nBars, blue.");'),
+      [{ type: "text.delta", delta: "Saved." }, { type: "turn.completed", replayState: null }],
+    ]);
+    const { result, items, outputs, digest } = await runLoop(provider, { memory: true });
+    expect(result.status).toBe("completed");
+    expect(imageParts(provider.requests[1]!)).toEqual([{ type: "image", mimeType: "image/jpeg", data: IMAGE_BASE64 }]);
+
+    const change = { id: expect.any(String), op: "write", name: "chart-style", tainted: true };
+    expect(items.find((item) => item.kind === "tool-result")).toMatchObject({ result: { ok: true, summary: "Browser program completed." }, memory: [change] });
+    expect(buildRunDigest(digest, "completed")!.entries).toContainEqual({ type: "memory", op: "write", name: "chart-style", tainted: true });
+    for (const persisted of [JSON.stringify(items), JSON.stringify(digest), JSON.stringify(await listMemories()), ...outputs]) {
+      expect(persisted).not.toContain(IMAGE_BASE64);
+      expect(persisted).not.toContain("data:image");
+    }
   });
 
   it("allows MAX_RUN_IMAGES per run", async () => {
