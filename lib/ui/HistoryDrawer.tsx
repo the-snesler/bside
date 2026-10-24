@@ -189,6 +189,7 @@ function Row({ session, openId, run, agentTabs, now, onOpen, onRename, onPin, on
           <span class="history__meta">
             <time dateTime={updated.toISOString()} title={updated.toLocaleString()}>{formatRelativeTime(session.updatedAt, now)}</time>
             {isOpen && " · Current"}
+            {session.scheduled && " · Scheduled"}
             {tabs > 0 && ` · ${tabsLabel}`}
             {runHere && <span class="history__status">{run!.waitingFor === "confirmation" ? " · Needs confirmation" : run!.waitingFor === "help" ? " · Needs your help" : " · Working"}</span>}
             {/* Last, so a narrow row truncates it before the status. */}

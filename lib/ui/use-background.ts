@@ -416,6 +416,7 @@ function applyEvent(
         text: event.payload.prompt,
         context: event.payload.page,
         ...(event.payload.ask ? { ask: event.payload.ask } : {}),
+        ...(event.payload.scheduled ? { scheduled: event.payload.scheduled } : {}),
         at: event.at,
       };
       const conversationId = event.conversationId!;

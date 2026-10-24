@@ -16,6 +16,11 @@ export default defineConfig({
     icons: { "32": "icon.svg" },
     permissions: [
       "storage",
+      // User-authored local scheduled tasks (docs/automation.md): one-shot
+      // wakeups, no catch-up runs after a browser restart.
+      "alarms",
+      // Private generic hints only, behind an explicit opt-in (default off).
+      "notifications",
       "cookies",
       "identity",
       "webRequest",

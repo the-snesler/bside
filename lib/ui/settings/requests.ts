@@ -1,4 +1,6 @@
 import type {
+  AutomationRequest,
+  AutomationResponse,
   CredentialRequest,
   CredentialResponse,
   HistoryRequest,
@@ -39,6 +41,7 @@ export const sendInstructionsRequest = (request: RequestBody<InstructionsRequest
 export const sendSiteNotesRequest = (request: RequestBody<SiteNotesRequest>) => send<SiteNotesRequest, SiteNotesResponse>(request);
 export const sendMcpRequest = (request: RequestBody<McpRequest>) => send<McpRequest, McpResponse>(request);
 export const sendMemoryRequest = (request: RequestBody<MemoryRequest>) => send<MemoryRequest, MemoryResponse>(request);
+export const sendAutomationRequest = (request: RequestBody<AutomationRequest>) => send<AutomationRequest, AutomationResponse>(request);
 
 /** Shown when the background rejects or drops a request; never the raw error. */
 export const BACKGROUND_FAILURE = "The background could not complete this request. Try again.";

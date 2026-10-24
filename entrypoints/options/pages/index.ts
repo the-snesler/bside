@@ -7,6 +7,7 @@ import MessageUser from "~icons/tabler/message-user";
 import WorldPin from "~icons/tabler/world-pin";
 import Brain from "~icons/tabler/brain";
 import PlugConnected from "~icons/tabler/plug-connected";
+import Clock from "~icons/tabler/clock";
 import { SkillsEditor } from "@/lib/ui/SkillsEditor";
 import type { OptionsApp } from "../state";
 import { GeneralPage } from "./General";
@@ -16,6 +17,7 @@ import { InstructionsPage } from "./Instructions";
 import { SiteNotesPage } from "./SiteNotes";
 import { MemoryPage } from "./Memory";
 import { ConnectionsPage } from "./Connections";
+import { AutomationPage } from "./Automation";
 
 export interface SettingsPageProps {
   app: OptionsApp;
@@ -105,6 +107,15 @@ export const SETTINGS_PAGES: readonly SettingsPage[] = [
     description: "Let bside work in your accounts on other services.",
     keywords: ["MCP", "Notion", "Todoist", "Integrations", "Apps", "Connect", "Disconnect", "Tools", "Confirm writes", "Read-only", "OAuth", "Accounts"],
     component: ConnectionsPage,
+  },
+  {
+    id: "automation",
+    label: "Automation",
+    group: "Agent",
+    icon: Clock,
+    description: "Scheduled prompts and private desktop notifications.",
+    keywords: ["Scheduled tasks", "Daily", "Interval", "Notifications", "Approvals", "Results", "Enable", "Delete task"],
+    component: AutomationPage,
   },
   {
     id: "history",

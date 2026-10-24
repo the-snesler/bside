@@ -237,6 +237,7 @@ export function App() {
                         )}
                         {turn.prompt && (
                           <li class="timeline__item timeline__item--user">
+                            {turn.prompt.scheduled && <p class="timeline__meta">Scheduled · {turn.prompt.scheduled.name} · {new Date(turn.prompt.scheduled.scheduledAt).toLocaleString()}</p>}
                             <p class="timeline__text">
                               {parsePromptMentions(turn.prompt.text).map((segment) =>
                                 segment.kind === "text" ? (

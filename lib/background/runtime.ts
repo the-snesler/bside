@@ -20,6 +20,9 @@ import { readInstructions, saveSiteNoteFromSidebar } from "@/lib/background/inst
 import { readMemoryIndex, runMemory, undoMemoryChanges } from "@/lib/background/memory";
 import { matchSiteNotes, pageOrigin, siteNoteForPage, type SiteNote } from "@/lib/domain/instructions";
 import type { ApprovalBadge } from "@/lib/background/approval-badge";
+import { TaskScheduler, type RecordTaskStart, type SchedulerAlarms, type TaskDispatch } from "@/lib/background/scheduler";
+import type { ScheduledSource, ScheduledTask } from "@/lib/domain/automation";
+import type { RunNotifications } from "@/lib/background/notifications";
 import type { McpConnections } from "@/lib/background/mcp";
 import type { McpToolDefinition } from "@/lib/mcp/tools";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
@@ -43,6 +46,8 @@ import {
   getAppSettings,
   getConversation,
   getHistorySettings,
+  getNotificationSettings,
+  saveNotificationSettings,
   isSessionUntouched,
   loadMessageQueue,
   loadWorkspaceFiles,
@@ -75,6 +80,8 @@ import { hasTokens, newRunUsage, type RunUsageV1 } from "@/lib/domain/usage";
 import type { AppSettingsV1, ModelDefinition, ProviderAdapter, ProviderAuth, ProviderDefinition } from "@/lib/domain/provider";
 import type {
   AgentTabsState,
+  AutomationRequest,
+  AutomationResponse,
   AgentTabSummary,
   ApprovalRequest,
   ContentMessage,
@@ -110,9 +117,10 @@ const RETENTION_SWEEP_MS = 60 * 60_000;
 export interface RuntimeClock {
   now(): number;
   setInterval(callback: () => void, ms: number): unknown;
+  clearInterval?(timer: unknown): void;
 }
 
-const SYSTEM_CLOCK: RuntimeClock = { now: () => Date.now(), setInterval: (callback, ms) => setInterval(callback, ms) };
+const SYSTEM_CLOCK: RuntimeClock = { now: () => Date.now(), setInterval: (callback, ms) => setInterval(callback, ms), clearInterval: (timer) => clearInterval(timer as ReturnType<typeof setInterval>) };
 
 type RunLifecycleStatus = "running" | "awaiting-approval" | "awaiting-help" | "cancelling";
 
@@ -142,6 +150,7 @@ interface ActiveRun {
   runId: string;
   /** The session the run started in; every item it produces is appended there. */
   sessionId: string;
+  scheduled?: ScheduledSource;
   controller: AbortController;
   agentLoop: AgentLoop;
   status: RunLifecycleStatus;
@@ -165,6 +174,11 @@ export class BackgroundRuntime {
   #approvalBadge: ApprovalBadge | null;
   /** Connected accounts' tools; none when absent. */
   #mcp: McpConnections | null;
+  #scheduler: TaskScheduler;
+  #scheduledStarting = false;
+  #notifications: RunNotifications | null;
+  #sweepTimer: unknown;
+  #disposed = false;
   #activeRun: ActiveRun | null = null;
   #notice: string | null = null;
   #clock: RuntimeClock;
@@ -245,7 +259,7 @@ export class BackgroundRuntime {
 
   constructor(
     sidebarHub: SidebarHub,
-    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController; sites?: SiteEnv; approvalBadge?: ApprovalBadge; clock?: RuntimeClock; mcp?: McpConnections } = {},
+    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController; sites?: SiteEnv; approvalBadge?: ApprovalBadge; clock?: RuntimeClock; mcp?: McpConnections; alarms?: SchedulerAlarms; notifications?: RunNotifications } = {},
   ) {
     this.#sidebarHub = sidebarHub;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
@@ -263,6 +277,9 @@ export class BackgroundRuntime {
     this.#sites = options.sites ?? browserSiteEnv();
     this.#approvalBadge = options.approvalBadge ?? null;
     this.#mcp = options.mcp ?? null;
+    this.#notifications = options.notifications ?? null;
+    this.#scheduler = new TaskScheduler({ alarms: options.alarms, now: () => this.#clock.now(),
+      dispatch: (task, at, recordStart) => this.#launchScheduled(task, at, recordStart), liveSessions: async () => (await listSessions()).map((s) => s.id) });
     this.#workspace.onOwnershipChange = () => void this.#queueAgentTabSync();
   }
 
@@ -290,12 +307,28 @@ export class BackgroundRuntime {
         .finally(() => restored.catch(() => {}))
         .then(() => this.#applyRetention()),
       restored,
-    ]).then(() => {});
+    ]).then(async () => {
+      await this.#scheduler.initialize();
+      await this.#syncScheduleBadge();
+      await this.#notifications?.initialize();
+      await this.#notifications?.setEnabled((await getNotificationSettings()).enabled);
+    }).catch(() => {
+      console.warn("[bside] Could not restore scheduled tasks; no missed runs will be started.");
+    });
     await this.#ready;
-    this.#clock.setInterval(() => {
+    if (this.#disposed) return;
+    this.#sweepTimer = this.#clock.setInterval(() => {
       void this.#closeIdleAgentTabs();
       if (this.#clock.now() - this.#lastRetentionAt >= RETENTION_SWEEP_MS) void this.#applyRetention().catch(() => {});
     }, AGENT_TAB_SWEEP_MS);
+  }
+
+  dispose(): void {
+    this.#disposed = true;
+    this.#activeRun?.controller.abort();
+    this.#scheduler.dispose();
+    void this.#notifications?.dispose();
+    this.#clock.clearInterval?.(this.#sweepTimer);
   }
 
   /**
@@ -792,6 +825,10 @@ export class BackgroundRuntime {
   async #runSessionCommand(command: SessionCommand): Promise<void> {
     try { await this.#queueSessionOp(() => this.#applySessionCommand(command)); }
     catch { this.#notice = "Could not update chats. Try again."; }
+    if (command.type === "session.open") {
+      await this.#scheduler.markRead(await this.#openSession()).catch(() => {});
+      await this.#syncScheduleBadge();
+    }
     await this.#sidebarHub.broadcastSnapshot();
     await this.#publishSessions();
   }
@@ -858,6 +895,10 @@ export class BackgroundRuntime {
    * deletion and pruning both spare the active run's.
    */
   async #forgetSessions(ids: readonly string[], closeTabs: boolean): Promise<void> {
+    // Do not await while holding the session-operation lock: an alarm may
+    // already hold the scheduler lock and be waiting to reserve a session.
+    // The queued detach runs before a subsequent settings read or alarm.
+    void this.#scheduler.forgetSessions(ids).then(() => this.#syncScheduleBadge()).catch(() => {});
     if (this.#retryable && ids.includes(this.#retryable.sessionId)) this.#retryable = null;
     for (const id of ids) this.#queues.delete(id);
     if (this.#debugSessionId !== null && ids.includes(this.#debugSessionId)) this.#clearDebugBuffers();
@@ -984,6 +1025,94 @@ export class BackgroundRuntime {
     } catch (error) {
       return { v: 1, id: request.id, ok: false, error: toNormalizedError(error, "persistence") };
     }
+  }
+
+  /** Only the options-page adapter calls this; no automation command exists on the sidebar Port. */
+  async handleAutomationRequest(request: AutomationRequest): Promise<AutomationResponse> {
+    await this.#ready;
+    try {
+      if (request.type === "automation.save") await this.#scheduler.save(request.taskId, request.task);
+      else if (request.type === "automation.delete") await this.#scheduler.remove(request.taskId);
+      else if (request.type === "automation.notifications.save") {
+        await saveNotificationSettings({ version: 1, enabled: request.enabled });
+        await this.#notifications?.setEnabled(request.enabled);
+      }
+      else if (request.type === "automation.results") {
+        const task = (await this.#scheduler.list()).find((t) => t.id === request.taskId);
+        if (!task?.sessionId) throw new Error("This task has no saved results yet.");
+        await this.openResultsSession(task.sessionId);
+      }
+      await this.#syncScheduleBadge();
+      return { v: 1, id: request.id, ok: true, tasks: await this.#scheduler.list(), notifications: await getNotificationSettings(), available: this.#scheduler.available };
+    } catch {
+      return { v: 1, id: request.id, ok: false, error: { code: "INVALID_REQUEST", message: "Could not update automation. Check the task fields and try again.", retryable: false, phase: "persistence" } };
+    }
+  }
+
+  async handleAlarm(name: string): Promise<void> {
+    await this.#ready;
+    await this.#scheduler.handleAlarm(name).catch(() => {});
+  }
+
+  /** A deliberate UI/notification click, never called by automatic dispatch. */
+  async openResultsSession(sessionId: string): Promise<void> {
+    await this.#ready;
+    await this.#runSessionCommand({ v: 1, id: crypto.randomUUID(), type: "session.open", sessionId });
+  }
+
+  async openAttentionSession(): Promise<void> {
+    await this.#ready;
+    const waiting = this.#activeRun;
+    const sessionId = waiting?.pendingApproval || waiting?.pendingHelp ? waiting.sessionId :
+      (await this.#scheduler.list()).filter((t) => t.unread).toSorted((a, b) => (b.lastRun?.startedAt ?? 0) - (a.lastRun?.startedAt ?? 0))[0]?.sessionId;
+    if (sessionId) await this.openResultsSession(sessionId);
+  }
+
+  async #syncScheduleBadge(): Promise<void> {
+    this.#approvalBadge?.setResults((await this.#scheduler.list()).some((t) => t.unread));
+  }
+
+  async #launchScheduled(task: ScheduledTask, scheduledAt: number, recordStart: RecordTaskStart): Promise<TaskDispatch> {
+    if (this.#disposed) return { status: "unavailable" };
+    if (this.#activeRun || this.#scheduledStarting || this.#sessionOpsPending > 0) return { status: "skipped-busy" };
+    this.#scheduledStarting = true;
+    try {
+      return await this.#queueSessionOp(async (): Promise<TaskDispatch> => {
+        if (this.#activeRun) return { status: "skipped-busy" };
+        // Never recreate a deleted results session from a stale alarm. Its
+        // queued detach disables the task; only explicit re-enabling recreates it.
+        if (task.sessionId && !await getConversation(task.sessionId)) return { status: "unavailable" };
+        const sessionId = task.sessionId ?? (await createSession()).id;
+        if (!task.sessionId) await updateSession(sessionId, { title: task.name });
+        const runId = crypto.randomUUID();
+        const scheduled: ScheduledSource = { taskId: task.id, name: task.name, url: task.url, scheduledAt };
+        await recordStart(sessionId, runId);
+        if (this.#disposed) return { status: "unavailable" };
+        // #startRun claims the global slot synchronously. Do not hold the
+        // scheduler/session lock for the provider request or a user pause.
+        void this.#startRun(sessionId, task.prompt, undefined, { scheduled, runId }).catch(async () => {
+          if (this.#activeRun?.runId !== runId) return;
+          this.#activeRun.status = "cancelling";
+          this.#activeRun.controller.abort();
+          this.#approvalBadge?.set(false);
+          void this.#notifications?.clearRun(runId);
+          await clearRunCheckpoint().catch(() => {});
+          const error: NormalizedError = { code: "PROTOCOL_ERROR", message: "The scheduled run stopped unexpectedly. Its earlier actions may have taken effect.", retryable: false, phase: "persistence" };
+          await appendConversationItem(sessionId, { id: crypto.randomUUID(), kind: "run-digest", digest: { version: 1, status: "failed", error: error.message, entries: [], omittedEntries: 0 }, at: this.#clock.now() }).catch(() => {});
+          await touchSession(sessionId, { scheduled }).catch(() => {});
+          this.#sidebarHub.startRun(sessionId);
+          this.#sidebarHub.publishRunEvent(runId, "run.failed", error);
+          await this.#scheduler.updateRun(task.id, runId, "failed").catch(() => {});
+          await this.#syncScheduleBadge();
+          await this.#publishSessions();
+          this.#activeRun = null;
+          this.#refreshShield();
+          void this.#notifications?.finished(runId, sessionId, { scheduled: true, durationMs: 0, status: "failed" });
+          await this.#sidebarHub.broadcastSnapshot();
+        });
+        return { status: "started", runId, sessionId };
+      });
+    } finally { this.#scheduledStarting = false; }
   }
 
   async #getCredentialStatus() {
@@ -1163,9 +1292,10 @@ export class BackgroundRuntime {
    * names the queued follow-up the prompt came from; its user message keeps
    * that id, and it leaves the queue once that message is written.
    */
-  async #startRun(sessionId: string, rawPrompt: string | null, queuedId?: string, accepted?: { skill?: Skill; ask?: AskContextV1 }, askId?: string): Promise<void> {
+  async #startRun(sessionId: string, rawPrompt: string | null, queuedId?: string, accepted?: { skill?: Skill; ask?: AskContextV1; scheduled?: ScheduledSource; runId?: string }, askId?: string): Promise<void> {
+    if (this.#disposed) return;
     const retry = rawPrompt === null;
-    if (this.#activeRun || this.#sessionOpsPending > 0 || (retry && this.#retryable?.sessionId !== sessionId)) {
+    if (this.#activeRun || (!accepted?.scheduled && (this.#sessionOpsPending > 0 || this.#scheduledStarting)) || (retry && this.#retryable?.sessionId !== sessionId)) {
       await this.#sidebarHub.broadcastSnapshot();
       return;
     }
@@ -1185,7 +1315,7 @@ export class BackgroundRuntime {
     // Claim the run slot synchronously, before any `await`, so a second
     // `run.start` arriving before credential lookup resolves still sees an
     // active run and is dropped rather than racing into a second run.
-    const runId = crypto.randomUUID();
+    const runId = accepted?.runId ?? crypto.randomUUID();
     const controller = new AbortController();
     const tabController = this.#tabControllerFactory();
     // The session's scratch files load on the first program that uses them; memory is global and read at each use.
@@ -1195,6 +1325,7 @@ export class BackgroundRuntime {
     const run: ActiveRun = this.#activeRun = {
       runId,
       sessionId,
+      ...(accepted?.scheduled ? { scheduled: accepted.scheduled } : {}),
       controller,
       agentLoop,
       status: "running",
@@ -1221,7 +1352,7 @@ export class BackgroundRuntime {
       const available = await getSkills();
       catalog = skillCatalog(available);
       for (const skill of available) scope.skills.set(skill.name, skill);
-      if (!retry) skill = accepted ? accepted.skill : await captureInvokedSkill(prompt!, available);
+      if (!retry) skill = accepted && !accepted.scheduled ? accepted.skill : await captureInvokedSkill(prompt!, available);
       const chatgpt = await this.#chatgpt.status();
       const credential = chatgpt.connected ? null : await getOpenAICredential();
       if (!chatgpt.connected && !credential) throw new ProviderStreamError("Sign in with ChatGPT or add an OpenAI API key in settings before starting a conversation.", "AUTHENTICATION");
@@ -1231,10 +1362,22 @@ export class BackgroundRuntime {
       if (retry && !conversation.items.some(isTurnStart)) throw new ProviderStreamError("There is no turn to retry.", "INVALID_REQUEST");
       if (!this.#askIsCurrent(askId)) throw new ProviderStreamError(this.#notice!, "INVALID_REQUEST");
       ask = retry ? conversation.items.findLast(isTurnStart)?.ask : accepted?.ask ?? this.#consumeAsk(askId, sessionId);
+      if (retry) run.scheduled = conversation.items.findLast(isTurnStart)?.scheduled;
+      controller.signal.throwIfAborted();
     } catch (error) {
       this.#activeRun = null;
       await this.#settleSteers(sessionId);
       this.#notice = toNormalizedError(error, "setup").message;
+      if (run.scheduled) {
+        const safe = error instanceof ProviderStreamError ? error.message : "Scheduled run could not start. Check your connection and task settings.";
+        if (!retry) await appendConversationItem(sessionId, { id: crypto.randomUUID(), kind: "message", role: "user", text: prompt!, context: null, scheduled: run.scheduled, at: this.#clock.now() }).catch(() => {});
+        await appendConversationItem(sessionId, { id: crypto.randomUUID(), kind: "run-digest", digest: { version: 1, status: "failed", error: safe, entries: [], omittedEntries: 0 }, at: this.#clock.now() }).catch(() => {});
+        await touchSession(sessionId, { scheduled: run.scheduled }).catch(() => {});
+        void this.#scheduler.updateRun(run.scheduled.taskId, runId, controller.signal.aborted ? "cancelled" : "failed").catch(() => {});
+        void this.#notifications?.finished(runId, sessionId, { scheduled: true, durationMs: 0, status: controller.signal.aborted ? "cancelled" : "failed" });
+        void this.#syncScheduleBadge();
+        await this.#publishSessions();
+      }
       await this.#sidebarHub.broadcastSnapshot();
       return;
     }
@@ -1251,7 +1394,7 @@ export class BackgroundRuntime {
     // The active tab is an agent tab while the user watches one. The run's
     // own is attached under /agent-tabs; another session's stays invisible to it.
     const askOwner = ask ? this.#workspace.agentTabs.get(ask.tabId)?.sessionId : undefined;
-    const captureOutcome = ask
+    const captureOutcome = run.scheduled ? await this.#captureScheduledPage(tabController, run) : ask
       ? askOwner && askOwner !== sessionId ? null : await tabController.capturePage(ask.tabId)
       : await tabController.captureActivePage();
     const captured = captureOutcome?.ok ? captureOutcome.value : null;
@@ -1271,6 +1414,7 @@ export class BackgroundRuntime {
         text: prompt!,
         skill,
         ...(ask ? { ask } : {}),
+        ...(run.scheduled ? { scheduled: run.scheduled } : {}),
         ...(sites.length ? { sites } : {}),
         context: artifact ? { artifactId: artifact.artifactId, kind: "page", title: artifact.title, url: artifact.url, capturedAt: artifact.capturedAt } : null,
         at: Date.now(),
@@ -1283,7 +1427,7 @@ export class BackgroundRuntime {
     const userItem = items[userIndex] as UserMessageItem;
     this.#retryable = null;
 
-    this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt: userItem.text, page: userItem.context, ask: userItem.ask ?? null, retry });
+    this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt: userItem.text, page: userItem.context, ask: userItem.ask ?? null, retry, ...(userItem.scheduled ? { scheduled: userItem.scheduled } : {}) });
     await this.#writeCheckpoint(run, "running", "");
 
     // Pi owns assistant/tool replay during this run. Persisted tool items are
@@ -1303,6 +1447,29 @@ export class BackgroundRuntime {
     await this.#runAgentLoop(runId, transcript, catalog, personal, artifact, auth);
   }
 
+  async #captureScheduledPage(tabs: TabController, run: ActiveRun): Promise<Awaited<ReturnType<TabController["captureActivePage"]>>> {
+    let tabId: number | null = null;
+    try {
+      run.controller.signal.throwIfAborted();
+      tabId = await tabs.createTab(run.scheduled!.url);
+      this.#workspace.agentTabs.set(tabId, { role: "agent", sessionId: run.sessionId, lastUsedAt: this.#clock.now() });
+      await tabs.tagAgentTab(tabId, { v: 2, role: "agent", sessionId: run.sessionId, lastUsedAt: this.#clock.now() });
+      await tabs.hideTab(tabId);
+      await tabs.waitUntilReady(tabId, run.controller.signal);
+      const bound = await tabs.forTab(tabId);
+      const outcome = await bound.snapshot();
+      if (!outcome.ok) return outcome;
+      const artifact = bound.currentAttachment()!;
+      return { ok: true, value: { artifact, snapshot: outcome.value } };
+    } catch {
+      if (tabId !== null) {
+        await tabs.closeTab(tabId).catch(() => {});
+        this.#workspace.agentTabs.delete(tabId);
+      }
+      return { ok: false, error: { code: "UNSUPPORTED_PAGE", message: "The scheduled target could not be attached. Open its HTTP(S) URL in an agent tab to try again.", retryable: false, phase: "page" } };
+    } finally { void this.#queueAgentTabSync(); }
+  }
+
   async #runAgentLoop(runId: string, transcript: ConversationItem[], catalog: SkillSummary[], personal: Personalization,
     artifact: ContextArtifact | null, auth: ProviderAuth): Promise<void> {
     const run = this.#activeRun;
@@ -1311,7 +1478,7 @@ export class BackgroundRuntime {
     const settings = await this.#getValidatedSettings();
     // Titles a new session from its first prompt and records the model for the history list.
     // The index only lags on failure, so a failed write never stops the run.
-    await touchSession(run.sessionId, { prompt: transcript.findLast(isTurnStart)?.text, modelId: settings.modelId }).catch(() => {});
+    await touchSession(run.sessionId, { prompt: transcript.findLast(isTurnStart)?.text, modelId: settings.modelId, scheduled: run.scheduled }).catch(() => {});
     await this.#publishSessions();
     const record: RunRecord = {
       runId, modelId: settings.modelId, reasoningEffort: settings.reasoningEffort, startedAt: Date.now(), endedAt: null, status: "running", error: null,
@@ -1410,6 +1577,9 @@ export class BackgroundRuntime {
         run.pendingApproval = request;
         run.status = request ? "awaiting-approval" : "running";
         this.#approvalBadge?.set(request !== null);
+        if (request) void this.#notifications?.pending(runId, run.sessionId, "approval");
+        else void this.#notifications?.clearPending(runId);
+        if (run.scheduled) void this.#scheduler.updateRun(run.scheduled.taskId, runId, request ? "awaiting-approval" : "running").catch(() => {});
         void this.#sidebarHub.broadcastSnapshot();
       },
       onHelpPending: (request) => {
@@ -1418,6 +1588,9 @@ export class BackgroundRuntime {
         run.pendingHelp = request;
         if (run.status !== "cancelling") run.status = request ? "awaiting-help" : "running";
         this.#approvalBadge?.set(request !== null);
+        if (request) void this.#notifications?.pending(runId, run.sessionId, "help");
+        else void this.#notifications?.clearPending(runId);
+        if (run.scheduled) void this.#scheduler.updateRun(run.scheduled.taskId, runId, request ? "awaiting-help" : "running").catch(() => {});
         // The help tab's shield comes off while the request is open.
         this.#refreshShield();
         // Recorded when the pause opens; the run's next item records it running again.
@@ -1452,6 +1625,9 @@ export class BackgroundRuntime {
     const finish = async () => {
       await clearRunCheckpoint();
       await touchSession(run.sessionId, { usage: run.usage ?? undefined }).catch(() => {});
+      if (run.scheduled) await this.#scheduler.updateRun(run.scheduled.taskId, runId, result.status).catch(() => {});
+      if (run.scheduled) await this.#syncScheduleBadge();
+      void this.#notifications?.finished(runId, run.sessionId, { scheduled: !!run.scheduled, durationMs: this.#clock.now() - runStartedAt, status: result.status });
       this.#activeRun = null;
       this.#refreshShield();
       // After the run slot is released, so no steer can be accepted for this run any more.
@@ -1535,6 +1711,8 @@ export class BackgroundRuntime {
   #cancelRun(runId: string): void {
     if (!this.#activeRun || this.#activeRun.runId !== runId || this.#activeRun.status === "cancelling") return;
     this.#activeRun.status = "cancelling";
+    this.#approvalBadge?.set(false);
+    void this.#notifications?.clearPending(runId);
     this.#activeRun.controller.abort();
   }
 

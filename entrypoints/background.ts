@@ -9,6 +9,8 @@ import { BackgroundRuntime } from "@/lib/background/runtime";
 import { ApprovalBadge } from "@/lib/background/approval-badge";
 import { registerSiteRequestHeaders } from "@/lib/sites";
 import { registerEntryPoints, type EntryPointsApi } from "@/lib/background/context-menu";
+import { isAutomationRequest, type AutomationResponse } from "@/lib/protocol";
+import { RunNotifications } from "@/lib/background/notifications";
 
 export default defineBackground({
   persistent: true,
@@ -19,8 +21,16 @@ export default defineBackground({
     const sidebarHub = new SidebarHub();
     const approvalBadge = new ApprovalBadge(browser.browserAction);
     const mcp = new McpConnections({ clientVersion: browser.runtime.getManifest().version });
-    const runtime = new BackgroundRuntime(sidebarHub, { approvalBadge, mcp });
+    const notifications = new RunNotifications({ api: browser.notifications ? {
+      create: (id, options) => browser.notifications.create(id, { ...options, iconUrl: browser.runtime.getURL("/icon.svg") }),
+      clear: (id) => browser.notifications.clear(id), getAll: () => browser.notifications.getAll(),
+      onClicked: browser.notifications.onClicked, onClosed: browser.notifications.onClosed,
+    } : undefined,
+      openSidebar: () => Reflect.get(browser, "sidebarAction").open(), selectSession: (id) => runtime.openResultsSession(id) });
+    const runtime = new BackgroundRuntime(sidebarHub, { approvalBadge, mcp, alarms: browser.alarms, notifications });
     sidebarHub.delegate = runtime;
+    void notifications.initialize();
+    globalThis.addEventListener("unload", () => runtime.dispose(), { once: true });
 
     registerSiteRequestHeaders(browser);
     registerEntryPoints(browser as unknown as EntryPointsApi, {
@@ -29,6 +39,8 @@ export default defineBackground({
       newChat: async () => { await runtime.handleCommand({ v: 1, id: crypto.randomUUID(), type: "session.create" }); },
       focusComposer: () => sidebarHub.focusComposer(),
     });
+
+    browser.alarms.onAlarm.addListener((alarm) => { void runtime.handleAlarm(alarm.name); });
 
     browser.runtime.onConnect.addListener((port) => {
       if (port.name !== SIDEBAR_PORT_NAME) return;
@@ -42,7 +54,8 @@ export default defineBackground({
       );
       // Both calls stay synchronous in the click handler to keep the user
       // gesture; a pending approval or help request opens the sidebar rather than closing it.
-      void (approvalBadge.pending ? sidebarAction.open() : sidebarAction.toggle());
+      void (approvalBadge.attention ? sidebarAction.open() : sidebarAction.toggle());
+      if (approvalBadge.attention) void runtime.openAttentionSession();
     });
 
     browser.tabs.onActivated.addListener(({ tabId }) => {
@@ -73,7 +86,7 @@ export default defineBackground({
     // the sender's.
     const optionsUrl = browser.runtime.getURL("/options.html");
     browser.runtime.onMessage.addListener((message: unknown, sender):
-      Promise<CredentialResponse | SettingsResponse | HistoryResponse | SkillsResponse | InstructionsResponse | SiteNotesResponse | MemoryResponse | McpResponse | ContentMessageResponse> | undefined => {
+      Promise<CredentialResponse | SettingsResponse | HistoryResponse | SkillsResponse | InstructionsResponse | SiteNotesResponse | MemoryResponse | McpResponse | ContentMessageResponse | AutomationResponse> | undefined => {
       if (sender.id !== browser.runtime.id) return undefined;
       if (sender.url?.replace(/#.*$/s, "") !== optionsUrl) {
         const tabId = contentMessageTab(sender, browser.runtime.id);
@@ -81,6 +94,7 @@ export default defineBackground({
         return runtime.handleContentMessage(tabId, message);
       }
       if (isCredentialRequest(message)) return runtime.handleCredentialRequest(message);
+      if (isAutomationRequest(message)) return runtime.handleAutomationRequest(message);
       if (isSettingsRequest(message)) return runtime.handleSettingsRequest(message);
       if (isHistoryRequest(message)) return runtime.handleHistoryRequest(message);
       if (isInstructionsRequest(message)) return handleInstructionsRequest(message);

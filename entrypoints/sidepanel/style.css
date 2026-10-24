@@ -140,7 +140,16 @@ select:disabled {
 }
 .timeline__item--user {
   display: flex;
+  flex-direction: column;
+  align-items: flex-end;
   justify-content: flex-end;
+}
+.timeline__meta {
+  margin: 0 0 5px;
+  max-width: 88%;
+  font-size: 11px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
 }
 .timeline__text {
   margin: 0;

@@ -4,6 +4,9 @@ import { approvingPopup, fakeMcpServers } from "@/tests/helpers/mcp-server";
 import type { Browser } from "wxt/browser";
 import { AGENT_TAB_IDLE_MS, BackgroundRuntime } from "@/lib/background/runtime";
 import { ApprovalBadge } from "@/lib/background/approval-badge";
+import { SCHEDULE_ALARM } from "@/lib/background/scheduler";
+import { RunNotifications } from "@/lib/background/notifications";
+import { taskDraft, type TaskDraft } from "@/lib/domain/automation";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController } from "@/lib/background/tab-controller";
@@ -15,8 +18,10 @@ import {
   saveOpenAICredential, appendConversationItem, createSession, ensureOpenSession, getConversation, getOpenAICredential, getOpenSessionId,
   listSessions, loadMessageQueue, saveHistorySettings, saveMessageQueue, saveRunCheckpoint, setOpenSessionId, updateSession,
   getAppSettings, saveAppSettings, getSiteNotes, getRunCheckpoint,
+  getScheduledTasks, getNotificationSettings, saveNotificationSettings,
 } from "@/lib/storage";
 import type { ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
+import { isTurnStart } from "@/lib/domain/conversation";
 import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
 import type { PageSnapshot } from "@/lib/domain/tools";
 import type { AgentTabsState, SidebarCommand, SidebarEvent } from "@/lib/protocol";
@@ -3273,5 +3278,194 @@ describe("BackgroundRuntime: context-menu drafts", () => {
     expect((await listMemories())[0]?.provenance).toMatchObject({ by: "agent", tainted: true });
     expect((await openConversation()).items.find((item) => item.kind === "message" && item.role === "user" && item.text === "Explain")).toMatchObject({ ask: { id: "ask-1" }, ...(mode === "steer" ? { delivery: "steer" } : {}) });
     expect(capture).toHaveBeenCalledTimes(mode === "follow-up" ? 1 : 0);
+  });
+});
+
+describe("BackgroundRuntime: scheduled automation", () => {
+  const draft: TaskDraft = { name: "Morning check", prompt: "Check this page", url: "https://example.test/", enabled: true, schedule: { kind: "interval", minutes: 5 } };
+  const runtimes: BackgroundRuntime[] = [];
+  afterEach(() => { for (const runtime of runtimes.splice(0)) runtime.dispose(); });
+  async function setup(provider = new FakeProvider(), notifications?: RunNotifications) {
+    await saveOpenAICredential("sk-test");
+    const openId = await ensureOpenSession();
+    const { clock, advance } = manualClock(Date.now());
+    const { api, tags, factory } = fakeTabsApi([{ id: 1, url: "https://private-user-page.test/", title: "Private page", hidden: false }]);
+    api.tabs.sendMessage.mockImplementation(async (tabId, message) => {
+      const request = message as { id: string; type: string };
+      const base = { v: 1, id: request.id, ok: true, type: request.type, url: "https://example.test/" };
+      if (request.type === "page.health") return { ...base, url: "https://example.test/" };
+      if (request.type === "page.snapshot") return { ...base, frames: 0, snapshot: { version: 2, tabId, documentId: `doc-${tabId}`, url: "https://example.test/", title: "Target page", text: "SCHEDULED_PAGE_TEXT", offset: 0, end: 19, totalChars: 19, selectionText: "" } };
+      return base;
+    });
+    const texts: string[] = [];
+    const badge = new ApprovalBadge({ setBadgeText: ({ text }) => { texts.push(text); }, setBadgeBackgroundColor: () => {} });
+    const hub = new SidebarHub();
+    const alarms = { create: vi.fn(), clear: vi.fn(async () => true) };
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory, clock, alarms, approvalBadge: badge, notifications });
+    runtimes.push(runtime); hub.delegate = runtime;
+    await runtime.initialize();
+    const saved = await runtime.handleAutomationRequest({ v: 1, id: "save", type: "automation.save", taskId: null, task: draft });
+    if (!saved.ok) throw new Error(saved.error.message);
+    const taskId = saved.tasks[0]!.id;
+    return { runtime, provider, advance, api, tags, taskId, openId, badge, texts, alarms };
+  }
+  const ended = async (taskId: string) => {
+    await vi.waitFor(async () => expect((await getScheduledTasks()).find((t) => t.id === taskId)?.lastRun?.endedAt).toBeTypeOf("number"));
+    return (await getScheduledTasks()).find((t) => t.id === taskId)!;
+  };
+
+  it("runs in a dedicated owned agent tab/session, preserves open chat, and reuses the results session", async () => {
+    const provider = new FakeProvider();
+    provider.script = [{ type: "text.delta", delta: "Checked." }, { type: "turn.completed", replayState: null }];
+    const { runtime, advance, api, tags, taskId, openId, texts } = await setup(provider);
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
+    const first = await ended(taskId);
+    expect(first.sessionId).not.toBe(openId);
+    expect(await getOpenSessionId()).toBe(openId);
+    expect((await getConversation(openId))!.items).toEqual([]);
+    const session = (await getConversation(first.sessionId!))!;
+    expect(session.scheduled).toMatchObject({ taskId, name: draft.name, url: draft.url });
+    expect(session.items.find(isTurnStart)).toMatchObject({ text: draft.prompt, scheduled: { taskId }, context: { url: draft.url } });
+    expect(api.tabs.create).toHaveBeenCalledWith({ url: draft.url, active: false });
+    expect(tags.get(100)).toMatchObject({ v: 2, sessionId: first.sessionId, role: "agent" });
+    expect(api.tabs.sendMessage.mock.calls.some(([id]) => id === 1)).toBe(false);
+    expect(JSON.stringify(provider.requests)).toContain("SCHEDULED_PAGE_TEXT");
+    expect(JSON.stringify(provider.requests)).not.toContain("private-user-page");
+    expect(texts.at(-1)).toBe("•");
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); await ended(taskId);
+    expect((await getScheduledTasks())[0]!.sessionId).toBe(first.sessionId);
+    expect((await getConversation(first.sessionId!))!.items.filter(isTurnStart)).toHaveLength(2);
+    await runtime.openAttentionSession();
+    expect(await getOpenSessionId()).toBe(first.sessionId);
+    expect((await getScheduledTasks())[0]!.unread).toBe(false);
+    expect(texts.at(-1)).toBe("");
+  });
+
+  it("skips busy ticks without interrupting a user run, including repeated alarms", async () => {
+    const { provider, release } = blockingProvider();
+    const { runtime, advance, taskId, openId } = await setup(provider);
+    const userRun = runtime.handleCommand({ v: 1, id: "user", type: "run.start", prompt: "User work" });
+    await untilRequested(provider);
+    const activeId = (await runtime.getSnapshot()).activeRun!.runId;
+    advance(300_000);
+    await Promise.all([runtime.handleAlarm(SCHEDULE_ALARM), runtime.handleAlarm(SCHEDULE_ALARM)]);
+    expect((await getScheduledTasks())[0]).toMatchObject({ lastTick: { status: "skipped-busy" }, lastRun: null, sessionId: null });
+    expect((await runtime.getSnapshot()).activeRun!.runId).toBe(activeId);
+    expect(provider.requests).toHaveLength(1);
+    release(); await userRun;
+    expect((await getScheduledTasks())[0]!.lastRun).toBeNull();
+    expect(await getOpenSessionId()).toBe(openId);
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); await ended(taskId);
+    expect(provider.requests).toHaveLength(2);
+  });
+
+  it("never runs two due tasks simultaneously", async () => {
+    const { provider, release } = blockingProvider();
+    const { runtime, advance, taskId } = await setup(provider);
+    await runtime.handleAutomationRequest({ v: 1, id: "second", type: "automation.save", taskId: null, task: { ...draft, name: "Second task" } });
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); await untilRequested(provider);
+    const tasks = await getScheduledTasks();
+    expect(tasks.filter((t) => t.lastRun)).toHaveLength(1);
+    expect(tasks[1]!.lastTick?.status).toBe("skipped-busy");
+    expect(provider.requests).toHaveLength(1);
+    release(); await ended(taskId);
+  });
+
+  it("pauses scheduled confirmation until the user responds and preserves ! priority", async () => {
+    const provider = new FakeProvider();
+    scripted(provider, [[
+      { type: "tool.call", call: { id: "confirm", name: "request_action_confirmation", arguments: { title: "Send", message: "Send the draft?", artifact: "Draft" } } },
+      { type: "tool.call", call: { id: "after", name: "browser_program", arguments: { source: 'return fs.write("/workspace/approved.txt", "approved");' } } },
+      { type: "turn.completed", replayState: null },
+    ], [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }]]);
+    const { runtime, advance, taskId, openId, badge, texts } = await setup(provider);
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun?.status).toBe("awaiting-approval"));
+    const active = (await runtime.getSnapshot()).activeRun!;
+    expect((await getScheduledTasks())[0]!.lastRun?.status).toBe("awaiting-approval");
+    expect(await getOpenSessionId()).toBe(openId);
+    expect(provider.requests).toHaveLength(1);
+    badge.setResults(true); await tick(); expect(texts.at(-1)).toBe("!");
+    await runtime.openAttentionSession(); expect(await getOpenSessionId()).toBe(active.conversationId);
+    await runtime.handleCommand({ v: 1, id: "approve", type: "action.approve", runId: active.runId, callId: "confirm" });
+    const task = await ended(taskId);
+    expect((await getConversation(task.sessionId!))!.items.some((item) => item.kind === "tool-result" && item.callId === "after" && item.result.ok)).toBe(true);
+    expect(provider.requests).toHaveLength(2);
+    expect(texts.at(-1)).toBe("•");
+  });
+
+  it("keeps Ask-memory policy as a pause in scheduled runs, and cancellation remains terminal", async () => {
+    await browser.storage.local.set({ memorySettings: { version: 1, writes: "ask" } });
+    const provider = new FakeProvider();
+    scripted(provider, programRound('return fs.write("/memory/scheduled-note.md", "A note\\nBody");'));
+    const { runtime, advance, taskId } = await setup(provider);
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun?.status).toBe("awaiting-approval"));
+    const active = (await runtime.getSnapshot()).activeRun!;
+    expect(active.pendingApproval?.memory?.name).toBe("scheduled-note");
+    expect(await listMemories()).toEqual([]);
+    await runtime.handleCommand({ v: 1, id: "cancel", type: "run.cancel", runId: active.runId });
+    expect((await ended(taskId)).lastRun?.status).toBe("cancelled");
+    expect(await listMemories()).toEqual([]);
+  });
+
+  it("snapshots current skills/site notes/memory without changing the cache prefix", async () => {
+    const provider = new FakeProvider();
+    provider.script = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
+    const { runtime, advance, taskId } = await setup(provider);
+    const skill = { name: "scheduled", description: "Scheduled summary", body: "FIRST_SKILL" };
+    await handleSkillsRequest({ v: 1, id: "skill", type: "skills.save", skill });
+    await handleSiteNotesRequest({ v: 1, id: "note", type: "siteNotes.save", note: { origin: "https://example.test", includeSubdomains: false, text: "SITE_NOTE" } });
+    await writeMemory({ name: "morning", description: "MEMORY_INDEX", body: "Memory body" }, { sessionId: "seed", runId: "seed", tainted: false });
+    const original = (await getScheduledTasks())[0]!;
+    await runtime.handleAutomationRequest({ v: 1, id: "edit", type: "automation.save", taskId, task: { ...taskDraft(original), prompt: "/scheduled check this page" } });
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); const first = await ended(taskId);
+    const user = (await getConversation(first.sessionId!))!.items.find(isTurnStart)!;
+    expect(user.skill).toEqual(skill); expect(user.sites?.[0]?.text).toBe("SITE_NOTE");
+    const input = provider.requests[0]!;
+    expect(JSON.stringify(input.context.messages)).toContain("MEMORY_INDEX");
+    expect(JSON.stringify(input.context.messages)).toContain("Scheduling source");
+    expect(input.context.systemPrompt).not.toContain("SITE_NOTE");
+    expect(input.context.systemPrompt).not.toContain("MEMORY_INDEX");
+    await handleSkillsRequest({ v: 1, id: "edit-skill", type: "skills.save", skill: { ...skill, body: "SECOND_SKILL" } });
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); await ended(taskId);
+    const prompts = (await getConversation(first.sessionId!))!.items.filter(isTurnStart);
+    expect(prompts[0]!.skill?.body).toBe("FIRST_SKILL"); expect(prompts[1]!.skill?.body).toBe("SECOND_SKILL");
+    expect(provider.requests[1]!.context.systemPrompt).toEqual(input.context.systemPrompt);
+  });
+
+  it("session deletion, delete-all and retention disable schedules and remove result links", async () => {
+    for (const mode of ["delete", "all", "retention"]) {
+      const provider = new FakeProvider(); provider.script = [{ type: "turn.completed", replayState: null }];
+      const { runtime, advance, taskId } = await setup(provider);
+      advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); const task = await ended(taskId);
+      if (mode === "delete") await runtime.handleCommand({ v: 1, id: "delete", type: "session.delete", sessionId: task.sessionId!, closeAgentTabs: true });
+      if (mode === "all") await runtime.handleHistoryRequest({ v: 1, id: "all", type: "history.deleteAll" });
+      if (mode === "retention") { advance(8 * 24 * 60 * 60_000); await runtime.handleHistoryRequest({ v: 1, id: "retention", type: "history.retention.save", retention: "7d" }); }
+      const response = await runtime.handleAutomationRequest({ v: 1, id: "list", type: "automation.get" });
+      expect(response.ok && response.tasks.find((t) => t.id === taskId)).toMatchObject({ enabled: false, sessionId: null, lastRun: null, nextAt: null });
+      advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); expect(provider.requests).toHaveLength(1);
+      runtime.dispose(); fakeBrowser.reset();
+    }
+  });
+
+  it("notifications remain opt-in through the background, use generic text, and clicks select results", async () => {
+    const create = vi.fn(async (id: string) => id);
+    const openSidebar = vi.fn(); let clicked: ((id: string) => void) | undefined;
+    let runtime!: BackgroundRuntime;
+    const notifications = new RunNotifications({ api: { create, clear: async () => true, onClicked: { addListener: (cb) => { clicked = cb; }, removeListener: vi.fn() } }, openSidebar, selectSession: (id) => runtime.openResultsSession(id) });
+    const provider = new FakeProvider(); provider.script = [{ type: "text.delta", delta: "PRIVATE_MODEL_TEXT" }, { type: "turn.completed", replayState: null }];
+    const setupResult = await setup(provider, notifications); runtime = setupResult.runtime;
+    expect(await getNotificationSettings()).toEqual({ version: 1, enabled: false });
+    setupResult.advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); await ended(setupResult.taskId);
+    expect(create).not.toHaveBeenCalled();
+    await runtime.handleAutomationRequest({ v: 1, id: "enable", type: "automation.notifications.save", enabled: true });
+    setupResult.advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); const task = await ended(setupResult.taskId);
+    await vi.waitFor(() => expect(create).toHaveBeenCalledOnce());
+    const wire = JSON.stringify(create.mock.calls); expect(wire).not.toContain("PRIVATE"); expect(wire).not.toContain("example.test"); expect(wire).not.toContain(draft.prompt);
+    clicked!(create.mock.calls[0]![0]); expect(openSidebar).toHaveBeenCalledOnce();
+    await vi.waitFor(async () => expect(await getOpenSessionId()).toBe(task.sessionId));
+    await runtime.handleAutomationRequest({ v: 1, id: "disable", type: "automation.notifications.save", enabled: false });
+    expect(await getNotificationSettings()).toEqual({ version: 1, enabled: false });
   });
 });

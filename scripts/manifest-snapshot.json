@@ -4,6 +4,7 @@
   "background_persistent": true,
   "permissions": [
     "<all_urls>",
+    "alarms",
     "cookies",
     "https://ai.todoist.net/*",
     "https://api.openai.com/*",
@@ -12,6 +13,7 @@
     "https://todoist.com/*",
     "identity",
     "menus",
+    "notifications",
     "search",
     "sessions",
     "storage",
