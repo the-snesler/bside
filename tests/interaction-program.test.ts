@@ -44,3 +44,28 @@ describe("hover in browser programs", () => {
     expect((await run('return await page.ref("e1").hover(1);')).summary).toContain("hover() takes 0 arguments");
   });
 });
+
+describe("modifier presses in browser programs", () => {
+  it("sends a parsed chord, in a frame too, and refuses keys outside the closed set before any effect", async () => {
+    const { tab, run, onEffect } = setup('<textarea aria-label="Reply"></textarea>', '<div contenteditable="true" aria-label="Doc"></div>');
+    await run("await page.snapshot();");
+    const sent = await run('return await page.ref("e1").press("ctrl+Enter");');
+    expect(sent.ok, sent.summary).toBe(true);
+    expect(sent.summary).toContain('Pressed Control+Enter on [e1 textbox "Reply"].');
+    expect(tab.requestsTo(0).at(-1)).toMatchObject({ type: "page.execute", action: { kind: "press", key: "Enter", modifiers: ["Control"] } });
+    const plain = await run('return await page.ref("e1").press("Tab");');
+    expect(tab.requestsTo(0).at(-1)).toMatchObject({ action: { kind: "press", key: "Tab" } });
+    expect((tab.requestsTo(0).at(-1) as { action: object }).action).not.toHaveProperty("modifiers");
+    expect(plain.ok).toBe(true);
+
+    const framed = await run('return await page.ref("f1:e1").press("Shift+Meta+k");');
+    expect(framed.ok, framed.summary).toBe(true);
+    expect(tab.requestsTo(5).at(-1)).toMatchObject({ action: { kind: "press", key: "k", modifiers: ["Shift", "Meta"] } });
+
+    const effects = onEffect.mock.calls.length;
+    for (const [chord, message] of [["Control+c", "never uses the clipboard"], ["F12", "press() supports"], ["q", "type text with fill()"]] as const) {
+      expect(await run(`return await page.ref("e1").press(${JSON.stringify(chord)});`)).toMatchObject({ ok: false, summary: expect.stringContaining(message) });
+    }
+    expect(onEffect.mock.calls.length).toBe(effects);
+  });
+});

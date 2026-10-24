@@ -26,7 +26,11 @@
  */
 
 import { TABLE_LIMITS } from "@/lib/domain/tools";
-import type { CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, PageFindResult, PageRect, PageSnapshot, PageTable, SearchResult, TableRole, ToolResult, UploadFile } from "@/lib/domain/tools";
+import type {
+  CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, KeyModifier, PageFindResult, PageRect, PageSnapshot, PageTable, PressKey, SearchResult,
+  TableRole, ToolResult, UploadFile,
+} from "@/lib/domain/tools";
+import { formatKeyChord } from "@/lib/validation";
 import { boundOutline, findInOutline, sliceOutline } from "@/lib/domain/outline";
 
 // ---------------------------------------------------------------------------
@@ -1469,20 +1473,51 @@ function check(control: OutlineControl, checked: boolean): Effect {
 const KEY_CODES: Record<string, { code: string; keyCode: number; key: string }> = {
   Enter: { code: "Enter", keyCode: 13, key: "Enter" }, Tab: { code: "Tab", keyCode: 9, key: "Tab" },
   Escape: { code: "Escape", keyCode: 27, key: "Escape" }, Space: { code: "Space", keyCode: 32, key: " " },
-  Backspace: { code: "Backspace", keyCode: 8, key: "Backspace" }, ArrowUp: { code: "ArrowUp", keyCode: 38, key: "ArrowUp" },
-  ArrowDown: { code: "ArrowDown", keyCode: 40, key: "ArrowDown" }, ArrowLeft: { code: "ArrowLeft", keyCode: 37, key: "ArrowLeft" },
-  ArrowRight: { code: "ArrowRight", keyCode: 39, key: "ArrowRight" },
+  Backspace: { code: "Backspace", keyCode: 8, key: "Backspace" }, Delete: { code: "Delete", keyCode: 46, key: "Delete" },
+  ArrowUp: { code: "ArrowUp", keyCode: 38, key: "ArrowUp" }, ArrowDown: { code: "ArrowDown", keyCode: 40, key: "ArrowDown" },
+  ArrowLeft: { code: "ArrowLeft", keyCode: 37, key: "ArrowLeft" }, ArrowRight: { code: "ArrowRight", keyCode: 39, key: "ArrowRight" },
+  Home: { code: "Home", keyCode: 36, key: "Home" }, End: { code: "End", keyCode: 35, key: "End" },
+  PageUp: { code: "PageUp", keyCode: 33, key: "PageUp" }, PageDown: { code: "PageDown", keyCode: 34, key: "PageDown" },
 };
 
-function press(control: OutlineControl, key: string, outline: Outline): Effect {
+const MODIFIER_KEYS: Record<KeyModifier, { code: string; keyCode: number; flag: "ctrlKey" | "altKey" | "shiftKey" | "metaKey" }> = {
+  Control: { code: "ControlLeft", keyCode: 17, flag: "ctrlKey" }, Alt: { code: "AltLeft", keyCode: 18, flag: "altKey" },
+  Shift: { code: "ShiftLeft", keyCode: 16, flag: "shiftKey" }, Meta: { code: "MetaLeft", keyCode: 91, flag: "metaKey" },
+};
+
+/** A named key's codes, or a letter's or digit's (`KeyK`, `Digit7`); Shift makes a letter's `key` uppercase. */
+function keyInfo(key: PressKey, shift: boolean): { code: string; keyCode: number; key: string } {
+  const named = KEY_CODES[key];
+  if (named) return named;
+  const upper = key.toUpperCase();
+  return /\d/.test(key)
+    ? { code: `Digit${key}`, keyCode: upper.charCodeAt(0), key }
+    : { code: `Key${upper}`, keyCode: upper.charCodeAt(0), key: shift ? upper : key };
+}
+
+/**
+ * Presses a key on the element: each modifier goes down in order, then the
+ * key (keydown, keypress for an unmodified Enter or Space, keyup) with the
+ * modifier flags set, then the modifiers come up in reverse. Only an
+ * unmodified Enter has a default here (submitting a text field's form, or
+ * activating a button or link); everything else is the page's own handlers.
+ */
+function press(control: OutlineControl, key: PressKey, modifiers: readonly KeyModifier[], outline: Outline): Effect {
   const element = control.element;
-  const info = KEY_CODES[key]!;
   (element as HTMLElement).focus?.();
-  const init = { key: info.key, code: info.code, keyCode: info.keyCode, which: info.keyCode, bubbles: true, cancelable: true, composed: true };
-  const proceed = element.dispatchEvent(new KeyboardEvent("keydown", init));
-  if (key === "Enter" || key === "Space") element.dispatchEvent(new KeyboardEvent("keypress", init));
+  const flags = { ctrlKey: false, altKey: false, shiftKey: false, metaKey: false };
+  const keyboard = (type: string, info: { code: string; keyCode: number; key: string }) =>
+    element.dispatchEvent(new KeyboardEvent(type, { key: info.key, code: info.code, keyCode: info.keyCode, which: info.keyCode, bubbles: true, cancelable: true, composed: true, ...flags }));
+  for (const modifier of modifiers) {
+    const { flag, ...info } = MODIFIER_KEYS[modifier];
+    flags[flag] = true;
+    keyboard("keydown", { ...info, key: modifier });
+  }
+  const info = keyInfo(key, flags.shiftKey);
+  const proceed = keyboard("keydown", info);
+  if ((key === "Enter" || key === "Space") && !modifiers.length) keyboard("keypress", info);
   const notes: string[] = [];
-  if (proceed && key === "Enter") {
+  if (proceed && key === "Enter" && !modifiers.length) {
     if ((isInput(element) && TEXT_INPUT_TYPES.has(inputType(element))) && element.form) {
       const invalid = invalidFormControls(element.form, outline);
       if (invalid.length) notes.push(`Native validation blocked submission: ${invalid.join("; ")}`);
@@ -1492,8 +1527,13 @@ function press(control: OutlineControl, key: string, outline: Outline): Effect {
       (element as HTMLElement).click();
     }
   }
-  element.dispatchEvent(new KeyboardEvent("keyup", init));
-  return { ok: true, message: `Pressed ${key} on ${describe(control)}.`, notes };
+  keyboard("keyup", info);
+  for (const modifier of [...modifiers].reverse()) {
+    const { flag, ...info } = MODIFIER_KEYS[modifier];
+    flags[flag] = false;
+    keyboard("keyup", { ...info, key: modifier });
+  }
+  return { ok: true, message: `Pressed ${formatKeyChord(key, modifiers)} on ${describe(control)}.`, notes };
 }
 
 function upload(control: OutlineControl, files: UploadFile[]): Effect {
@@ -1601,7 +1641,7 @@ export async function executeDomAction(
     case "fill": effect = fill(control!, action.text); break;
     case "select": effect = select(control!, action.values); break;
     case "check": effect = check(control!, action.checked); break;
-    case "press": effect = press(control!, action.key, before); break;
+    case "press": effect = press(control!, action.key, action.modifiers ?? [], before); break;
     case "upload": effect = upload(control!, action.files); break;
     case "scroll": effect = scroll(document, control, action.direction, action.amount); break;
   }

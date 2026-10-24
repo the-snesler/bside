@@ -50,7 +50,13 @@ export type UploadFile =
   | { name: string; mimeType: string; text: string }
   | { name: string; mimeType: string; base64: string };
 
-export type PressKey = "Enter" | "Tab" | "Escape" | "Space" | "Backspace" | "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight";
+export type NamedKey = "Enter" | "Tab" | "Escape" | "Space" | "Backspace" | "Delete" | "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" |
+  "Home" | "End" | "PageUp" | "PageDown";
+/** A letter or digit; pressed only together with Control, Alt, or Meta (bare text is typed with fill). */
+export type CharacterKey = "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j" | "k" | "l" | "m" | "n" | "o" | "p" | "q" | "r" | "s" | "t" |
+  "u" | "v" | "w" | "x" | "y" | "z" | "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9";
+export type PressKey = NamedKey | CharacterKey;
+export type KeyModifier = "Control" | "Alt" | "Shift" | "Meta";
 
 /** The closed set of effects the content script may perform. */
 export type DomAction =
@@ -60,7 +66,8 @@ export type DomAction =
   | { kind: "fill"; target: ElementTarget; text: string }
   | { kind: "select"; target: ElementTarget; values: string[] }
   | { kind: "check"; target: ElementTarget; checked: boolean }
-  | { kind: "press"; target: ElementTarget; key: PressKey }
+  /** A key, optionally held with modifiers (`Control+Enter`); a closed set that never includes copy, cut, or paste. */
+  | { kind: "press"; target: ElementTarget; key: PressKey; modifiers?: KeyModifier[] }
   | { kind: "upload"; target: ElementTarget; files: UploadFile[] }
   | { kind: "scroll"; target: ElementTarget | null; direction: "up" | "down" | "left" | "right"; amount: "line" | "page" };
 

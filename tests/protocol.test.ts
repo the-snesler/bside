@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { validateDomAction } from "@/lib/validation";
+import { formatKeyChord, parseKeyChord, validateDomAction } from "@/lib/validation";
 import {
   contentMessageTab,
   isContentMessage,
@@ -363,6 +363,10 @@ describe("isPageExecuteRequest: accepts the closed action union only", () => {
       { kind: "check", target: ref, checked: true },
       { kind: "hover", target: ref },
       { kind: "press", target: ref, key: "Enter" },
+      { kind: "press", target: ref, key: "Enter", modifiers: ["Control"] },
+      { kind: "press", target: ref, key: "Tab", modifiers: ["Shift"] },
+      { kind: "press", target: ref, key: "k", modifiers: ["Meta"] },
+      { kind: "press", target: ref, key: "a", modifiers: ["Control", "Shift"] },
       { kind: "upload", target: ref, files: [{ name: "a.txt", mimeType: "text/plain", text: "hi" }] },
       { kind: "upload", target: ref, files: [{ name: "a.png", mimeType: "image/png", base64: "iVBORw0KGgo=" }] },
       { kind: "scroll", target: null, direction: "down", amount: "page" },
@@ -382,6 +386,16 @@ describe("isPageExecuteRequest: accepts the closed action union only", () => {
       { kind: "click", target: { kind: "ref", ref: "#email", documentId: "doc" } },
       { kind: "click", target: { kind: "ref", ref: "e1" } },
       { kind: "press", target: ref, key: "F12" },
+      { kind: "press", target: ref, key: "Enter", modifiers: [] },
+      { kind: "press", target: ref, key: "Enter", modifiers: ["Hyper"] },
+      { kind: "press", target: ref, key: "Enter", modifiers: ["Shift", "Shift"] },
+      { kind: "press", target: ref, key: "a" },
+      { kind: "press", target: ref, key: "a", modifiers: ["Shift"] },
+      { kind: "press", target: ref, key: "c", modifiers: ["Control"] },
+      { kind: "press", target: ref, key: "v", modifiers: ["Meta"] },
+      { kind: "press", target: ref, key: "x", modifiers: ["Control", "Shift"] },
+      { kind: "press", target: ref, key: "Delete", modifiers: ["Shift"] },
+      { kind: "press", target: ref, key: "A", modifiers: ["Control"] },
       { kind: "upload", target: ref, files: [{ name: "../etc/passwd", mimeType: "text/plain", text: "" }] },
       { kind: "upload", target: ref, files: [] },
       { kind: "upload", target: ref, files: [{ name: "a.png", mimeType: "image/jpeg", base64: "iVBORw0KGgo=" }] },
@@ -459,5 +473,27 @@ describe("page shield messages", () => {
     expect(isContentMessageResponse({ v: 1, id: "1", ok: true, shield: "visible" })).toBe(false);
     expect(isContentMessageResponse({ v: 1, id: "1", ok: false, shield: "off" })).toBe(false);
     expect(isContentMessageResponse(undefined)).toBe(false);
+  });
+});
+
+describe("parseKeyChord", () => {
+  it("parses chords as programs write them, case-insensitively and in a canonical modifier order", () => {
+    expect(parseKeyChord("Enter")).toEqual({ key: "Enter", modifiers: [] });
+    expect(parseKeyChord(" ")).toEqual({ key: "Space", modifiers: [] });
+    expect(parseKeyChord("Control+Enter")).toEqual({ key: "Enter", modifiers: ["Control"] });
+    expect(parseKeyChord("shift+tab")).toEqual({ key: "Tab", modifiers: ["Shift"] });
+    expect(parseKeyChord("Shift + Ctrl + K")).toEqual({ key: "k", modifiers: ["Control", "Shift"] });
+    expect(parseKeyChord("Cmd+Option+1")).toEqual({ key: "1", modifiers: ["Alt", "Meta"] });
+    expect(formatKeyChord("k", ["Control", "Shift"])).toBe("Control+Shift+k");
+  });
+
+  it("explains chords outside the closed set", () => {
+    expect(parseKeyChord("F5")).toMatchObject({ error: expect.stringContaining("press() supports") });
+    expect(parseKeyChord("Hyper+Enter")).toMatchObject({ error: expect.stringContaining('Unknown modifier "Hyper"') });
+    expect(parseKeyChord("Control+Control+Enter")).toMatchObject({ error: expect.stringContaining("each at most once") });
+    expect(parseKeyChord("k")).toMatchObject({ error: expect.stringContaining("type text with fill()") });
+    expect(parseKeyChord("Shift+k")).toMatchObject({ error: expect.stringContaining("only with Control, Alt, or Meta") });
+    for (const chord of ["Control+c", "Meta+V", "Ctrl+Shift+x", "Shift+Delete"]) expect(parseKeyChord(chord)).toMatchObject({ error: expect.stringContaining("never uses the clipboard") });
+    for (const chord of ["", "+", "Control+", "a+b"]) expect(parseKeyChord(chord)).toHaveProperty("error");
   });
 });

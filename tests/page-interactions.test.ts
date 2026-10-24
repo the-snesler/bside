@@ -88,3 +88,54 @@ describe("hover", () => {
     expect(await act(registry, { kind: "hover", target: ref("e1", "old") })).toMatchObject({ ok: false, code: "STALE_SNAPSHOT" });
   });
 });
+
+describe("modifier presses", () => {
+  beforeEach(() => { document.body.innerHTML = ""; });
+
+  function keys(id: string): string[] {
+    const log: string[] = [];
+    for (const type of ["keydown", "keypress", "keyup"]) {
+      document.getElementById(id)!.addEventListener(type, (event) => {
+        const key = event as KeyboardEvent;
+        const held = [key.ctrlKey && "C", key.altKey && "A", key.shiftKey && "S", key.metaKey && "M"].filter(Boolean).join("");
+        log.push(`${type} ${key.key}/${key.code}${held ? ` +${held}` : ""}`);
+      });
+    }
+    return log;
+  }
+
+  it("holds each modifier down around the key, with the flags set, then releases them in reverse", async () => {
+    const registry = setup('<textarea id="message" aria-label="Message"></textarea>');
+    const log = keys("message");
+    const result = await act(registry, { kind: "press", target: ref("e1"), key: "Enter", modifiers: ["Control", "Shift"] });
+    expect(result).toMatchObject({ ok: true, summary: expect.stringContaining('Pressed Control+Shift+Enter on [e1 textbox "Message"].') });
+    expect(log).toEqual([
+      "keydown Control/ControlLeft +C", "keydown Shift/ShiftLeft +CS",
+      "keydown Enter/Enter +CS", "keyup Enter/Enter +CS",
+      "keyup Shift/ShiftLeft +C", "keyup Control/ControlLeft",
+    ]);
+  });
+
+  it("sends a page's own Control+Enter handler the chord, without the unmodified Enter's form submit", async () => {
+    const registry = setup('<form id="form"><input id="q" aria-label="Query"><p id="out"></p></form>');
+    let submitted = 0;
+    document.getElementById("form")!.addEventListener("submit", (event) => { event.preventDefault(); submitted++; });
+    document.getElementById("q")!.addEventListener("keydown", (event) => {
+      if ((event as KeyboardEvent).key === "Enter" && (event as KeyboardEvent).ctrlKey) document.getElementById("out")!.textContent = "Sent with Ctrl+Enter";
+    });
+    const result = await act(registry, { kind: "press", target: ref("e1"), key: "Enter", modifiers: ["Control"] });
+    expect(result.summary).toContain("+ Sent with Ctrl+Enter");
+    expect(submitted).toBe(0);
+    await act(registry, { kind: "press", target: ref("e1"), key: "Enter" });
+    expect(submitted).toBe(1);
+  });
+
+  it("presses letters with their key codes, uppercase under Shift", async () => {
+    const registry = setup('<div id="editor" contenteditable="true" aria-label="Doc"></div>');
+    const log = keys("editor");
+    await act(registry, { kind: "press", target: ref("e1"), key: "k", modifiers: ["Meta"] });
+    await act(registry, { kind: "press", target: ref("e1"), key: "z", modifiers: ["Control", "Shift"] });
+    await act(registry, { kind: "press", target: ref("e1"), key: "7", modifiers: ["Alt"] });
+    expect(log.filter((line) => line.startsWith("keydown") && !/Left/.test(line))).toEqual(["keydown k/KeyK +M", "keydown Z/KeyZ +CS", "keydown 7/Digit7 +A"]);
+  });
+});

@@ -31,7 +31,7 @@ import type {
 import { MAX_FRAME_OUTLINE_CHARS } from "@/lib/protocol";
 import type { CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, PageArtifactSummary, PageErrorCode, PageFindResult, PageRect, PageSnapshot, PageTable, SearchResult, ToolResult } from "@/lib/domain/tools";
 import { findInOutline, lineOffsets, sliceOutline } from "@/lib/domain/outline";
-import { base64Bytes, isSessionId, validateHttpUrl, WORKSPACE_MAX_BINARY_BYTES } from "@/lib/validation";
+import { base64Bytes, formatKeyChord, isSessionId, validateHttpUrl, WORKSPACE_MAX_BINARY_BYTES } from "@/lib/validation";
 
 const NAVIGATION_TIMEOUT_MS = 10_000;
 const PROBE_DELAYS_MS = [100, 200, 400, 800, 1_600, 3_200];
@@ -631,7 +631,7 @@ export class TabController {
       }
       await this.#refreshMetadata(settled.value.url);
       return {
-        result: { ok: true, summary: `${action.kind === "click" ? "Clicked" : `Pressed ${action.key}`}; the page navigated to ${this.#url} (${JSON.stringify(this.#title ?? "")}). Earlier refs are invalid; read a snapshot or use page.find().` },
+        result: { ok: true, summary: `${action.kind === "click" ? "Clicked" : `Pressed ${formatKeyChord(action.key, action.modifiers)}`}; the page navigated to ${this.#url} (${JSON.stringify(this.#title ?? "")}). Earlier refs are invalid; read a snapshot or use page.find().` },
         documentId: null,
       };
     }
@@ -665,7 +665,7 @@ export class TabController {
         await sleep(delay);
         const health = await this.#probeHealth(tabId, frameId);
         if (health) {
-          const verb = action.kind === "click" ? "Clicked" : `Pressed ${action.key}`;
+          const verb = action.kind === "click" ? "Clicked" : `Pressed ${formatKeyChord(action.key, action.modifiers)}`;
           return { result: { ok: true, summary: `${verb}; frame f${frame} navigated to ${health.url}. Its earlier refs are invalid; read a snapshot.` }, documentId: null };
         }
       }

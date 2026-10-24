@@ -1,4 +1,4 @@
-import { TABLE_LIMITS, type DomAction, type ElementTarget, type JsonValue, type PageFindResult, type PageSnapshot, type PressKey, type ToolResult, type UploadFile } from "@/lib/domain/tools";
+import { TABLE_LIMITS, type DomAction, type ElementTarget, type JsonValue, type PageFindResult, type PageSnapshot, type ToolResult, type UploadFile } from "@/lib/domain/tools";
 import type { Skill } from "@/lib/domain/skills";
 import {
   isMemoryTainted, MAX_MEMORIES, MAX_MEMORY_BODY, MAX_MEMORY_SEARCH_LIMIT, MEMORY_SEARCH_LIMIT, MemoryError, memoryDraftProblem, memoryPath,
@@ -7,7 +7,7 @@ import {
 } from "@/lib/domain/memory";
 import { MAX_SNAPSHOT_CHARS } from "@/lib/protocol";
 import {
-  binaryTypeFor, isWorkspacePath, MAX_UPLOAD_FILE_CHARS, MAX_UPLOAD_FILES, PRESS_KEYS, VIEWABLE_IMAGE_TYPES, WORKSPACE_BINARY_TYPES,
+  binaryTypeFor, isWorkspacePath, MAX_UPLOAD_FILE_CHARS, MAX_UPLOAD_FILES, parseKeyChord, VIEWABLE_IMAGE_TYPES, WORKSPACE_BINARY_TYPES,
   WORKSPACE_MAX_BINARY_BYTES, WORKSPACE_MAX_BINARY_TOTAL_BYTES, WORKSPACE_MAX_FILE_CHARS, WORKSPACE_MAX_FILES,
 } from "@/lib/validation";
 import { SITE_APIS } from "@/lib/sites";
@@ -23,7 +23,7 @@ Reading: await page.snapshot() returns the page outline: text in document order 
 Tables: a line like [table e12 "Caption" 340 rows × 6 cols] (or [grid …]) marks a data table. await page.table("e12") (or page.ref("f2:e7").table(), page.getByRole("table", {name: "Caption"}).table()) returns {caption, headers, rows, totalRows, offset, nextOffset} as JSON, ${TABLE_LIMITS.defaultRows} rows at a time; page on with table("e12", {offset: 50, limit: 100}) (limit ≤ ${TABLE_LIMITS.maxRows}). Multi-row headers read "Group / Column", a spanned cell repeats in every row and column it covers, and a cell lists the refs of controls in it ("Alice [e14 link]"). Read rankings, cohorts, and comparisons from it rather than from outline text.
 Searching: await page.find("text") lists matching outline lines (with refs) and their offsets — use it on long pages instead of reading everything. await page.waitFor("text", 8000) waits up to 15000 ms for text to appear. await web.search("query") returns web results (title, URL, snippet) from a hidden search tab; open results with browser.open(url).
 Targeting: page.ref("e5") (or page.ref("f2:e4") inside a frame) targets the element with that ref from your latest snapshot/find/diff of that page; refs stay valid until the page (or, for f2:e4, that frame) navigates or reloads. page.getByRole("button", {name: "Save"}) matches a unique element by role and case-insensitive name substring ({exact: true} for exact). page.getByText("Save") matches any interactive element by name. Both search the top document and its same-origin frames only. Ambiguous or missing matches fail and list candidate refs.
-Actions (on a locator): click(), hover() (moves the pointer onto it, e.g. to open a menu that opens on mouseover; leaves the element hovered before), fill(text) (inputs, textareas, rich-text editors; dates as YYYY-MM-DD), selectOption("label or value" | [...]), setChecked(bool), check(), uncheck(), press("Enter"|"Tab"|"Escape"|"Space"|"Backspace"|"ArrowDown"|…), setInputFiles("/workspace/file.txt" | [...]) attaches scratch files (text or saved images) to a file input. Each action reports the effect, native validation problems, and the page outline lines that appeared (+) or disappeared (−). Use that diff to verify outcomes.
+Actions (on a locator): click(), hover() (moves the pointer onto it, e.g. to open a menu that opens on mouseover; leaves the element hovered before), fill(text) (inputs, textareas, rich-text editors; dates as YYYY-MM-DD), selectOption("label or value" | [...]), setChecked(bool), check(), uncheck(), press("Enter"|"Tab"|"Escape"|"Space"|"Backspace"|"Delete"|"ArrowDown"|"Home"|"PageDown"|…, or a chord such as "Control+Enter", "Shift+Tab", "Meta+k": modifiers Control, Alt, Shift, Meta; a letter or digit only with Control, Alt, or Meta; copy/cut/paste are refused. Keys reach the page's own handlers only, so browser shortcuts and Tab focus moves do not happen), setInputFiles("/workspace/file.txt" | [...]) attaches scratch files (text or saved images) to a file input. Each action reports the effect, native validation problems, and the page outline lines that appeared (+) or disappeared (−). Use that diff to verify outcomes.
 Page methods: navigate(url), goBack(), scroll("down"|"up", "page"|"line"), path().
 Seeing: await page.screenshot() attaches an image of the visible viewport to this program's result; screenshot({fullPage: true}) covers the whole page (very long pages are cut), screenshot({ref: "e5"}) or page.ref("e5").screenshot() crops to one element from your latest snapshot (in a frame, f2:e4, to the part of it the frame shows). Use it for layout, charts, images, canvas, or when the outline is unclear; prefer snapshot() for text. Images are shown to you once, in your next step only, and a task may take only a few: note what you need from them right away.
 Concurrency: const [a, b] = await Promise.all([callA, callB]); runs up to 8 calls at once and keeps result order. Calls on the same tab still run one at a time. If one call fails, the rest are cancelled and the error says which finished; their effects stay committed.
@@ -1006,10 +1006,9 @@ export class BrowserProgram {
       action = { kind: "check", target, checked: method === "check" };
     } else if (method === "press") {
       count(1);
-      const key = text(0) === " " ? "Space" : text(0);
-      if (!(PRESS_KEYS as readonly string[]).includes(key))
-        throw new Error(`press() supports ${PRESS_KEYS.join(", ")}.`);
-      action = { kind: "press", target, key: key as PressKey };
+      const chord = parseKeyChord(text(0));
+      if ("error" in chord) throw new Error(chord.error);
+      action = { kind: "press", target, key: chord.key, ...(chord.modifiers.length ? { modifiers: chord.modifiers } : {}) };
     } else if (method === "setInputFiles") {
       count(1);
       action = {
