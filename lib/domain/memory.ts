@@ -64,13 +64,24 @@ export interface MemoryChange {
   tainted: boolean;
 }
 
-/** A change the Ask policy puts to the user. Model-written text: render as text only. */
+/**
+ * A change the Ask policy puts to the user through the confirmation card:
+ * the entry as it would be saved, or as it is before a removal. Model-written
+ * text: render as text only.
+ */
 export interface MemoryApproval {
   op: "write" | "remove";
   name: string;
   description: string;
   body: string;
+  /** A write that replaces an existing entry. */
+  replaces: boolean;
   tainted: boolean;
+}
+
+/** The confirmation card's title for a memory change. */
+export function memoryApprovalTitle(change: MemoryApproval): string {
+  return `${change.op === "remove" ? "Forget" : change.replaces ? "Update" : "Remember"} memory “${change.name}”`;
 }
 
 export function isMemoryName(value: unknown): value is string {

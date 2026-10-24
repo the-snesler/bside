@@ -22,7 +22,7 @@ import { DEFAULT_CONTEXT_WINDOW } from "@/lib/providers/openai-models";
 import { renderUserPrompt } from "@/lib/background/skill-context";
 import { renderSkillCatalog, type Skill, type SkillSummary } from "@/lib/domain/skills";
 import { matchSiteNotes, renderCustomInstructions, renderToolSiteNotes, type SiteNote } from "@/lib/domain/instructions";
-import { isMemoryChange, type MemoryChange } from "@/lib/domain/memory";
+import { isMemoryChange, memoryApprovalTitle, type MemoryApproval, type MemoryChange } from "@/lib/domain/memory";
 
 export interface AgentLoopParams {
   runId: string;
@@ -413,23 +413,18 @@ export class AgentLoop {
     let result: ToolResult;
     if (call.name === "request_action_confirmation" && typeof args.title === "string" && args.title.trim().length > 0 && args.title.length <= 160 &&
         typeof args.message === "string" && args.message.trim().length > 0 && args.message.length <= 4000 && typeof args.artifact === "string" && args.artifact.length <= 32000 && Object.keys(args).length === 3) {
-      const request: ApprovalRequest = { call, origin: "", display: args.title, target: {} };
-      const waitStartedAt = this.#limits.now();
-      // Register before publishing so an immediate UI response cannot be lost.
-      const decision = waitFor(this.#pendingApprovals, call.id, signal, false);
-      this.#sidebarHub.publishRunEvent(params.runId, "action.approval-required", request);
-      params.onApprovalPending(request);
-      const approved = await decision;
-      this.#pausedMs += this.#limits.now() - waitStartedAt;
-      params.onApprovalPending(null);
-      result = approved && !signal.aborted && !params.signal.aborted
+      const approved = await this.#awaitApproval(params, { call, origin: "", display: args.title, target: {} }, signal);
+      result = approved
         ? { ok: true, summary: "approved:true. The user confirmed the described action only." }
         : { ok: false, code: "ACTION_DENIED", summary: "approved:false. Do not perform this action. The user denied it or the run was cancelled." };
     } else if (call.name === "request_user_help" && isHelpArguments(args)) {
       result = await this.#requestHelp(params, call, args, signal);
     } else if (call.name === "browser_program" && typeof args.source === "string" && Object.keys(args).length === 1) {
       this.#sidebarHub.publishRunEvent(params.runId, "tool.requested", { call, display: "Browser program" });
-      result = await this.#program.execute(args.source, signal);
+      // Under the user's Ask memory policy, each memory change the program makes waits for their decision.
+      result = await this.#program.execute(args.source, signal, {
+        confirmMemory: (change: MemoryApproval) => this.#awaitApproval(params, { call, origin: "", display: memoryApprovalTitle(change), target: {}, memory: change }, signal),
+      });
       const images = this.#program.takeImages();
       if (images.length && this.#acceptsImages) this.#images.set(call.id, images);
       else if (images.length) result = { ...result, summary: `${result.summary}\nThis model does not accept images, so the screenshots were not shown; read page.snapshot() instead.` };
@@ -445,6 +440,23 @@ export class AgentLoop {
     if (call.name === "browser_program") result = this.#withSiteNotes(params, result);
     this.#executedCallIds.set(call.id, result);
     return result;
+  }
+
+  /**
+   * Opens the confirmation card for `request` and waits for the user's
+   * decision; the wait does not count toward the wall-clock budget. `true`
+   * only when approved before the run was cancelled.
+   */
+  async #awaitApproval(params: AgentLoopParams, request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
+    const waitStartedAt = this.#limits.now();
+    // Register before publishing so an immediate UI response cannot be lost.
+    const decision = waitFor(this.#pendingApprovals, request.call.id, signal, false);
+    this.#sidebarHub.publishRunEvent(params.runId, "action.approval-required", request);
+    params.onApprovalPending(request);
+    const approved = await decision;
+    this.#pausedMs += this.#limits.now() - waitStartedAt;
+    params.onApprovalPending(null);
+    return approved && !signal.aborted && !params.signal.aborted;
   }
 
   /** Appends the user's notes for sites the program used, each the first time this run (the turn's user message counts). */

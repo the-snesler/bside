@@ -918,6 +918,25 @@ describe("history drawer", () => {
     expect(root.textContent).not.toContain("Needs you");
   });
 
+  it("asks to approve a memory change on the program's own step under the Ask policy, showing the text as text", async () => {
+    const { posted, emit } = await mountApp();
+    await emit({ runId: "r1", conversationId: "a", type: "run.started", payload: { prompt: "Remember my seat", page: null, retry: false } });
+    const call = { id: "p1", name: "browser_program" as const, arguments: { source: 'fs.write("/memory/seat.md", "Seat\\nWindow");' } };
+    await emit({ runId: "r1", conversationId: "a", type: "tool.requested", payload: { call, display: "Browser program" } });
+    const memory = { op: "write" as const, name: "seat", description: "Seat <b>pref</b>", body: "Window", replaces: false, tainted: true };
+    await emit({ runId: "r1", conversationId: "a", type: "action.approval-required", payload: { call, origin: "", display: "Remember memory “seat”", target: {}, memory } });
+
+    expect(root.textContent).toContain("Waiting for your approval");
+    expect(root.textContent).toContain("Waiting for approval: Remember memory “seat”");
+    expect(root.querySelector(".trace__item[data-status=\"pending\"] .tool-call")?.textContent).toBe("Seat <b>pref</b>\n\nWindow");
+    expect(root.querySelector(".tool-call b")).toBeNull();
+    expect(root.querySelector(".memory-approval__warning")?.textContent).toContain("not something a page told it to remember");
+    // The program's step is shown once, not again for its confirmation.
+    expect(root.querySelectorAll(".trace .trace .trace__item")).toHaveLength(1);
+    await act(() => button("Approve")!.click());
+    expect(posted.at(-1)).toMatchObject({ type: "action.approve", runId: "r1", callId: "p1" });
+  });
+
   it("states the watched tab's shield in the tray and offers Take over until the user takes over", async () => {
     const { posted, emit, bySession } = await mountApp();
     await act(() => root.querySelector<HTMLButtonElement>(".agent-tabs-toggle")!.click());

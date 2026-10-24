@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { storage } from "wxt/utils/storage";
 import { BrowserProgram, parseProgram, ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
 import { listMemories, runMemory } from "@/lib/background/memory";
+import { saveMemorySettings } from "@/lib/storage";
+import type { MemoryApproval } from "@/lib/domain/memory";
 import type { ScratchFileEntry, ScratchStore } from "@/lib/background/browser-program";
 import { TabController, type TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import type { DomAction, PageSnapshot, SearchResult } from "@/lib/domain/tools";
@@ -655,6 +657,45 @@ describe("browser program memory", () => {
     const marked = setup({ memory: true });
     marked.program.taint();
     expect((await marked.run('fs.write("/memory/x.md", "X");')).data).toMatchObject({ memory: [{ name: "x", tainted: true }] });
+  });
+
+  it("refuses every change while the user's policy is off, but still reads and searches", async () => {
+    const { run } = setup({ memory: true });
+    await run('fs.write("/memory/kept.md", "Kept");');
+    await saveMemorySettings({ version: 1, writes: "off" });
+    for (const source of ['fs.write("/memory/new.md", "New");', 'fs.remove("/memory/kept.md");']) {
+      const result = await run(source);
+      expect(result).toMatchObject({ ok: false, code: "ACTION_DENIED" });
+      expect(result.summary).toContain("turned memory saving off");
+    }
+    expect((await listMemories()).map((entry) => entry.name)).toEqual(["kept"]);
+    expect((await run('return fs.read("/memory/kept.md");')).ok).toBe(true);
+    expect((await run('return memory.search("kept");')).ok).toBe(true);
+  });
+
+  it("puts each change to the user under the ask policy, and changes nothing when they decline", async () => {
+    await saveMemorySettings({ version: 1, writes: "ask" });
+    const { program, abort } = setup({ memory: true });
+    const asked: MemoryApproval[] = [];
+    const decide = (approved: boolean) => ({ confirmMemory: async (change: MemoryApproval) => { asked.push(change); return approved; } });
+    const declined = await program.execute('fs.write("/memory/seat.md", "Seat\\nWindow");', abort.signal, decide(false));
+    expect(declined).toMatchObject({ ok: false, code: "ACTION_DENIED" });
+    expect(declined.summary).toContain("The user declined saving /memory/seat.md");
+    expect(await listMemories()).toEqual([]);
+    expect((await program.execute('fs.write("/memory/seat.md", "Seat\\nWindow"); fs.write("/memory/seat.md", "Seat\\nAisle");', abort.signal, decide(true))).ok).toBe(true);
+    expect((await program.execute('fs.remove("/memory/seat.md");', abort.signal, decide(true))).ok).toBe(true);
+    expect(asked).toEqual([
+      { op: "write", name: "seat", description: "Seat", body: "Window", replaces: false, tainted: false },
+      { op: "write", name: "seat", description: "Seat", body: "Window", replaces: false, tainted: false },
+      { op: "write", name: "seat", description: "Seat", body: "Aisle", replaces: true, tainted: false },
+      { op: "remove", name: "seat", description: "Seat", body: "Aisle", replaces: false, tainted: false },
+    ]);
+    // Nothing to ask about: a missing entry, or invalid text, fails first.
+    expect(await program.execute('fs.remove("/memory/seat.md");', abort.signal, decide(true))).toMatchObject({ ok: false, code: "TARGET_MISSING" });
+    expect((await program.execute('fs.write("/memory/key.md", "Key\\nsk-proj-Ab3dEf6hIj9kLm2nOp5qRs");', abort.signal, decide(true))).code).toBe("INVALID_TOOL_ARGUMENTS");
+    expect(asked).toHaveLength(4);
+    // Without a way to ask, nothing is saved.
+    expect(await program.execute('fs.write("/memory/x.md", "X");', abort.signal)).toMatchObject({ ok: false, code: "ACTION_DENIED" });
   });
 
   it("gives concurrent memory writes their own slots", async () => {

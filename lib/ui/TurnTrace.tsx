@@ -1,6 +1,7 @@
 import { useEffect, useState } from "preact/hooks";
 import ArrowsMove from "~icons/tabler/arrows-move";
 import ArrowsVertical from "~icons/tabler/arrows-vertical";
+import Brain from "~icons/tabler/brain";
 import BrandYoutube from "~icons/tabler/brand-youtube";
 import Camera from "~icons/tabler/camera";
 import Checkbox from "~icons/tabler/checkbox";
@@ -87,8 +88,9 @@ function failed(activity: Activity): boolean {
   return !(activity.call.name === "request_action_confirmation" && activity.result.code === "ACTION_DENIED");
 }
 
-/** Icon, status, and a title that states that status in words. */
-export function describeActivity(activity: Activity, pending: boolean): { Icon: Icon; title: string; status?: TraceStatus } {
+/** Icon, status, and a title that states that status in words. `approval` is the request pending on this step, if any. */
+export function describeActivity(activity: Activity, pending: boolean, approval?: ApprovalRequest | null): { Icon: Icon; title: string; status?: TraceStatus } {
+  if (pending && approval?.memory) return { Icon: Brain, title: `Waiting for approval: ${approval.display}`, status: "pending" };
   if (activity.call.name === "request_action_confirmation") {
     const title = stringArg(activity, "title") || "an action";
     if (pending) return { Icon: Shield, title: `Waiting for approval: ${title}`, status: "pending" };
@@ -164,9 +166,25 @@ function HelpActions(props: { tab: AgentTabSummary | null; onShowTab: () => void
   );
 }
 
+/** A memory change the user's Ask policy holds for approval: the entry as it would be saved, or as it is before removal. */
+function MemoryApprovalCard(props: { change: NonNullable<ApprovalRequest["memory"]> }) {
+  const { change } = props;
+  return (
+    <>
+      <p>{change.op === "remove" ? "bside wants to forget this memory:" : change.replaces ? "bside wants to update this memory:" : "bside wants to remember this:"}</p>
+      <pre class="tool-call">{change.body ? `${change.description}\n\n${change.body}` : change.description}</pre>
+      {change.tainted && change.op === "write" && (
+        <p class="memory-approval__warning">bside read web content earlier in this task. Make sure this is something you want kept, not something a page told it to remember.</p>
+      )}
+    </>
+  );
+}
+
 function ActivityLine(props: {
   activity: Activity;
   pending: boolean;
+  /** The confirmation pending on this step, when it is a memory change under the Ask policy. */
+  approval?: ApprovalRequest | null;
   onApprove: () => void;
   onDeny: () => void;
   helpTab?: AgentTabSummary | null;
@@ -174,7 +192,8 @@ function ActivityLine(props: {
   onResolveHelp?: (outcome: HelpOutcome, note: string) => void;
 }) {
   const { activity, pending } = props;
-  const { Icon, title, status } = describeActivity(activity, pending);
+  const { Icon, title, status } = describeActivity(activity, pending, props.approval);
+  const memoryApproval = pending ? props.approval?.memory : undefined;
   const elapsed = activity.endedAt === null ? 0 : activity.endedAt - activity.startedAt;
   const isConfirmation = activity.call.name === "request_action_confirmation";
   const isHelp = activity.call.name === "request_user_help";
@@ -188,7 +207,9 @@ function ActivityLine(props: {
       status={status}
       open={pending}
     >
-      {isConfirmation ? (
+      {memoryApproval ? (
+        <MemoryApprovalCard change={memoryApproval} />
+      ) : isConfirmation ? (
         <>
           <p>{stringArg(activity, "message")}</p>
           {artifact && <pre class="tool-call">{artifact}</pre>}
@@ -314,6 +335,7 @@ export function TurnTrace(props: {
                     key={activity.id}
                     activity={activity}
                     pending={pendingApproval?.call.id === activity.call.id || pendingHelp?.call.id === activity.call.id}
+                    approval={pendingApproval?.call.id === activity.call.id ? pendingApproval : null}
                     onApprove={() => props.onApprove(activity.call.id)}
                     onDeny={() => props.onDeny(activity.call.id)}
                     helpTab={pendingHelp?.call.id === activity.call.id ? props.agentTabs?.find((tab) => tab.id === pendingHelp.tabId) ?? null : null}

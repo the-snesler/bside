@@ -405,11 +405,13 @@ function applyEvent(
     setState((prev) => {
       const committed = commitPendingText(prev, event.conversationId);
       if (!committed.activeRun) return committed;
+      // A memory change under the Ask policy pauses a browser program whose call is already shown.
+      const shown = committed.conversation.items.some((item) => item.kind === "tool-call" && item.call.id === event.payload.call.id);
       const callItem: ConversationItem = { id: `${event.payload.call.id}-call`, kind: "tool-call", call: event.payload.call, at: event.at };
       return {
         ...committed,
         activeRun: { ...committed.activeRun, status: "awaiting-approval", pendingApproval: event.payload },
-        conversation: appendItem(committed, event.conversationId, callItem),
+        conversation: shown ? committed.conversation : appendItem(committed, event.conversationId, callItem),
       };
     });
     return;

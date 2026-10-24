@@ -1721,10 +1721,27 @@ export class BrowserProgram {
     throw new Error("Memory supports fs.list, fs.read, fs.write, and fs.remove.");
   }
 
-  /** Saves `draft` (or removes `name` when it is `null`) for this run, and records the change. */
+  /**
+   * Saves `draft` (or removes `name` when it is `null`) for this run under
+   * the user's write policy, read at each change: `off` refuses it, `ask`
+   * puts it to the user first, `auto` applies it. Records the change.
+   */
   async #changeMemory(draft: MemoryDraft | null, name: string): Promise<string> {
     const memory = this.#memory();
     const path = memoryPath(name);
+    const policy = await memory.policy();
+    if (policy === "off") {
+      throw new ProgramError(`The user turned memory saving off in bside's settings, so ${path} was not ${draft ? "saved" : "removed"}. Do not retry; mention it to the user if it matters.`, "ACTION_DENIED");
+    }
+    if (policy === "ask") {
+      const existing = (await memory.list()).find((entry) => entry.name === name);
+      if (!draft && !existing) throw new ProgramError(`${path} does not exist. List memories with fs.list("/memory").`, "TARGET_MISSING");
+      const shown = draft ?? existing!;
+      const approval: MemoryApproval = { op: draft ? "write" : "remove", name, description: shown.description, body: shown.body, replaces: draft !== null && existing !== undefined, tainted: this.#tainted };
+      if (!(await this.#confirmMemory?.(approval))) {
+        throw new ProgramError(`The user declined ${draft ? "saving" : "removing"} ${path}; nothing was changed. Do not retry it.`, "ACTION_DENIED");
+      }
+    }
     try {
       const change = draft ? await memory.write(draft, this.#tainted) : await memory.remove(name, this.#tainted);
       this.#memoryChanges.push(change);

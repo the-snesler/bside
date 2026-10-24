@@ -29,7 +29,7 @@ import { REASONING_EFFORTS, type AppSettingsV1, type ChatGPTStatus, type Provide
 import type { RunUsageV1 } from "@/lib/domain/usage";
 import { isSkill, isSkillName, type Skill, type SkillSummary } from "@/lib/domain/skills";
 import { isCustomInstructionsText, isSiteNote, isSiteOrigin, type SiteNote } from "@/lib/domain/instructions";
-import type { MemoryChange } from "@/lib/domain/memory";
+import type { MemoryApproval, MemoryChange } from "@/lib/domain/memory";
 import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction, validateElementTarget } from "@/lib/validation";
 
 // ---------------------------------------------------------------------------
@@ -396,6 +396,11 @@ export interface ApprovalRequest {
   origin: string;
   display: string;
   target: { ref?: string; role?: string; name?: string };
+  /**
+   * Set when the user's Ask memory policy gates a change a browser program
+   * (`call`) is making, rather than a `request_action_confirmation` call.
+   */
+  memory?: MemoryApproval;
 }
 
 /** A run paused on `request_user_help`. `reason` is untrusted model text: render it as text only. */

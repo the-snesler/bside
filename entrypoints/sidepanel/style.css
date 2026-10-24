@@ -353,6 +353,10 @@ summary.trace__line:focus-visible .trace__chevron,
   opacity: 0.55;
   cursor: default;
 }
+.memory-approval__warning {
+  color: var(--ink);
+  font-weight: 500;
+}
 .help__reason {
   white-space: pre-wrap;
   overflow-wrap: anywhere;

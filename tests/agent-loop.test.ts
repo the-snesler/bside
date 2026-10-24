@@ -13,6 +13,7 @@ import type { PageSnapshot, ToolCall } from "@/lib/domain/tools";
 import type { ApprovalRequest, HelpRequest, SidebarEvent } from "@/lib/protocol";
 import { ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
 import { listMemories, runMemory } from "@/lib/background/memory";
+import { saveMemorySettings } from "@/lib/storage";
 import { splitSystemMessage, TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
 
 function buildSnapshot(overrides: Partial<PageSnapshot> = {}): PageSnapshot {
@@ -1393,6 +1394,43 @@ describe("AgentLoop: memory", () => {
       { type: "memory", op: "write", name: "coffee", tainted: false },
     ]);
     expect((await listMemories())[0]?.provenance).toEqual({ by: "agent", sessionId: "s1", runId: "run1", at: expect.any(Number), tainted: false });
+  });
+
+  it("routes each change through the confirmation card under the ask policy: approval saves it", async () => {
+    await saveMemorySettings({ version: 1, writes: "ask" });
+    const { result, port, approvals, toolResults } = await runMemoryLoop({
+      rounds: [write("call_1"), done],
+      onApprovalPending: (request, loop) => { if (request) queueMicrotask(() => loop.approve(request.call.id)); },
+    });
+    expect(result.status).toBe("completed");
+    const request = port.received.find((event) => event.type === "action.approval-required")?.payload as ApprovalRequest;
+    expect(request).toMatchObject({ call: { id: "call_1", name: "browser_program" }, display: "Remember memory “coffee”",
+      memory: { op: "write", name: "coffee", description: "Usual coffee order", body: "Oat flat white.", replaces: false, tainted: false } });
+    expect(approvals.map((approval) => approval?.call.id ?? null)).toEqual(["call_1", null]);
+    expect(toolResults()[0]).toContain("Saved /memory/coffee.md.");
+    expect((await listMemories()).map((entry) => entry.name)).toEqual(["coffee"]);
+  });
+
+  it("blocks the change and the round's later calls when the user denies it under the ask policy", async () => {
+    await saveMemorySettings({ version: 1, writes: "ask" });
+    const { result, toolResults, loop } = await runMemoryLoop({
+      rounds: [
+        () => [
+          toolCallEvent("call_1", "browser_program", { source: 'fs.write("/memory/coffee.md", "Coffee");' }),
+          toolCallEvent("call_2", "browser_program", { source: 'fs.write("/memory/tea.md", "Tea");' }),
+          { type: "turn.completed", replayState: null },
+        ],
+        done,
+      ],
+      onApprovalPending: (request, loop) => { if (request) queueMicrotask(() => loop.deny(request.call.id)); },
+    });
+    expect(result.status).toBe("completed");
+    const [denied, skipped] = toolResults();
+    expect(denied).toContain("ACTION_DENIED");
+    expect(denied).toContain("The user declined saving /memory/coffee.md");
+    expect(skipped).toContain("SKIPPED");
+    expect(await listMemories()).toEqual([]);
+    expect(buildRunDigest(loop.digestSteps(), "completed")!.entries.some((entry) => entry.type === "memory")).toBe(false);
   });
 
   it("taints a run whose message carried a page, or whose history replays run notes", async () => {
