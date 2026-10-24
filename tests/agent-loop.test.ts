@@ -1167,11 +1167,12 @@ describe("AgentLoop: compaction", () => {
 
   it("keeps going without losing data when summarizing fails, leaving the oldest turns out only if the request would not fit", async () => {
     const failing = () => new WindowProvider([() => { throw new ProviderStreamError("Rate limited.", "RATE_LIMIT"); }, answer], WINDOW);
+    // Seven turns pass the compaction threshold but, with the system prompt and tool help, still fit the fallback share.
     const near = failing();
-    const nearRun = await run(near, history(8));
+    const nearRun = await run(near, history(7));
     expect(nearRun.result.status).toBe("completed");
     expect(nearRun.items.some((item) => item.kind === "compaction")).toBe(false);
-    expect(near.requests[1]!.context.messages).toHaveLength(17);
+    expect(near.requests[1]!.context.messages).toHaveLength(15);
 
     const over = failing();
     const overRun = await run(over, history(12));
@@ -1200,11 +1201,11 @@ describe("AgentLoop: compaction", () => {
       () => [{ type: "text.delta", delta: "## Goal\nOrchid res" }, { type: "turn.completed", replayState: null, usage: { output: 8192 }, stopReason: "length" }],
       answer,
     ], WINDOW);
-    const { result, items, usage } = await run(provider, history(8));
+    const { result, items, usage } = await run(provider, history(7));
     expect(result.status).toBe("completed");
     expect(items.some((item) => item.kind === "compaction")).toBe(false);
     expect(usage[0]).toBe(8192);
-    expect(provider.requests[1]!.context.messages).toHaveLength(17);
+    expect(provider.requests[1]!.context.messages).toHaveLength(15);
   });
 
   it("folds the previous summary into the next one, as the first summarized message", async () => {
