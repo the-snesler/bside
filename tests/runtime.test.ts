@@ -22,6 +22,7 @@ import { splitSystemMessage, TEST_MODEL, toPiStream, type ScriptedProviderEvent 
 import { buildTurns } from "@/lib/ui/turns";
 import { handleSkillsRequest } from "@/lib/background/skills";
 import { handleInstructionsRequest, handleSiteNotesRequest } from "@/lib/background/instructions";
+import { listMemories, writeMemory } from "@/lib/background/memory";
 
 type ProviderUsage = NonNullable<Extract<ScriptedProviderEvent, { type: "turn.completed" }>["usage"]>;
 
@@ -343,6 +344,45 @@ describe("BackgroundRuntime: custom instructions and site notes", () => {
       requestId: "save", note: { origin: "https://example.com", includeSubdomains: true, text: "Hi" }, error: null,
     });
     expect(other.received.some((event) => event.type.startsWith("siteNote."))).toBe(false);
+  });
+});
+
+describe("BackgroundRuntime: memory", () => {
+  const send = (runtime: BackgroundRuntime, command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+
+  it("lists the run-start memory index on the current turn only, keeping it for the run and out of the system prompt and earlier turns", async () => {
+    await saveOpenAICredential("sk-test");
+    await writeMemory({ name: "coffee", description: "Usual coffee order", body: "Oat flat white" }, { sessionId: "old", runId: "old", tainted: false });
+    const provider = new FakeProvider();
+    let round = 0;
+    provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      if (round++ === 0) {
+        yield { type: "tool.call", call: { id: "save", name: "browser_program", arguments: { source: 'fs.write("/memory/seat.md", "Seat\\nWindow");' } } } as ScriptedProviderEvent;
+        yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+        return;
+      }
+      yield { type: "text.delta", delta: "Done." } as ScriptedProviderEvent;
+      yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+    } });
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
+    await send(runtime, { type: "run.start", prompt: "Remember my seat" });
+    expect((await listMemories()).map((entry) => entry.name)).toEqual(["seat", "coffee"]);
+    const [first, second] = provider.requests.map((request) => request.context);
+    expect(first!.systemPrompt).not.toContain("[bside memory]");
+    const turn = JSON.stringify(first!.messages[0]);
+    expect(turn).toContain("[bside memory]");
+    expect(turn).toContain("/memory/coffee.md");
+    // The index is the run's snapshot: the second round does not list the memory the first round saved.
+    expect(JSON.stringify(second!.messages[0])).toBe(turn);
+    expect(turn).not.toContain("/memory/seat.md");
+
+    await send(runtime, { type: "run.start", prompt: "And now?" });
+    const later = provider.requests.at(-1)!.context;
+    expect(later.systemPrompt).toBe(first!.systemPrompt);
+    expect(later.messages[0]!.content).toBe("Remember my seat");
+    expect(JSON.stringify(later.messages.at(-1))).toContain("/memory/seat.md");
+    // The saved change is on the persisted program result, for the trace and Undo.
+    expect((await openConversation()).items.find((item) => item.kind === "tool-result" && item.callId === "save")).toMatchObject({ memory: [{ op: "write", name: "seat", tainted: false }] });
   });
 });
 

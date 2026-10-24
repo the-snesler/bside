@@ -47,6 +47,12 @@ export interface AgentLoopParams {
    */
   siteNotes?: readonly SiteNote[];
   contextArtifact: ContextArtifact | null;
+  /**
+   * The memory index as it was at run start (`renderMemoryIndex`), sent on
+   * the current user turn only, like the page outline, so neither the system
+   * prompt nor earlier turns change when memory does. Never persisted.
+   */
+  memoryIndex?: string | null;
   auth: ProviderAuth;
   signal: AbortSignal;
   onDelta: (delta: string) => void;
@@ -239,7 +245,7 @@ export class AgentLoop {
     let limitError: NormalizedError | null = null;
     if (params.contextArtifact) this.#program.observe(params.contextArtifact.snapshot.tabId, params.contextArtifact.snapshot.documentId);
     // The attached page, earlier run notes, and a summary carry web content the model reads before any tool runs.
-    if (params.contextArtifact || renderHistory(history.transcript, model, null).some((entry) => entry.untrusted)) this.#program.taint();
+    if (params.contextArtifact || renderHistory(history.transcript, model, { contextArtifact: null }).some((entry) => entry.untrusted)) this.#program.taint();
     for (const note of params.transcript.findLast(isTurnStart)?.sites ?? []) this.#surfacedSites.add(note.origin);
     const agent = this.#agent = new Agent({
       // Every steer waiting at a boundary is delivered together.
@@ -325,7 +331,7 @@ export class AgentLoop {
         const end = messages.indexOf(history.messages.at(-1)!);
         if (compacted && !params.signal.aborted && end > 0 && messages.at(-1)!.role === "assistant") {
           // Pi's leading system message, the summarized history, then this run's messages without the failed round.
-          agent.state.messages = [messages[0]!, ...renderHistory(compacted, model, params.contextArtifact).map((entry) => entry.message), ...messages.slice(end + 1, -1)];
+          agent.state.messages = [messages[0]!, ...renderHistory(compacted, model, params).map((entry) => entry.message), ...messages.slice(end + 1, -1)];
           await agent.continue();
         }
       }
@@ -513,12 +519,12 @@ export class AgentLoop {
    */
   async #prepareHistory(params: AgentLoopParams, model: Model<Api>, onOutput: (usage: AssistantMessage["usage"]) => void):
     Promise<{ transcript: readonly ConversationItem[]; messages: Message[] } | null> {
-    const entries = renderHistory(params.transcript, model, params.contextArtifact);
+    const entries = renderHistory(params.transcript, model, params);
     const window = contextWindow(model);
     if (estimateHistoryTokens(params, entries) <= Math.floor(window * COMPACTION_THRESHOLD)) return { transcript: params.transcript, messages: entries.map((entry) => entry.message) };
     const compacted = await this.#compact(params, params.transcript, model, onOutput);
     if (params.signal.aborted) return null;
-    if (compacted) return { transcript: compacted, messages: renderHistory(compacted, model, params.contextArtifact).map((entry) => entry.message) };
+    if (compacted) return { transcript: compacted, messages: renderHistory(compacted, model, params).map((entry) => entry.message) };
     let kept = entries;
     while (estimateHistoryTokens(params, kept) > window * FALLBACK_HISTORY_SHARE) {
       const next = kept.findIndex((entry, index) => index > 0 && entry.userTurn);
@@ -539,7 +545,7 @@ export class AgentLoop {
    */
   async #compact(params: AgentLoopParams, transcript: readonly ConversationItem[], model: Model<Api>,
     onOutput: (usage: AssistantMessage["usage"]) => void): Promise<readonly ConversationItem[] | null> {
-    const entries = renderHistory(transcript, model, params.contextArtifact);
+    const entries = renderHistory(transcript, model, params);
     const keepRecentTokens = Math.min(KEEP_RECENT_TOKENS, Math.floor(contextWindow(model) * 0.15));
     const turnStarts = entries.flatMap((entry, index) => entry.userTurn ? [index] : []);
     let cut = turnStarts.at(-1);
@@ -753,13 +759,14 @@ function replayedDigests(items: readonly ConversationItem[]): Set<string> {
  * Renders persisted items into provider history, deterministically, so a
  * session's earlier turns replay byte-identically across runs:
  * - the latest compaction's summary note, then only the items from its boundary;
- * - user and assistant message text (the page outline only on the current user turn), with
+ * - user and assistant message text (the memory index and page outline only on the current user turn), with
  *   each delivered steer as a plain user message where the model received it, inside its turn;
  * - run digests as user-role notes after the turn they describe, within the replay budget.
  * Tool calls and results are never replayed: each run's digest stands in for them.
  */
-function renderHistory(items: readonly ConversationItem[], model: Model<Api>, artifact: ContextArtifact | null): HistoryEntry[] {
-  const current = items.findLastIndex(isTurnStart);
+function renderHistory(items: readonly ConversationItem[], model: Model<Api>, current: Pick<AgentLoopParams, "contextArtifact" | "memoryIndex">): HistoryEntry[] {
+  const { contextArtifact: artifact, memoryIndex } = current;
+  const latest = items.findLastIndex(isTurnStart);
   const compaction = activeCompaction(items);
   const start = compaction ? items.findIndex((item) => item.id === compaction.firstKeptItemId) : 0;
   const shown = items.slice(start);
@@ -770,9 +777,10 @@ function renderHistory(items: readonly ConversationItem[], model: Model<Api>, ar
     if (item.kind === "run-digest" && digests.has(item.id)) entries.push({ itemId: item.id, userTurn: false, untrusted: true, message: note(renderDigestNote(item.digest), item.at) });
     if (item.kind !== "message") return;
     if (item.role === "user") {
-      entries.push({ itemId: item.id, userTurn: isTurnStart(item), message: !artifact || start + offset !== current
+      const extras = start + offset !== latest ? [] : [...(memoryIndex ? [memoryIndex] : []), ...(artifact ? [renderPageContext(artifact)] : [])];
+      entries.push({ itemId: item.id, userTurn: isTurnStart(item), message: !extras.length
         ? { role: "user", content: renderUserPrompt(item), timestamp: item.at }
-        : { role: "user", content: [{ type: "text", text: renderUserPrompt(item) }, { type: "text", text: renderPageContext(artifact) }], timestamp: item.at } });
+        : { role: "user", content: [renderUserPrompt(item), ...extras].map((text) => ({ type: "text" as const, text })), timestamp: item.at } });
       return;
     }
     entries.push({ itemId: item.id, userTurn: false, message: {

@@ -16,7 +16,7 @@ import { getSkills } from "@/lib/background/skills";
 import { captureInvokedSkill } from "@/lib/background/skill-context";
 import { skillCatalog, type Skill, type SkillSummary } from "@/lib/domain/skills";
 import { readInstructions, saveSiteNoteFromSidebar } from "@/lib/background/instructions";
-import { runMemory } from "@/lib/background/memory";
+import { readMemoryIndex, runMemory } from "@/lib/background/memory";
 import { matchSiteNotes, pageOrigin, siteNoteForPage, type SiteNote } from "@/lib/domain/instructions";
 import type { ApprovalBadge } from "@/lib/background/approval-badge";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
@@ -111,6 +111,13 @@ export interface RuntimeClock {
 const SYSTEM_CLOCK: RuntimeClock = { now: () => Date.now(), setInterval: (callback, ms) => setInterval(callback, ms) };
 
 type RunLifecycleStatus = "running" | "awaiting-approval" | "awaiting-help" | "cancelling";
+
+/** The user's instructions and site notes, and the memory index, snapshotted when a run starts. */
+interface Personalization {
+  instructions: string;
+  siteNotes: SiteNote[];
+  memoryIndex: string | null;
+}
 
 /** Run-level diagnostics for context export; held in memory only. */
 interface RunRecord {
@@ -1138,10 +1145,11 @@ export class BackgroundRuntime {
     let conversation: Conversation | null;
     let skill: Skill | undefined;
     let catalog: SkillSummary[];
-    // Like skills, the run uses the custom instructions and site notes as they are now.
-    let personal: { instructions: string; siteNotes: SiteNote[] };
+    // Like skills, the run uses the custom instructions, site notes, and memory index as they are now.
+    let personal: Personalization;
     try {
-      personal = await readInstructions();
+      // Memory the run cannot read is left out of its prompt rather than stopping it.
+      personal = { ...await readInstructions(), memoryIndex: await readMemoryIndex().catch(() => null) };
       const available = await getSkills();
       catalog = skillCatalog(available);
       for (const skill of available) scope.skills.set(skill.name, skill);
@@ -1221,7 +1229,7 @@ export class BackgroundRuntime {
     await this.#runAgentLoop(runId, transcript, catalog, personal, artifact, auth);
   }
 
-  async #runAgentLoop(runId: string, transcript: ConversationItem[], catalog: SkillSummary[], personal: { instructions: string; siteNotes: SiteNote[] },
+  async #runAgentLoop(runId: string, transcript: ConversationItem[], catalog: SkillSummary[], personal: Personalization,
     artifact: ContextArtifact | null, auth: ProviderAuth): Promise<void> {
     const run = this.#activeRun;
     if (!run || run.runId !== runId) return;
@@ -1262,6 +1270,7 @@ export class BackgroundRuntime {
       skills: catalog,
       instructions: personal.instructions,
       siteNotes: personal.siteNotes,
+      memoryIndex: personal.memoryIndex,
       contextArtifact: artifact,
       auth,
       onContext: (context) => { this.#latestContext = context; },
