@@ -369,6 +369,9 @@ describe("BackgroundRuntime: memory", () => {
     expect((await listMemories()).map((entry) => entry.name)).toEqual(["seat", "coffee"]);
     const [first, second] = provider.requests.map((request) => request.context);
     expect(first!.systemPrompt).not.toContain("[bside memory]");
+    // The fixed policy says what memories are; the entries themselves never reach the system prompt.
+    expect(first!.systemPrompt).toContain("Memories under /memory are notes you saved in earlier chats");
+    expect(first!.systemPrompt).not.toContain("Usual coffee order");
     const turn = JSON.stringify(first!.messages[0]);
     expect(turn).toContain("[bside memory]");
     expect(turn).toContain("/memory/coffee.md");
