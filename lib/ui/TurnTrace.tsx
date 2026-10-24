@@ -2,6 +2,7 @@ import { useEffect, useState } from "preact/hooks";
 import ArrowsMove from "~icons/tabler/arrows-move";
 import ArrowsVertical from "~icons/tabler/arrows-vertical";
 import BrandYoutube from "~icons/tabler/brand-youtube";
+import Camera from "~icons/tabler/camera";
 import Checkbox from "~icons/tabler/checkbox";
 import Clock from "~icons/tabler/clock";
 import ExternalLink from "~icons/tabler/external-link";
@@ -14,6 +15,7 @@ import List from "~icons/tabler/list";
 import LockAccess from "~icons/tabler/lock-access";
 import Login from "~icons/tabler/login";
 import Paperclip from "~icons/tabler/paperclip";
+import Photo from "~icons/tabler/photo";
 import Pointer from "~icons/tabler/pointer";
 import Search from "~icons/tabler/search";
 import Selector from "~icons/tabler/selector";
@@ -43,6 +45,8 @@ const PROGRAM_ACTIONS: [RegExp, Icon, string, string, string][] = [
   [/web\.search\(/, WorldSearch, "Searching the web", "Searched the web", "Web search failed"],
   [/youtube\s*\.\s*\w+\s*\(/, BrandYoutube, "Reading YouTube", "Read YouTube", "Couldn't read YouTube"],
   [/\.navigate\(|\.goBack\(|browser\.open\(/, ExternalLink, "Opening a page", "Opened a page", "Couldn't open a page"],
+  [/\.screenshot\s*\(/, Camera, "Taking a screenshot", "Took a screenshot", "Couldn't take a screenshot"],
+  [/fs\s*\.\s*view\s*\(/, Photo, "Looking at an image", "Looked at an image", "Couldn't show an image"],
   [/fs\.remove\(/, Trash, "Removing a file or tab", "Removed a file or tab", "Couldn't remove a file or tab"],
   [/fs\.move\(/, ArrowsMove, "Moving a file or tab", "Moved a file or tab", "Couldn't move a file or tab"],
   [/fs\.write\(/, FilePencil, "Writing a scratch file", "Wrote a scratch file", "Couldn't write a scratch file"],

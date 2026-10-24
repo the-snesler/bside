@@ -34,6 +34,16 @@ describe("trace read labels", () => {
     expect(describeActivity(activity(source, false), false)).toMatchObject({ title: "Couldn't read YouTube", status: "error" });
   });
 
+  it("labels screenshots and viewed images by their call, without any image", () => {
+    const shot = 'const page = browser.tab("/agent-tabs/3/page.md"); await page.snapshot(); await page.ref("e4").screenshot({save: "/workspace/chart.png"});';
+    expect(describeActivity(activity(shot), false)).toMatchObject({ title: "Taking a screenshot", status: "running" });
+    expect(describeActivity(activity(shot, true), false).title).toBe("Took a screenshot");
+    expect(describeActivity(activity(shot, false), false)).toMatchObject({ title: "Couldn't take a screenshot", status: "error" });
+    expect(describeActivity(activity('await fs.view("/workspace/chart.png");', true), false).title).toBe("Looked at an image");
+    // An effect in the same program still names the step.
+    expect(describeActivity(activity('await page.ref("e1").click(); await page.screenshot();', true), false).title).toBe("Clicked a page control");
+  });
+
   it("keeps page labels for page snapshots", () => {
     const source = 'const page = browser.tab("/tabs/12/page.md"); page.snapshot();';
     expect(describeActivity(activity(source), false).title).toBe("Reading page content");
