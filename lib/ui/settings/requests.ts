@@ -5,6 +5,8 @@ import type {
   HistoryResponse,
   InstructionsRequest,
   InstructionsResponse,
+  MemoryRequest,
+  MemoryResponse,
   SettingsRequest,
   SettingsResponse,
   SiteNotesRequest,
@@ -33,6 +35,7 @@ export const sendHistoryRequest = (request: RequestBody<HistoryRequest>) => send
 export const sendSkillsRequest = (request: RequestBody<SkillsRequest>) => send<SkillsRequest, SkillsResponse>(request);
 export const sendInstructionsRequest = (request: RequestBody<InstructionsRequest>) => send<InstructionsRequest, InstructionsResponse>(request);
 export const sendSiteNotesRequest = (request: RequestBody<SiteNotesRequest>) => send<SiteNotesRequest, SiteNotesResponse>(request);
+export const sendMemoryRequest = (request: RequestBody<MemoryRequest>) => send<MemoryRequest, MemoryResponse>(request);
 
 /** Shown when the background rejects or drops a request; never the raw error. */
 export const BACKGROUND_FAILURE = "The background could not complete this request. Try again.";

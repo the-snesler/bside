@@ -29,7 +29,7 @@ import { REASONING_EFFORTS, type AppSettingsV1, type ChatGPTStatus, type Provide
 import type { RunUsageV1 } from "@/lib/domain/usage";
 import { isSkill, isSkillName, type Skill, type SkillSummary } from "@/lib/domain/skills";
 import { isCustomInstructionsText, isSiteNote, isSiteOrigin, type SiteNote } from "@/lib/domain/instructions";
-import type { MemoryApproval, MemoryChange } from "@/lib/domain/memory";
+import { isMemoryDraft, isMemoryName, MEMORY_WRITE_POLICIES, type MemoryApproval, type MemoryChange, type MemoryDraft, type MemoryEntry, type MemorySettingsV1 } from "@/lib/domain/memory";
 import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction, validateElementTarget } from "@/lib/validation";
 
 // ---------------------------------------------------------------------------
@@ -596,6 +596,34 @@ export function isSiteNotesRequest(value: unknown): value is SiteNotesRequest {
   if (candidate.type === "siteNotes.list") return true;
   if (candidate.type === "siteNotes.save") return isSiteNote(candidate.note);
   if (candidate.type === "siteNotes.delete") return isSiteOrigin(candidate.origin);
+  return false;
+}
+
+/** Agent memory; options page only (the sidebar's `memory.undo` is the one exception). */
+export type MemoryRequest =
+  | { v: 1; id: string; type: "memory.list" }
+  /** The user's edit of an existing entry: its description and body. Records the user as its source. */
+  | { v: 1; id: string; type: "memory.save"; entry: MemoryDraft }
+  | { v: 1; id: string; type: "memory.delete"; name: string }
+  /** "Forget everything": deletes every entry. */
+  | { v: 1; id: string; type: "memory.forgetAll" }
+  | { v: 1; id: string; type: "memory.settings.save"; settings: MemorySettingsV1 };
+
+export type MemoryResponse =
+  | { v: 1; id: string; ok: true; entries: MemoryEntry[]; settings: MemorySettingsV1 }
+  | { v: 1; id: string; ok: false; error: NormalizedError };
+
+export function isMemoryRequest(value: unknown): value is MemoryRequest {
+  if (!isEnvelope(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.type === "memory.list" || candidate.type === "memory.forgetAll") return true;
+  if (candidate.type === "memory.save") return isMemoryDraft(candidate.entry);
+  if (candidate.type === "memory.delete") return isMemoryName(candidate.name);
+  if (candidate.type === "memory.settings.save") {
+    const settings = candidate.settings as Record<string, unknown> | null;
+    return typeof settings === "object" && settings !== null && Object.keys(settings).length === 2 && settings.version === 1 &&
+      (MEMORY_WRITE_POLICIES as readonly unknown[]).includes(settings.writes);
+  }
   return false;
 }
 

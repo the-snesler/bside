@@ -5,6 +5,7 @@ import Sparkles from "~icons/tabler/sparkles";
 import ShieldLock from "~icons/tabler/shield-lock";
 import MessageUser from "~icons/tabler/message-user";
 import WorldPin from "~icons/tabler/world-pin";
+import Brain from "~icons/tabler/brain";
 import { SkillsEditor } from "@/lib/ui/SkillsEditor";
 import type { OptionsApp } from "../state";
 import { GeneralPage } from "./General";
@@ -12,6 +13,7 @@ import { AccountPage } from "./Account";
 import { HistoryPage } from "./History";
 import { InstructionsPage } from "./Instructions";
 import { SiteNotesPage } from "./SiteNotes";
+import { MemoryPage } from "./Memory";
 
 export interface SettingsPageProps {
   app: OptionsApp;
@@ -83,6 +85,15 @@ export const SETTINGS_PAGES: readonly SettingsPage[] = [
     description: "Notes bside reads when it works on a particular site.",
     keywords: ["Site instructions", "Per-site", "Websites", "Domains", "Origins", "Subdomains", "Remember this site", "Memory"],
     component: SiteNotesPage,
+  },
+  {
+    id: "memory",
+    label: "Memory",
+    group: "Agent",
+    icon: Brain,
+    description: "What bside remembers across chats, and whether it may save more.",
+    keywords: ["Memories", "Remember", "Forget everything", "Saved notes", "Auto", "Ask", "Off", "Export", "JSON", "Web content", "Undo", "Personalization"],
+    component: MemoryPage,
   },
   {
     id: "history",

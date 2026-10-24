@@ -1,5 +1,6 @@
 import { MAX_MEMORIES, MemoryError, memoryDraftProblem, memoryPath, renderMemoryIndex, sortMemories, type MemoryChange, type MemoryDraft, type MemoryEntry } from "@/lib/domain/memory";
-import { getMemorySettings, loadMemories, removeAllMemories, removeMemory, saveMemory, type MemorySlot } from "@/lib/storage";
+import { getMemorySettings, loadMemories, removeAllMemories, removeMemory, saveMemory, saveMemorySettings, type MemorySlot } from "@/lib/storage";
+import { isMemoryRequest, type MemoryRequest, type MemoryResponse, type NormalizedError } from "@/lib/protocol";
 import type { MemoryAccess } from "@/lib/background/browser-program";
 
 /**
@@ -150,4 +151,35 @@ export function runMemory(sessionId: string, runId: string): MemoryAccess {
     write: (draft, tainted) => writeMemory(draft, { sessionId, runId, tainted }),
     remove: (name, tainted) => forgetMemory(name, { sessionId, runId, tainted }),
   };
+}
+
+const invalid = (message: string): NormalizedError => ({ code: "INVALID_REQUEST", message, retryable: false, phase: "setup" });
+
+/** The options page's Memory requests: browse, edit, delete, forget everything, and the write policy. */
+export function handleMemoryRequest(request: MemoryRequest): Promise<MemoryResponse> {
+  return serialized(async (): Promise<MemoryResponse> => {
+    const { id } = request;
+    if (!isMemoryRequest(request)) return { v: 1, id, ok: false, error: invalid("Invalid memory request.") };
+    try {
+      if (request.type === "memory.save") {
+        const problem = memoryDraftProblem(request.entry);
+        if (problem) return { v: 1, id, ok: false, error: invalid(problem) };
+        const existing = (await loadMemories()).find((slot) => slot.entry.name === request.entry.name);
+        if (!existing) return { v: 1, id, ok: false, error: invalid("That memory no longer exists.") };
+        const { description, body } = request.entry;
+        await saveMemory({ slot: existing.slot, entry: { ...existing.entry, description, body, provenance: { by: "user", at: Date.now() } } });
+      } else if (request.type === "memory.delete") {
+        const existing = (await loadMemories()).find((slot) => slot.entry.name === request.name);
+        if (existing) await removeMemory(existing.slot);
+      } else if (request.type === "memory.forgetAll") {
+        await removeAllMemories();
+        journal = [];
+      } else if (request.type === "memory.settings.save") {
+        await saveMemorySettings(request.settings);
+      }
+      return { v: 1, id, ok: true, entries: sortMemories((await loadMemories()).map((slot) => slot.entry)), settings: await getMemorySettings() };
+    } catch {
+      return { v: 1, id, ok: false, error: { code: "PROTOCOL_ERROR", message: "Memory could not be read or saved. Try again.", retryable: true, phase: "persistence" } };
+    }
+  });
 }

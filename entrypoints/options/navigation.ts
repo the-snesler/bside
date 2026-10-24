@@ -1,9 +1,14 @@
 import type { SettingsPage } from "./pages";
 
-/** `#/skills` → `"skills"`; anything else → null. */
+/** `#/skills` → `"skills"`, `#/memory/coffee` → `"memory"`; anything else → null. */
 export function routeFromHash(hash: string): string | null {
-  const match = /^#\/([a-z0-9-]+)\/?$/.exec(hash);
+  const match = /^#\/([a-z0-9-]+)(?:\/[a-z0-9-]*)?\/?$/.exec(hash);
   return match ? match[1]! : null;
+}
+
+/** The item a deep link names on its page: `#/memory/coffee` → `"coffee"`; none → null. */
+export function itemFromHash(hash: string): string | null {
+  return /^#\/[a-z0-9-]+\/([a-z0-9-]+)\/?$/.exec(hash)?.[1] ?? null;
 }
 
 export const hrefFor = (page: Pick<SettingsPage, "id">) => `#/${page.id}`;
