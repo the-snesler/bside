@@ -6,7 +6,9 @@
  * The outline walks the composed tree in document order: open and closed
  * shadow roots, slot assignments, and same-origin frames. Interactive
  * elements are inlined as `[e12 button "Save"]` tokens whose refs stay bound
- * to the same element for the document's lifetime. Hidden radios, checkboxes,
+ * to the same element for the document's lifetime. A cross-origin frame is a
+ * placeholder line (`ChildFrame`) for the background to fill in with that
+ * frame's own outline, whose refs carry a frame prefix (`f3:e12`). Hidden radios, checkboxes,
  * and file inputs with a visible label are exposed and operated through that
  * label; other hidden elements are never targetable.
  *
@@ -21,7 +23,8 @@
  * they also hold for elements from same-origin frames (other realms).
  */
 
-import type { CaptureGeometry, DomAction, ElementTarget, PageFindResult, PageRect, PageSnapshot, SearchResult, ToolResult, UploadFile } from "@/lib/domain/tools";
+import type { CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, PageFindResult, PageRect, PageSnapshot, SearchResult, ToolResult, UploadFile } from "@/lib/domain/tools";
+import { boundOutline, findInOutline, sliceOutline } from "@/lib/domain/outline";
 
 // ---------------------------------------------------------------------------
 // Ref registry
@@ -340,6 +343,8 @@ function controlValue(element: Element): string {
 
 export interface OutlineControl {
   ref: string;
+  /** The ref as the model sees it: `e12`, or `f3:e12` in a cross-origin frame. */
+  label: string;
   role: string;
   name: string;
   element: Element;
@@ -355,7 +360,8 @@ type Segment =
   | { t: "break" }
   | { t: "prefix"; text: string }
   | { t: "cell" }
-  | { t: "control"; control: OutlineControl };
+  | { t: "control"; control: OutlineControl }
+  | { t: "frame"; frame: Omit<ChildFrame, "line"> };
 
 export interface Outline {
   lines: string[];
@@ -364,7 +370,19 @@ export interface Outline {
   controls: OutlineControl[];
   byElement: Map<Element, OutlineControl>;
   byRef: Map<string, OutlineControl>;
+  /** Cross-origin frames whose placeholder lines are in `lines`. */
+  frames: ChildFrame[];
+  /** Prefix of this frame's ref labels. */
+  refPrefix: string;
   scanLimited: boolean;
+}
+
+/** How a content script renders its frame's outline. */
+export interface OutlineOptions {
+  /** Prefix for this frame's ref labels: "" in the top frame, `f3:` in the frame the background calls f3. */
+  refPrefix?: string;
+  /** Firefox's frame id for a frame element (`runtime.getFrameId`), or -1. Without it, cross-origin frames stay opaque. */
+  frameIdOf?: (frame: Element) => number;
 }
 
 interface WalkContext {
@@ -382,7 +400,7 @@ class OutlineBuilder {
   scanLimited = false;
   #lastText = "";
 
-  constructor(private registry: ElementRefRegistry, private pageUrl: string) {}
+  constructor(private registry: ElementRefRegistry, private pageUrl: string, private options: OutlineOptions) {}
 
   text(text: string): void {
     if (!text) return;
@@ -431,9 +449,7 @@ class OutlineBuilder {
     const display = style?.display ?? "";
 
     if (tag === "iframe" || tag === "frame") {
-      // Tracking pixels and ad beacons are 0–1 px frames.
-      const tiny = [style?.width, style?.height].some((size) => size?.endsWith("px") && parseFloat(size) < 2);
-      if (visible && !tiny) this.#frame(element as HTMLIFrameElement, context);
+      if (visible && !isTrackerFrame(element, style)) this.#frame(element as HTMLIFrameElement, context);
       return;
     }
     if (tag.startsWith("svg:")) {
@@ -581,7 +597,8 @@ class OutlineBuilder {
     if (proxy) details.push("via-label");
     if (optionsDetail) details.push(optionsDetail);
 
-    const control: OutlineControl = { ref: refFor(this.registry, element), role, name, element, proxy, disabled, details, ...(href ? { href } : {}) };
+    const ref = refFor(this.registry, element);
+    const control: OutlineControl = { ref, label: `${this.options.refPrefix ?? ""}${ref}`, role, name, element, proxy, disabled, details, ...(href ? { href } : {}) };
     this.controls.push(control);
     this.byElement.set(element, control);
     this.segments.push({ t: "control", control });
@@ -611,7 +628,10 @@ class OutlineBuilder {
     this.break();
     const label = `${title ? ` ${JSON.stringify(title)}` : ""}`;
     if (!frameDocument?.body) {
-      this.text(`[frame${label} cross-origin → ${clip(src, 200)}]`);
+      // Its own content script reads it; the background splices that outline in here.
+      const frameId = this.options.frameIdOf?.(frame) ?? -1;
+      if (frameId > 0) this.segments.push({ t: "frame", frame: { frameId, title, url: clip(src, 500) } });
+      else this.text(`[frame${label} cross-origin → ${clip(src, 200)}]`);
       this.break();
       return;
     }
@@ -659,15 +679,34 @@ function displayHref(href: string, pageUrl: string): string {
   }
 }
 
+/**
+ * Tracking pixels, ad beacons, and parked frames: 0–1 px, or laid out
+ * entirely above or left of the page. Left out of the outline.
+ */
+function isTrackerFrame(frame: Element, style: CSSStyleDeclaration | null): boolean {
+  if ([style?.width, style?.height].some((size) => size?.endsWith("px") && parseFloat(size) < 2)) return true;
+  const box = frame.getBoundingClientRect();
+  // A box with no size at all means no layout ran (or the frame is display: contents); judge by style alone.
+  if (!box.width && !box.height) return false;
+  if (box.width < 2 || box.height < 2) return true;
+  const view = frame.ownerDocument.defaultView;
+  return box.right + (view?.scrollX ?? 0) <= 0 || box.bottom + (view?.scrollY ?? 0) <= 0;
+}
+
+/** A cross-origin frame's placeholder line; the background replaces it with the frame's outline. */
+function renderFrame(frame: Omit<ChildFrame, "line">): string {
+  return `[frame${frame.title ? ` ${JSON.stringify(frame.title)}` : ""} → ${clip(frame.url, 200)}]`;
+}
+
 function renderControl(control: OutlineControl): string {
-  const parts = [control.ref, control.role];
+  const parts = [control.label, control.role];
   if (control.name) parts.push(JSON.stringify(control.name));
   if (control.href) parts.push(`→ ${control.href}`);
   parts.push(...control.details);
   return `[${parts.join(" ")}]`;
 }
 
-function render(segments: Segment[]): string[] {
+function render(segments: Segment[], frames: ChildFrame[]): string[] {
   const lines: string[] = [];
   let current = "";
   let prefixOnly = false;
@@ -685,7 +724,11 @@ function render(segments: Segment[]): string[] {
     if (segment.t === "text") append(segment.text);
     else if (segment.t === "control") append(renderControl(segment.control));
     else if (segment.t === "break") flush();
-    else if (segment.t === "prefix") {
+    else if (segment.t === "frame") {
+      flush();
+      frames.push({ ...segment.frame, line: lines.length });
+      lines.push(renderFrame(segment.frame));
+    } else if (segment.t === "prefix") {
       flush();
       current = segment.text;
       prefixOnly = true;
@@ -711,48 +754,36 @@ function dropRedundantLinks(segments: Segment[]): Segment[] {
   return drop.size ? segments.filter((_, index) => !drop.has(index)) : segments;
 }
 
-export function buildOutline(document: Document, registry: ElementRefRegistry): Outline {
-  const builder = new OutlineBuilder(registry, document.location?.href ?? "");
+export function buildOutline(document: Document, registry: ElementRefRegistry, options: OutlineOptions = {}): Outline {
+  const builder = new OutlineBuilder(registry, document.location?.href ?? "", options);
   if (document.body) builder.walk(document.body, { visible: true, pre: false, inControl: false, parentStyle: null });
   const segments = dropRedundantLinks(builder.segments);
   const kept = new Set(segments.flatMap((segment) => (segment.t === "control" ? [segment.control] : [])));
   const controls = builder.controls.filter((control) => kept.has(control));
-  let lines = render(segments);
+  const rendered: ChildFrame[] = [];
+  const lines = render(segments, rendered);
   if (builder.scanLimited) lines.push("[Page too large: outline scan stopped early. Use page.find() for specific content.]");
-  const offsets: number[] = [];
-  let total = 0;
-  const bounded: string[] = [];
-  for (const line of lines) {
-    if (total + line.length > MAX_OUTLINE_CHARS) { bounded.push("[Outline truncated: page exceeds the outline size limit]"); offsets.push(total); break; }
-    offsets.push(total);
-    bounded.push(line);
-    total += line.length + 1;
-  }
-  lines = bounded;
+  const { lines: bounded, offsets } = boundOutline(lines, MAX_OUTLINE_CHARS, "[Outline truncated: page exceeds the outline size limit]");
+  const frames = rendered.filter((frame) => frame.line < bounded.length && bounded[frame.line] === lines[frame.line]);
   const byElement = new Map(controls.map((control) => [control.element, control]));
   const byRef = new Map(controls.map((control) => [control.ref, control]));
-  return { lines, offsets, controls, byElement, byRef, scanLimited: builder.scanLimited };
+  return { lines: bounded, offsets, controls, byElement, byRef, frames, refPrefix: options.refPrefix ?? "", scanLimited: builder.scanLimited };
 }
 
 // ---------------------------------------------------------------------------
 // Snapshot, find, and search-result extraction
 // ---------------------------------------------------------------------------
 
+/** One slice of the outline. Pass `outline` when it is already built. */
 export function extractSnapshot(
   document: Document,
   tabId: number,
   registry: ElementRefRegistry,
   options: { offset: number; maxChars: number } = { offset: 0, maxChars: 16_000 },
+  outline: Outline = buildOutline(document, registry),
 ): PageSnapshot {
-  const outline = buildOutline(document, registry);
   const text = outline.lines.join("\n");
-  let start = Math.min(Math.max(options.offset, 0), text.length);
-  if (start > 0 && text[start - 1] !== "\n") start = text.lastIndexOf("\n", start - 1) + 1;
-  let end = Math.min(text.length, start + options.maxChars);
-  if (end < text.length) {
-    const cut = text.lastIndexOf("\n", end);
-    if (cut > start) end = cut;
-  }
+  const { start, end } = sliceOutline(text, options.offset, options.maxChars);
   return {
     version: 2,
     tabId,
@@ -763,34 +794,28 @@ export function extractSnapshot(
     offset: start,
     end,
     totalChars: text.length,
-    selectionText: trimText(document.getSelection?.()?.toString() ?? "").slice(0, 2000),
+    selectionText: selectionText(document),
   };
 }
 
-const MAX_FIND_MATCHES = 30;
-const FIND_LINE_LIMIT = 400;
+function selectionText(document: Document): string {
+  return trimText(document.getSelection?.()?.toString() ?? "").slice(0, 2000);
+}
 
-export function findInPage(document: Document, registry: ElementRefRegistry, query: string): PageFindResult {
-  const outline = buildOutline(document, registry);
-  const needle = trimText(query).toLowerCase();
-  const matches: PageFindResult["matches"] = [];
-  let count = 0;
-  outline.lines.forEach((line, index) => {
-    const position = line.toLowerCase().indexOf(needle);
-    if (position < 0) return;
-    count++;
-    if (matches.length >= MAX_FIND_MATCHES) return;
-    let text = line;
-    if (line.length > FIND_LINE_LIMIT) {
-      const from = Math.max(0, position - 180);
-      text = `${from > 0 ? "…" : ""}${line.slice(from, from + FIND_LINE_LIMIT)}${from + FIND_LINE_LIMIT < line.length ? "…" : ""}`;
-    }
-    // A short preceding line (often a label or heading) gives the match context.
-    const previous = outline.lines[index - 1];
-    if (previous && previous.length <= 120 && !previous.toLowerCase().includes(needle)) text = `${previous}\n${text}`;
-    matches.push({ offset: outline.offsets[index] ?? 0, text });
-  });
-  return { documentId: registry.documentId, url: document.location?.href ?? "", query, count, matches };
+/** Outline lines matching `query`, with context. Pass `outline` when it is already built. */
+export function findInPage(document: Document, registry: ElementRefRegistry, query: string, outline: Outline = buildOutline(document, registry)): PageFindResult {
+  return { documentId: registry.documentId, url: document.location?.href ?? "", query, ...findInOutline(outline.lines, outline.offsets, query) };
+}
+
+/**
+ * This frame's whole outline, at most `maxChars`, for the background to
+ * compose with its cross-origin frames' outlines.
+ */
+export function extractFrameOutline(document: Document, registry: ElementRefRegistry, maxChars: number, options: OutlineOptions): FrameOutline {
+  const outline = buildOutline(document, registry, options);
+  const { lines } = boundOutline(outline.lines, maxChars, "[Frame outline truncated: it exceeds the frame size limit]");
+  const frames = outline.frames.filter((frame) => frame.line < lines.length && lines[frame.line] === outline.lines[frame.line]);
+  return { documentId: registry.documentId, url: document.location?.href ?? "", title: document.title ?? "", lines, frames, selectionText: selectionText(document) };
 }
 
 const SEARCH_ENGINE_HOSTS = ["duckduckgo.com", "bing.com", "google.com", "search.yahoo.com", "startpage.com"];
@@ -877,7 +902,7 @@ export function settleDom(document: Document): Promise<void> {
 type Resolved = { ok: true; control: OutlineControl } | { ok: false; result: ToolResult };
 
 function describe(control: OutlineControl): string {
-  return `[${[control.ref, control.role, ...(control.name ? [JSON.stringify(control.name)] : [])].join(" ")}]`;
+  return `[${[control.label, control.role, ...(control.name ? [JSON.stringify(control.name)] : [])].join(" ")}]`;
 }
 
 function candidatesText(controls: OutlineControl[], limit = 8): string {
@@ -888,8 +913,10 @@ function candidatesText(controls: OutlineControl[], limit = 8): string {
 /** `allowDisabled` resolves a disabled control too (looking at one is fine; operating it is not). */
 function resolveTarget(outline: Outline, registry: ElementRefRegistry, target: ElementTarget, allowDisabled = false): Resolved {
   if (target.kind === "ref") {
+    const ref = `${outline.refPrefix}${target.ref}`;
     if (target.documentId !== registry.documentId) {
-      return { ok: false, result: { ok: false, code: "STALE_SNAPSHOT", summary: `Ref ${target.ref} came from an earlier page load; this tab now shows a different document. Read a fresh snapshot.` } };
+      const where = outline.refPrefix ? `frame ${outline.refPrefix.slice(0, -1)}` : "this tab";
+      return { ok: false, result: { ok: false, code: "STALE_SNAPSHOT", summary: `Ref ${ref} came from an earlier page load; ${where} now shows a different document. Read a fresh snapshot.` } };
     }
     const control = outline.byRef.get(target.ref);
     if (control) {
@@ -897,8 +924,8 @@ function resolveTarget(outline: Outline, registry: ElementRefRegistry, target: E
       return { ok: true, control };
     }
     const element = registry.byRef.get(target.ref);
-    if (element?.isConnected) return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `Ref ${target.ref} is currently hidden or not an interactive element.` } };
-    return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: `Ref ${target.ref} is no longer on the page. Read a fresh snapshot.` } };
+    if (element?.isConnected) return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `Ref ${ref} is currently hidden or not an interactive element.` } };
+    return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: `Ref ${ref} is no longer on the page. Read a fresh snapshot.` } };
   }
   const wanted = target.name === null ? null : trimText(target.name);
   const sameRole = outline.controls.filter((control) => target.role === "*" || control.role === target.role ||
@@ -918,15 +945,17 @@ function resolveTarget(outline: Outline, registry: ElementRefRegistry, target: E
     return { ok: true, control };
   }
   const label = `${target.role === "*" ? "element" : target.role}${wanted === null ? "" : ` ${target.exact ? "named exactly" : "with name containing"} ${JSON.stringify(wanted)}`}`;
+  // Locators search this document only; another frame's elements are reached by their refs.
+  const inFrames = outline.frames.length ? ` Elements inside cross-origin frames are reached only by ref, like page.ref("f1:e3").` : "";
   if (matches.length > 1) {
-    return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: `Locator ${label} matched ${matches.length} elements: ${candidatesText(matches)}. Use page.ref("eN") for the intended one.` } };
+    return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: `Locator ${label} matched ${matches.length} elements: ${candidatesText(matches)}. Use page.ref("eN") for the intended one.${inFrames}` } };
   }
   const similar = wanted
     ? outline.controls.filter((control) => control.name.toLowerCase().includes(wanted.toLowerCase().slice(0, 24)))
     : [];
   const kind = target.role === "*" ? "Interactive" : target.role;
   const hint = similar.length ? ` Similar controls: ${candidatesText(similar)}.` : sameRole.length ? ` ${kind} controls on the page: ${candidatesText(sameRole)}.` : ` No ${kind} controls are visible.`;
-  return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: `Locator ${label} matched 0 elements.${hint} Use page.ref("eN") from a snapshot.` } };
+  return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: `Locator ${label} matched 0 elements.${hint} Use page.ref("eN") from a snapshot.${inFrames}` } };
 }
 
 function dispatch(element: Element, type: string, init: EventInit = {}): boolean {
@@ -1173,8 +1202,9 @@ export async function executeDomAction(
   registry: ElementRefRegistry,
   action: DomAction,
   settle: Settle = settleDom,
+  options: OutlineOptions = {},
 ): Promise<ToolResult> {
-  const before = buildOutline(document, registry);
+  const before = buildOutline(document, registry, options);
   const urlBefore = document.location?.href;
   let control: OutlineControl | null = null;
   if (action.target) {
@@ -1194,7 +1224,7 @@ export async function executeDomAction(
   }
   if (!effect.ok) return { ok: false, code: effect.code ?? "NOT_INTERACTABLE", summary: effect.message };
   await settle(document);
-  const after = buildOutline(document, registry);
+  const after = buildOutline(document, registry, options);
   const location = document.location?.href;
   const parts = [effect.message, ...(effect.notes ?? [])];
   if (action.kind !== "scroll") parts.push(describeChanges(before.lines, after.lines));
@@ -1208,7 +1238,7 @@ export async function executeDomAction(
  * (resolved like an action's target against a fresh outline, so a ref from an
  * earlier document is stale). Same-origin frames add their offsets.
  */
-export function measureForCapture(document: Document, registry: ElementRefRegistry, target: ElementTarget | null):
+export function measureForCapture(document: Document, registry: ElementRefRegistry, target: ElementTarget | null, options: OutlineOptions = {}):
   { ok: true; geometry: CaptureGeometry } | { ok: false; result: ToolResult } {
   const view = document.defaultView;
   const root = document.documentElement;
@@ -1224,7 +1254,7 @@ export function measureForCapture(document: Document, registry: ElementRefRegist
   };
   let element: PageRect | null = null;
   if (target) {
-    const resolved = resolveTarget(buildOutline(document, registry), registry, target, true);
+    const resolved = resolveTarget(buildOutline(document, registry, options), registry, target, true);
     if (!resolved.ok) return resolved;
     const { control } = resolved;
     element = documentRect(control.element, view);

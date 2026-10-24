@@ -87,6 +87,30 @@ export interface PageSnapshot {
   selectionText: string;
 }
 
+/**
+ * A cross-origin frame in a frame's outline. Its own content script reads it;
+ * the background replaces the placeholder line with that outline.
+ */
+export interface ChildFrame {
+  /** Firefox's frame id (`runtime.getFrameId`), as `tabs.sendMessage` addresses it. */
+  frameId: number;
+  /** Index of the frame's placeholder line in the outline's `lines`. */
+  line: number;
+  title: string;
+  /** The frame element's `src`; the frame's own outline reports where it actually is. */
+  url: string;
+}
+
+/** One frame's whole (bounded) outline, for the background to compose a tab's outline from. */
+export interface FrameOutline {
+  documentId: string;
+  url: string;
+  title: string;
+  lines: string[];
+  frames: ChildFrame[];
+  selectionText: string;
+}
+
 export interface PageFindResult {
   documentId: string;
   url: string;
