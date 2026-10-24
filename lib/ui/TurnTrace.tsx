@@ -54,7 +54,7 @@ const PROGRAM_ACTIONS: [RegExp, Icon, string, string, string][] = [
   [/\.dragTo\s*\(/, DragDrop, "Dragging a page item", "Dragged a page item", "Couldn't drag a page item"],
   [/\.click\(|\.press\(/, Pointer, "Clicking a page control", "Clicked a page control", "Couldn't click a page control"],
   [/\.fill\(/, Forms, "Filling page fields", "Filled page fields", "Couldn't fill page fields"],
-  [/\.selectOption\(/, Selector, "Selecting an option", "Selected an option", "Couldn't select an option"],
+  [/\.selectOption\(|\.choose\s*\(/, Selector, "Selecting an option", "Selected an option", "Couldn't select an option"],
   [/\.setChecked\(|\.check\(|\.uncheck\(/, Checkbox, "Updating a checkbox", "Updated a checkbox", "Couldn't update a checkbox"],
   [/\.hover\s*\(/, HandFinger, "Hovering over a page control", "Hovered over a page control", "Couldn't hover over a page control"],
   [/web\.search\(/, WorldSearch, "Searching the web", "Searched the web", "Web search failed"],

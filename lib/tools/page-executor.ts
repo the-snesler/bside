@@ -1546,6 +1546,158 @@ function select(control: OutlineControl, values: string[]): Effect {
   return { ok: true, message: `Selected ${chosen.map((option) => JSON.stringify(optionLabel(option))).join(", ")} in ${describe(control)}.` };
 }
 
+/** Types `text` into an editable combobox to filter its options, as keystrokes would: keydown, the new value with an input event, keyup. Never a change event, which some widgets take as a commit. */
+function typeFilter(element: HTMLInputElement | HTMLTextAreaElement, text: string): void {
+  element.focus?.();
+  const last = text.at(-1) ?? "";
+  const key = { key: last, bubbles: true, cancelable: true, composed: true };
+  element.dispatchEvent(new KeyboardEvent("keydown", key));
+  element.value = text;
+  element.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: text }));
+  element.dispatchEvent(new KeyboardEvent("keyup", key));
+}
+
+/** The listboxes a combobox controls (`aria-controls`, `aria-owns`, its active descendant's), or failing that every rendered listbox in its document. */
+function listboxesFor(control: OutlineControl): Element[] {
+  const element = control.element;
+  if (control.role === "listbox") return [element];
+  const named = ["aria-controls", "aria-owns"].flatMap((attribute) => (element.getAttribute(attribute) ?? "").split(/\s+/).filter(Boolean))
+    .map((id) => rootLookup(element, id)).filter((found): found is Element => !!found);
+  const active = element.getAttribute("aria-activedescendant");
+  const activeOption = active ? rootLookup(element, active) : null;
+  const isListbox = (candidate: Element) => explicitRole(candidate) === "listbox";
+  const found = new Set<Element>();
+  for (const candidate of named) {
+    if (isListbox(candidate)) found.add(candidate);
+    else for (const inner of composedDescendants(candidate, isListbox, () => false, { nodes: 20_000 })) found.add(inner);
+    if (!found.size && composedDescendants(candidate, (inner) => explicitRole(inner) === "option", () => false, { nodes: 20_000 }).length) found.add(candidate);
+  }
+  for (let node: Element | null = activeOption; node; node = composedParent(node)) if (isListbox(node)) { found.add(node); break; }
+  const rendered = [...found].filter(isRendered);
+  if (rendered.length) return rendered;
+  const body = element.ownerDocument.body;
+  return body ? composedDescendants(body, isListbox, () => false, { nodes: MAX_VISITED_NODES }).filter(isRendered) : [];
+}
+
+interface ShownOption { element: Element; label: string }
+
+function shownOptions(control: OutlineControl): ShownOption[] {
+  return listboxesFor(control).flatMap((listbox) => composedDescendants(listbox, (candidate) => explicitRole(candidate) === "option", () => false, { nodes: 20_000 }))
+    .filter(isRendered)
+    .map((element) => ({ element, label: accessibleName(element, "option") || composedText(element, NAME_LIMIT) }));
+}
+
+/** The one option whose text is `wanted` (case-insensitive), else the one containing it. */
+function matchOption(options: ShownOption[], wanted: string): { option: ShownOption } | { matches: ShownOption[] } {
+  const lower = wanted.toLowerCase();
+  const exact = options.filter((option) => option.label.toLowerCase() === lower);
+  if (exact.length === 1) return { option: exact[0]! };
+  if (exact.length > 1) return { matches: exact };
+  const partial = options.filter((option) => option.label.toLowerCase().includes(lower));
+  return partial.length === 1 ? { option: partial[0]! } : { matches: partial };
+}
+
+/** What a combobox shows as its value: an input's value, or the text of a button-like one. */
+function shownValue(element: Element): string {
+  return isInput(element) || isTextArea(element) ? trimText(element.value ?? "") : composedText(element, VALUE_LIMIT);
+}
+
+/** How long `choose` waits for a combobox's options to appear and settle. */
+const CHOOSE_WAIT_MS = 5_000;
+const CHOOSE_MAX_WAITS = 20;
+
+/**
+ * Picks one option of a select or combobox. A native select selects it; an
+ * input with a datalist takes the option's value. An ARIA combobox (or
+ * listbox, or element with aria-haspopup=listbox) is opened with a click if
+ * collapsed, typed into when it is a text field (so filtering widgets load
+ * matching options), and then waited on until exactly one shown option
+ * matches; that option is clicked and the combobox's shown value checked.
+ * Never picks among ambiguous matches.
+ */
+async function choose(document: Document, control: OutlineControl, option: string, settle: Settle): Promise<Effect> {
+  const element = control.element;
+  const wanted = trimText(option);
+  if (isSelect(element)) return select(control, [option]);
+  const listId = isInput(element) ? element.getAttribute("list") : null;
+  if (isInput(element) && listId) {
+    const list = rootLookup(element, listId);
+    const values = list ? Array.from(list.querySelectorAll("option")).map((candidate) => ({ element: candidate as Element, label: trimText(candidate.getAttribute("label") || candidate.textContent || "") || (candidate as HTMLOptionElement).value })) : [];
+    const matched = matchOption(values, wanted);
+    if (!("option" in matched)) return { ok: false, code: "TARGET_MISSING", message: `${matched.matches.length ? `${matched.matches.length} suggestions match` : "No suggestion matches"} ${JSON.stringify(wanted)} in ${describe(control)}. Suggestions: ${values.slice(0, 30).map((value) => value.label).join(" | ") || "(none)"}` };
+    return fill(control, (matched.option.element as HTMLOptionElement).value || matched.option.label);
+  }
+  const popup = element.getAttribute("aria-haspopup");
+  if (control.role !== "combobox" && control.role !== "listbox" && popup !== "listbox") {
+    return { ok: false, code: "NOT_INTERACTABLE", message: `${describe(control)} is not a select or combobox. Click it to open its list and click the option; for a date field that accepts typed dates, use fill(text, {commit: true}).` };
+  }
+  try { (element as HTMLElement).scrollIntoView?.({ block: "center", inline: "nearest" }); } catch { /* detached or unsupported */ }
+  if (control.role !== "listbox" && (element.getAttribute("aria-expanded") !== "true" || !shownOptions(control).length)) pointerClick(element);
+  const editable = (isInput(element) && TEXT_INPUT_TYPES.has(inputType(element))) || isTextArea(element);
+  const typed = editable && !(element as HTMLInputElement).readOnly;
+  if (typed) typeFilter(element as HTMLInputElement, wanted);
+
+  const deadline = Date.now() + CHOOSE_WAIT_MS;
+  let options: ShownOption[] = [];
+  let matched: ReturnType<typeof matchOption> = { matches: [] };
+  for (let wait = 0; wait < CHOOSE_MAX_WAITS && Date.now() < deadline; wait++) {
+    await settle(document);
+    options = shownOptions(control);
+    matched = matchOption(options, wanted);
+    if ("option" in matched) break;
+  }
+  if (!("option" in matched)) {
+    const listed = options.slice(0, 20).map((shown) => JSON.stringify(shown.label)).join(", ");
+    if (matched.matches.length > 1) return { ok: false, code: "TARGET_MISSING", message: `${matched.matches.length} options match ${JSON.stringify(wanted)} in ${describe(control)}: ${matched.matches.slice(0, 20).map((shown) => JSON.stringify(shown.label)).join(", ")}. Choose with the full option text.` };
+    return {
+      ok: false, code: "TARGET_MISSING",
+      message: options.length
+        ? `No option matching ${JSON.stringify(wanted)} in ${describe(control)}. Options shown: ${listed}${options.length > 20 ? ", …" : ""}.`
+        : `No options appeared for ${describe(control)} within ${CHOOSE_WAIT_MS / 1000} s (it shows no role=listbox with role=option items). Read a snapshot and click its options; for a date field that accepts typed dates, use fill(text, {commit: true}).`,
+    };
+  }
+  const picked = matched.option;
+  if (isDisabled(picked.element)) return { ok: false, code: "NOT_INTERACTABLE", message: `Option ${JSON.stringify(picked.label)} is disabled.` };
+  movePointerTo(picked.element);
+  pointerClick(picked.element);
+  await settle(document);
+  const shown = shownValue(element);
+  const label = picked.label.toLowerCase();
+  // Text typed to filter proves nothing: an input that still shows just that, with its list open, may have ignored the click.
+  const closed = element.getAttribute("aria-expanded") === "false" || !isRendered(picked.element);
+  const confirmed = (picked.element.isConnected && picked.element.getAttribute("aria-selected") === "true") ||
+    (!!shown && (shown.toLowerCase().includes(label) || label.includes(shown.toLowerCase())) && (!typed || closed || shown !== wanted));
+  return confirmed
+    ? { ok: true, message: `Chose ${JSON.stringify(picked.label)} in ${describe(control)}${shown ? `; it shows ${JSON.stringify(clip(shown, 120))}` : ""}.` }
+    : { ok: true, message: `Clicked option ${JSON.stringify(picked.label)} in ${describe(control)}, but could not confirm it: the field shows ${JSON.stringify(clip(shown, 120))}. Check the changes below or read a snapshot.` };
+}
+
+/**
+ * Fills a field, then commits it as a typed-date picker expects: Enter
+ * (keydown/keyup only; no form submit), then blur. Reports the value the
+ * field kept, which a picker may have reformatted; an emptied field failed.
+ */
+async function fillAndCommit(document: Document, control: OutlineControl, text: string, settle: Settle): Promise<Effect> {
+  const filled = fill(control, text);
+  if (!filled.ok) return filled;
+  const element = control.element as HTMLElement;
+  const enter = { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true, composed: true };
+  element.dispatchEvent(new KeyboardEvent("keydown", enter));
+  element.dispatchEvent(new KeyboardEvent("keyup", enter));
+  if (document.activeElement === element) element.blur();
+  else {
+    element.dispatchEvent(new FocusEvent("blur", { composed: true }));
+    element.dispatchEvent(new FocusEvent("focusout", { bubbles: true, composed: true }));
+  }
+  await settle(document);
+  const kept = shownValue(control.element);
+  if (!kept) {
+    const placeholder = control.element.getAttribute("placeholder");
+    return { ok: false, code: "NOT_INTERACTABLE", message: `${describe(control)} did not keep ${JSON.stringify(text)}; it is empty after Enter and blur.${placeholder ? ` Its placeholder suggests the format ${JSON.stringify(placeholder)}.` : ""} If it needs its calendar, click it and pick the day.` };
+  }
+  return { ok: true, message: `Filled and committed ${describe(control)}; it shows ${JSON.stringify(clip(kept, 120))}${kept === trimText(text) ? "" : " (the field reformatted it)"}.`, notes: filled.notes };
+}
+
 function check(control: OutlineControl, checked: boolean): Effect {
   const element = control.element;
   const read = (): boolean | null => isInput(element) ? element.checked : element.getAttribute("aria-checked") === "true" ? true : element.getAttribute("aria-checked") === "false" ? false : null;
@@ -1749,8 +1901,9 @@ export async function executeDomAction(
     case "click": effect = click(control!, before); break;
     case "hover": effect = hover(control!); break;
     case "drag": effect = await drag(control!, to!); break;
-    case "fill": effect = fill(control!, action.text); break;
+    case "fill": effect = action.commit ? await fillAndCommit(document, control!, action.text, settle) : fill(control!, action.text); break;
     case "select": effect = select(control!, action.values); break;
+    case "choose": effect = await choose(document, control!, action.option, settle); break;
     case "check": effect = check(control!, action.checked); break;
     case "press": effect = press(control!, action.key, action.modifiers ?? [], before); break;
     case "upload": effect = upload(control!, action.files); break;

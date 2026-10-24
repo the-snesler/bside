@@ -148,9 +148,10 @@ export function validateDomAction(raw: unknown): DomAction | null {
     }
     case "fill": {
       const t = target();
-      if (!t || !hasExactKeys(raw, ["kind", "target", "text"])) return null;
-      if (typeof raw.text !== "string" || raw.text.length > MAX_FILL_TEXT_LEN) return null;
-      return { kind: "fill", target: t, text: raw.text };
+      if (!t || typeof raw.text !== "string" || raw.text.length > MAX_FILL_TEXT_LEN) return null;
+      if (hasExactKeys(raw, ["kind", "target", "text"])) return { kind: "fill", target: t, text: raw.text };
+      if (!hasExactKeys(raw, ["kind", "target", "text", "commit"]) || typeof raw.commit !== "boolean") return null;
+      return { kind: "fill", target: t, text: raw.text, commit: raw.commit };
     }
     case "select": {
       const t = target();
@@ -158,6 +159,12 @@ export function validateDomAction(raw: unknown): DomAction | null {
       if (!Array.isArray(raw.values) || raw.values.length === 0 || raw.values.length > MAX_SELECT_VALUES) return null;
       if (!raw.values.every((value) => typeof value === "string" && value.length <= MAX_SELECT_VALUE_LEN)) return null;
       return { kind: "select", target: t, values: raw.values as string[] };
+    }
+    case "choose": {
+      const t = target();
+      if (!t || !hasExactKeys(raw, ["kind", "target", "option"])) return null;
+      if (!isBoundedString(raw.option, MAX_SELECT_VALUE_LEN) || !raw.option.trim()) return null;
+      return { kind: "choose", target: t, option: raw.option };
     }
     case "check": {
       const t = target();

@@ -23,7 +23,7 @@ Reading: await page.snapshot() returns the page outline: text in document order 
 Tables: a line like [table e12 "Caption" 340 rows × 6 cols] (or [grid …]) marks a data table. await page.table("e12") (or page.ref("f2:e7").table(), page.getByRole("table", {name: "Caption"}).table()) returns {caption, headers, rows, totalRows, offset, nextOffset} as JSON, ${TABLE_LIMITS.defaultRows} rows at a time; page on with table("e12", {offset: 50, limit: 100}) (limit ≤ ${TABLE_LIMITS.maxRows}). Multi-row headers read "Group / Column", a spanned cell repeats in every row and column it covers, and a cell lists the refs of controls in it ("Alice [e14 link]"). Read rankings, cohorts, and comparisons from it rather than from outline text.
 Searching: await page.find("text") lists matching outline lines (with refs) and their offsets — use it on long pages instead of reading everything. await page.waitFor("text", 8000) waits up to 15000 ms for text to appear. await web.search("query") returns web results (title, URL, snippet) from a hidden search tab; open results with browser.open(url).
 Targeting: page.ref("e5") (or page.ref("f2:e4") inside a frame) targets the element with that ref from your latest snapshot/find/diff of that page; refs stay valid until the page (or, for f2:e4, that frame) navigates or reloads. page.getByRole("button", {name: "Save"}) matches a unique element by role and case-insensitive name substring ({exact: true} for exact). page.getByText("Save") matches any interactive element by name. Both search the top document and its same-origin frames only. Ambiguous or missing matches fail and list candidate refs.
-Actions (on a locator): click(), hover() (moves the pointer onto it, e.g. to open a menu that opens on mouseover; leaves the element hovered before), dragTo(page.ref("e9")) (drags it onto another element in the same page or frame: HTML drag and drop for draggable items, pointer events otherwise; items in the outline as [eN draggable …] are drag sources), fill(text) (inputs, textareas, rich-text editors; dates as YYYY-MM-DD), selectOption("label or value" | [...]), setChecked(bool), check(), uncheck(), press("Enter"|"Tab"|"Escape"|"Space"|"Backspace"|"Delete"|"ArrowDown"|"Home"|"PageDown"|…, or a chord such as "Control+Enter", "Shift+Tab", "Meta+k": modifiers Control, Alt, Shift, Meta; a letter or digit only with Control, Alt, or Meta; copy/cut/paste are refused. Keys reach the page's own handlers only, so browser shortcuts and Tab focus moves do not happen), setInputFiles("/workspace/file.txt" | [...]) attaches scratch files (text or saved images) to a file input. Each action reports the effect, native validation problems, and the page outline lines that appeared (+) or disappeared (−). Use that diff to verify outcomes.
+Actions (on a locator): click(), hover() (moves the pointer onto it, e.g. to open a menu that opens on mouseover; leaves the element hovered before), dragTo(page.ref("e9")) (drags it onto another element in the same page or frame: HTML drag and drop for draggable items, pointer events otherwise; items in the outline as [eN draggable …] are drag sources), fill(text) (inputs, textareas, rich-text editors; dates as YYYY-MM-DD), fill(text, {commit: true}) (then Enter and blur, for custom date pickers that accept typed dates in their own format, often their placeholder's; reports the value the field kept), selectOption("label or value" | [...]), choose("option text") (native selects and custom comboboxes/listboxes: opens it, types the text into an editable one to filter, waits up to 5 s for role=option items, clicks the one matching exactly or else the only one containing the text, and reports what the field shows; fails listing the options when none or several match), setChecked(bool), check(), uncheck(), press("Enter"|"Tab"|"Escape"|"Space"|"Backspace"|"Delete"|"ArrowDown"|"Home"|"PageDown"|…, or a chord such as "Control+Enter", "Shift+Tab", "Meta+k": modifiers Control, Alt, Shift, Meta; a letter or digit only with Control, Alt, or Meta; copy/cut/paste are refused. Keys reach the page's own handlers only, so browser shortcuts and Tab focus moves do not happen), setInputFiles("/workspace/file.txt" | [...]) attaches scratch files (text or saved images) to a file input. Each action reports the effect, native validation problems, and the page outline lines that appeared (+) or disappeared (−). Use that diff to verify outcomes.
 Page methods: navigate(url), goBack(), scroll("down"|"up", "page"|"line"), path().
 Seeing: await page.screenshot() attaches an image of the visible viewport to this program's result; screenshot({fullPage: true}) covers the whole page (very long pages are cut), screenshot({ref: "e5"}) or page.ref("e5").screenshot() crops to one element from your latest snapshot (in a frame, f2:e4, to the part of it the frame shows). Use it for layout, charts, images, canvas, or when the outline is unclear; prefer snapshot() for text. Images are shown to you once, in your next step only, and a task may take only a few: note what you need from them right away.
 Concurrency: const [a, b] = await Promise.all([callA, callB]); runs up to 8 calls at once and keeps result order. Calls on the same tab still run one at a time. If one call fails, the rest are cancelled and the error says which finished; their effects stay committed.
@@ -255,7 +255,7 @@ type Value = JsonValue | Handle | Value[] | { [key: string]: Value };
 const METHODS = new Set([
   "list", "read", "write", "move", "remove", "view", "tab", "open", "search", "stringify",
   "snapshot", "find", "waitFor", "ref", "getByRole", "getByText", "navigate", "goBack", "scroll", "path",
-  "click", "fill", "selectOption", "setChecked", "check", "uncheck", "press", "setInputFiles", "all", "screenshot", "table", "hover", "dragTo",
+  "click", "fill", "selectOption", "setChecked", "check", "uncheck", "press", "setInputFiles", "all", "screenshot", "table", "hover", "dragTo", "choose",
   ...SITE_APIS.flatMap((site) => Object.keys(site.methods)),
 ]);
 const RESERVED_NAMES = ["fs", "browser", "JSON", "web", "Promise", "memory", "await", "return", ...SITE_APIS.map((site) => site.name)];
@@ -985,8 +985,19 @@ export class BrowserProgram {
       count(1);
       action = { kind: "drag", target, to: this.#dropTarget(receiver, frame, args[0]!) };
     } else if (method === "fill") {
+      count(1, 2);
+      const options = args[1];
+      if (options !== undefined) {
+        const record = options && typeof options === "object" && !Array.isArray(options) && !this.#handles.has(options as object) ? options as Record<string, Value> : null;
+        if (!record || Object.keys(record).some((key) => key !== "commit") || typeof record.commit !== "boolean")
+          throw new Error("fill(text, {commit: true}) takes only a commit flag.");
+        action = { kind: "fill", target, text: text(0), ...(record.commit ? { commit: true } : {}) };
+      } else action = { kind: "fill", target, text: text(0) };
+    } else if (method === "choose") {
       count(1);
-      action = { kind: "fill", target, text: text(0) };
+      const option = text(0, "the option's text");
+      if (!option.trim() || option.length > 256) throw new Error("choose() expects the option's text, 1–256 characters.");
+      action = { kind: "choose", target, option };
     } else if (method === "selectOption") {
       count(1);
       const values = typeof args[0] === "string" ? [args[0]] : args[0];
@@ -1021,7 +1032,7 @@ export class BrowserProgram {
       };
     } else
       throw new Error(
-        "Locators support click, hover, dragTo, fill, selectOption, setChecked, check, uncheck, press, setInputFiles, screenshot, table.",
+        "Locators support click, hover, dragTo, fill, choose, selectOption, setChecked, check, uncheck, press, setInputFiles, screenshot, table.",
       );
     signal.throwIfAborted();
     // A lost response can follow a committed effect; disable automatic retry before dispatch.

@@ -76,4 +76,8 @@ describe("trace read labels", () => {
     expect(describeActivity(activity('await page.ref("e4").dragTo(page.ref("e9"));'), false).title).toBe("Dragging a page item");
     expect(describeActivity(activity('await page.ref("e4").dragTo("e9");', false), false)).toMatchObject({ title: "Couldn't drag a page item", status: "error" });
   });
+
+  it("labels combobox choices like option selection", () => {
+    expect(describeActivity(activity('await page.getByRole("combobox", {name: "Country"}).choose("Canada");', true), false).title).toBe("Selected an option");
+  });
 });

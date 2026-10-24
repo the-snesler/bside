@@ -65,8 +65,11 @@ export type DomAction =
   | { kind: "hover"; target: ElementTarget }
   /** Drags the target onto `to`, both in one document: HTML drag and drop for a draggable source, pointer events otherwise. */
   | { kind: "drag"; target: ElementTarget; to: ElementTarget }
-  | { kind: "fill"; target: ElementTarget; text: string }
+  /** With `commit`, Enter and blur follow the text, as a typed-date picker needs to accept it. */
+  | { kind: "fill"; target: ElementTarget; text: string; commit?: boolean }
   | { kind: "select"; target: ElementTarget; values: string[] }
+  /** Picks the one option matching `option` in a native select or an ARIA combobox/listbox: opens it, types to filter if editable, waits for options. */
+  | { kind: "choose"; target: ElementTarget; option: string }
   | { kind: "check"; target: ElementTarget; checked: boolean }
   /** A key, optionally held with modifiers (`Control+Enter`); a closed set that never includes copy, cut, or paste. */
   | { kind: "press"; target: ElementTarget; key: PressKey; modifiers?: KeyModifier[] }

@@ -199,11 +199,12 @@ describe("drag and drop", () => {
   });
 
   it("drags other elements with pointer events: down on the source, moves with the button held, up on the target", async () => {
-    const registry = setup('<div id="todo"><div id="card" role="button">Write report</div></div><div id="done"><button id="drop">Done column</button></div>');
+    const registry = setup('<main id="board"><div id="todo"><div id="card" role="button">Write report</div></div><div id="done"><button id="drop">Done column</button></div></main>');
     const log: string[] = [];
     let dragging: Element | null = null;
     for (const type of ["pointerdown", "mousedown", "pointermove", "mousemove", "pointerup", "mouseup"]) {
-      document.addEventListener(type, (event) => {
+      // Like a board library, listen above the items (the board, not the document, so later tests do not hear it).
+      document.getElementById("board")!.addEventListener(type, (event) => {
         const mouse = event as MouseEvent;
         log.push(`${(event.target as Element).id}:${type}:${mouse.buttons}`);
         if (type === "pointerdown") dragging = event.target as Element;
@@ -222,5 +223,135 @@ describe("drag and drop", () => {
     const { registry } = sortable();
     expect(await act(registry, { kind: "drag", target: ref("e1"), to: ref("e2", "old") })).toMatchObject({ ok: false, code: "STALE_SNAPSHOT", summary: expect.stringContaining("Drop target: Ref e2 came from an earlier page load") });
     expect(await act(registry, { kind: "drag", target: ref("e1"), to: ref("e1") })).toMatchObject({ ok: false, code: "INVALID_TOOL_ARGUMENTS" });
+  });
+});
+
+describe("choose in comboboxes", () => {
+  beforeEach(() => { document.body.innerHTML = ""; });
+
+  const COUNTRIES = ["Cameroon", "Canada", "Chile", "Denmark"];
+
+  /** An ARIA 1.2 editable combobox that filters its listbox as the user types and fills itself from a clicked option. */
+  function autocomplete(options: { async?: boolean; inert?: boolean } = {}): ElementRegistry {
+    const registry = setup('<label for="country">Country</label><input id="country" role="combobox" aria-controls="country-list" aria-expanded="false" autocomplete="off"><ul id="country-list" role="listbox" hidden></ul><p id="out"></p>');
+    const input = document.getElementById("country") as HTMLInputElement;
+    const list = document.getElementById("country-list")!;
+    const render = () => {
+      list.innerHTML = COUNTRIES.filter((country) => country.toLowerCase().includes(input.value.toLowerCase()))
+        .map((country) => `<li role="option" id="opt-${country}">${country}</li>`).join("");
+      list.hidden = false;
+      input.setAttribute("aria-expanded", "true");
+    };
+    input.addEventListener("input", () => (options.async ? setTimeout(render, 30) : render()));
+    input.addEventListener("click", render);
+    list.addEventListener("click", (event) => {
+      if (options.inert) return;
+      const option = (event.target as Element).closest("[role=option]")!;
+      input.value = option.textContent!;
+      list.hidden = true;
+      input.setAttribute("aria-expanded", "false");
+      document.getElementById("out")!.textContent = `Country set: ${input.value}`;
+    });
+    return registry;
+  }
+  type ElementRegistry = ReturnType<typeof setup>;
+  const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 10));
+
+  it("types to filter, picks the only option containing the text, and confirms the value", async () => {
+    const registry = autocomplete();
+    const result = await act(registry, { kind: "choose", target: ref("e1"), option: "Can" });
+    expect(result).toMatchObject({ ok: true });
+    expect(result.summary).toContain('Chose "Canada" in [e1 combobox "Country"]; it shows "Canada".');
+    expect(result.summary).toContain("+ Country set: Canada");
+    expect((document.getElementById("country") as HTMLInputElement).value).toBe("Canada");
+  });
+
+  it("waits for options a widget renders later", async () => {
+    const registry = autocomplete({ async: true });
+    const result = await executeDomAction(document, registry, { kind: "choose", target: ref("e1"), option: "denmark" }, tick);
+    expect(result).toMatchObject({ ok: true, summary: expect.stringContaining('Chose "Denmark"') });
+  });
+
+  it("never guesses among several matches, and lists the options when none match", async () => {
+    const registry = autocomplete();
+    expect(await act(registry, { kind: "choose", target: ref("e1"), option: "C" })).toMatchObject({
+      ok: false, code: "TARGET_MISSING", summary: expect.stringContaining('3 options match "C" in [e1 combobox "Country"]: "Cameroon", "Canada", "Chile"'),
+    });
+    expect((document.getElementById("out")!.textContent)).toBe("");
+    expect(await act(registry, { kind: "choose", target: ref("e1"), option: "Narnia" })).toMatchObject({
+      ok: false, code: "TARGET_MISSING", summary: expect.stringContaining("No options appeared for [e1 combobox"),
+    });
+  });
+
+  it("opens a button-like combobox with a click and picks from its listbox without typing", async () => {
+    const registry = setup('<div id="size" role="combobox" tabindex="0" aria-haspopup="listbox" aria-expanded="false" aria-controls="sizes" aria-label="Size">Medium</div><div id="sizes" role="listbox" hidden><div role="option">Small</div><div role="option" aria-disabled="true">Large</div><div role="option">Medium</div></div>');
+    const size = document.getElementById("size")!;
+    const sizes = document.getElementById("sizes")!;
+    size.addEventListener("click", () => { sizes.hidden = false; size.setAttribute("aria-expanded", "true"); });
+    sizes.addEventListener("click", (event) => {
+      const option = (event.target as Element).closest("[role=option]")!;
+      if (option.getAttribute("aria-disabled") === "true") return;
+      size.textContent = option.textContent;
+      sizes.hidden = true;
+    });
+    expect(await act(registry, { kind: "choose", target: ref("e1"), option: "small" })).toMatchObject({ ok: true, summary: expect.stringContaining('Chose "Small" in [e1 combobox "Size"]; it shows "Small".') });
+    expect(await act(registry, { kind: "choose", target: ref("e1"), option: "Large" })).toMatchObject({ ok: false, code: "NOT_INTERACTABLE", summary: 'Option "Large" is disabled.' });
+    expect(await act(registry, { kind: "choose", target: ref("e1"), option: "Huge" })).toMatchObject({ ok: false, summary: expect.stringContaining('Options shown: "Small", "Large", "Medium".') });
+  });
+
+  it("says so when the clicked option did not show up in the field", async () => {
+    const registry = autocomplete({ inert: true });
+    const result = await act(registry, { kind: "choose", target: ref("e1"), option: "Chile" });
+    expect(result).toMatchObject({ ok: true, summary: expect.stringContaining('Clicked option "Chile" in [e1 combobox "Country"], but could not confirm it: the field shows "Chile".') });
+  });
+
+  it("selects native options and datalist suggestions, and refuses controls that are not comboboxes", async () => {
+    const registry = setup('<select aria-label="Plan"><option>Free</option><option>Team</option></select><input aria-label="City" list="cities"><datalist id="cities"><option value="Oslo"></option><option value="Osaka"></option></datalist><button>Go</button>');
+    expect(await act(registry, { kind: "choose", target: ref("e1"), option: "Team" })).toMatchObject({ ok: true, summary: expect.stringContaining('Selected "Team"') });
+    expect(await act(registry, { kind: "choose", target: ref("e2"), option: "osl" })).toMatchObject({ ok: true });
+    expect((document.querySelector("input") as HTMLInputElement).value).toBe("Oslo");
+    expect(await act(registry, { kind: "choose", target: ref("e2"), option: "Os" })).toMatchObject({ ok: false, summary: expect.stringContaining('2 suggestions match "Os"') });
+    expect(await act(registry, { kind: "choose", target: ref("e3"), option: "x" })).toMatchObject({ ok: false, code: "NOT_INTERACTABLE", summary: expect.stringContaining("fill(text, {commit: true})") });
+  });
+});
+
+describe("typed-date pickers", () => {
+  /** A picker input that parses MM/DD/YYYY on Enter or blur and shows it as "Mon D, YYYY", clearing anything else. */
+  function datePicker(): ReturnType<typeof setup> {
+    const registry = setup('<label for="when">Departure</label><input id="when" placeholder="MM/DD/YYYY"><p id="log"></p>');
+    const input = document.getElementById("when") as HTMLInputElement;
+    const commit = () => {
+      const match = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(input.value);
+      if (!match) { if (!/^[A-Z][a-z]{2} /.test(input.value)) input.value = ""; return; }
+      const month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][Number(match[1]) - 1];
+      input.value = `${month} ${Number(match[2])}, ${match[3]}`;
+      document.getElementById("log")!.textContent = "Committed";
+    };
+    input.addEventListener("keydown", (event) => { if ((event as KeyboardEvent).key === "Enter") commit(); });
+    input.addEventListener("blur", commit);
+    return registry;
+  }
+
+  it("commits typed dates with Enter and blur, and reports the value the picker kept", async () => {
+    const registry = datePicker();
+    const result = await act(registry, { kind: "fill", target: ref("e1"), text: "11/03/2026", commit: true });
+    expect(result).toMatchObject({ ok: true });
+    expect(result.summary).toContain('Filled and committed [e1 textbox "Departure"]; it shows "Nov 3, 2026" (the field reformatted it).');
+    expect(result.summary).toContain("+ Committed");
+  });
+
+  it("fails when the picker rejects the text, pointing at its placeholder", async () => {
+    const registry = datePicker();
+    expect(await act(registry, { kind: "fill", target: ref("e1"), text: "2026-11-03", commit: true })).toMatchObject({
+      ok: false, code: "NOT_INTERACTABLE", summary: expect.stringContaining('did not keep "2026-11-03"; it is empty after Enter and blur. Its placeholder suggests the format "MM/DD/YYYY".'),
+    });
+  });
+
+  it("does not submit the field's form on the commit's Enter", async () => {
+    const registry = setup('<form id="f"><input aria-label="Date"></form>');
+    let submitted = false;
+    document.getElementById("f")!.addEventListener("submit", (event) => { event.preventDefault(); submitted = true; });
+    expect(await act(registry, { kind: "fill", target: ref("e1"), text: "2026-11-03", commit: true })).toMatchObject({ ok: true, summary: expect.stringContaining('it shows "2026-11-03".') });
+    expect(submitted).toBe(false);
   });
 });
