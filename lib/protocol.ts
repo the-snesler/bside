@@ -37,6 +37,7 @@ import { isMcpToolName, MCP_TRUST_LEVELS, type McpApproval, type McpServerStatus
 import { isMcpServerId } from "@/lib/mcp/servers";
 import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction, validateElementTarget, validateHttpUrl } from "@/lib/validation";
 import type { AskContextV1 } from "@/lib/domain/ask";
+import { isTaskDraft, isTaskId, type TaskDraft, type ScheduledTask, type ScheduledSource, type NotificationSettingsV1 } from "@/lib/domain/automation";
 
 // ---------------------------------------------------------------------------
 // Content script <-> background: PageRequest / PageResponse (tabs.sendMessage)
@@ -682,7 +683,7 @@ export type SidebarEvent =
   /** The pending context-menu chip changed: a new click, alt text the page reported, sent, or removed. Not run-sequenced. */
   | EventBase<"ask.changed", { ask: AskContextV1 | null }>
   | EventBase<"composer.focus", null>
-  | EventBase<"run.started", { prompt: string; page: PageArtifactSummary | null; ask: AskContextV1 | null; retry: boolean }>
+  | EventBase<"run.started", { prompt: string; page: PageArtifactSummary | null; ask: AskContextV1 | null; retry: boolean; scheduled?: ScheduledSource }>
   | EventBase<"assistant.delta", { delta: string }>
   | EventBase<"tool.requested", { call: ToolCall; display: string }>
   | EventBase<"action.approval-required", ApprovalRequest>
@@ -756,6 +757,25 @@ export type SkillsRequest =
   | { v: 1; id: string; type: "skills.list" }
   | { v: 1; id: string; type: "skills.save"; skill: Skill }
   | { v: 1; id: string; type: "skills.delete"; name: string };
+
+/** Automation settings and result selection: options.html only, never sidebar/content commands. */
+export type AutomationRequest =
+  | { v: 1; id: string; type: "automation.get" }
+  | { v: 1; id: string; type: "automation.save"; taskId: string | null; task: TaskDraft }
+  | { v: 1; id: string; type: "automation.delete"; taskId: string }
+  | { v: 1; id: string; type: "automation.results"; taskId: string }
+  | { v: 1; id: string; type: "automation.notifications.save"; enabled: boolean };
+export type AutomationResponse =
+  | { v: 1; id: string; ok: true; tasks: ScheduledTask[]; notifications: NotificationSettingsV1; available: boolean }
+  | { v: 1; id: string; ok: false; error: NormalizedError };
+export function isAutomationRequest(value: unknown): value is AutomationRequest {
+  if (!isEnvelope(value)) return false;
+  const v = value as Record<string, unknown>;
+  if (v.type === "automation.get") return true;
+  if (v.type === "automation.save") return (v.taskId === null || isTaskId(v.taskId)) && isTaskDraft(v.task);
+  if (v.type === "automation.delete" || v.type === "automation.results") return isTaskId(v.taskId);
+  return v.type === "automation.notifications.save" && typeof v.enabled === "boolean";
+}
 
 export type SkillsResponse =
   | { v: 1; id: string; ok: true; skills: Skill[]; builtinNames: string[] }

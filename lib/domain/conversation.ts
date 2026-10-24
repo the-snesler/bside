@@ -10,6 +10,7 @@ import type { Skill } from "@/lib/domain/skills";
 import type { SiteNote } from "@/lib/domain/instructions";
 import type { MemoryChange } from "@/lib/domain/memory";
 import type { AskContextV1 } from "@/lib/domain/ask";
+import type { ScheduledSource } from "@/lib/domain/automation";
 
 export type ConversationItem =
   | {
@@ -28,6 +29,8 @@ export type ConversationItem =
       sites?: SiteNote[];
       /** What the user right-clicked ("Ask bside about…"), sent with this message; rendered on it on every replay. */
       ask?: AskContextV1;
+      /** User-authored schedule metadata snapshotted at the tick, never a permission grant. */
+      scheduled?: ScheduledSource;
       /**
        * `"steer"`: guidance sent while the turn's run was working, persisted
        * where the model received it (after a tool round). It belongs to the
@@ -119,6 +122,8 @@ export interface RunDigestV1 {
 /** One session's entry in `ConversationIndexV1`. A session id is its conversation id. */
 export interface ConversationSummary {
   id: string;
+  /** Latest schedule that ran here; kept as a label after the task is deleted. */
+  scheduled?: ScheduledSource;
   /** Empty until the first prompt names the session. Untrusted text: render as text only. */
   title: string;
   /** `"prompt"` titles come from the first user prompt; `"user"` titles come from a rename and are never auto-overwritten. */

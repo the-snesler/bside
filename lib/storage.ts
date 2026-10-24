@@ -11,6 +11,7 @@
  */
 
 import { storage } from "wxt/utils/storage";
+import { isScheduledTask, isScheduledSource, MAX_SCHEDULED_TASKS, taskDraft, type ScheduledTask, type ScheduledTasksV1, type NotificationSettingsV1 } from "@/lib/domain/automation";
 import { isSkill } from "@/lib/domain/skills";
 import { isAskContext } from "@/lib/domain/ask";
 import { isCustomInstructionsText, isSiteNote, MAX_SITE_NOTES, type CustomInstructionsV1, type SiteNote, type SiteNotesV1 } from "@/lib/domain/instructions";
@@ -147,6 +148,7 @@ function isValidConversationItem(value: unknown): value is ConversationItem {
   if (v.kind === "message") {
     if (typeof v.text !== "string") return false;
     if (v.role === "user") return (v.context === null || typeof v.context === "object") && (v.delivery === undefined || v.delivery === "steer") && (v.skill === undefined || isSkill(v.skill)) &&
+      (v.scheduled === undefined || isScheduledSource(v.scheduled)) &&
       (v.sites === undefined || (Array.isArray(v.sites) && v.sites.length <= MAX_SITE_NOTES && v.sites.every(isSiteNote))) && (v.ask === undefined || isAskContext(v.ask));
     return v.role === "assistant";
   }
@@ -208,6 +210,44 @@ export async function getHistorySettings(): Promise<HistorySettingsV1> {
 
 export async function saveHistorySettings(settings: HistorySettingsV1): Promise<void> {
   await historySettingsItem.setValue(settings);
+}
+
+// Automation records are only written by the background scheduler. Every read
+// removes corrupt entries and later duplicates; unrelated storage is untouched.
+const scheduledTasksItem = storage.defineItem<ScheduledTasksV1>("local:scheduledTasks", { version: 1 });
+const notificationSettingsItem = storage.defineItem<NotificationSettingsV1>("local:notificationSettings", { version: 1 });
+
+export async function getScheduledTasks(): Promise<ScheduledTask[]> {
+  const raw: unknown = await scheduledTasksItem.getValue();
+  if (raw === null) return [];
+  const record = raw as Partial<ScheduledTasksV1> | null;
+  if (record?.version !== 1 || !Array.isArray(record.tasks)) { await scheduledTasksItem.removeValue(); return []; }
+  const tasks: ScheduledTask[] = [];
+  for (const t of record.tasks) {
+    if (tasks.length >= MAX_SCHEDULED_TASKS || !isScheduledTask(t) || tasks.some((other) => other.id === t.id || (t.sessionId !== null && other.sessionId === t.sessionId))) continue;
+    tasks.push({ ...taskDraft(t), id: t.id, createdAt: t.createdAt, updatedAt: t.updatedAt, sessionId: t.sessionId, nextAt: t.nextAt, unread: t.unread,
+      lastTick: t.lastTick ? { at: t.lastTick.at, status: t.lastTick.status } : null,
+      lastRun: t.lastRun ? { runId: t.lastRun.runId, startedAt: t.lastRun.startedAt, endedAt: t.lastRun.endedAt, status: t.lastRun.status } : null });
+  }
+  if (JSON.stringify(tasks) !== JSON.stringify(record.tasks)) await saveScheduledTasks(tasks);
+  return tasks;
+}
+
+export async function saveScheduledTasks(tasks: ScheduledTask[]): Promise<void> {
+  if (tasks.length > MAX_SCHEDULED_TASKS || !tasks.every(isScheduledTask)) throw new Error("Invalid scheduled tasks.");
+  await scheduledTasksItem.setValue({ version: 1, tasks });
+}
+
+export async function getNotificationSettings(): Promise<NotificationSettingsV1> {
+  const raw: unknown = await notificationSettingsItem.getValue();
+  const v = raw as Partial<NotificationSettingsV1> | null;
+  if (v?.version === 1 && typeof v.enabled === "boolean") return { version: 1, enabled: v.enabled };
+  if (raw !== null) await notificationSettingsItem.removeValue();
+  return { version: 1, enabled: false };
+}
+
+export async function saveNotificationSettings(settings: NotificationSettingsV1): Promise<void> {
+  await notificationSettingsItem.setValue({ version: 1, enabled: settings.enabled });
 }
 
 // ---------------------------------------------------------------------------
@@ -470,7 +510,7 @@ function withConversationLock<T>(task: () => Promise<T>): Promise<T> {
 function isValidSummary(value: unknown): value is ConversationSummary {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
-  return isSessionId(v.id) && typeof v.title === "string" && v.title.length <= 200 &&
+  return isSessionId(v.id) && (v.scheduled === undefined || isScheduledSource(v.scheduled)) && typeof v.title === "string" && v.title.length <= 200 &&
     (v.titleSource === "prompt" || v.titleSource === "user") && Number.isFinite(v.createdAt) && Number.isFinite(v.updatedAt) &&
     typeof v.pinned === "boolean" && Number.isSafeInteger(v.itemCount) && (v.itemCount as number) >= 0 &&
     (v.lastModelId === null || (typeof v.lastModelId === "string" && v.lastModelId.length <= 200)) && isValidUsageTotals(v.usage);
@@ -665,7 +705,7 @@ export function appendConversationItem(id: string, item: ConversationItem): Prom
  * prompt unless the session already has one, and an ended run's usage added
  * to the running total.
  */
-export function touchSession(id: string, turn: { prompt?: string; modelId?: string; usage?: RunUsageV1 } = {}): Promise<void> {
+export function touchSession(id: string, turn: { prompt?: string; modelId?: string; usage?: RunUsageV1; scheduled?: import("@/lib/domain/automation").ScheduledSource } = {}): Promise<void> {
   return withConversationLock(async () => {
     const sessions = await readIndex();
     const index = sessions.findIndex((session) => session.id === id);
@@ -674,6 +714,7 @@ export function touchSession(id: string, turn: { prompt?: string; modelId?: stri
     const record = await readRecord(id);
     sessions[index] = {
       ...session,
+      ...(turn.scheduled ? { scheduled: turn.scheduled } : {}),
       itemCount: record?.itemCount ?? session.itemCount,
       updatedAt: record?.updatedAt ?? session.updatedAt,
       lastModelId: turn.modelId ?? session.lastModelId,
