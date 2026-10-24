@@ -1,4 +1,5 @@
 // @vitest-environment happy-dom
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { BrowserProgram, ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
 import { FRAME_LIMITS, FrameAliases, TabController } from "@/lib/background/tab-controller";
@@ -304,5 +305,48 @@ describe("screenshots of elements inside frames", () => {
     expect(viaLocator.ok, viaLocator.summary).toBe(true);
     expect(captureTab).toHaveBeenCalledTimes(2);
     expect(captureTab).toHaveBeenLastCalledWith(1, expect.objectContaining({ rect: { x: 230, y: 1030, width: 100, height: 40 } }));
+  });
+});
+
+describe("the frames fixture", () => {
+  const body = (file: string) => readFileSync(`tests/fixtures/${file}`, "utf8").match(/<body>([\s\S]*)<\/body>/)![1]!;
+
+  it("pays inside the cross-origin payment frame and reads the confirmation the top document shows", async () => {
+    // innerHTML runs no scripts: frames load by frame id, and the fixture's submit and message handlers are installed below.
+    const top = body("frames-page.html")
+      .replace('<iframe id="payment" title="Payment" src=', '<iframe id="payment" title="Payment" data-frame-id="5" data-src=')
+      .replace('<iframe id="pixel" src=', '<iframe id="pixel" data-frame-id="6" data-src=');
+    const tab = createFramedTab([
+      { frameId: 0, url: "http://127.0.0.1:4173/frames-page.html", title: "Frames Fixture", html: top },
+      { frameId: 5, url: "http://localhost:4173/frame-payment.html", title: "Payment Frame", html: body("frame-payment.html") },
+      { frameId: 6, url: "http://localhost:4173/frame-payment.html?pixel", html: body("frame-payment.html") },
+    ], "http://127.0.0.1:4173/frames-page.html");
+    const frame = tab.frames.get(5)!.document;
+    frame.querySelector("form")!.addEventListener("submit", (event) => {
+      event.preventDefault();
+      frame.getElementById("result")!.textContent = `Card accepted: ending ${(frame.getElementById("card") as HTMLInputElement).value.slice(-4)}`;
+      tab.frames.get(0)!.document.getElementById("status")!.textContent = "Payment received. Order confirmed.";
+    });
+    const program = new BrowserProgram(new TabController(tab.api, undefined, new FrameAliases()), { state: new WorkspaceState(), sessionId: "s1", files: new ScratchFiles() }, () => {});
+    const signal = new AbortController().signal;
+
+    const read = await program.execute('const page = browser.tab("/tabs/1/page.md"); return await page.snapshot();', signal);
+    expect(read.summary).toContain([
+      "Order total: $42.00",
+      '[frame f1 "Payment" (http://localhost:4173/frame-payment.html)]',
+      '  Card number [f1:e1 textbox "Card number"] [f1:e2 button "Pay"]',
+      "[/frame f1]",
+    ].join("\n"));
+    // The 1 px frame is left out and never asked.
+    expect(read.summary).not.toContain("?pixel");
+    expect(tab.requestsTo(6)).toEqual([]);
+
+    const paid = await program.execute('await page.ref("f1:e1").fill("4242424242424242"); await page.ref("f1:e2").click();', signal);
+    expect(paid.ok, paid.summary).toBe(true);
+    expect(paid.summary).toContain("+ Card accepted: ending 4242");
+    expect(paid.summary).toContain("The diff covers frame f1 only");
+
+    const confirmed = await program.execute('return await page.find("Order confirmed");', signal);
+    expect(confirmed.summary).toContain("Payment received. Order confirmed.");
   });
 });

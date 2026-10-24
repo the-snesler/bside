@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Payment Frame</title>
+  </head>
+  <body>
+    <form id="pay-form">
+      <label for="card">Card number</label>
+      <input id="card" autocomplete="off" />
+      <button type="submit">Pay</button>
+    </form>
+    <p id="result" aria-live="polite"></p>
+
+    <script>
+      document.getElementById("pay-form").addEventListener("submit", function (event) {
+        event.preventDefault();
+        var card = document.getElementById("card").value;
+        document.getElementById("result").textContent = "Card accepted: ending " + card.slice(-4);
+        parent.postMessage("paid", "*");
+      });
+    </script>
+  </body>
+</html>

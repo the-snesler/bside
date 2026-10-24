@@ -30,7 +30,8 @@ export interface FakeFrame {
 }
 
 /**
- * One tab whose frames are separate documents, each answered the way
+ * One tab whose frames are separate documents (the top frame is the test
+ * window's document), each answered the way
  * `entrypoints/page.content.ts` answers in that frame, by the real page
  * executor. Requests must be addressed to one frame, in both the options and
  * the message, or the fake throws.
@@ -38,7 +39,8 @@ export interface FakeFrame {
 export function createFramedTab(specs: FakeFrameSpec[], tabUrl = specs[0]!.url) {
   const frames = new Map<number, FakeFrame>();
   const load = (spec: FakeFrameSpec, documentId = `doc-${spec.frameId}`) => {
-    const document = globalThis.document.implementation.createHTMLDocument(spec.title ?? "");
+    // The top frame is the window's own document, so computed styles apply; subframes are windowless documents.
+    const document = spec.frameId === 0 ? globalThis.document : globalThis.document.implementation.createHTMLDocument(spec.title ?? "");
     document.body.innerHTML = spec.html;
     for (const frame of Array.from(document.querySelectorAll<HTMLIFrameElement>("iframe[data-src]"))) {
       Object.defineProperty(frame, "contentDocument", { get: () => null });
