@@ -2,11 +2,9 @@ import { useEffect, useState } from "preact/hooks";
 import ArrowsMove from "~icons/tabler/arrows-move";
 import ArrowsVertical from "~icons/tabler/arrows-vertical";
 import Brain from "~icons/tabler/brain";
-import BrandNotion from "~icons/tabler/brand-notion";
 import BrandYoutube from "~icons/tabler/brand-youtube";
 import Camera from "~icons/tabler/camera";
 import Checkbox from "~icons/tabler/checkbox";
-import Checklist from "~icons/tabler/checklist";
 import Clock from "~icons/tabler/clock";
 import ExternalLink from "~icons/tabler/external-link";
 import FilePencil from "~icons/tabler/file-pencil";
@@ -19,7 +17,6 @@ import LockAccess from "~icons/tabler/lock-access";
 import Login from "~icons/tabler/login";
 import Paperclip from "~icons/tabler/paperclip";
 import Photo from "~icons/tabler/photo";
-import PlugConnected from "~icons/tabler/plug-connected";
 import Pointer from "~icons/tabler/pointer";
 import Search from "~icons/tabler/search";
 import Selector from "~icons/tabler/selector";
@@ -31,7 +28,8 @@ import WorldSearch from "~icons/tabler/world-search";
 import { PROMPT_MENTION_PATTERN } from "@/lib/domain/conversation";
 import type { HelpKind } from "@/lib/domain/tools";
 import { MAX_HELP_NOTE_CHARS } from "@/lib/domain/tools";
-import { findMcpServer, type McpServerIcon } from "@/lib/mcp/servers";
+import { findMcpServer } from "@/lib/mcp/servers";
+import { mcpServerIcon } from "@/lib/ui/mcp-icons";
 import type { AgentTabSummary, ApprovalRequest, HelpOutcome, HelpRequest } from "@/lib/protocol";
 import { Markdown } from "@/lib/ui/Markdown";
 import { Mascot, type MascotMood } from "@/lib/ui/Mascot";
@@ -40,15 +38,11 @@ import { formatDuration, type Activity, type Turn, type TurnStep } from "@/lib/u
 
 type Icon = typeof Pointer;
 
-/** Bundled icons for directory servers (no remote assets). */
-export const MCP_SERVER_ICONS: Record<McpServerIcon, Icon> = { "brand-notion": BrandNotion, checklist: Checklist };
-
 /** A connected account's tool call: the server's icon and "Notion: notion-search". */
 function mcpLabel(activity: Activity): { Icon: Icon; label: string } | null {
   const mcp = activity.call.mcp;
   if (!mcp) return null;
-  const server = findMcpServer(mcp.server);
-  return { Icon: server ? MCP_SERVER_ICONS[server.icon] : PlugConnected, label: `${server?.name ?? mcp.server}: ${mcp.tool}` };
+  return { Icon: mcpServerIcon(mcp.server), label: `${findMcpServer(mcp.server)?.name ?? mcp.server}: ${mcp.tool}` };
 }
 
 /** First matching effect wins: [source pattern, icon, running, done, failed]. */

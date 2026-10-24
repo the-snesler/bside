@@ -6,6 +6,7 @@ import ShieldLock from "~icons/tabler/shield-lock";
 import MessageUser from "~icons/tabler/message-user";
 import WorldPin from "~icons/tabler/world-pin";
 import Brain from "~icons/tabler/brain";
+import PlugConnected from "~icons/tabler/plug-connected";
 import { SkillsEditor } from "@/lib/ui/SkillsEditor";
 import type { OptionsApp } from "../state";
 import { GeneralPage } from "./General";
@@ -14,6 +15,7 @@ import { HistoryPage } from "./History";
 import { InstructionsPage } from "./Instructions";
 import { SiteNotesPage } from "./SiteNotes";
 import { MemoryPage } from "./Memory";
+import { ConnectionsPage } from "./Connections";
 
 export interface SettingsPageProps {
   app: OptionsApp;
@@ -94,6 +96,15 @@ export const SETTINGS_PAGES: readonly SettingsPage[] = [
     description: "What bside remembers across chats, and whether it may save more.",
     keywords: ["Memories", "Remember", "Forget everything", "Saved notes", "Auto", "Ask", "Off", "Export", "JSON", "Web content", "Undo", "Personalization"],
     component: MemoryPage,
+  },
+  {
+    id: "connections",
+    label: "Connections",
+    group: "Agent",
+    icon: PlugConnected,
+    description: "Let bside work in your accounts on other services.",
+    keywords: ["MCP", "Notion", "Todoist", "Integrations", "Apps", "Connect", "Disconnect", "Tools", "Confirm writes", "Read-only", "OAuth", "Accounts"],
+    component: ConnectionsPage,
   },
   {
     id: "history",

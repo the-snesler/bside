@@ -317,6 +317,30 @@ svg {
   margin-bottom: var(--space-2);
 }
 
+.settings-connection__name {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.settings-connection__icon {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+
+.settings-connection__line {
+  display: block;
+}
+
+.settings-connection__tool {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow-wrap: anywhere;
+}
+
 .settings-badge--warning {
   background: color-mix(in srgb, var(--error) 14%, transparent);
   color: var(--error);
