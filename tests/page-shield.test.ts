@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { buildOutline, createElementRefRegistry, excludeFromOutline, executeDomAction, findInPage, type ElementRefRegistry } from "@/lib/tools/page-executor";
+import { buildOutline, createElementRefRegistry, excludeFromOutline, executeDomAction, findInPage, measureForCapture, type ElementRefRegistry } from "@/lib/tools/page-executor";
 import { blocksPageInput, createPageShield, type PageShield } from "@/lib/tools/page-shield";
 import type { DomAction } from "@/lib/domain/tools";
 
@@ -141,5 +141,28 @@ describe("page shield", () => {
     await vi.waitFor(() => expect(host()?.parentElement).toBe(document.documentElement));
     shield.set("off");
     expect(host()).toBeNull();
+  });
+
+  it("is hidden from a screenshot but keeps blocking the user's input, and shows again after", () => {
+    const { shield, host } = mountShield();
+    shield.set("working");
+    shield.hideForCapture(true);
+    expect((host() as HTMLElement).style.getPropertyValue("visibility")).toBe("hidden");
+    expect((host() as HTMLElement).style.getPropertyPriority("visibility")).toBe("important");
+    const pageKeys = vi.fn();
+    document.addEventListener("keydown", pageKeys);
+    const key = new KeyboardEvent("keydown", { key: "a", bubbles: true, composed: true });
+    Object.defineProperty(key, "isTrusted", { value: true });
+    document.querySelector("#email")!.dispatchEvent(key);
+    expect(pageKeys).not.toHaveBeenCalled();
+    document.removeEventListener("keydown", pageKeys);
+    shield.hideForCapture(false);
+    expect((host() as HTMLElement).style.getPropertyValue("visibility")).toBe("visible");
+  });
+
+  it("is not measured as a screenshot target", () => {
+    mountShield().shield.set("working");
+    const registry = createElementRefRegistry("doc");
+    expect(measureForCapture(document, registry, { kind: "role", role: "button", name: "Take over", exact: false })).toMatchObject({ ok: false, result: { code: "TARGET_MISSING" } });
   });
 });

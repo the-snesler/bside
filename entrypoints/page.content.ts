@@ -1,5 +1,7 @@
 import {
   isContentMessageResponse,
+  isPageCaptureDoneRequest,
+  isPageCapturePrepareRequest,
   isPageExecuteRequest,
   isPageFindRequest,
   isPageHealthRequest,
@@ -14,8 +16,12 @@ import {
   extractSearchResults,
   extractSnapshot,
   findInPage,
+  measureForCapture,
 } from "@/lib/tools/page-executor";
 import { createPageShield } from "@/lib/tools/page-shield";
+
+/** The shield shows again on its own if the background never ends a capture. */
+const CAPTURE_SHIELD_TIMEOUT_MS = 5_000;
 
 export default defineContentScript({
   matches: ["http://*/*", "https://*/*"],
@@ -37,6 +43,11 @@ export default defineContentScript({
     const shield = createPageShield(document, () => tellBackground("shield.takeover"));
     tellBackground("shield.sync");
     window.addEventListener("pageshow", (event) => { if (event.persisted) tellBackground("shield.sync"); });
+    let captureTimer: ReturnType<typeof setTimeout> | undefined;
+    const endCapture = () => {
+      clearTimeout(captureTimer);
+      shield.hideForCapture(false);
+    };
 
     browser.runtime.onMessage.addListener((message: unknown): Promise<PageResponse> | undefined => {
       if (isPageHealthRequest(message)) {
@@ -57,6 +68,21 @@ export default defineContentScript({
         return executeDomAction(document, registry, message.action).then((result) => (
           { v: 1, id: message.id, ok: true, type: "page.execute", result, documentId: registry.documentId }
         ));
+      }
+      if (isPageCapturePrepareRequest(message)) {
+        const measured = measureForCapture(document, registry, message.target);
+        if (!measured.ok) {
+          const { code, summary } = measured.result;
+          return Promise.resolve({ v: 1, id: message.id, ok: false, error: { code: code === "STALE_SNAPSHOT" || code === "TARGET_MISSING" ? code : "NOT_INTERACTABLE", message: summary, retryable: false, phase: "page" } });
+        }
+        clearTimeout(captureTimer);
+        shield.hideForCapture(true);
+        captureTimer = setTimeout(endCapture, CAPTURE_SHIELD_TIMEOUT_MS);
+        return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.capture-prepare", geometry: measured.geometry });
+      }
+      if (isPageCaptureDoneRequest(message)) {
+        endCapture();
+        return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.capture-done" });
       }
       if (isPageShieldRequest(message)) {
         shield.set(message.shield);

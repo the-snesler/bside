@@ -8,6 +8,8 @@ import {
   isPageExecuteRequest,
   isPageFindRequest,
   isPageHealthRequest,
+  isPageCaptureDoneRequest,
+  isPageCapturePrepareRequest,
   isPageShieldRequest,
   isPageSnapshotRequest,
   isSettingsRequest,
@@ -338,6 +340,17 @@ describe("page shield messages", () => {
     expect(isPageShieldRequest({ v: 1, id: "1", type: "page.shield", shield: "off" })).toBe(false);
     expect(isPageShieldRequest({ v: 1, id: "1", type: "page.shield", tabId: -1, shield: "off" })).toBe(false);
     expect(isPageShieldRequest({ v: 2, id: "1", type: "page.shield", tabId: 3, shield: "off" })).toBe(false);
+  });
+
+  it("accepts capture requests only with a tab id and a valid target or none", () => {
+    const ref = { kind: "ref", ref: "e5", documentId: "doc" };
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", tabId: 3, target: null })).toBe(true);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", tabId: 3, target: ref })).toBe(true);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", tabId: 3, target: { kind: "css", selector: "#x" } })).toBe(false);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", tabId: 3 })).toBe(false);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", target: null })).toBe(false);
+    expect(isPageCaptureDoneRequest({ v: 1, id: "1", type: "page.capture-done", tabId: 3 })).toBe(true);
+    expect(isPageCaptureDoneRequest({ v: 1, id: "1", type: "page.capture-done" })).toBe(false);
   });
 
   it("accepts only the two content-script messages, which name no tab", () => {

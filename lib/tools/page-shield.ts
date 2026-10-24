@@ -13,6 +13,8 @@
  * keeps it out of every snapshot, find, and change diff. Styles are set
  * through the CSSOM, which page CSPs do not restrict.
  *
+ * A screenshot hides it from view while the image is taken, never from input.
+ *
  * Only trusted (user) input is blocked. The agent's effects are synthetic
  * events dispatched straight to their target element (see page-executor.ts),
  * so they pass through untouched, as do its focus() and scroll calls.
@@ -42,6 +44,11 @@ const LABELS: Record<Exclude<PageShieldState, "off">, string> = {
 export interface PageShield {
   readonly state: PageShieldState;
   set(state: PageShieldState): void;
+  /**
+   * Hides the shield from view (not from input) while bside takes a
+   * screenshot, so it is not in the image; trusted input stays blocked.
+   */
+  hideForCapture(hidden: boolean): void;
 }
 
 /**
@@ -163,8 +170,15 @@ export function createPageShield(document: Document, onTakeOver: () => void): Pa
     for (const type of BLOCKED_EVENTS) view?.addEventListener(type, onWindowInput, { capture: true, passive: false });
   }
 
+  function hideForCapture(hidden: boolean): void {
+    css(host, { visibility: hidden ? "hidden" : "visible" }, true);
+    // Apply the style now: a screenshot paints right after this returns.
+    if (hidden) view?.getComputedStyle(host).visibility;
+  }
+
   return {
     get state() { return state; },
     set,
+    hideForCapture,
   };
 }

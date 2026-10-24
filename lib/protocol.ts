@@ -10,7 +10,9 @@
  */
 
 import type {
+  CaptureGeometry,
   DomAction,
+  ElementTarget,
   HelpKind,
   PageArtifactSummary,
   PageErrorCode,
@@ -27,7 +29,7 @@ import { REASONING_EFFORTS, type AppSettingsV1, type ChatGPTStatus, type Provide
 import type { RunUsageV1 } from "@/lib/domain/usage";
 import { isSkill, isSkillName, type Skill, type SkillSummary } from "@/lib/domain/skills";
 import { isCustomInstructionsText, isSiteNote, isSiteOrigin, type SiteNote } from "@/lib/domain/instructions";
-import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction } from "@/lib/validation";
+import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction, validateElementTarget } from "@/lib/validation";
 
 // ---------------------------------------------------------------------------
 // Content script <-> background: PageRequest / PageResponse (tabs.sendMessage)
@@ -91,7 +93,30 @@ export interface PageShieldRequest {
   shield: PageShieldState;
 }
 
-export type PageRequest = PageHealthRequest | PageSnapshotRequest | PageFindRequest | PageSearchResultsRequest | PageExecuteRequest | PageShieldRequest;
+/**
+ * Measures the page for a screenshot: the viewport, the page size, and the
+ * target element's box (a ref must come from the current document). The
+ * page shield, if showing, is hidden until `page.capture-done` (or a short
+ * timeout) so it is not in the image; it keeps blocking the user's input.
+ */
+export interface PageCapturePrepareRequest {
+  v: 1;
+  id: string;
+  type: "page.capture-prepare";
+  tabId: number;
+  target: ElementTarget | null;
+}
+
+/** Ends a capture: the page shield shows again if it was hidden for it. */
+export interface PageCaptureDoneRequest {
+  v: 1;
+  id: string;
+  type: "page.capture-done";
+  tabId: number;
+}
+
+export type PageRequest = PageHealthRequest | PageSnapshotRequest | PageFindRequest | PageSearchResultsRequest | PageExecuteRequest | PageShieldRequest |
+  PageCapturePrepareRequest | PageCaptureDoneRequest;
 
 export interface PageHealthResponse {
   v: 1;
@@ -143,6 +168,21 @@ export interface PageShieldResponse {
   type: "page.shield";
 }
 
+export interface PageCapturePrepareResponse {
+  v: 1;
+  id: string;
+  ok: true;
+  type: "page.capture-prepare";
+  geometry: CaptureGeometry;
+}
+
+export interface PageCaptureDoneResponse {
+  v: 1;
+  id: string;
+  ok: true;
+  type: "page.capture-done";
+}
+
 export interface PageErrorResponse {
   v: 1;
   id: string;
@@ -157,6 +197,8 @@ export type PageResponse =
   | PageSearchResultsResponse
   | PageExecuteResponse
   | PageShieldResponse
+  | PageCapturePrepareResponse
+  | PageCaptureDoneResponse
   | PageErrorResponse;
 
 export function isPageHealthRequest(value: unknown): value is PageHealthRequest {
@@ -194,6 +236,16 @@ export function isPageShieldRequest(value: unknown): value is PageShieldRequest 
   if (!isEnvelope(value) || value.type !== "page.shield") return false;
   const candidate = value as Record<string, unknown>;
   return isTabId(candidate.tabId) && (PAGE_SHIELD_STATES as readonly unknown[]).includes(candidate.shield);
+}
+
+export function isPageCapturePrepareRequest(value: unknown): value is PageCapturePrepareRequest {
+  if (!isEnvelope(value) || value.type !== "page.capture-prepare") return false;
+  const candidate = value as Record<string, unknown>;
+  return isTabId(candidate.tabId) && (candidate.target === null || validateElementTarget(candidate.target) !== null);
+}
+
+export function isPageCaptureDoneRequest(value: unknown): value is PageCaptureDoneRequest {
+  return isEnvelope(value) && value.type === "page.capture-done" && isTabId((value as Record<string, unknown>).tabId);
 }
 
 // ---------------------------------------------------------------------------

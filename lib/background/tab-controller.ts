@@ -6,10 +6,13 @@
  * newly opened tab is never implicitly adopted. forTab creates a separate
  * controller for an explicitly selected workspace tab. Agent-tab ownership is
  * recorded as a session tab value (`AGENT_TAB_TAG_KEY`) on the tab itself.
+ * Screenshots go through `tabs.captureTab`, bounded here (see `screenshot`).
  */
 
 import type {
   NormalizedError,
+  PageCaptureDoneRequest,
+  PageCapturePrepareRequest,
   PageExecuteRequest,
   PageFindRequest,
   PageHealthRequest,
@@ -19,7 +22,7 @@ import type {
   PageShieldState,
   PageSnapshotRequest,
 } from "@/lib/protocol";
-import type { DomAction, PageArtifactSummary, PageErrorCode, PageFindResult, PageSnapshot, SearchResult, ToolResult } from "@/lib/domain/tools";
+import type { CaptureGeometry, DomAction, ElementTarget, PageArtifactSummary, PageErrorCode, PageFindResult, PageRect, PageSnapshot, SearchResult, ToolResult } from "@/lib/domain/tools";
 import { isSessionId, validateHttpUrl } from "@/lib/validation";
 
 const NAVIGATION_TIMEOUT_MS = 10_000;
@@ -27,6 +30,15 @@ const PROBE_DELAYS_MS = [100, 200, 400, 800, 1_600, 3_200];
 const UNSUPPORTED_HOSTNAME_SUFFIXES = [".mozilla.org", ".mozilla.com"];
 export const DEFAULT_SNAPSHOT_CHARS = 16_000;
 export const ARTIFACT_SNAPSHOT_CHARS = 8_000;
+
+/** Longest side of a screenshot, in image pixels; larger captures are rendered at a smaller scale. */
+export const SCREENSHOT_MAX_DIMENSION = 1600;
+/** Most bytes one screenshot may have (decoded); a larger one is retaken smaller, then refused. */
+export const SCREENSHOT_MAX_BYTES = 1_500_000;
+/** A full-page screenshot covers at most this much of the page, in CSS pixels; the rest is cut. */
+export const FULL_PAGE_MAX_CSS = { width: 4_000, height: 12_000 };
+/** JPEG quality, then smaller scales and qualities tried in turn while an image is over the byte cap. */
+const CAPTURE_ATTEMPTS = [{ scale: 1, quality: 70 }, { scale: 0.7, quality: 55 }, { scale: 0.5, quality: 45 }];
 
 export const AGENT_TAB_TAG_KEY = "bside.agentTab";
 export const AGENT_TAB_ROLES = ["agent", "search"] as const;
@@ -63,6 +75,36 @@ export type TabSnapshot = {
 };
 type TabUpdatedListener = (tabId: number, changeInfo: { status?: string }, tab: TabSnapshot) => void;
 
+/** `tabs.captureTab` options (Firefox's `extensionTypes.ImageDetails`): `rect` in CSS pixels of the document, `scale` image pixels per CSS pixel. */
+export interface CaptureOptions {
+  format: "jpeg" | "png";
+  quality?: number;
+  rect: PageRect;
+  scale: number;
+}
+
+/** What a screenshot covers: the visible viewport, the whole page (within `FULL_PAGE_MAX_CSS`), or one element. */
+export interface ScreenshotRequest {
+  area: "viewport" | "full";
+  target: ElementTarget | null;
+  format: "jpeg" | "png";
+}
+
+/** One bounded screenshot, held in memory for one provider round; never persisted. */
+export interface Screenshot {
+  mimeType: "image/jpeg" | "image/png";
+  /** Base64 image bytes, without a data-URL prefix. */
+  data: string;
+  /** Decoded size in bytes. */
+  bytes: number;
+  width: number;
+  height: number;
+  url: string;
+  documentId: string;
+  /** Whether a full-page or element capture was cut at `FULL_PAGE_MAX_CSS`. */
+  cut: boolean;
+}
+
 export interface TabControllerBrowserApi {
   tabs: {
     query(query: { active?: boolean; lastFocusedWindow?: boolean }): Promise<TabSnapshot[]>;
@@ -71,6 +113,8 @@ export interface TabControllerBrowserApi {
     show?(tabId: number): Promise<void>;
     move?(tabId: number, moveProperties: { windowId: number; index: number }): Promise<unknown>;
     remove?(tabId: number): Promise<void>;
+    /** Resolves to a data URL. Needs `<all_urls>`. */
+    captureTab?(tabId: number, options: CaptureOptions): Promise<string>;
     update(tabId: number, updateProperties: { url: string } | { active: true }): Promise<unknown>;
     goBack(tabId: number): Promise<void>;
     sendMessage(tabId: number, message: unknown): Promise<unknown>;
@@ -90,14 +134,19 @@ export type PageOutcome<T> = { ok: true; value: T } | { ok: false; error: Normal
 /** A DOM action's result plus the document it ran in (null when the page navigated away). */
 export type ActionOutcome = { result: ToolResult; documentId: string | null };
 
+/** Whether a captured image is one flat color, as a tab that was not painted comes out. */
+export type BlankImageCheck = (dataUrl: string) => Promise<boolean>;
+
 export class TabController {
   #browserApi: TabControllerBrowserApi;
+  #isBlank: BlankImageCheck;
   #tabId: number | null = null;
   #url: string | null = null;
   #title: string | null = null;
 
-  constructor(browserApi: TabControllerBrowserApi) {
+  constructor(browserApi: TabControllerBrowserApi, isBlank: BlankImageCheck = isBlankImage) {
     this.#browserApi = browserApi;
+    this.#isBlank = isBlank;
   }
 
   get tabId(): number | null {
@@ -116,7 +165,7 @@ export class TabController {
   async forTab(tabId: number): Promise<TabController> {
     const tab = (await this.listTabs()).find((tab) => tab.id === tabId);
     if (!tab) throw new Error("Tab is closed or unsupported.");
-    const controller = new TabController(this.#browserApi);
+    const controller = new TabController(this.#browserApi, this.#isBlank);
     controller.#tabId = tabId;
     controller.#url = tab.url!;
     controller.#title = tab.title ?? "";
@@ -273,6 +322,76 @@ export class TabController {
     return this.#request(this.#tabId, { type: "page.search-results", tabId: this.#tabId }, "page.search-results");
   }
 
+  /**
+   * Captures the bound tab with `tabs.captureTab`, bounded to
+   * `SCREENSHOT_MAX_DIMENSION` pixels (by rendering at a smaller scale) and
+   * `SCREENSHOT_MAX_BYTES` (retaking it smaller, then refusing). The page
+   * measures itself first and hides its shield until the capture ends.
+   *
+   * Firefox paints background tabs for `captureTab` (it draws the document
+   * from its content process), and a hidden agent tab is a background tab. If
+   * a hidden tab still fails to capture or comes out blank, it is shown
+   * without being activated, captured again, and hidden again; the hide runs
+   * in `finally`, and Firefox never hides the active tab, so a tab the user
+   * switched to (or is watching) stays visible.
+   */
+  async screenshot(request: ScreenshotRequest): Promise<PageOutcome<Screenshot>> {
+    const tabId = this.#tabId;
+    if (tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
+    const capture = this.#browserApi.tabs.captureTab?.bind(this.#browserApi.tabs);
+    if (!capture) return pageError("UNSUPPORTED_PAGE", "Screenshots are unavailable in this browser.");
+    const measured = await this.#request<CaptureGeometry>(tabId, { type: "page.capture-prepare", tabId, target: request.target }, "page.capture-prepare");
+    if (!measured.ok) return measured;
+    try {
+      const geometry = measured.value;
+      const { rect, cut } = captureRect(geometry, request);
+      if (rect.width < 1 || rect.height < 1) return pageError("NOT_INTERACTABLE", "There is nothing visible to capture.");
+      const fit = Math.min(1, SCREENSHOT_MAX_DIMENSION / Math.max(rect.width, rect.height));
+      for (const attempt of CAPTURE_ATTEMPTS) {
+        const scale = fit * attempt.scale;
+        const options: CaptureOptions = { format: request.format, rect, scale, ...(request.format === "jpeg" ? { quality: attempt.quality } : {}) };
+        const dataUrl = await this.#capture(tabId, options, capture);
+        const image = parseImageDataUrl(dataUrl, request.format);
+        if (!image) return pageError("TAB_CHANGED", "Firefox returned an unreadable screenshot.");
+        if (image.bytes > SCREENSHOT_MAX_BYTES) continue;
+        this.#url = geometry.url;
+        this.#title = geometry.title;
+        return { ok: true, value: {
+          ...image, width: Math.max(1, Math.round(rect.width * scale)), height: Math.max(1, Math.round(rect.height * scale)),
+          url: geometry.url, documentId: geometry.documentId, cut,
+        } };
+      }
+      return { ok: false, error: { code: "LIMIT_EXCEEDED", message: `The screenshot stayed over ${SCREENSHOT_MAX_BYTES.toLocaleString("en-US")} bytes at reduced size; capture the viewport or one element instead.`, retryable: false, phase: "page" } };
+    } catch {
+      return pageError("TAB_CHANGED", "Firefox could not capture this tab.");
+    } finally {
+      const done: PageCaptureDoneRequest = { v: 1, id: crypto.randomUUID(), type: "page.capture-done", tabId };
+      await this.#browserApi.tabs.sendMessage(tabId, done).catch(() => {});
+    }
+  }
+
+  /** One capture, falling back to briefly showing a hidden tab when the capture fails or comes out blank. */
+  async #capture(tabId: number, options: CaptureOptions, capture: (tabId: number, options: CaptureOptions) => Promise<string>): Promise<string> {
+    let first: string | null = null;
+    try {
+      first = await capture(tabId, options);
+      if (!(await this.#isBlank(first))) return first;
+    } catch {
+      // Retried below if the tab is hidden.
+    }
+    const hidden = (await this.allTabs()).find((tab) => tab.id === tabId)?.hidden === true;
+    if (!hidden || !this.#browserApi.tabs.show || !this.#browserApi.tabs.hide) {
+      if (first !== null) return first;
+      throw new Error("Capture failed.");
+    }
+    await this.#browserApi.tabs.show(tabId);
+    try {
+      return await capture(tabId, options);
+    } finally {
+      await this.#browserApi.tabs.hide(tabId).catch(() => []);
+    }
+  }
+
   /** Forwards one DOM action. A click/press that tears down the document settles like a navigation instead of repeating. */
   async act(action: DomAction): Promise<ActionOutcome> {
     const tabId = this.#tabId;
@@ -332,8 +451,8 @@ export class TabController {
 
   async #request<T>(
     tabId: number,
-    body: Omit<PageSnapshotRequest, "v" | "id"> | Omit<PageFindRequest, "v" | "id"> | Omit<PageSearchResultsRequest, "v" | "id">,
-    type: "page.snapshot" | "page.find" | "page.search-results",
+    body: Omit<PageSnapshotRequest, "v" | "id"> | Omit<PageFindRequest, "v" | "id"> | Omit<PageSearchResultsRequest, "v" | "id"> | Omit<PageCapturePrepareRequest, "v" | "id">,
+    type: "page.snapshot" | "page.find" | "page.search-results" | "page.capture-prepare",
   ): Promise<PageOutcome<T>> {
     const request = { v: 1, id: crypto.randomUUID(), ...body };
     let response: PageResponse | undefined;
@@ -348,6 +467,7 @@ export class TabController {
     if (response.type === "page.snapshot") return { ok: true, value: response.snapshot as T };
     if (response.type === "page.find") return { ok: true, value: response.result as T };
     if (response.type === "page.search-results") return { ok: true, value: { results: response.results, url: response.url, excerpt: response.excerpt } as T };
+    if (response.type === "page.capture-prepare") return { ok: true, value: response.geometry as T };
     return pageError("TAB_CHANGED", "Unexpected response from the page.");
   }
 
@@ -392,6 +512,59 @@ export class TabController {
       // Content script not attached yet on the new document; keep probing.
     }
     return null;
+  }
+}
+
+/** The document rectangle a screenshot covers, and whether it was cut at `FULL_PAGE_MAX_CSS`. */
+function captureRect(geometry: CaptureGeometry, request: ScreenshotRequest): { rect: PageRect; cut: boolean } {
+  const page = { x: 0, y: 0, width: Math.min(geometry.page.width, FULL_PAGE_MAX_CSS.width), height: Math.min(geometry.page.height, FULL_PAGE_MAX_CSS.height) };
+  const area = geometry.element ?? (request.area === "full" ? page : geometry.viewport);
+  const x = Math.max(0, Math.floor(area.x));
+  const y = Math.max(0, Math.floor(area.y));
+  const right = Math.min(Math.ceil(area.x + area.width), x + FULL_PAGE_MAX_CSS.width);
+  const bottom = Math.min(Math.ceil(area.y + area.height), y + FULL_PAGE_MAX_CSS.height);
+  const cut = (request.area === "full" && !geometry.element && (geometry.page.width > page.width || geometry.page.height > page.height)) ||
+    (geometry.element !== null && (right < area.x + area.width || bottom < area.y + area.height));
+  return { rect: { x, y, width: Math.max(0, right - x), height: Math.max(0, bottom - y) }, cut };
+}
+
+/** The base64 bytes of a `data:image/…;base64,` URL in the requested format, and their decoded size. */
+function parseImageDataUrl(dataUrl: unknown, format: "jpeg" | "png"): { mimeType: "image/jpeg" | "image/png"; data: string; bytes: number } | null {
+  const mimeType = format === "jpeg" ? "image/jpeg" : "image/png";
+  const prefix = `data:${mimeType};base64,`;
+  if (typeof dataUrl !== "string" || !dataUrl.startsWith(prefix)) return null;
+  const data = dataUrl.slice(prefix.length);
+  if (!data || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) return null;
+  return { mimeType, data, bytes: base64Bytes(data) };
+}
+
+/** Decoded size of base64 text. */
+export function base64Bytes(data: string): number {
+  return Math.floor((data.length * 3) / 4) - (data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0);
+}
+
+/**
+ * Whether an image is one flat color, sampled at 8×8. Needs the background
+ * page's `createImageBitmap` and `OffscreenCanvas`; elsewhere it answers false.
+ */
+async function isBlankImage(dataUrl: string): Promise<boolean> {
+  if (typeof createImageBitmap !== "function" || typeof OffscreenCanvas !== "function") return false;
+  try {
+    const [header, data] = dataUrl.split(",", 2);
+    const bytes = Uint8Array.from(atob(data ?? ""), (char) => char.charCodeAt(0));
+    const bitmap = await createImageBitmap(new Blob([bytes], { type: /^data:([^;]+)/.exec(header ?? "")?.[1] ?? "image/png" }));
+    const canvas = new OffscreenCanvas(8, 8);
+    const context = canvas.getContext("2d");
+    if (!context) return false;
+    context.drawImage(bitmap, 0, 0, 8, 8);
+    bitmap.close();
+    const pixels = context.getImageData(0, 0, 8, 8).data;
+    for (let i = 4; i < pixels.length; i += 4) {
+      for (let channel = 0; channel < 3; channel++) if (Math.abs(pixels[i + channel]! - pixels[channel]!) > 2) return false;
+    }
+    return true;
+  } catch {
+    return false;
   }
 }
 

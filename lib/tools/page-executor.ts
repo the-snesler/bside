@@ -21,7 +21,7 @@
  * they also hold for elements from same-origin frames (other realms).
  */
 
-import type { DomAction, ElementTarget, PageFindResult, PageSnapshot, SearchResult, ToolResult } from "@/lib/domain/tools";
+import type { CaptureGeometry, DomAction, ElementTarget, PageFindResult, PageRect, PageSnapshot, SearchResult, ToolResult } from "@/lib/domain/tools";
 
 // ---------------------------------------------------------------------------
 // Ref registry
@@ -885,14 +885,15 @@ function candidatesText(controls: OutlineControl[], limit = 8): string {
   return controls.length > limit ? `${shown}; …+${controls.length - limit} more` : shown;
 }
 
-function resolveTarget(outline: Outline, registry: ElementRefRegistry, target: ElementTarget): Resolved {
+/** `allowDisabled` resolves a disabled control too (looking at one is fine; operating it is not). */
+function resolveTarget(outline: Outline, registry: ElementRefRegistry, target: ElementTarget, allowDisabled = false): Resolved {
   if (target.kind === "ref") {
     if (target.documentId !== registry.documentId) {
       return { ok: false, result: { ok: false, code: "STALE_SNAPSHOT", summary: `Ref ${target.ref} came from an earlier page load; this tab now shows a different document. Read a fresh snapshot.` } };
     }
     const control = outline.byRef.get(target.ref);
     if (control) {
-      if (control.disabled) return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `${describe(control)} is disabled.` } };
+      if (control.disabled && !allowDisabled) return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `${describe(control)} is disabled.` } };
       return { ok: true, control };
     }
     const element = registry.byRef.get(target.ref);
@@ -913,7 +914,7 @@ function resolveTarget(outline: Outline, registry: ElementRefRegistry, target: E
   }
   if (matches.length === 1) {
     const control = matches[0]!;
-    if (control.disabled) return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `${describe(control)} is disabled.` } };
+    if (control.disabled && !allowDisabled) return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `${describe(control)} is disabled.` } };
     return { ok: true, control };
   }
   const label = `${target.role === "*" ? "element" : target.role}${wanted === null ? "" : ` ${target.exact ? "named exactly" : "with name containing"} ${JSON.stringify(wanted)}`}`;
@@ -1192,4 +1193,57 @@ export async function executeDomAction(
   if (action.kind !== "scroll") parts.push(describeChanges(before.lines, after.lines));
   if (location && location !== urlBefore) parts.push(`URL changed to ${location}`);
   return { ok: true, summary: parts.join("\n") };
+}
+
+/**
+ * Measures the page for a screenshot, in document coordinates: the scrolled
+ * viewport, the page's full size, and the target element's border box
+ * (resolved like an action's target against a fresh outline, so a ref from an
+ * earlier document is stale). Same-origin frames add their offsets.
+ */
+export function measureForCapture(document: Document, registry: ElementRefRegistry, target: ElementTarget | null):
+  { ok: true; geometry: CaptureGeometry } | { ok: false; result: ToolResult } {
+  const view = document.defaultView;
+  const root = document.documentElement;
+  const viewport: PageRect = {
+    x: view?.scrollX ?? 0,
+    y: view?.scrollY ?? 0,
+    width: root?.clientWidth || view?.innerWidth || 0,
+    height: root?.clientHeight || view?.innerHeight || 0,
+  };
+  const page = {
+    width: Math.max(viewport.width, root?.scrollWidth ?? 0, document.body?.scrollWidth ?? 0),
+    height: Math.max(viewport.height, root?.scrollHeight ?? 0, document.body?.scrollHeight ?? 0),
+  };
+  let element: PageRect | null = null;
+  if (target) {
+    const resolved = resolveTarget(buildOutline(document, registry), registry, target, true);
+    if (!resolved.ok) return resolved;
+    const { control } = resolved;
+    element = documentRect(control.element, view);
+    if ((!element.width || !element.height) && control.proxy) element = documentRect(control.proxy, view);
+    if (!element.width || !element.height) {
+      return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `${describe(control)} has no visible box to capture.` } };
+    }
+  }
+  return {
+    ok: true,
+    geometry: { documentId: registry.documentId, url: document.location?.href ?? "", title: document.title, viewport, page, element },
+  };
+}
+
+/** An element's border box relative to the top document, adding the offsets of the same-origin frames it is in. */
+function documentRect(element: Element, top: Window | null): PageRect {
+  const box = element.getBoundingClientRect();
+  let x = box.left;
+  let y = box.top;
+  let view = element.ownerDocument.defaultView;
+  while (view && view !== top && view.frameElement) {
+    const frame = view.frameElement;
+    const outer = frame.getBoundingClientRect();
+    x += outer.left + frame.clientLeft;
+    y += outer.top + frame.clientTop;
+    view = frame.ownerDocument.defaultView;
+  }
+  return { x: x + (top?.scrollX ?? 0), y: y + (top?.scrollY ?? 0), width: box.width, height: box.height };
 }

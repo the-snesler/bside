@@ -8,6 +8,7 @@ import {
   extractSearchResults,
   extractSnapshot,
   findInPage,
+  measureForCapture,
   type ElementRefRegistry,
 } from "@/lib/tools/page-executor";
 import type { DomAction, ElementTarget } from "@/lib/domain/tools";
@@ -342,3 +343,32 @@ describe("change descriptions", () => {
     expect(describeChanges(["a", "b"], ["a", "c", "c"])).toBe("Page changes (+2 −1 lines):\n+ c\n+ c\n- b");
   });
 });
+
+describe("measureForCapture", () => {
+  it("reports the viewport, the page size, and a target's box in document coordinates", () => {
+    setBody('<button id="go">Go</button><button disabled>Off</button>');
+    const registry = createElementRefRegistry("doc");
+    buildOutline(document, registry);
+    const button = document.querySelector("#go")!;
+    button.getBoundingClientRect = () => ({ left: 20, top: 30, width: 60, height: 24, right: 80, bottom: 54, x: 20, y: 30, toJSON: () => ({}) });
+    window.scrollTo(0, 0);
+    const measured = measureForCapture(document, registry, role("button", "Go"));
+    expect(measured).toMatchObject({ ok: true, geometry: { documentId: "doc", element: { x: 20, y: 30, width: 60, height: 24 } } });
+    if (!measured.ok) return;
+    expect(measured.geometry.viewport.width).toBeGreaterThan(0);
+    expect(measured.geometry.page.height).toBeGreaterThanOrEqual(measured.geometry.viewport.height);
+    expect(measureForCapture(document, registry, null)).toMatchObject({ ok: true, geometry: { element: null } });
+  });
+
+  it("rejects a ref from an earlier document and an element without a box; a disabled control is fine to look at", () => {
+    setBody('<button>Go</button><button disabled id="off">Off</button>');
+    const registry = createElementRefRegistry("doc");
+    buildOutline(document, registry);
+    expect(measureForCapture(document, registry, { kind: "ref", ref: "e1", documentId: "old" })).toMatchObject({ ok: false, result: { code: "STALE_SNAPSHOT" } });
+    expect(measureForCapture(document, registry, role("button", "Go"))).toMatchObject({ ok: false, result: { code: "NOT_INTERACTABLE" } });
+    const off = document.querySelector("#off")!;
+    off.getBoundingClientRect = () => ({ left: 0, top: 0, width: 10, height: 10, right: 10, bottom: 10, x: 0, y: 0, toJSON: () => ({}) });
+    expect(measureForCapture(document, registry, role("button", "Off")).ok).toBe(true);
+  });
+});
+

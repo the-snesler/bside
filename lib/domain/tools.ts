@@ -104,6 +104,25 @@ export interface SearchResult {
   snippet: string;
 }
 
+/** A rectangle in CSS pixels, in document coordinates (relative to the top-left of the page). */
+export interface PageRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** Where a screenshot can be taken from: the scrolled viewport, the whole page, and an optional target element's box. */
+export interface CaptureGeometry {
+  documentId: string;
+  url: string;
+  title: string;
+  viewport: PageRect;
+  page: { width: number; height: number };
+  /** The target element's border box, or null when the capture has no target. */
+  element: PageRect | null;
+}
+
 /** Summary of a captured page, safe to persist alongside a conversation turn. */
 export interface PageArtifactSummary {
   artifactId: string;
