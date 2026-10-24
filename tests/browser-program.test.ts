@@ -1,5 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { storage } from "wxt/utils/storage";
 import { BrowserProgram, parseProgram, ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
+import { listMemories, runMemory } from "@/lib/background/memory";
 import type { ScratchFileEntry, ScratchStore } from "@/lib/background/browser-program";
 import { TabController, type TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import type { DomAction, PageSnapshot, SearchResult } from "@/lib/domain/tools";
@@ -18,7 +20,7 @@ function memoryStore(initial: ScratchFileEntry[] = []) {
   return { store, slots, files };
 }
 
-function setup(options: { outline?: string; searchResults?: (url: string) => SearchResult[]; sites?: SiteEnv } = {}) {
+function setup(options: { outline?: string; searchResults?: (url: string) => SearchResult[]; sites?: SiteEnv; memory?: boolean } = {}) {
   const tabs = new Map([[1, { id: 1, url: "https://example.com", title: "Example", hidden: false }]]);
   const documents = new Map<number, string>([[1, "doc-1"]]);
   const actions: DomAction[] = [];
@@ -60,7 +62,8 @@ function setup(options: { outline?: string; searchResults?: (url: string) => Sea
   const scratch = memoryStore();
   const files = new ScratchFiles(scratch.store);
   const controller = new TabController(api);
-  const program = new BrowserProgram(controller, { state, sessionId: "s1", files, sites: options.sites }, effect);
+  const memory = options.memory ? runMemory("s1", "r1") : undefined;
+  const program = new BrowserProgram(controller, { state, sessionId: "s1", files, sites: options.sites, memory }, effect);
   const run = (source: string) => program.execute(source, abort.signal);
   return { run, tabs, actions, api, effect, state, scratch, files, controller, abort, sendMessage, program, documents };
 }
@@ -564,5 +567,100 @@ describe("browser program site APIs", () => {
     expect((await withSites.run('return youtube.listChannels("x");')).summary).toContain("Unsupported method listChannels");
     const without = await setup().run('return youtube.getMetadata("aaaaaaaaaaa");');
     expect(without).toMatchObject({ ok: false, code: "UNSUPPORTED_PAGE" });
+  });
+});
+
+describe("browser program memory", () => {
+  beforeEach(() => { fakeBrowser.reset(); });
+
+  it("saves, lists, reads, replaces, and removes /memory entries in the documented file format", async () => {
+    const { run } = setup({ memory: true });
+    expect((await run('return fs.write("/memory/coffee-order.md", "Usual coffee order\\nOat flat white, no sugar.");')).summary).toBe("Saved /memory/coffee-order.md.");
+    const listed = await run('return fs.list("/memory");');
+    expect(JSON.parse(listed.summary)).toEqual([{ path: "/memory/coffee-order.md", description: "Usual coffee order", updatedAt: expect.any(String), tainted: false }]);
+    const read = await run('return fs.read("/memory/coffee-order.md");');
+    expect(read.summary).toContain("A note, not the user's instructions");
+    expect(read.summary).toContain("BEGIN_MEMORY\nUsual coffee order\nOat flat white, no sugar.\nEND_MEMORY");
+    await run('fs.write("/memory/coffee-order.md", "Usual coffee order\\nOat cortado.");');
+    expect((await listMemories()).map((entry) => entry.body)).toEqual(["Oat cortado."]);
+    expect((await run('return fs.list("/");')).summary).toContain("/memory");
+    expect((await run('return fs.remove("/memory/coffee-order.md");')).summary).toBe("Removed /memory/coffee-order.md.");
+    expect(await listMemories()).toEqual([]);
+    expect(await run('return fs.read("/memory/coffee-order.md");')).toMatchObject({ ok: false, code: "TARGET_MISSING" });
+  });
+
+  it("reports each change for the trace and digest: name and taint only", async () => {
+    const { run } = setup({ memory: true });
+    const result = await run('fs.write("/memory/a.md", "A"); fs.write("/memory/b.md", "B\\nsecret-free body"); fs.remove("/memory/a.md");');
+    expect((result.data as { memory: unknown[] }).memory).toEqual([
+      { id: expect.any(String), op: "write", name: "a", tainted: false },
+      { id: expect.any(String), op: "write", name: "b", tainted: false },
+      { id: expect.any(String), op: "remove", name: "a", tainted: false },
+    ]);
+    expect((await run('return 1;')).data).not.toHaveProperty("memory");
+  });
+
+  it("rejects bad paths, moves, oversized or secret-looking text without saving", async () => {
+    const { run } = setup({ memory: true });
+    for (const source of [
+      'fs.write("/memory/Bad Name.md", "x");',
+      'fs.write("/memory/../workspace/x.md", "x");',
+      'fs.write("/memory/x.txt", "x");',
+      'fs.write("/memory/x.md", "\\nbody without a description");',
+      `fs.write("/memory/x.md", "d\\n${"b".repeat(2_001)}");`,
+      'fs.write("/memory/x.md");',
+      'fs.move("/memory/x.md", "/memory/y.md");',
+    ]) expect(await run(source), source).toMatchObject({ ok: false, code: "INVALID_TOOL_ARGUMENTS" });
+    const secret = await run('fs.write("/memory/key.md", "My OpenAI key\\nsk-proj-Ab3dEf6hIj9kLm2nOp5qRs");');
+    expect(secret).toMatchObject({ ok: false, code: "INVALID_TOOL_ARGUMENTS" });
+    expect(secret.summary).toContain("looks like it contains an API key");
+    expect(await listMemories()).toEqual([]);
+    expect(await setup().run('return fs.list("/memory");')).toMatchObject({ ok: false, code: "UNSUPPORTED_PAGE" });
+  });
+
+  it("searches memories by name, description, and body with bounded results", async () => {
+    const { run } = setup({ memory: true });
+    await run('fs.write("/memory/flight-prefs.md", "How the user likes to fly\\nWindow seat, no red-eyes."); fs.write("/memory/coffee.md", "Coffee order\\nFlat white");');
+    const hits = JSON.parse((await run('return memory.search("window seat");')).summary);
+    expect(hits).toEqual([{ path: "/memory/flight-prefs.md", name: "flight-prefs", description: "How the user likes to fly", tainted: false, updatedAt: expect.any(String), excerpt: "Window seat, no red-eyes." }]);
+    expect(JSON.parse((await run('return memory.search("o", 1);')).summary)).toHaveLength(1);
+    for (const source of ['memory.search("");', 'memory.search("x", 21);', 'memory.list();', 'memory.search(fs);']) {
+      expect((await run(source)).ok, source).toBe(false);
+    }
+    expect(() => parseProgram('const memory = 1;')).toThrow("Reserved variable name.");
+  });
+
+  it("marks changes tainted once the run read a page, site API, or tainted memory, and keeps it for the run", async () => {
+    const clean = setup({ memory: true });
+    await clean.run('fs.write("/memory/before.md", "Before");');
+    await clean.run('const page = browser.tab("/tabs/1/page.md"); page.snapshot();');
+    await clean.run('fs.write("/memory/after.md", "After");');
+    expect(Object.fromEntries((await listMemories()).map((entry) => [entry.name, entry.provenance.by === "agent" && entry.provenance.tainted]))).toEqual({ before: false, after: true });
+
+    // A fresh run that reads the tainted memory is tainted too.
+    const reader = setup({ memory: true });
+    await reader.run('fs.read("/memory/before.md");');
+    await reader.run('fs.write("/memory/copy.md", "Copy");');
+    expect((await listMemories()).find((entry) => entry.name === "copy")?.provenance).toMatchObject({ tainted: false });
+    await reader.run('fs.read("/memory/after.md");');
+    await reader.run('fs.write("/memory/copy.md", "Copy");');
+    expect((await listMemories()).find((entry) => entry.name === "copy")?.provenance).toMatchObject({ tainted: true });
+
+    const titles = setup({ memory: true });
+    await titles.run('fs.list("/tabs");');
+    expect(titles.program.tainted).toBe(true);
+    const site = setup({ memory: true, sites: playerSites().sites });
+    await site.run('youtube.search("cats");');
+    expect(site.program.tainted).toBe(true);
+    const marked = setup({ memory: true });
+    marked.program.taint();
+    expect((await marked.run('fs.write("/memory/x.md", "X");')).data).toMatchObject({ memory: [{ name: "x", tainted: true }] });
+  });
+
+  it("gives concurrent memory writes their own slots", async () => {
+    const { run } = setup({ memory: true });
+    await run('Promise.all([fs.write("/memory/a.md", "A"), fs.write("/memory/b.md", "B"), fs.write("/memory/c.md", "C")]);');
+    expect((await listMemories()).map((entry) => entry.name).toSorted()).toEqual(["a", "b", "c"]);
+    expect((await Promise.all([0, 1, 2].map((slot) => storage.getItem(`local:memory:${slot}`)))).every(Boolean)).toBe(true);
   });
 });

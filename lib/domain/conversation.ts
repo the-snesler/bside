@@ -8,6 +8,7 @@ import type { HelpKind, PageArtifactSummary, ToolCall, ToolResult } from "@/lib/
 import type { RunUsageV1, UsageTotals } from "@/lib/domain/usage";
 import type { Skill } from "@/lib/domain/skills";
 import type { SiteNote } from "@/lib/domain/instructions";
+import type { MemoryChange } from "@/lib/domain/memory";
 
 export type ConversationItem =
   | {
@@ -39,6 +40,8 @@ export type ConversationItem =
       kind: "tool-result";
       callId: string;
       result: Omit<ToolResult, "data">;
+      /** Memory changes a browser program made (names and taint only), for the trace's Undo and the run digest. */
+      memory?: MemoryChange[];
       at: number;
     }
   /** What a run did, appended when it ends; replayed to later runs as notes (see `lib/domain/run-digest.ts`). Not shown in the transcript. */
@@ -92,7 +95,9 @@ export type RunDigestEntry =
   | { type: "program"; source: string; ok: boolean | null; code: string | null; urls: string[]; excerpt: string }
   | { type: "confirmation"; title: string; approved: boolean | null }
   /** A `request_user_help` pause: `outcome` is the user's answer, `"failed"` when the call was refused (not one of the chat's agent tabs). */
-  | { type: "help"; kind: HelpKind; reason: string; outcome: "done" | "unable" | "failed" | null };
+  | { type: "help"; kind: HelpKind; reason: string; outcome: "done" | "unable" | "failed" | null }
+  /** A memory the preceding program saved or removed; `tainted` when the run had read untrusted content first. */
+  | { type: "memory"; op: "write" | "remove"; name: string; tainted: boolean };
 
 export interface RunDigestV1 {
   version: 1;

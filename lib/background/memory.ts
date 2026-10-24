@@ -1,8 +1,6 @@
-import {
-  findSecret, isMemoryDraft, MAX_MEMORIES, MAX_MEMORY_BODY, MAX_MEMORY_DESCRIPTION, memoryPath, renderMemoryIndex, sortMemories,
-  type MemoryChange, type MemoryDraft, type MemoryEntry,
-} from "@/lib/domain/memory";
+import { MAX_MEMORIES, MemoryError, memoryDraftProblem, memoryPath, renderMemoryIndex, sortMemories, type MemoryChange, type MemoryDraft, type MemoryEntry } from "@/lib/domain/memory";
 import { getMemorySettings, loadMemories, removeAllMemories, removeMemory, saveMemory, type MemorySlot } from "@/lib/storage";
+import type { MemoryAccess } from "@/lib/background/browser-program";
 
 /**
  * Background-owned agent memory. Runs write through `/memory` with the run's
@@ -19,25 +17,11 @@ function serialized<T>(task: () => Promise<T>): Promise<T> {
   return operation;
 }
 
-/** A safe reason a memory change was refused; `limit` when memory is full. */
-export class MemoryError extends Error {
-  constructor(message: string, readonly limit = false) { super(message); }
-}
-
 /** Who made a change: a run's changes carry its session, run, and whether it had read untrusted content. */
 export interface MemorySource {
   sessionId: string;
   runId: string;
   tainted: boolean;
-}
-
-/** Why `draft` cannot be saved, or `null`. Never echoes a matched secret. */
-export function checkMemoryDraft(draft: MemoryDraft): string | null {
-  if (!isMemoryDraft(draft)) {
-    return `Invalid memory. Use a name of lowercase letters, digits, and hyphens (up to 48), a one-line description of 1–${MAX_MEMORY_DESCRIPTION} characters, and a body of up to ${MAX_MEMORY_BODY.toLocaleString("en-US")}.`;
-  }
-  const secret = findSecret(`${draft.name}\n${draft.description}\n${draft.body}`);
-  return secret ? `This memory looks like it contains ${secret}, so it was not saved. Never keep passwords, keys, tokens, card numbers, or other secrets in memory.` : null;
 }
 
 /**
@@ -85,7 +69,7 @@ export function readMemoryIndex(): Promise<string | null> {
 /** Saves or replaces one entry from a run. Throws a `MemoryError`. */
 export function writeMemory(draft: MemoryDraft, source: MemorySource, now = Date.now()): Promise<MemoryChange> {
   return serialized(async () => {
-    const problem = checkMemoryDraft(draft);
+    const problem = memoryDraftProblem(draft);
     if (problem) throw new MemoryError(problem);
     const slots = await loadMemories();
     const existing = slots.find((slot) => slot.entry.name === draft.name);
@@ -156,4 +140,14 @@ export function forgetAllMemories(): Promise<void> {
     await removeAllMemories();
     journal = [];
   });
+}
+
+/** One run's `/memory`: its changes carry the run's session and id; the write policy is read at each change. */
+export function runMemory(sessionId: string, runId: string): MemoryAccess {
+  return {
+    list: listMemories,
+    policy: async () => (await getMemorySettings()).writes,
+    write: (draft, tainted) => writeMemory(draft, { sessionId, runId, tainted }),
+    remove: (name, tainted) => forgetMemory(name, { sessionId, runId, tainted }),
+  };
 }

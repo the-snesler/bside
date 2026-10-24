@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { storage } from "wxt/utils/storage";
-import { forgetAllMemories, forgetMemory, listMemories, MemoryError, undoMemoryChanges, writeMemory } from "@/lib/background/memory";
+import { forgetAllMemories, forgetMemory, listMemories, undoMemoryChanges, writeMemory } from "@/lib/background/memory";
 import {
-  findSecret, isMemoryDraft, isMemoryEntry, MAX_MEMORIES, MEMORY_INDEX_CHARS, parseMemoryFile, renderMemoryFile, renderMemoryIndex, searchMemories,
+  findSecret, isMemoryDraft, isMemoryEntry, MAX_MEMORIES, MemoryError, MEMORY_INDEX_CHARS, parseMemoryFile, renderMemoryFile, renderMemoryIndex, searchMemories,
   type MemoryEntry,
 } from "@/lib/domain/memory";
 import { getMemorySettings, loadMemories, saveMemorySettings } from "@/lib/storage";

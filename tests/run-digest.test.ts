@@ -124,3 +124,32 @@ describe("run digests", () => {
     expect(isValidRunDigest({ ...digest, entries: [{ type: "help", kind: "login", reason: "x", outcome: "maybe" }] })).toBe(false);
   });
 });
+
+describe("run digests: memory changes", () => {
+  const changes = [
+    { id: "m1", op: "write" as const, name: "coffee", tainted: false },
+    { id: "m2", op: "remove" as const, name: "old-trip", tainted: true },
+  ];
+
+  it("records each change after its program, by name and taint only", () => {
+    const digest = buildRunDigest([{ ...program("p1", 'fs.write("/memory/coffee.md", "Oat flat white");', { ok: true, summary: "Saved." }), memory: changes }], "completed")!;
+    expect(digest.entries.slice(1)).toEqual([
+      { type: "memory", op: "write", name: "coffee", tainted: false },
+      { type: "memory", op: "remove", name: "old-trip", tainted: true },
+    ]);
+    expect(isValidRunDigest(digest)).toBe(true);
+    const note = renderDigestNote(digest);
+    expect(note).toContain("2. saved memory /memory/coffee.md\n3. removed memory /memory/old-trip.md (after reading web content)");
+    expect(isValidRunDigest({ ...digest, entries: [{ type: "memory", op: "write", name: "Bad Name", tainted: false }] })).toBe(false);
+    expect(isValidRunDigest({ ...digest, entries: [{ type: "memory", op: "write", name: "x", tainted: false, body: "leak" }] })).toBe(false);
+  });
+
+  it("rebuilds them from the persisted tool results after an interruption", () => {
+    const items: ConversationItem[] = [
+      { id: "u", kind: "message", role: "user", text: "Remember my coffee", context: null, at: 0 },
+      { id: "c", kind: "tool-call", call: { id: "p1", name: "browser_program", arguments: { source: 'fs.write("/memory/coffee.md", "x");' } }, at: 1 },
+      { id: "r", kind: "tool-result", callId: "p1", result: { ok: true, summary: "Browser program completed." }, memory: [changes[0]!], at: 2 },
+    ];
+    expect(digestFromItems(items)!.entries.at(-1)).toEqual({ type: "memory", op: "write", name: "coffee", tainted: false });
+  });
+});

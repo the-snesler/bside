@@ -16,6 +16,7 @@ import { getSkills } from "@/lib/background/skills";
 import { captureInvokedSkill } from "@/lib/background/skill-context";
 import { skillCatalog, type Skill, type SkillSummary } from "@/lib/domain/skills";
 import { readInstructions, saveSiteNoteFromSidebar } from "@/lib/background/instructions";
+import { runMemory } from "@/lib/background/memory";
 import { matchSiteNotes, pageOrigin, siteNoteForPage, type SiteNote } from "@/lib/domain/instructions";
 import type { ApprovalBadge } from "@/lib/background/approval-badge";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
@@ -1115,8 +1116,9 @@ export class BackgroundRuntime {
     const runId = crypto.randomUUID();
     const controller = new AbortController();
     const tabController = this.#tabControllerFactory();
-    // The session's scratch files load on the first program that uses them.
-    const scope = { state: this.#workspace, sessionId, files: new ScratchFiles(workspaceStore(sessionId)), skills: new Map<string, Skill>(), sites: this.#sites };
+    // The session's scratch files load on the first program that uses them; memory is global and read at each use.
+    const scope = { state: this.#workspace, sessionId, files: new ScratchFiles(workspaceStore(sessionId)), skills: new Map<string, Skill>(), sites: this.#sites,
+      memory: runMemory(sessionId, runId) };
     const agentLoop = new AgentLoop(this.#provider, tabController, this.#sidebarHub, scope);
     const run: ActiveRun = this.#activeRun = {
       runId,

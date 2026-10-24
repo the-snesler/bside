@@ -81,6 +81,11 @@ export function isMemoryDescription(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.length <= MAX_MEMORY_DESCRIPTION && !/[\r\n\u2028\u2029]/.test(value);
 }
 
+/** A safe reason a memory change was refused, for the model or the user; `limit` when memory is full. */
+export class MemoryError extends Error {
+  constructor(message: string, readonly limit = false) { super(message); }
+}
+
 export function isMemoryDraft(value: unknown): value is MemoryDraft {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const draft = value as Record<string, unknown>;
@@ -170,6 +175,15 @@ function entropy(text: string): number {
   let bits = 0;
   for (const count of counts.values()) bits -= (count / text.length) * Math.log2(count / text.length);
   return bits;
+}
+
+/** Why `draft` cannot be saved, or `null`. Never echoes a matched secret. */
+export function memoryDraftProblem(draft: MemoryDraft): string | null {
+  if (!isMemoryDraft(draft)) {
+    return `Invalid memory. Use a name of lowercase letters, digits, and hyphens (up to ${MAX_MEMORY_NAME}), a one-line description of 1–${MAX_MEMORY_DESCRIPTION} characters, and a body of up to ${MAX_MEMORY_BODY.toLocaleString("en-US")}.`;
+  }
+  const secret = findSecret(`${draft.name}\n${draft.description}\n${draft.body}`);
+  return secret ? `This memory looks like it contains ${secret}, so it was not saved. Never keep passwords, keys, tokens, card numbers, or other secrets in memory.` : null;
 }
 
 /** What `text` seems to contain that must not be saved, or `null`. */

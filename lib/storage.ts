@@ -13,7 +13,7 @@
 import { storage } from "wxt/utils/storage";
 import { isSkill } from "@/lib/domain/skills";
 import { isCustomInstructionsText, isSiteNote, MAX_SITE_NOTES, type CustomInstructionsV1, type SiteNote, type SiteNotesV1 } from "@/lib/domain/instructions";
-import { DEFAULT_MEMORY_SETTINGS, isMemoryEntry, MAX_MEMORIES, MEMORY_WRITE_POLICIES, type MemoryEntry, type MemoryEntryV1, type MemorySettingsV1 } from "@/lib/domain/memory";
+import { DEFAULT_MEMORY_SETTINGS, isMemoryChange, isMemoryEntry, MAX_MEMORIES, MEMORY_WRITE_POLICIES, type MemoryEntry, type MemoryEntryV1, type MemorySettingsV1 } from "@/lib/domain/memory";
 import { REASONING_EFFORTS, type AppSettingsV1, type ModelListing, type ReasoningEffort } from "@/lib/domain/provider";
 import type { Conversation, ConversationIndexV1, ConversationItem, ConversationSummary, HistorySettingsV1, MessageQueueV1, QueuedMessage } from "@/lib/domain/conversation";
 import { COMPACTION_SUMMARY_MAX_CHARS, HISTORY_RETENTIONS, isTurnStart, MAX_QUEUED_MESSAGES, titleFromPrompt } from "@/lib/domain/conversation";
@@ -149,7 +149,10 @@ function isValidConversationItem(value: unknown): value is ConversationItem {
     return v.role === "assistant";
   }
   if (v.kind === "tool-call") return typeof v.call === "object" && v.call !== null;
-  if (v.kind === "tool-result") return typeof v.callId === "string" && typeof v.result === "object" && v.result !== null;
+  if (v.kind === "tool-result") {
+    return typeof v.callId === "string" && typeof v.result === "object" && v.result !== null &&
+      (v.memory === undefined || (Array.isArray(v.memory) && v.memory.length <= 64 && v.memory.every(isMemoryChange)));
+  }
   if (v.kind === "run-digest") return isValidRunDigest(v.digest);
   if (v.kind === "run-usage") return isValidRunUsage(v.usage);
   if (v.kind === "compaction") {

@@ -29,6 +29,7 @@ import { REASONING_EFFORTS, type AppSettingsV1, type ChatGPTStatus, type Provide
 import type { RunUsageV1 } from "@/lib/domain/usage";
 import { isSkill, isSkillName, type Skill, type SkillSummary } from "@/lib/domain/skills";
 import { isCustomInstructionsText, isSiteNote, isSiteOrigin, type SiteNote } from "@/lib/domain/instructions";
+import type { MemoryChange } from "@/lib/domain/memory";
 import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction, validateElementTarget } from "@/lib/validation";
 
 // ---------------------------------------------------------------------------
@@ -465,7 +466,8 @@ export type SidebarEvent =
   | EventBase<"tool.requested", { call: ToolCall; display: string }>
   | EventBase<"action.approval-required", ApprovalRequest>
   | EventBase<"help.requested", HelpRequest>
-  | EventBase<"tool.result", { callId: string; result: ToolResult }>
+  /** `memory`: what a browser program saved or removed, names and taint only. */
+  | EventBase<"tool.result", { callId: string; result: ToolResult; memory?: MemoryChange[] }>
   /** A steer reached the model; `item` is the persisted user message (`delivery: "steer"`), whose id is the queued message's. */
   | EventBase<"steer.delivered", { item: ConversationItem }>
   /** The run's cumulative usage after a provider response. At the run's end it is persisted as the `run-usage` item `usage-<runId>`. */

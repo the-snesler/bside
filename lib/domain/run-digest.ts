@@ -1,7 +1,7 @@
 /**
  * Run digests: a compact, bounded record of what a run's tools actually did
  * (programs and their sources, URLs read, result excerpts, failures,
- * confirmations, requests for the user's help), built by the background from the tool ledger rather than
+ * confirmations, requests for the user's help, memory changes), built by the background from the tool ledger rather than
  * from model text. Later runs see digests as untrusted notes, so a follow-up
  * like "what was the 3rd result?" works without browsing again.
  */
@@ -9,6 +9,7 @@
 import type { ConversationItem, RunDigestEntry, RunDigestStatus, RunDigestV1 } from "@/lib/domain/conversation";
 import { isTurnStart } from "@/lib/domain/conversation";
 import { HELP_KINDS, type ToolCall, type ToolResult } from "@/lib/domain/tools";
+import { isMemoryName, memoryPath, type MemoryChange } from "@/lib/domain/memory";
 
 export const DIGEST_SOURCE_CHARS = 600;
 export const DIGEST_EXCERPT_CHARS = 1200;
@@ -26,6 +27,8 @@ export interface DigestStep {
   result: Omit<ToolResult, "data"> | null;
   /** Page URLs the program read, opened, or navigated to, in order. */
   urls?: readonly string[];
+  /** Memories the program saved or removed. */
+  memory?: readonly MemoryChange[];
 }
 
 function clip(text: string, max: number): string {
@@ -34,6 +37,7 @@ function clip(text: string, max: number): string {
 
 function entryChars(entry: RunDigestEntry): number {
   if (entry.type === "program") return entry.source.length + entry.excerpt.length + entry.urls.reduce((sum, url) => sum + url.length, 0);
+  if (entry.type === "memory") return entry.name.length;
   return entry.type === "help" ? entry.reason.length : entry.title.length;
 }
 
@@ -62,9 +66,16 @@ function toEntry(step: DigestStep): RunDigestEntry | null {
   };
 }
 
+/** A step's entry, then one per memory change its program made. */
+function toEntries(step: DigestStep): RunDigestEntry[] {
+  const entry = toEntry(step);
+  if (!entry) return [];
+  return [entry, ...(step.memory ?? []).map(({ op, name, tainted }): RunDigestEntry => ({ type: "memory", op, name, tainted }))];
+}
+
 /** A bounded digest of a run's tool calls, or `null` if the run made none. */
 export function buildRunDigest(steps: readonly DigestStep[], status: RunDigestStatus, error: string | null = null): RunDigestV1 | null {
-  const all = steps.flatMap((step) => toEntry(step) ?? []);
+  const all = steps.flatMap(toEntries);
   if (all.length === 0) return null;
   const entries: RunDigestEntry[] = [];
   let chars = 0;
@@ -83,8 +94,9 @@ export function buildRunDigest(steps: readonly DigestStep[], status: RunDigestSt
  */
 export function digestFromItems(items: readonly ConversationItem[]): RunDigestV1 | null {
   const turn = items.slice(items.findLastIndex(isTurnStart) + 1);
-  const results = new Map(turn.flatMap((item) => item.kind === "tool-result" ? [[item.callId, item.result] as const] : []));
-  return buildRunDigest(turn.flatMap((item) => item.kind === "tool-call" ? [{ call: item.call, result: results.get(item.call.id) ?? null }] : []), "interrupted");
+  const results = new Map(turn.flatMap((item) => item.kind === "tool-result" ? [[item.callId, item] as const] : []));
+  return buildRunDigest(turn.flatMap((item) => item.kind === "tool-call"
+    ? [{ call: item.call, result: results.get(item.call.id)?.result ?? null, memory: results.get(item.call.id)?.memory }] : []), "interrupted");
 }
 
 const HELP_OUTCOME_TEXT = {
@@ -122,6 +134,10 @@ export function renderDigestNote(digest: RunDigestV1): string {
       lines.push(`${n}. asked the user for help (${entry.kind}) ${JSON.stringify(entry.reason)}: ${HELP_OUTCOME_TEXT[entry.outcome ?? "none"]}`);
       return;
     }
+    if (entry.type === "memory") {
+      lines.push(`${n}. ${entry.op === "write" ? "saved" : "removed"} memory ${memoryPath(entry.name)}${entry.tainted ? " (after reading web content)" : ""}`);
+      return;
+    }
     lines.push(`${n}. browser_program: ${entry.ok === null ? "no result recorded" : entry.ok ? "ok" : `failed${entry.code ? ` (${entry.code})` : ""}`}`);
     lines.push(`source:\n${entry.source}`);
     if (entry.urls.length) lines.push(`visited: ${entry.urls.join(" ")}`);
@@ -147,6 +163,7 @@ function isDigestEntry(value: unknown): value is RunDigestEntry {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
   if (v.type === "confirmation") return typeof v.title === "string" && v.title.length <= DIGEST_TITLE_CHARS && (v.approved === null || typeof v.approved === "boolean");
+  if (v.type === "memory") return Object.keys(v).length === 4 && (v.op === "write" || v.op === "remove") && isMemoryName(v.name) && typeof v.tainted === "boolean";
   if (v.type === "help") {
     return (HELP_KINDS as readonly unknown[]).includes(v.kind) && typeof v.reason === "string" && v.reason.length <= DIGEST_TITLE_CHARS &&
       (v.outcome === null || v.outcome === "done" || v.outcome === "unable" || v.outcome === "failed");

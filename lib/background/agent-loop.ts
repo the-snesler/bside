@@ -22,6 +22,7 @@ import { DEFAULT_CONTEXT_WINDOW } from "@/lib/providers/openai-models";
 import { renderUserPrompt } from "@/lib/background/skill-context";
 import { renderSkillCatalog, type Skill, type SkillSummary } from "@/lib/domain/skills";
 import { matchSiteNotes, renderCustomInstructions, renderToolSiteNotes, type SiteNote } from "@/lib/domain/instructions";
+import { isMemoryChange, type MemoryChange } from "@/lib/domain/memory";
 
 export interface AgentLoopParams {
   runId: string;
@@ -237,6 +238,8 @@ export class AgentLoop {
     let rounds = 0;
     let limitError: NormalizedError | null = null;
     if (params.contextArtifact) this.#program.observe(params.contextArtifact.snapshot.tabId, params.contextArtifact.snapshot.documentId);
+    // The attached page, earlier run notes, and a summary carry web content the model reads before any tool runs.
+    if (params.contextArtifact || renderHistory(history.transcript, model, null).some((entry) => entry.untrusted)) this.#program.taint();
     for (const note of params.transcript.findLast(isTurnStart)?.sites ?? []) this.#surfacedSites.add(note.origin);
     const agent = this.#agent = new Agent({
       // Every steer waiting at a boundary is delivered together.
@@ -363,9 +366,10 @@ export class AgentLoop {
     const persistedResult = call.name === "browser_program"
       ? { ok: result.ok, ...(result.code ? { code: result.code } : {}), summary: result.ok ? "Browser program completed." : diagnostic }
       : stripData(result);
-    await params.onItem({ id: crypto.randomUUID(), kind: "tool-result", callId: call.id, result: persistedResult, at: Date.now() });
+    const memory = memoryChanges(result.data);
+    await params.onItem({ id: crypto.randomUUID(), kind: "tool-result", callId: call.id, result: persistedResult, ...(memory.length ? { memory } : {}), at: Date.now() });
     // Publish the persisted shape so live rows match what a reload renders.
-    this.#sidebarHub.publishRunEvent(params.runId, "tool.result", { callId: call.id, result: persistedResult });
+    this.#sidebarHub.publishRunEvent(params.runId, "tool.result", { callId: call.id, result: persistedResult, ...(memory.length ? { memory } : {}) });
   }
 
   #createTools(params: AgentLoopParams): AgentTool<TSchema, { toolResult: ToolResult }>[] {
@@ -437,7 +441,7 @@ export class AgentLoop {
     } else result = { ok: false, code: "INVALID_TOOL_ARGUMENTS", summary: "Invalid tool arguments." };
     if (!result.ok) this.#roundFailed = true;
     // The digest records what the tool did; site notes are only for the model.
-    this.#steps.push({ call, result: stripData(result), urls: visitedUrls(result.data) });
+    this.#steps.push({ call, result: stripData(result), urls: visitedUrls(result.data), memory: memoryChanges(result.data) });
     if (call.name === "browser_program") result = this.#withSiteNotes(params, result);
     this.#executedCallIds.set(call.id, result);
     return result;
@@ -695,10 +699,15 @@ function summaryFailure(message: AssistantMessage): string {
 
 type CompactionItem = Extract<ConversationItem, { kind: "compaction" }>;
 
-/** One replayed history message and the item it renders; `userTurn` marks a user prompt, where turns start (a steer does not). */
+/**
+ * One replayed history message and the item it renders; `userTurn` marks a
+ * user prompt, where turns start (a steer does not). `untrusted`: a run-notes
+ * or summary note, which carries web content.
+ */
 interface HistoryEntry {
   itemId: string;
   userTurn: boolean;
+  untrusted?: boolean;
   message: Message;
 }
 
@@ -744,9 +753,9 @@ function renderHistory(items: readonly ConversationItem[], model: Model<Api>, ar
   const shown = items.slice(start);
   const digests = replayedDigests(shown);
   const note = (text: string, at: number): Message => ({ role: "user", content: text, timestamp: at });
-  const entries: HistoryEntry[] = compaction ? [{ itemId: compaction.id, userTurn: false, message: note(renderSummaryNote(compaction.summary), compaction.at) }] : [];
+  const entries: HistoryEntry[] = compaction ? [{ itemId: compaction.id, userTurn: false, untrusted: true, message: note(renderSummaryNote(compaction.summary), compaction.at) }] : [];
   shown.forEach((item, offset) => {
-    if (item.kind === "run-digest" && digests.has(item.id)) entries.push({ itemId: item.id, userTurn: false, message: note(renderDigestNote(item.digest), item.at) });
+    if (item.kind === "run-digest" && digests.has(item.id)) entries.push({ itemId: item.id, userTurn: false, untrusted: true, message: note(renderDigestNote(item.digest), item.at) });
     if (item.kind !== "message") return;
     if (item.role === "user") {
       entries.push({ itemId: item.id, userTurn: isTurnStart(item), message: !artifact || start + offset !== current
@@ -791,6 +800,11 @@ export function currentTime(now: Date): ToolResult {
 function messageText(message: Message): string {
   if (typeof message.content === "string") return message.content;
   return message.content.map((part) => part.type === "text" ? part.text : "").join("");
+}
+
+/** Memory changes a browser program reported in `data.memory`. */
+function memoryChanges(data: JsonValue | undefined): MemoryChange[] {
+  return data !== undefined && isRecord(data) && Array.isArray(data.memory) ? data.memory.filter((change): change is JsonValue & MemoryChange => isMemoryChange(change)) : [];
 }
 
 /** URLs a browser program reported in `data.visited`. */
