@@ -1,6 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentLoop, MAX_RUN_IMAGES } from "@/lib/background/agent-loop";
 import { BrowserProgram, ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
+import { listMemories, runMemory } from "@/lib/background/memory";
+import type { MemoryApproval } from "@/lib/domain/memory";
+import { saveMemorySettings } from "@/lib/storage";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController, type CaptureOptions, type TabControllerBrowserApi, type TabSnapshot } from "@/lib/background/tab-controller";
 import type { ConversationItem } from "@/lib/domain/conversation";
@@ -64,12 +67,13 @@ function fakeTabs() {
   return { api, tabs, prepared, captures, executed };
 }
 
-function setupProgram(maxImages = 3) {
+function setupProgram(maxImages = 3, options: { files?: ScratchFiles; memory?: boolean } = {}) {
   const fake = fakeTabs();
   const state = new WorkspaceState();
   state.adoptTab(2, "s1");
-  const files = new ScratchFiles();
-  const program = new BrowserProgram(new TabController(fake.api, async () => false), { state, sessionId: "s1", files, maxImages }, () => {});
+  const files = options.files ?? new ScratchFiles();
+  const memory = options.memory ? runMemory("s1", "r1") : undefined;
+  const program = new BrowserProgram(new TabController(fake.api, async () => false), { state, sessionId: "s1", files, maxImages, memory }, () => {});
   const run = (source: string) => program.execute(source, new AbortController().signal);
   return { ...fake, state, program, run, files };
 }
@@ -221,6 +225,37 @@ describe("binary /workspace files", () => {
     expect((await run('await fs.view("/workspace/missing.png");')).summary).toContain("File does not exist");
     await files.write("/workspace/doc.md", { kind: "text", content: "# Notes" });
     expect((await run('await fs.view("/workspace/doc.md");')).summary).toContain("fs.view() shows images");
+  });
+});
+
+describe("screenshots and agent memory", () => {
+  beforeEach(() => { fakeBrowser.reset(); });
+  const taint = async (name: string) => (await listMemories()).find((entry) => entry.name === name)?.provenance;
+
+  it("taints a run that took a screenshot or viewed a saved image, before memory changes record it", async () => {
+    const files = new ScratchFiles();
+    const shooter = setupProgram(3, { files, memory: true });
+    expect((await shooter.run('await browser.tab("/tabs/1/page.md").screenshot({save: "/workspace/shot.jpg"}); fs.write("/memory/chart.md", "Chart");')).ok).toBe(true);
+    expect(await taint("chart")).toMatchObject({ tainted: true });
+
+    // A later run in the chat reads no page, only the saved screenshot.
+    const viewer = setupProgram(3, { files, memory: true });
+    await viewer.run('fs.write("/memory/before.md", "Before");');
+    expect(await taint("before")).toMatchObject({ tainted: false });
+    expect((await viewer.run('await fs.view("/workspace/shot.jpg"); fs.write("/memory/after.md", "After");')).ok).toBe(true);
+    expect(await taint("after")).toMatchObject({ tainted: true });
+    expect(viewer.captures).toEqual([]);
+  });
+
+  it("shows the taint on the Ask card for a change after a screenshot", async () => {
+    await saveMemorySettings({ version: 1, writes: "ask" });
+    const { program } = setupProgram(3, { memory: true });
+    const asked: MemoryApproval[] = [];
+    const result = await program.execute('await browser.tab("/tabs/1/page.md").screenshot(); fs.write("/memory/chart.md", "Chart\\nBars");', new AbortController().signal,
+      { confirmMemory: async (change) => { asked.push(change); return true; } });
+    expect(result.ok, result.summary).toBe(true);
+    expect(asked).toEqual([{ op: "write", name: "chart", description: "Chart", body: "Bars", replaces: false, tainted: true }]);
+    expect(program.takeImages()).toHaveLength(1);
   });
 });
 

@@ -509,8 +509,9 @@ export class BrowserProgram {
   #locks = new Map<string, Promise<void>>();
   /**
    * Whether this run has read untrusted content: a page (outline, find,
-   * action diff, tab titles), web search, a site API, earlier run notes, or
-   * a memory that was itself saved tainted. Memory changes record it.
+   * action diff, screenshot, tab titles), a saved image (`fs.view`), web
+   * search, a site API, earlier run notes, or a memory that was itself saved
+   * tainted. Memory changes record it.
    */
   #tainted = false;
   /** Memory changes the current program made, returned as `data.memory` for the trace, Undo, and the run digest. */
@@ -1670,6 +1671,8 @@ export class BrowserProgram {
       if (method === "view") {
         if (file.kind !== "binary" || !VIEWABLE_IMAGE_TYPES.includes(file.mimeType))
           throw new Error(`fs.view() shows images (${VIEWABLE_IMAGE_TYPES.join(", ")}); read text files with fs.read().`);
+        // Saved images are screenshots: page content, possibly from an earlier run.
+        this.#tainted = true;
         return this.#attach({ mimeType: file.mimeType, data: file.data, placeholder: `[image ${path}, ${file.bytes} bytes]` });
       }
       if (method === "remove") {
