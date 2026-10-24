@@ -8,7 +8,9 @@
  * elements are inlined as `[e12 button "Save"]` tokens whose refs stay bound
  * to the same element for the document's lifetime. A cross-origin frame is a
  * placeholder line (`ChildFrame`) for the background to fill in with that
- * frame's own outline, whose refs carry a frame prefix (`f3:e12`). Hidden radios, checkboxes,
+ * frame's own outline, whose refs carry a frame prefix (`f3:e12`). Data tables
+ * and ARIA grids get a ref and a size line (`[table e12 "Caption" 340 rows ×
+ * 6 cols]`) for `extractTable` to read them as JSON. Hidden radios, checkboxes,
  * and file inputs with a visible label are exposed and operated through that
  * label; other hidden elements are never targetable.
  *
@@ -23,7 +25,8 @@
  * they also hold for elements from same-origin frames (other realms).
  */
 
-import type { CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, PageFindResult, PageRect, PageSnapshot, SearchResult, ToolResult, UploadFile } from "@/lib/domain/tools";
+import { TABLE_LIMITS } from "@/lib/domain/tools";
+import type { CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, PageFindResult, PageRect, PageSnapshot, PageTable, SearchResult, TableRole, ToolResult, UploadFile } from "@/lib/domain/tools";
 import { boundOutline, findInOutline, sliceOutline } from "@/lib/domain/outline";
 
 // ---------------------------------------------------------------------------
@@ -370,6 +373,8 @@ export interface Outline {
   controls: OutlineControl[];
   byElement: Map<Element, OutlineControl>;
   byRef: Map<string, OutlineControl>;
+  /** Data tables and ARIA grids by ref, for `extractTable`; they are read, never operated. */
+  tables: Map<string, OutlineControl>;
   /** Cross-origin frames whose placeholder lines are in `lines`. */
   frames: ChildFrame[];
   /** Prefix of this frame's ref labels. */
@@ -396,6 +401,7 @@ class OutlineBuilder {
   readonly segments: Segment[] = [];
   readonly controls: OutlineControl[] = [];
   readonly byElement = new Map<Element, OutlineControl>();
+  readonly tables = new Map<string, OutlineControl>();
   visited = 0;
   scanLimited = false;
   #lastText = "";
@@ -498,6 +504,7 @@ class OutlineBuilder {
     }
 
     if (visible) this.#dataValue(element);
+    if (visible) this.#table(element);
 
     if (role && visible) {
       const descend = this.#control(element, role);
@@ -603,6 +610,23 @@ class OutlineBuilder {
     this.byElement.set(element, control);
     this.segments.push({ t: "control", control });
     return descend;
+  }
+
+  /** A data table or ARIA grid gets a ref and a size line before its rows, so the model can read it with `page.table`. */
+  #table(element: Element): void {
+    const role = tableRole(element);
+    if (!role) return;
+    const rows = tableRows(element);
+    if (!rows) return;
+    const ref = refFor(this.registry, element);
+    const name = tableName(element);
+    const table: OutlineControl = { ref, label: `${this.options.refPrefix ?? ""}${ref}`, role, name, element, proxy: null, disabled: false, details: [] };
+    this.tables.set(ref, table);
+    const count = Math.min(rows.body.length, TABLE_LIMITS.maxScanRows);
+    const columns = Math.max(0, ...[...rows.head, ...rows.body.slice(0, 5)].map((row) => cellsOf(row, tagOf(element) !== "table").reduce((sum, cell) => sum + cell.colSpan, 0)));
+    this.break();
+    this.segments.push({ t: "text", text: `[${role} ${table.label}${name ? ` ${JSON.stringify(name)}` : ""} ${count}${rows.body.length > count ? "+" : ""} row${count === 1 ? "" : "s"} × ${columns} col${columns === 1 ? "" : "s"}]` });
+    this.break();
   }
 
   /** Hidden native radios/checkboxes/file inputs stay operable through a visible label. */
@@ -767,7 +791,7 @@ export function buildOutline(document: Document, registry: ElementRefRegistry, o
   const frames = rendered.filter((frame) => frame.line < bounded.length && bounded[frame.line] === lines[frame.line]);
   const byElement = new Map(controls.map((control) => [control.element, control]));
   const byRef = new Map(controls.map((control) => [control.ref, control]));
-  return { lines: bounded, offsets, controls, byElement, byRef, frames, refPrefix: options.refPrefix ?? "", scanLimited: builder.scanLimited };
+  return { lines: bounded, offsets, controls, byElement, byRef, tables: builder.tables, frames, refPrefix: options.refPrefix ?? "", scanLimited: builder.scanLimited };
 }
 
 // ---------------------------------------------------------------------------
@@ -874,6 +898,282 @@ export function extractSearchResults(document: Document, limit = 10): SearchResu
 }
 
 // ---------------------------------------------------------------------------
+// Tables
+// ---------------------------------------------------------------------------
+
+const TABLE_ROLES = new Set<string>(["table", "grid", "treegrid"]);
+const ARIA_CELL_ROLES = new Set(["cell", "gridcell", "columnheader", "rowheader"]);
+/** Elements one ARIA grid's row or cell search visits at most. */
+const MAX_TABLE_NODES = 200_000;
+/** Rowspan/colspan beyond these are clamped, as browsers do. */
+const MAX_ROW_SPAN = 65_534;
+const MAX_COL_SPAN = 1_000;
+
+function explicitRole(element: Element): string | null {
+  return element.getAttribute("role")?.trim().split(/\s+/)[0]?.toLowerCase() || null;
+}
+
+/**
+ * The role of a data table: ARIA tables and grids, and native tables that
+ * hold data (a caption, header cells, or at least two rows and columns
+ * without a nested table). Layout tables and role=presentation are not.
+ */
+function tableRole(element: Element): TableRole | null {
+  const role = explicitRole(element);
+  if (role && TABLE_ROLES.has(role)) return role as TableRole;
+  if (tagOf(element) !== "table" || role === "presentation" || role === "none") return null;
+  if (element.hasAttribute("summary") || Array.from(element.children).some((child) => tagOf(child) === "caption" || tagOf(child) === "thead")) return "table";
+  const rows = nativeRows(element);
+  const all = [...rows.head, ...rows.body];
+  if (all.some((row) => Array.from(row.children).some((cell) => tagOf(cell) === "th"))) return "table";
+  return all.length >= 2 && all.some((row) => cellsOf(row, false).length >= 2) && !element.querySelector("table") ? "table" : null;
+}
+
+function tableName(element: Element): string {
+  const named = element.getAttribute("aria-labelledby") || element.getAttribute("aria-label") ? accessibleName(element, "table") : "";
+  if (named) return named;
+  const caption = Array.from(element.children).find((child) => tagOf(child) === "caption");
+  return caption ? composedText(caption, NAME_LIMIT) : trimText(element.getAttribute("title") ?? "");
+}
+
+function isHiddenRow(row: Element): boolean {
+  return isLocallyHidden(row, styleOf(row));
+}
+
+/** A native table's own rows (not a nested table's): thead, then tbody and bare rows in order, then tfoot. */
+function nativeRows(table: Element): { head: Element[]; body: Element[] } {
+  const head: Element[] = [];
+  const body: Element[] = [];
+  const foot: Element[] = [];
+  const rowsOf = (section: Element) => Array.from(section.children).filter((row) => tagOf(row) === "tr");
+  for (const child of Array.from(table.children)) {
+    const tag = tagOf(child);
+    if (tag === "thead") head.push(...rowsOf(child));
+    else if (tag === "tfoot") foot.push(...rowsOf(child));
+    else if (tag === "tbody") body.push(...rowsOf(child));
+    else if (tag === "tr") body.push(child);
+  }
+  return { head, body: [...body, ...foot] };
+}
+
+/** Elements under `root` in the flat tree matching `match`, not descending into matches or into elements `stop` accepts. */
+function composedDescendants(root: Element, match: (element: Element) => boolean, stop: (element: Element) => boolean, budget: { nodes: number }): Element[] {
+  const found: Element[] = [];
+  const visit = (node: Node) => {
+    for (const child of composedChildren(node)) {
+      if (child.nodeType !== 1 || budget.nodes-- <= 0) continue;
+      const element = child as Element;
+      if (OUTLINE_EXCLUDED.has(element)) continue;
+      if (match(element)) found.push(element);
+      else if (!stop(element)) visit(element);
+    }
+  };
+  visit(root);
+  return found;
+}
+
+function isTableElement(element: Element): boolean {
+  return tagOf(element) === "table" || TABLE_ROLES.has(explicitRole(element) ?? "");
+}
+
+/** An ARIA grid's own rows, header rows being the leading rows whose cells are all column headers. */
+function ariaRows(grid: Element): { head: Element[]; body: Element[] } {
+  const budget = { nodes: MAX_TABLE_NODES };
+  const rows = composedDescendants(grid, (element) => explicitRole(element) === "row", isTableElement, budget);
+  let headers = 0;
+  while (headers < rows.length) {
+    const cells = cellsOf(rows[headers]!, true);
+    if (!cells.length || !cells.every((cell) => cell.header)) break;
+    headers++;
+  }
+  return { head: rows.slice(0, headers), body: rows.slice(headers) };
+}
+
+/**
+ * Rendered header and data rows. A native table without a thead takes its
+ * leading all-`th` rows as headers. Null when it has no rows at all.
+ */
+function tableRows(table: Element): { head: Element[]; body: Element[] } | null {
+  let rows: { head: Element[]; body: Element[] };
+  if (tagOf(table) === "table") {
+    rows = nativeRows(table);
+    if (!rows.head.length) {
+      let headers = 0;
+      while (headers < rows.body.length - 1 || (headers < rows.body.length && rows.body.length === 1)) {
+        const cells = Array.from(rows.body[headers]!.children).filter((cell) => tagOf(cell) === "td" || tagOf(cell) === "th");
+        if (!cells.length || !cells.every((cell) => tagOf(cell) === "th")) break;
+        headers++;
+      }
+      rows = { head: rows.body.slice(0, headers), body: rows.body.slice(headers) };
+    }
+  } else rows = ariaRows(table);
+  const head = rows.head.filter((row) => !isHiddenRow(row));
+  const body = rows.body.filter((row) => !isHiddenRow(row));
+  return head.length || body.length ? { head, body } : null;
+}
+
+interface TableCell { element: Element; colSpan: number; rowSpan: number; header: boolean }
+
+function span(element: Element, attribute: string, aria: string, fallback: number, max: number): number {
+  const raw = element.getAttribute(attribute) ?? element.getAttribute(aria);
+  if (raw === null || !/^\s*\d+\s*$/.test(raw)) return fallback;
+  const value = Number(raw);
+  return Math.min(value, max);
+}
+
+/** One row's cells, native (`td`/`th`) or ARIA (cell, gridcell, columnheader, rowheader). A rowspan of 0 spans the rest of the rows. */
+function cellsOf(row: Element, aria: boolean): TableCell[] {
+  const elements = aria
+    ? composedDescendants(row, (element) => ARIA_CELL_ROLES.has(explicitRole(element) ?? ""), (element) => explicitRole(element) === "row" || isTableElement(element), { nodes: 5_000 })
+    : Array.from(row.children).filter((cell) => tagOf(cell) === "td" || tagOf(cell) === "th");
+  return elements.filter((cell) => !isLocallyHidden(cell, styleOf(cell))).map((cell) => ({
+    element: cell,
+    colSpan: Math.max(1, span(cell, aria ? "aria-colspan" : "colspan", "aria-colspan", 1, MAX_COL_SPAN)),
+    rowSpan: span(cell, aria ? "aria-rowspan" : "rowspan", "aria-rowspan", 1, MAX_ROW_SPAN),
+    header: aria ? explicitRole(cell) === "columnheader" : tagOf(cell) === "th" && (cell.getAttribute("scope") ?? "").toLowerCase() !== "row",
+  }));
+}
+
+/**
+ * Lays out rows into columns, expanding row and column spans: each grid row
+ * lists, per column, the cell element covering it. Only the first `count`
+ * rows are laid out; spans never cross from `rows` into another group.
+ */
+function layoutRows(rows: Element[], count: number, aria: boolean): Element[][] {
+  const grid: Element[][] = [];
+  const carry: { element: Element; remaining: number }[] = [];
+  for (let index = 0; index < Math.min(count, rows.length); index++) {
+    const line: Element[] = [];
+    let column = 0;
+    const fillCarried = () => {
+      while (column < TABLE_LIMITS.maxColumns + 1 && (carry[column]?.remaining ?? 0) > 0) {
+        line[column] = carry[column]!.element;
+        carry[column]!.remaining--;
+        column++;
+      }
+    };
+    for (const cell of cellsOf(rows[index]!, aria)) {
+      fillCarried();
+      const rowSpan = cell.rowSpan === 0 ? rows.length - index : cell.rowSpan;
+      for (let k = 0; k < cell.colSpan && column + k <= TABLE_LIMITS.maxColumns; k++) {
+        line[column + k] = cell.element;
+        if (rowSpan > 1) carry[column + k] = { element: cell.element, remaining: rowSpan - 1 };
+        else delete carry[column + k];
+      }
+      column += cell.colSpan;
+    }
+    for (; column < carry.length; column++) {
+      if ((carry[column]?.remaining ?? 0) > 0) {
+        line[column] = carry[column]!.element;
+        carry[column]!.remaining--;
+      }
+    }
+    grid.push(line);
+  }
+  return grid;
+}
+
+/** A cell's visible text, bounded, followed by the refs of up to three controls inside it (`Alice [e14 link]`). */
+function cellText(cell: Element, outline: Outline): string {
+  const text = composedText(cell, TABLE_LIMITS.cellChars);
+  const controls: string[] = [];
+  const own = outline.byElement.get(cell);
+  if (own) controls.push(`[${own.label} ${own.role}]`);
+  for (const element of composedDescendants(cell, (candidate) => outline.byElement.has(candidate), () => false, { nodes: 500 })) {
+    if (controls.length >= 3) break;
+    const control = outline.byElement.get(element)!;
+    controls.push(`[${control.label} ${control.role}]`);
+  }
+  return clip([text, ...controls].filter(Boolean).join(" "), TABLE_LIMITS.cellChars + 120);
+}
+
+/**
+ * Reads one page of a table's data rows as JSON. The target is resolved like
+ * an action's against a fresh outline, so a ref from an earlier document is
+ * stale; it must name a table or grid from the outline.
+ */
+export function extractTable(
+  document: Document,
+  registry: ElementRefRegistry,
+  target: ElementTarget,
+  page: { offset: number; limit: number },
+  options: OutlineOptions = {},
+): { ok: true; table: PageTable } | { ok: false; result: ToolResult } {
+  const outline = buildOutline(document, registry, options);
+  const resolved = resolveTarget(outline, registry, target, { allowDisabled: true, accept: "tables" });
+  if (!resolved.ok) return resolved;
+  const { control } = resolved;
+  const role = control.role as TableRole;
+  const aria = tagOf(control.element) !== "table";
+  const rows = tableRows(control.element) ?? { head: [], body: [] };
+  const notes: string[] = [];
+  let body = rows.body;
+  if (body.length > TABLE_LIMITS.maxScanRows) {
+    notes.push(`Only the first ${TABLE_LIMITS.maxScanRows} rows are counted and readable.`);
+    body = body.slice(0, TABLE_LIMITS.maxScanRows);
+  }
+  const offset = Math.min(page.offset, body.length);
+  const limit = Math.min(Math.max(1, page.limit), TABLE_LIMITS.maxRows);
+  const headerGrid = layoutRows(rows.head, rows.head.length, aria);
+  const bodyGrid = layoutRows(body, offset + limit, aria).slice(offset);
+  const fullWidth = Math.max(0, ...[...headerGrid, ...bodyGrid].map((line) => line.length));
+  const width = Math.min(fullWidth, TABLE_LIMITS.maxColumns);
+  if (fullWidth > width) notes.push(`Only the first ${TABLE_LIMITS.maxColumns} columns are shown.`);
+
+  const texts = new Map<Element, string>();
+  const textOf = (cell: Element | undefined) => {
+    if (!cell) return "";
+    let text = texts.get(cell);
+    if (text === undefined) texts.set(cell, text = cellText(cell, outline));
+    return text;
+  };
+  const headers = headerGrid.length
+    ? Array.from({ length: width }, (_, column) => {
+      const parts: string[] = [];
+      let previous: Element | undefined;
+      for (const line of headerGrid) {
+        const cell = line[column];
+        if (!cell || cell === previous) continue;
+        previous = cell;
+        const text = textOf(cell);
+        if (text && parts.at(-1) !== text) parts.push(text);
+      }
+      return parts.join(" / ");
+    })
+    : [];
+  const out: string[][] = [];
+  let chars = 0;
+  for (const line of bodyGrid) {
+    const row = Array.from({ length: width }, (_, column) => textOf(line[column]));
+    const size = row.reduce((sum, cell) => sum + cell.length + 4, 0);
+    if (out.length && chars + size > TABLE_LIMITS.maxChars) break;
+    chars += size;
+    out.push(row);
+  }
+  const end = offset + out.length;
+  const declared = Number(control.element.getAttribute("aria-rowcount"));
+  if (aria && Number.isSafeInteger(declared) && declared > rows.head.length + rows.body.length) {
+    notes.push(`The grid reports ${declared} rows, but only ${rows.head.length + rows.body.length} are on the page; it loads the others as you scroll.`);
+  }
+  return {
+    ok: true,
+    table: {
+      documentId: registry.documentId,
+      url: document.location?.href ?? "",
+      ref: control.label,
+      role,
+      caption: control.name,
+      headers,
+      rows: out,
+      totalRows: body.length,
+      offset,
+      nextOffset: end < body.length ? end : null,
+      ...(notes.length ? { note: notes.join(" ") } : {}),
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------
 
@@ -910,25 +1210,42 @@ function candidatesText(controls: OutlineControl[], limit = 8): string {
   return controls.length > limit ? `${shown}; …+${controls.length - limit} more` : shown;
 }
 
-/** `allowDisabled` resolves a disabled control too (looking at one is fine; operating it is not). */
-function resolveTarget(outline: Outline, registry: ElementRefRegistry, target: ElementTarget, allowDisabled = false): Resolved {
+interface ResolveOptions {
+  /** Resolves a disabled control too (looking at one is fine; operating it is not). */
+  allowDisabled?: boolean;
+  /** What the target may be: an operable control (default), a table or grid to read, or either (a screenshot). */
+  accept?: "controls" | "tables" | "any";
+}
+
+function resolveTarget(outline: Outline, registry: ElementRefRegistry, target: ElementTarget, options: ResolveOptions = {}): Resolved {
+  const accept = options.accept ?? "controls";
+  const checked = (control: OutlineControl): Resolved => {
+    const table = TABLE_ROLES.has(control.role) && outline.tables.get(control.ref) === control;
+    if (table && accept === "controls") {
+      return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `${describe(control)} is a table; read it with page.table(${JSON.stringify(control.label)}), and act on the refs inside it.` } };
+    }
+    if (!table && accept === "tables") {
+      return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `${describe(control)} is not a table. Tables and grids appear in the outline as [table eN …] or [grid eN …].` } };
+    }
+    if (control.disabled && !options.allowDisabled) return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `${describe(control)} is disabled.` } };
+    return { ok: true, control };
+  };
   if (target.kind === "ref") {
     const ref = `${outline.refPrefix}${target.ref}`;
     if (target.documentId !== registry.documentId) {
       const where = outline.refPrefix ? `frame ${outline.refPrefix.slice(0, -1)}` : "this tab";
       return { ok: false, result: { ok: false, code: "STALE_SNAPSHOT", summary: `Ref ${ref} came from an earlier page load; ${where} now shows a different document. Read a fresh snapshot.` } };
     }
-    const control = outline.byRef.get(target.ref);
-    if (control) {
-      if (control.disabled && !allowDisabled) return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `${describe(control)} is disabled.` } };
-      return { ok: true, control };
-    }
+    const control = outline.byRef.get(target.ref) ?? outline.tables.get(target.ref);
+    if (control) return checked(control);
     const element = registry.byRef.get(target.ref);
     if (element?.isConnected) return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `Ref ${ref} is currently hidden or not an interactive element.` } };
     return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: `Ref ${ref} is no longer on the page. Read a fresh snapshot.` } };
   }
   const wanted = target.name === null ? null : trimText(target.name);
-  const sameRole = outline.controls.filter((control) => target.role === "*" || control.role === target.role ||
+  // Tables are found by their own roles; every other locator searches the controls.
+  const pool = TABLE_ROLES.has(target.role) ? [...outline.tables.values()] : outline.controls;
+  const sameRole = pool.filter((control) => target.role === "*" || control.role === target.role ||
     (target.role === "textbox" && control.role === "searchbox"));
   let matches = sameRole.filter((control) => {
     if (wanted === null) return true;
@@ -939,11 +1256,7 @@ function resolveTarget(outline: Outline, registry: ElementRefRegistry, target: E
     const whole = matches.filter((control) => control.name.toLowerCase() === wanted.toLowerCase());
     if (whole.length === 1) matches = whole;
   }
-  if (matches.length === 1) {
-    const control = matches[0]!;
-    if (control.disabled && !allowDisabled) return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `${describe(control)} is disabled.` } };
-    return { ok: true, control };
-  }
+  if (matches.length === 1) return checked(matches[0]!);
   const label = `${target.role === "*" ? "element" : target.role}${wanted === null ? "" : ` ${target.exact ? "named exactly" : "with name containing"} ${JSON.stringify(wanted)}`}`;
   // Locators search this document only; another frame's elements are reached by their refs.
   const inFrames = outline.frames.length ? ` Elements inside cross-origin frames are reached only by ref, like page.ref("f1:e3").` : "";
@@ -951,7 +1264,7 @@ function resolveTarget(outline: Outline, registry: ElementRefRegistry, target: E
     return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: `Locator ${label} matched ${matches.length} elements: ${candidatesText(matches)}. Use page.ref("eN") for the intended one.${inFrames}` } };
   }
   const similar = wanted
-    ? outline.controls.filter((control) => control.name.toLowerCase().includes(wanted.toLowerCase().slice(0, 24)))
+    ? pool.filter((control) => control.name.toLowerCase().includes(wanted.toLowerCase().slice(0, 24)))
     : [];
   const kind = target.role === "*" ? "Interactive" : target.role;
   const hint = similar.length ? ` Similar controls: ${candidatesText(similar)}.` : sameRole.length ? ` ${kind} controls on the page: ${candidatesText(sameRole)}.` : ` No ${kind} controls are visible.`;
@@ -1254,7 +1567,7 @@ export function measureForCapture(document: Document, registry: ElementRefRegist
   };
   let element: PageRect | null = null;
   if (target) {
-    const resolved = resolveTarget(buildOutline(document, registry, options), registry, target, true);
+    const resolved = resolveTarget(buildOutline(document, registry, options), registry, target, { allowDisabled: true, accept: "any" });
     if (!resolved.ok) return resolved;
     const { control } = resolved;
     element = documentRect(control.element, view);

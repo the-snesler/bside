@@ -137,6 +137,48 @@ export interface PageFindResult {
   frames?: Record<string, string>;
 }
 
+/** Bounds on one `page.table` read. */
+export const TABLE_LIMITS = {
+  /** Rows returned when the call names no limit. */
+  defaultRows: 50,
+  maxRows: 200,
+  /** Columns past this are left out, and the result says so. */
+  maxColumns: 50,
+  cellChars: 300,
+  /** Characters of cell text one read returns at most; it stops at a whole row and pages on from there. */
+  maxChars: 40_000,
+  /** Rows counted at most; a longer table is cut there. */
+  maxScanRows: 20_000,
+  maxOffset: 1_000_000,
+} as const;
+
+/** The table roles an outline lists (`[table e12 "Caption" 340 rows × 6 cols]`) and `page.table` reads. */
+export type TableRole = "table" | "grid" | "treegrid";
+
+/**
+ * One page of a table's data rows as plain JSON: multi-row headers are
+ * flattened to "Group / Column", row and column spans are expanded into
+ * every cell they cover, and cell text is bounded. A cell lists the refs of
+ * controls inside it (`Alice [e14 link]`).
+ */
+export interface PageTable {
+  documentId: string;
+  url: string;
+  /** The table's ref as the model sees it: `e12`, or `f3:e12` in a cross-origin frame. */
+  ref: string;
+  role: TableRole;
+  caption: string;
+  headers: string[];
+  rows: string[][];
+  /** Data rows in the table (header rows are not counted). */
+  totalRows: number;
+  offset: number;
+  /** Where the next page starts, or null after the last row. */
+  nextOffset: number | null;
+  /** Cut columns, a capped row count, or rows a virtualized grid has not rendered. */
+  note?: string;
+}
+
 export interface SearchResult {
   title: string;
   url: string;

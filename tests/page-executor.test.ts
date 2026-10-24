@@ -76,8 +76,8 @@ describe("outline extraction", () => {
     const text = outline();
     expect(text).toContain("# Agent Fixture\nOrchid launch moved to Friday.");
     expect(text).toContain("- First\n- Second");
-    expect(text).toContain("| Rank | Title\n| 1 | [e1 link \"Bad Boys\" → /m/1]");
-    expect(text).toContain('[e2 button "Submit"]');
+    expect(text).toContain("[table e1 1 row × 2 cols]\n| Rank | Title\n| 1 | [e2 link \"Bad Boys\" → /m/1]");
+    expect(text).toContain('[e3 button "Submit"]');
   });
 
   it("omits hidden content, templates, and aria-hidden subtrees", () => {
