@@ -24,8 +24,9 @@ export default defineConfig({
       "sessions",
       "https://api.openai.com/*",
       "https://auth.openai.com/*",
-      "http://*/*",
-      "https://*/*",
+      // Page content scripts, tab URLs, the sign-in callback filter, site API
+      // requests, and tabs.captureTab (screenshots), which requires <all_urls>.
+      "<all_urls>",
     ],
     content_security_policy: {
       extension_pages: CSP,

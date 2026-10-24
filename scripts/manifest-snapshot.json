@@ -3,9 +3,8 @@
   "gecko_id": "bside@tsuni.dev",
   "background_persistent": true,
   "permissions": [
+    "<all_urls>",
     "cookies",
-    "http://*/*",
-    "https://*/*",
     "https://api.openai.com/*",
     "https://auth.openai.com/*",
     "identity",
