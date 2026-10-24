@@ -19,13 +19,14 @@ import type {
   PageErrorCode,
   PageFindResult,
   PageSnapshot,
+  PageTable,
   SearchResult,
   ToolCall,
   ToolResult,
 } from "@/lib/domain/tools";
 import type { Conversation, ConversationItem, ConversationSummary, HistoryRetention, HistorySettingsV1, QueuedMessage } from "@/lib/domain/conversation";
 import { HISTORY_RETENTIONS } from "@/lib/domain/conversation";
-import { MAX_HELP_NOTE_CHARS } from "@/lib/domain/tools";
+import { MAX_HELP_NOTE_CHARS, TABLE_LIMITS } from "@/lib/domain/tools";
 import { REASONING_EFFORTS, type AppSettingsV1, type ChatGPTStatus, type ProviderDefinition } from "@/lib/domain/provider";
 import type { RunUsageV1 } from "@/lib/domain/usage";
 import { isSkill, isSkillName, type Skill, type SkillSummary } from "@/lib/domain/skills";
@@ -43,7 +44,7 @@ import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction, validateElementT
 // `tabs.sendMessage(tabId, request, { frameId })`; a content script answers
 // only requests naming its own frame. Snapshot, find, search results, the
 // shield, and capture-done are top-frame requests (`frameId` 0); health,
-// outline, execute, and capture-prepare may go to any frame. A frame other
+// outline, execute, table, and capture-prepare may go to any frame. A frame other
 // than the top renders its refs with the prefix the background names it by
 // (`refPrefix`, e.g. `f3:`); the top frame's prefix is empty.
 // ---------------------------------------------------------------------------
@@ -108,6 +109,19 @@ export interface PageExecuteRequest {
   action: DomAction;
 }
 
+/** Reads one page of a table's data rows (`PageTable`); the target must name a table or grid in the frame's current document. */
+export interface PageTableRequest {
+  v: 1;
+  id: string;
+  type: "page.table";
+  frameId: number;
+  tabId: number;
+  refPrefix: string;
+  target: ElementTarget;
+  offset: number;
+  limit: number;
+}
+
 /**
  * The page shield over a watched agent tab: `"working"` while the tab's
  * session has the active run, `"idle"` otherwise, `"off"` when the tab is not
@@ -155,7 +169,7 @@ export interface PageCaptureDoneRequest {
 }
 
 export type PageRequest = PageHealthRequest | PageSnapshotRequest | PageFindRequest | PageOutlineRequest | PageSearchResultsRequest | PageExecuteRequest |
-  PageShieldRequest | PageCapturePrepareRequest | PageCaptureDoneRequest;
+  PageTableRequest | PageShieldRequest | PageCapturePrepareRequest | PageCaptureDoneRequest;
 
 export interface PageHealthResponse {
   v: 1;
@@ -212,6 +226,14 @@ export interface PageExecuteResponse {
   documentId: string;
 }
 
+export interface PageTableResponse {
+  v: 1;
+  id: string;
+  ok: true;
+  type: "page.table";
+  table: PageTable;
+}
+
 export interface PageShieldResponse {
   v: 1;
   id: string;
@@ -248,6 +270,7 @@ export type PageResponse =
   | PageOutlineResponse
   | PageSearchResultsResponse
   | PageExecuteResponse
+  | PageTableResponse
   | PageShieldResponse
   | PageCapturePrepareResponse
   | PageCaptureDoneResponse
@@ -292,6 +315,15 @@ export function isPageExecuteRequest(value: unknown): value is PageExecuteReques
   const candidate = value as Record<string, unknown>;
   return isFrameId(candidate.frameId) && isRefPrefix(candidate.frameId, candidate.refPrefix) && isTabId(candidate.tabId) &&
     validateDomAction(candidate.action) !== null;
+}
+
+export function isPageTableRequest(value: unknown): value is PageTableRequest {
+  if (!isEnvelope(value) || value.type !== "page.table") return false;
+  const candidate = value as Record<string, unknown>;
+  return isFrameId(candidate.frameId) && isRefPrefix(candidate.frameId, candidate.refPrefix) && isTabId(candidate.tabId) &&
+    validateElementTarget(candidate.target) !== null &&
+    Number.isSafeInteger(candidate.offset) && (candidate.offset as number) >= 0 && (candidate.offset as number) <= TABLE_LIMITS.maxOffset &&
+    Number.isSafeInteger(candidate.limit) && (candidate.limit as number) >= 1 && (candidate.limit as number) <= TABLE_LIMITS.maxRows;
 }
 
 export function isPageShieldRequest(value: unknown): value is PageShieldRequest {

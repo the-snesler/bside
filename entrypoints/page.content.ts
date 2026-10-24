@@ -9,6 +9,7 @@ import {
   isPageSearchResultsRequest,
   isPageShieldRequest,
   isPageSnapshotRequest,
+  isPageTableRequest,
 } from "@/lib/protocol";
 import type { ContentMessage, PageResponse } from "@/lib/protocol";
 import {
@@ -18,6 +19,7 @@ import {
   extractFrameOutline,
   extractSearchResults,
   extractSnapshot,
+  extractTable,
   findInPage,
   measureForCapture,
   measureFrameForCapture,
@@ -110,6 +112,14 @@ export default defineContentScript({
         return executeDomAction(document, registry, message.action, settleDom, { refPrefix: message.refPrefix, frameIdOf }).then((result) => (
           { v: 1, id: message.id, ok: true, type: "page.execute", result, documentId: registry.documentId }
         ));
+      }
+      if (isPageTableRequest(message)) {
+        const read = extractTable(document, registry, message.target, { offset: message.offset, limit: message.limit }, { refPrefix: message.refPrefix, frameIdOf });
+        if (!read.ok) {
+          const { code, summary } = read.result;
+          return Promise.resolve({ v: 1, id: message.id, ok: false, error: { code: code === "STALE_SNAPSHOT" || code === "TARGET_MISSING" ? code : "NOT_INTERACTABLE", message: summary, retryable: false, phase: "page" } });
+        }
+        return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.table", table: read.table });
       }
       if (isPageCapturePrepareRequest(message)) {
         const measured = message.childFrameId !== null

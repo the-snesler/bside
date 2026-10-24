@@ -12,6 +12,7 @@ import {
   isPageOutlineRequest,
   isPageCaptureDoneRequest,
   isPageCapturePrepareRequest,
+  isPageTableRequest,
   isPageSearchResultsRequest,
   isPageShieldRequest,
   isPageSnapshotRequest,
@@ -413,6 +414,19 @@ describe("page shield messages", () => {
     expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, refPrefix: "", childFrameId: null, target: null })).toBe(false);
     expect(isPageCaptureDoneRequest({ v: 1, id: "1", type: "page.capture-done", frameId: 0, tabId: 3 })).toBe(true);
     expect(isPageCaptureDoneRequest({ v: 1, id: "1", type: "page.capture-done", frameId: 0 })).toBe(false);
+  });
+
+  it("accepts table reads in any frame with a valid target and bounded paging, and never a selector", () => {
+    const table = { v: 1, id: "1", type: "page.table", frameId: 0, tabId: 3, refPrefix: "", target: { kind: "ref", ref: "e5", documentId: "doc" }, offset: 0, limit: 50 };
+    expect(isPageTableRequest(table)).toBe(true);
+    expect(isPageTableRequest({ ...table, frameId: 9, refPrefix: "f2:" })).toBe(true);
+    expect(isPageTableRequest({ ...table, target: { kind: "role", role: "table", name: "Cohorts", exact: false } })).toBe(true);
+    expect(isPageTableRequest({ ...table, frameId: 9 })).toBe(false);
+    expect(isPageTableRequest({ ...table, target: { kind: "css", selector: "table" } })).toBe(false);
+    expect(isPageTableRequest({ ...table, target: null })).toBe(false);
+    for (const limit of [0, 201, 1.5, "50"]) expect(isPageTableRequest({ ...table, limit })).toBe(false);
+    for (const offset of [-1, 1_000_001, 0.5]) expect(isPageTableRequest({ ...table, offset })).toBe(false);
+    expect(isPageTableRequest({ ...table, tabId: undefined })).toBe(false);
   });
 
   it("accepts only the two content-script messages, which name no tab", () => {

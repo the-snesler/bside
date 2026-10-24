@@ -26,9 +26,10 @@ import type {
   PageShieldRequest,
   PageShieldState,
   PageSnapshotRequest,
+  PageTableRequest,
 } from "@/lib/protocol";
 import { MAX_FRAME_OUTLINE_CHARS } from "@/lib/protocol";
-import type { CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, PageArtifactSummary, PageErrorCode, PageFindResult, PageRect, PageSnapshot, SearchResult, ToolResult } from "@/lib/domain/tools";
+import type { CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, PageArtifactSummary, PageErrorCode, PageFindResult, PageRect, PageSnapshot, PageTable, SearchResult, ToolResult } from "@/lib/domain/tools";
 import { findInOutline, lineOffsets, sliceOutline } from "@/lib/domain/outline";
 import { base64Bytes, isSessionId, validateHttpUrl, WORKSPACE_MAX_BINARY_BYTES } from "@/lib/validation";
 
@@ -482,6 +483,15 @@ export class TabController {
     }
   }
 
+  /** One page of a table's data rows, read by the frame it is in (0 for the top document). */
+  async table(target: ElementTarget, page: { offset: number; limit: number }, frame = 0): Promise<PageOutcome<PageTable>> {
+    const tabId = this.#tabId;
+    if (tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
+    const route = this.#route(tabId, frame);
+    if (!route) return pageError("TARGET_MISSING", `Frame f${frame} is not on this page. Read a fresh snapshot.`);
+    return this.#request<PageTable>(tabId, { type: "page.table", frameId: route.frameId, tabId, refPrefix: route.refPrefix, target, ...page }, "page.table");
+  }
+
   async searchResults(): Promise<PageOutcome<{ results: SearchResult[]; url: string; excerpt: string }>> {
     if (this.#tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
     return this.#request(this.#tabId, { type: "page.search-results", frameId: TOP_FRAME, tabId: this.#tabId }, "page.search-results");
@@ -693,8 +703,8 @@ export class TabController {
   async #request<T>(
     tabId: number,
     body: Omit<PageSnapshotRequest, "v" | "id"> | Omit<PageFindRequest, "v" | "id"> | Omit<PageOutlineRequest, "v" | "id"> | Omit<PageSearchResultsRequest, "v" | "id"> |
-      Omit<PageCapturePrepareRequest, "v" | "id">,
-    type: "page.snapshot" | "page.find" | "page.outline" | "page.search-results" | "page.capture-prepare",
+      Omit<PageCapturePrepareRequest, "v" | "id"> | Omit<PageTableRequest, "v" | "id">,
+    type: "page.snapshot" | "page.find" | "page.outline" | "page.search-results" | "page.capture-prepare" | "page.table",
   ): Promise<PageOutcome<T>> {
     const request = { v: 1, id: crypto.randomUUID(), ...body };
     let response: PageResponse | undefined;
@@ -711,6 +721,7 @@ export class TabController {
     if (response.type === "page.outline") return { ok: true, value: response.outline as T };
     if (response.type === "page.search-results") return { ok: true, value: { results: response.results, url: response.url, excerpt: response.excerpt } as T };
     if (response.type === "page.capture-prepare") return { ok: true, value: response.geometry as T };
+    if (response.type === "page.table") return { ok: true, value: response.table as T };
     return pageError("TAB_CHANGED", "Unexpected response from the page.");
   }
 

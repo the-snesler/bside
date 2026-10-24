@@ -7,6 +7,7 @@ import {
   executeDomAction,
   extractFrameOutline,
   extractSnapshot,
+  extractTable,
   findInPage,
   measureForCapture,
   type ElementRefRegistry,
@@ -72,6 +73,11 @@ export function createFramedTab(specs: FakeFrameSpec[], tabUrl = specs[0]!.url) 
       case "page.execute": {
         const result = await executeDomAction(document, registry, request.action, instant, { refPrefix: request.refPrefix, frameIdOf });
         return { ...base, type: "page.execute", result, documentId: registry.documentId };
+      }
+      case "page.table": {
+        const read = extractTable(document, registry, request.target, request, { refPrefix: request.refPrefix, frameIdOf });
+        if (!read.ok) return { v: 1, id: request.id, ok: false, error: { code: read.result.code === "STALE_SNAPSHOT" ? "STALE_SNAPSHOT" : "NOT_INTERACTABLE", message: read.result.summary, retryable: false, phase: "page" } };
+        return { ...base, type: "page.table", table: { ...read.table, url: spec.url } };
       }
       case "page.capture-prepare": {
         const measured = measureForCapture(document, registry, request.target, { refPrefix: request.refPrefix, frameIdOf });

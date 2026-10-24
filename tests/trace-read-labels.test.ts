@@ -59,4 +59,11 @@ describe("trace read labels", () => {
     expect(skipped).toMatchObject({ title: "Skipped clicking a page control" });
     expect(skipped.status).toBeUndefined();
   });
+
+  it("labels table reads", () => {
+    const source = 'const page = browser.tab("/tabs/1/page.md"); await page.snapshot(); const t = await page.table("e4", {offset: 50});';
+    expect(describeActivity(activity(source), false).title).toBe("Reading a table");
+    expect(describeActivity(activity(source, true), false).title).toBe("Read a table");
+    expect(describeActivity(activity(source, false), false)).toMatchObject({ title: "Couldn't read a table", status: "error" });
+  });
 });

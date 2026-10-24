@@ -1,4 +1,4 @@
-import type { DomAction, ElementTarget, JsonValue, PageFindResult, PageSnapshot, PressKey, ToolResult, UploadFile } from "@/lib/domain/tools";
+import { TABLE_LIMITS, type DomAction, type ElementTarget, type JsonValue, type PageFindResult, type PageSnapshot, type PressKey, type ToolResult, type UploadFile } from "@/lib/domain/tools";
 import type { Skill } from "@/lib/domain/skills";
 import {
   isMemoryTainted, MAX_MEMORIES, MAX_MEMORY_BODY, MAX_MEMORY_SEARCH_LIMIT, MEMORY_SEARCH_LIMIT, MemoryError, memoryDraftProblem, memoryPath,
@@ -20,6 +20,7 @@ Output: bare expression statements (e.g. \`await x.click();\`) are printed, assi
 
 Tabs: fs.list("/tabs") (user tabs), fs.list("/agent-tabs") (hidden tabs this chat opened). const page = browser.tab("/tabs/12/page.md"); const res = await browser.open("https://…") opens a hidden agent tab.
 Reading: await page.snapshot() returns the page outline: text in document order with interactive elements inlined as [e5 button "Save"], [e7 textbox "Email" type=email required value="…"], [e9 link "Docs" → /docs], [e3 combobox "Country" selected="…" options: …]. Includes open/closed shadow DOM and iframes: a cross-origin frame appears in place as [frame f2 "Title" (url)], its lines indented, then [/frame f2], and its refs carry the frame's name (f2:e4); a frame bside cannot read stays one [frame … not readable] line. Long pages are paged: snapshot({offset: 16000, maxChars: 16000}) continues where the notice says (maxChars ≤ 40000). fs.read(tabPath) equals snapshot().
+Tables: a line like [table e12 "Caption" 340 rows × 6 cols] (or [grid …]) marks a data table. await page.table("e12") (or page.ref("f2:e7").table(), page.getByRole("table", {name: "Caption"}).table()) returns {caption, headers, rows, totalRows, offset, nextOffset} as JSON, ${TABLE_LIMITS.defaultRows} rows at a time; page on with table("e12", {offset: 50, limit: 100}) (limit ≤ ${TABLE_LIMITS.maxRows}). Multi-row headers read "Group / Column", a spanned cell repeats in every row and column it covers, and a cell lists the refs of controls in it ("Alice [e14 link]"). Read rankings, cohorts, and comparisons from it rather than from outline text.
 Searching: await page.find("text") lists matching outline lines (with refs) and their offsets — use it on long pages instead of reading everything. await page.waitFor("text", 8000) waits up to 15000 ms for text to appear. await web.search("query") returns web results (title, URL, snippet) from a hidden search tab; open results with browser.open(url).
 Targeting: page.ref("e5") (or page.ref("f2:e4") inside a frame) targets the element with that ref from your latest snapshot/find/diff of that page; refs stay valid until the page (or, for f2:e4, that frame) navigates or reloads. page.getByRole("button", {name: "Save"}) matches a unique element by role and case-insensitive name substring ({exact: true} for exact). page.getByText("Save") matches any interactive element by name. Both search the top document and its same-origin frames only. Ambiguous or missing matches fail and list candidate refs.
 Actions (on a locator): click(), fill(text) (inputs, textareas, rich-text editors; dates as YYYY-MM-DD), selectOption("label or value" | [...]), setChecked(bool), check(), uncheck(), press("Enter"|"Tab"|"Escape"|"Space"|"Backspace"|"ArrowDown"|…), setInputFiles("/workspace/file.txt" | [...]) attaches scratch files (text or saved images) to a file input. Each action reports the effect, native validation problems, and the page outline lines that appeared (+) or disappeared (−). Use that diff to verify outcomes.
@@ -254,7 +255,7 @@ type Value = JsonValue | Handle | Value[] | { [key: string]: Value };
 const METHODS = new Set([
   "list", "read", "write", "move", "remove", "view", "tab", "open", "search", "stringify",
   "snapshot", "find", "waitFor", "ref", "getByRole", "getByText", "navigate", "goBack", "scroll", "path",
-  "click", "fill", "selectOption", "setChecked", "check", "uncheck", "press", "setInputFiles", "all", "screenshot",
+  "click", "fill", "selectOption", "setChecked", "check", "uncheck", "press", "setInputFiles", "all", "screenshot", "table",
   ...SITE_APIS.flatMap((site) => Object.keys(site.methods)),
 ]);
 const RESERVED_NAMES = ["fs", "browser", "JSON", "web", "Promise", "memory", "await", "return", ...SITE_APIS.map((site) => site.name)];
@@ -970,6 +971,10 @@ export class BrowserProgram {
       count(0, 1);
       return this.#screenshot(controller, receiver.tabId, { target, frame }, args[0], false);
     }
+    if (method === "table") {
+      count(0, 1);
+      return this.#table(controller, receiver.tabId, { target, frame }, args[0]);
+    }
     if (method === "click") {
       count(0);
       action = { kind: "click", target };
@@ -1011,7 +1016,7 @@ export class BrowserProgram {
       };
     } else
       throw new Error(
-        "Locators support click, fill, selectOption, setChecked, check, uncheck, press, setInputFiles, screenshot.",
+        "Locators support click, fill, selectOption, setChecked, check, uncheck, press, setInputFiles, screenshot, table.",
       );
     signal.throwIfAborted();
     // A lost response can follow a committed effect; disable automatic retry before dispatch.
@@ -1085,6 +1090,13 @@ export class BrowserProgram {
           );
         await abortableSleep(500, signal);
       }
+    }
+    if (method === "table") {
+      count(1, 2);
+      const ref = text(0, 'a table ref like "e12"');
+      if (!REF_PATTERN.test(ref))
+        throw new Error(`Invalid ref ${JSON.stringify(ref)}; a table's ref looks like "e12", or "f3:e12" inside a frame.`);
+      return this.#table(controller, tabId, this.#target({ kind: "locator", tabId, target: { kind: "ref", ref } }), args[1]);
     }
     if (method === "ref") {
       count(1);
@@ -1203,7 +1215,7 @@ export class BrowserProgram {
     }
     signal.throwIfAborted();
     throw new Error(
-      "Pages support snapshot, screenshot, find, waitFor, ref, getByRole, getByText, navigate, goBack, scroll, path.",
+      "Pages support snapshot, screenshot, find, waitFor, table, ref, getByRole, getByText, navigate, goBack, scroll, path.",
     );
   }
 
@@ -1297,6 +1309,34 @@ export class BrowserProgram {
     const placeholder = this.#attach({ mimeType: value.mimeType, data: value.data, placeholder: `[screenshot ${value.width}x${value.height} of ${value.url}]` });
     const saved = typeof options.save === "string" ? `${placeholder} Saved to ${options.save} (${value.bytes} bytes).` : placeholder;
     return value.cut ? `${saved} The page is longer than one image allows; the bottom was cut. Scroll and take viewport screenshots for the rest.` : saved;
+  }
+
+  /** One page of a table's rows as plain JSON. Reading is not a page effect. */
+  async #table(
+    controller: TabController,
+    tabId: number,
+    located: { target: ElementTarget; frame: number },
+    rawOptions: Value | undefined,
+  ): Promise<Value> {
+    const usage = `table({offset?: number, limit?: 1–${TABLE_LIMITS.maxRows}})`;
+    if (rawOptions !== undefined && (!rawOptions || typeof rawOptions !== "object" || Array.isArray(rawOptions) || this.#handles.has(rawOptions as object)))
+      throw new Error(`${usage} takes an optional options object.`);
+    const options = (rawOptions ?? {}) as Record<string, Value>;
+    const extra = Object.keys(options).find((key) => key !== "offset" && key !== "limit");
+    if (extra) throw new Error(`Unsupported table option ${extra}; use ${usage}.`);
+    const offset = options.offset ?? 0;
+    const limit = options.limit ?? TABLE_LIMITS.defaultRows;
+    if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0 || offset > TABLE_LIMITS.maxOffset)
+      throw new Error("offset must be a non-negative integer.");
+    if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > TABLE_LIMITS.maxRows)
+      throw new Error(`limit must be 1–${TABLE_LIMITS.maxRows}.`);
+    const read = await controller.table(located.target, { offset, limit }, located.frame);
+    if (!read.ok) throw this.#pageError(read.error, tabId);
+    this.#visited.push(read.value.url);
+    // A table found by role may come from a document the model has not read; its cell refs resolve against it now.
+    this.#observeAction(tabId, located.frame, read.value.documentId);
+    const { documentId: _documentId, url: _url, ...table } = read.value;
+    return table as unknown as Value;
   }
 
   #checkImageBudget(): void {
