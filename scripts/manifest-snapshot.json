@@ -29,5 +29,11 @@
       "https://*/*"
     ]
   ],
+  "content_scripts_frames": [
+    {
+      "all_frames": true,
+      "match_about_blank": false
+    }
+  ],
   "web_accessible_resources": []
 }

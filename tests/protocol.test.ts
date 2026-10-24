@@ -10,6 +10,7 @@ import {
   isPageHealthRequest,
   isPageCaptureDoneRequest,
   isPageCapturePrepareRequest,
+  isPageSearchResultsRequest,
   isPageShieldRequest,
   isPageSnapshotRequest,
   isSettingsRequest,
@@ -252,11 +253,18 @@ describe("isSettingsRequest: accepts every valid variant, rejects malformed inpu
 
 describe("isPageHealthRequest: accepts valid, rejects malformed input", () => {
   it("accepts a well-formed health request", () => {
-    expect(isPageHealthRequest({ v: 1, id: "1", type: "page.health" })).toBe(true);
+    expect(isPageHealthRequest({ v: 1, id: "1", type: "page.health", frameId: 0 })).toBe(true);
   });
 
   it("rejects the wrong envelope type", () => {
-    expect(isPageHealthRequest({ v: 1, id: "1", type: "page.snapshot" })).toBe(false);
+    expect(isPageHealthRequest({ v: 1, id: "1", type: "page.snapshot", frameId: 0 })).toBe(false);
+  });
+
+  it("names the frame it is for: any frame id, never a missing or negative one", () => {
+    expect(isPageHealthRequest({ v: 1, id: "1", type: "page.health", frameId: 21474836481 })).toBe(true);
+    expect(isPageHealthRequest({ v: 1, id: "1", type: "page.health" })).toBe(false);
+    expect(isPageHealthRequest({ v: 1, id: "1", type: "page.health", frameId: -1 })).toBe(false);
+    expect(isPageHealthRequest({ v: 1, id: "1", type: "page.health", frameId: "0" })).toBe(false);
   });
 
   it("rejects a non-object value", () => {
@@ -266,7 +274,7 @@ describe("isPageHealthRequest: accepts valid, rejects malformed input", () => {
 });
 
 describe("isPageSnapshotRequest: accepts valid, rejects malformed input", () => {
-  const valid = { v: 1, id: "1", type: "page.snapshot", tabId: 1, offset: 0, maxChars: 16000 };
+  const valid = { v: 1, id: "1", type: "page.snapshot", frameId: 0, tabId: 1, offset: 0, maxChars: 16000 };
 
   it("accepts a bounded slice request", () => {
     expect(isPageSnapshotRequest(valid)).toBe(true);
@@ -276,6 +284,15 @@ describe("isPageSnapshotRequest: accepts valid, rejects malformed input", () => 
   it("rejects missing or non-numeric tab ids", () => {
     expect(isPageSnapshotRequest({ ...valid, tabId: undefined })).toBe(false);
     expect(isPageSnapshotRequest({ ...valid, tabId: "1" })).toBe(false);
+  });
+
+  it("is a top-frame request only", () => {
+    expect(isPageSnapshotRequest({ ...valid, frameId: 7 })).toBe(false);
+    expect(isPageSnapshotRequest({ ...valid, frameId: undefined })).toBe(false);
+    expect(isPageFindRequest({ v: 1, id: "1", type: "page.find", frameId: 7, tabId: 1, query: "x" })).toBe(false);
+    expect(isPageSearchResultsRequest({ v: 1, id: "1", type: "page.search-results", frameId: 7, tabId: 1 })).toBe(false);
+    expect(isPageShieldRequest({ v: 1, id: "1", type: "page.shield", frameId: 7, tabId: 1, shield: "off" })).toBe(false);
+    expect(isPageCaptureDoneRequest({ v: 1, id: "1", type: "page.capture-done", frameId: 7, tabId: 1 })).toBe(false);
   });
 
   it("rejects unbounded or malformed slices", () => {
@@ -288,15 +305,15 @@ describe("isPageSnapshotRequest: accepts valid, rejects malformed input", () => 
 
 describe("isPageFindRequest", () => {
   it("accepts bounded non-empty queries only", () => {
-    expect(isPageFindRequest({ v: 1, id: "1", type: "page.find", tabId: 1, query: "User Score" })).toBe(true);
-    expect(isPageFindRequest({ v: 1, id: "1", type: "page.find", tabId: 1, query: "  " })).toBe(false);
-    expect(isPageFindRequest({ v: 1, id: "1", type: "page.find", tabId: 1, query: "x".repeat(201) })).toBe(false);
+    expect(isPageFindRequest({ v: 1, id: "1", type: "page.find", frameId: 0, tabId: 1, query: "User Score" })).toBe(true);
+    expect(isPageFindRequest({ v: 1, id: "1", type: "page.find", frameId: 0, tabId: 1, query: "  " })).toBe(false);
+    expect(isPageFindRequest({ v: 1, id: "1", type: "page.find", frameId: 0, tabId: 1, query: "x".repeat(201) })).toBe(false);
   });
 });
 
 describe("isPageExecuteRequest: accepts the closed action union only", () => {
   const ref = { kind: "ref", ref: "e1", documentId: "doc-1" };
-  const execute = (action: unknown) => ({ v: 1, id: "1", type: "page.execute", tabId: 1, action });
+  const execute = (action: unknown) => ({ v: 1, id: "1", type: "page.execute", frameId: 0, tabId: 1, action });
 
   it("accepts every action kind with ref and role targets", () => {
     for (const action of [
@@ -312,6 +329,8 @@ describe("isPageExecuteRequest: accepts the closed action union only", () => {
       { kind: "scroll", target: null, direction: "down", amount: "page" },
     ]) expect(validateDomAction(action), JSON.stringify(action)).not.toBeNull();
     expect(isPageExecuteRequest(execute({ kind: "click", target: ref }))).toBe(true);
+    expect(isPageExecuteRequest({ ...execute({ kind: "click", target: ref }), frameId: 21474836481 })).toBe(true);
+    expect(isPageExecuteRequest({ ...execute({ kind: "click", target: ref }), frameId: undefined })).toBe(false);
   });
 
   it("rejects unknown kinds, extra keys, selectors, and malformed targets", () => {
@@ -333,30 +352,30 @@ describe("isPageExecuteRequest: accepts the closed action union only", () => {
       { kind: "fill", target: ref, text: "x".repeat(16_001) },
     ]) expect(validateDomAction(action), JSON.stringify(action)).toBeNull();
     expect(isPageExecuteRequest(execute({ kind: "click" }))).toBe(false);
-    expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", action: { kind: "click", target: ref } })).toBe(false);
+    expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", frameId: 0, action: { kind: "click", target: ref } })).toBe(false);
   });
 });
 
 describe("page shield messages", () => {
   it("accepts a shield request only with a tab id and a known state", () => {
     for (const shield of ["off", "working", "idle"]) {
-      expect(isPageShieldRequest({ v: 1, id: "1", type: "page.shield", tabId: 3, shield })).toBe(true);
+      expect(isPageShieldRequest({ v: 1, id: "1", type: "page.shield", frameId: 0, tabId: 3, shield })).toBe(true);
     }
-    expect(isPageShieldRequest({ v: 1, id: "1", type: "page.shield", tabId: 3, shield: "on" })).toBe(false);
-    expect(isPageShieldRequest({ v: 1, id: "1", type: "page.shield", shield: "off" })).toBe(false);
-    expect(isPageShieldRequest({ v: 1, id: "1", type: "page.shield", tabId: -1, shield: "off" })).toBe(false);
-    expect(isPageShieldRequest({ v: 2, id: "1", type: "page.shield", tabId: 3, shield: "off" })).toBe(false);
+    expect(isPageShieldRequest({ v: 1, id: "1", type: "page.shield", frameId: 0, tabId: 3, shield: "on" })).toBe(false);
+    expect(isPageShieldRequest({ v: 1, id: "1", type: "page.shield", frameId: 0, shield: "off" })).toBe(false);
+    expect(isPageShieldRequest({ v: 1, id: "1", type: "page.shield", frameId: 0, tabId: -1, shield: "off" })).toBe(false);
+    expect(isPageShieldRequest({ v: 2, id: "1", type: "page.shield", frameId: 0, tabId: 3, shield: "off" })).toBe(false);
   });
 
   it("accepts capture requests only with a tab id and a valid target or none", () => {
     const ref = { kind: "ref", ref: "e5", documentId: "doc" };
-    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", tabId: 3, target: null })).toBe(true);
-    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", tabId: 3, target: ref })).toBe(true);
-    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", tabId: 3, target: { kind: "css", selector: "#x" } })).toBe(false);
-    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", tabId: 3 })).toBe(false);
-    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", target: null })).toBe(false);
-    expect(isPageCaptureDoneRequest({ v: 1, id: "1", type: "page.capture-done", tabId: 3 })).toBe(true);
-    expect(isPageCaptureDoneRequest({ v: 1, id: "1", type: "page.capture-done" })).toBe(false);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, tabId: 3, target: null })).toBe(true);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, tabId: 3, target: ref })).toBe(true);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, tabId: 3, target: { kind: "css", selector: "#x" } })).toBe(false);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, tabId: 3 })).toBe(false);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, target: null })).toBe(false);
+    expect(isPageCaptureDoneRequest({ v: 1, id: "1", type: "page.capture-done", frameId: 0, tabId: 3 })).toBe(true);
+    expect(isPageCaptureDoneRequest({ v: 1, id: "1", type: "page.capture-done", frameId: 0 })).toBe(false);
   });
 
   it("accepts only the two content-script messages, which name no tab", () => {

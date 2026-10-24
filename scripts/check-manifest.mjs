@@ -43,6 +43,11 @@ function normalize(manifest) {
     content_scripts_matches: (manifest.content_scripts ?? []).map((script) =>
       sorted(script.matches),
     ),
+    // Which frames each content script runs in: subframes widen its reach.
+    content_scripts_frames: (manifest.content_scripts ?? []).map((script) => ({
+      all_frames: script.all_frames ?? false,
+      match_about_blank: script.match_about_blank ?? false,
+    })),
     web_accessible_resources: sorted(manifest.web_accessible_resources),
   };
 }

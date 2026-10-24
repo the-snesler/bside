@@ -23,33 +23,63 @@ import { createPageShield } from "@/lib/tools/page-shield";
 /** The shield shows again on its own if the background never ends a capture. */
 const CAPTURE_SHIELD_TIMEOUT_MS = 5_000;
 
+/**
+ * Firefox's id for a frame (a `WindowProxy`) or a frame element, as
+ * `tabs.sendMessage` addresses it; -1 when unknown. `runtime.getFrameId` is
+ * Firefox-only (96+) and missing from the shared WebExtension types.
+ */
+function frameIdOf(target: Window | Element): number {
+  try {
+    const getFrameId = (browser.runtime as unknown as { getFrameId?: (target: unknown) => number }).getFrameId;
+    const id = getFrameId?.(target);
+    return typeof id === "number" && Number.isSafeInteger(id) ? id : -1;
+  } catch {
+    return -1;
+  }
+}
+
 export default defineContentScript({
   matches: ["http://*/*", "https://*/*"],
+  // Every HTTP(S) frame gets its own instance so cross-origin frames can be
+  // read and operated. about:blank and srcdoc frames are left out: they are
+  // same-origin with their parent, whose instance walks them inline.
+  allFrames: true,
   runAt: "document_idle",
   main() {
+    const top = window === window.top;
+    // Requests name the frame they are for; an instance answers only its own.
+    // A subframe whose id Firefox does not report answers nothing.
+    const ownFrameId = top ? 0 : frameIdOf(window);
+    if (ownFrameId <= 0 && !top) return;
+
     // One ref registry per document lifetime; a navigation reloads this
     // content script and starts a fresh registry with a new document id.
     const registry = createElementRefRegistry();
 
-    // The background owns the shield's state; a new document (or one restored
-    // from the back/forward cache) asks for it, since a push may have missed it.
+    // Only the top frame has a shield. The background owns its state; a new
+    // document (or one restored from the back/forward cache) asks for it,
+    // since a push may have missed it. Subframes never message the background.
     let messageCount = 0;
     const tellBackground = (type: ContentMessage["type"]) => {
       const message: ContentMessage = { v: 1, id: `content-${++messageCount}`, type };
       browser.runtime.sendMessage(message).then((response: unknown) => {
-        if (isContentMessageResponse(response)) shield.set(response.shield);
+        if (isContentMessageResponse(response)) shield?.set(response.shield);
       }, () => {});
     };
-    const shield = createPageShield(document, () => tellBackground("shield.takeover"));
-    tellBackground("shield.sync");
-    window.addEventListener("pageshow", (event) => { if (event.persisted) tellBackground("shield.sync"); });
+    const shield = top ? createPageShield(document, () => tellBackground("shield.takeover")) : null;
+    if (shield) {
+      tellBackground("shield.sync");
+      window.addEventListener("pageshow", (event) => { if (event.persisted) tellBackground("shield.sync"); });
+    }
     let captureTimer: ReturnType<typeof setTimeout> | undefined;
     const endCapture = () => {
       clearTimeout(captureTimer);
-      shield.hideForCapture(false);
+      shield?.hideForCapture(false);
     };
 
     browser.runtime.onMessage.addListener((message: unknown): Promise<PageResponse> | undefined => {
+      // Top-frame-only requests are validated to name frame 0, so a subframe never answers them.
+      if ((message as { frameId?: unknown } | null)?.frameId !== ownFrameId) return undefined;
       if (isPageHealthRequest(message)) {
         return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.health", url: location.href });
       }
@@ -76,7 +106,7 @@ export default defineContentScript({
           return Promise.resolve({ v: 1, id: message.id, ok: false, error: { code: code === "STALE_SNAPSHOT" || code === "TARGET_MISSING" ? code : "NOT_INTERACTABLE", message: summary, retryable: false, phase: "page" } });
         }
         clearTimeout(captureTimer);
-        shield.hideForCapture(true);
+        shield?.hideForCapture(true);
         captureTimer = setTimeout(endCapture, CAPTURE_SHIELD_TIMEOUT_MS);
         return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.capture-prepare", geometry: measured.geometry });
       }
@@ -84,7 +114,7 @@ export default defineContentScript({
         endCapture();
         return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.capture-done" });
       }
-      if (isPageShieldRequest(message)) {
+      if (isPageShieldRequest(message) && shield) {
         shield.set(message.shield);
         return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.shield" });
       }

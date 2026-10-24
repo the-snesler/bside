@@ -144,13 +144,13 @@ describe("TabController: click-disconnect navigation settlement", () => {
     const { api, triggerUpdated } = createBrowserApi("http://127.0.0.1:4173/agent-page.html", "Agent Fixture");
     let executeAttempts = 0;
     const baseSendMessage = api.tabs.sendMessage as SendMessage;
-    api.tabs.sendMessage = vi.fn(async (tabId: number, message: unknown) => {
+    api.tabs.sendMessage = vi.fn(async (tabId: number, message: unknown, options: { frameId: number }) => {
       const request = message as { type: string };
       if (request.type === "page.execute") {
         executeAttempts += 1;
         throw new Error("Receiving end does not exist.");
       }
-      return baseSendMessage(tabId, message);
+      return baseSendMessage(tabId, message, options);
     });
 
     const controller = new TabController(api);
@@ -203,12 +203,12 @@ describe("TabController: action results pass through", () => {
   it("passes through STALE_SNAPSHOT and the executing document id", async () => {
     const { api } = createBrowserApi("http://127.0.0.1:4173/agent-page.html", "Agent Fixture");
     const baseSendMessage = api.tabs.sendMessage as SendMessage;
-    api.tabs.sendMessage = vi.fn(async (tabId: number, message: unknown) => {
+    api.tabs.sendMessage = vi.fn(async (tabId: number, message: unknown, options: { frameId: number }) => {
       const request = message as { id: string; type: string };
       if (request.type === "page.execute") {
         return { v: 1, id: request.id, ok: true, type: "page.execute", result: { ok: false, code: "STALE_SNAPSHOT", summary: "Ref came from an earlier page load." }, documentId: "doc-new" } satisfies PageResponse;
       }
-      return baseSendMessage(tabId, message);
+      return baseSendMessage(tabId, message, options);
     });
 
     const controller = new TabController(api);
@@ -225,7 +225,7 @@ describe("TabController: action results pass through", () => {
     await controller.captureActivePage();
     const outcome = await controller.snapshot({ offset: 500, maxChars: 2000 });
     expect(outcome.ok).toBe(true);
-    expect(api.tabs.sendMessage).toHaveBeenLastCalledWith(1, expect.objectContaining({ type: "page.snapshot", offset: 500, maxChars: 2000 }));
+    expect(api.tabs.sendMessage).toHaveBeenLastCalledWith(1, expect.objectContaining({ type: "page.snapshot", frameId: 0, offset: 500, maxChars: 2000 }), { frameId: 0 });
   });
 });
 

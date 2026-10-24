@@ -34,6 +34,13 @@ import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction, validateElementT
 
 // ---------------------------------------------------------------------------
 // Content script <-> background: PageRequest / PageResponse (tabs.sendMessage)
+//
+// The content script runs in every HTTP(S) frame. Each request names the frame
+// it is for (`frameId`, Firefox's id: 0 is the top frame) and is sent with
+// `tabs.sendMessage(tabId, request, { frameId })`; a content script answers
+// only requests naming its own frame. Snapshot, find, search results, the
+// shield, and capture-done are top-frame requests (`frameId` 0); health,
+// execute, and capture-prepare may go to any frame.
 // ---------------------------------------------------------------------------
 
 export const MAX_SNAPSHOT_CHARS = 40_000;
@@ -43,12 +50,14 @@ export interface PageHealthRequest {
   v: 1;
   id: string;
   type: "page.health";
+  frameId: number;
 }
 
 export interface PageSnapshotRequest {
   v: 1;
   id: string;
   type: "page.snapshot";
+  frameId: number;
   tabId: number;
   offset: number;
   maxChars: number;
@@ -58,6 +67,7 @@ export interface PageFindRequest {
   v: 1;
   id: string;
   type: "page.find";
+  frameId: number;
   tabId: number;
   query: string;
 }
@@ -66,6 +76,7 @@ export interface PageSearchResultsRequest {
   v: 1;
   id: string;
   type: "page.search-results";
+  frameId: number;
   tabId: number;
 }
 
@@ -73,6 +84,7 @@ export interface PageExecuteRequest {
   v: 1;
   id: string;
   type: "page.execute";
+  frameId: number;
   tabId: number;
   action: DomAction;
 }
@@ -90,6 +102,7 @@ export interface PageShieldRequest {
   v: 1;
   id: string;
   type: "page.shield";
+  frameId: number;
   tabId: number;
   shield: PageShieldState;
 }
@@ -104,6 +117,7 @@ export interface PageCapturePrepareRequest {
   v: 1;
   id: string;
   type: "page.capture-prepare";
+  frameId: number;
   tabId: number;
   target: ElementTarget | null;
 }
@@ -113,6 +127,7 @@ export interface PageCaptureDoneRequest {
   v: 1;
   id: string;
   type: "page.capture-done";
+  frameId: number;
   tabId: number;
 }
 
@@ -203,14 +218,14 @@ export type PageResponse =
   | PageErrorResponse;
 
 export function isPageHealthRequest(value: unknown): value is PageHealthRequest {
-  return isEnvelope(value) && value.type === "page.health";
+  return isEnvelope(value) && value.type === "page.health" && isFrameId((value as Record<string, unknown>).frameId);
 }
 
 export function isPageSnapshotRequest(value: unknown): value is PageSnapshotRequest {
   if (!isEnvelope(value) || value.type !== "page.snapshot") return false;
   const candidate = value as Record<string, unknown>;
   return (
-    isTabId(candidate.tabId) &&
+    candidate.frameId === 0 && isTabId(candidate.tabId) &&
     Number.isSafeInteger(candidate.offset) && (candidate.offset as number) >= 0 &&
     Number.isSafeInteger(candidate.maxChars) && (candidate.maxChars as number) >= 500 && (candidate.maxChars as number) <= MAX_SNAPSHOT_CHARS
   );
@@ -219,34 +234,38 @@ export function isPageSnapshotRequest(value: unknown): value is PageSnapshotRequ
 export function isPageFindRequest(value: unknown): value is PageFindRequest {
   if (!isEnvelope(value) || value.type !== "page.find") return false;
   const candidate = value as Record<string, unknown>;
-  return isTabId(candidate.tabId) && typeof candidate.query === "string" &&
+  return candidate.frameId === 0 && isTabId(candidate.tabId) && typeof candidate.query === "string" &&
     candidate.query.trim().length > 0 && candidate.query.length <= MAX_FIND_QUERY_LEN;
 }
 
 export function isPageSearchResultsRequest(value: unknown): value is PageSearchResultsRequest {
-  return isEnvelope(value) && value.type === "page.search-results" && isTabId((value as Record<string, unknown>).tabId);
+  if (!isEnvelope(value) || value.type !== "page.search-results") return false;
+  const candidate = value as Record<string, unknown>;
+  return candidate.frameId === 0 && isTabId(candidate.tabId);
 }
 
 export function isPageExecuteRequest(value: unknown): value is PageExecuteRequest {
   if (!isEnvelope(value) || value.type !== "page.execute") return false;
   const candidate = value as Record<string, unknown>;
-  return isTabId(candidate.tabId) && validateDomAction(candidate.action) !== null;
+  return isFrameId(candidate.frameId) && isTabId(candidate.tabId) && validateDomAction(candidate.action) !== null;
 }
 
 export function isPageShieldRequest(value: unknown): value is PageShieldRequest {
   if (!isEnvelope(value) || value.type !== "page.shield") return false;
   const candidate = value as Record<string, unknown>;
-  return isTabId(candidate.tabId) && (PAGE_SHIELD_STATES as readonly unknown[]).includes(candidate.shield);
+  return candidate.frameId === 0 && isTabId(candidate.tabId) && (PAGE_SHIELD_STATES as readonly unknown[]).includes(candidate.shield);
 }
 
 export function isPageCapturePrepareRequest(value: unknown): value is PageCapturePrepareRequest {
   if (!isEnvelope(value) || value.type !== "page.capture-prepare") return false;
   const candidate = value as Record<string, unknown>;
-  return isTabId(candidate.tabId) && (candidate.target === null || validateElementTarget(candidate.target) !== null);
+  return isFrameId(candidate.frameId) && isTabId(candidate.tabId) && (candidate.target === null || validateElementTarget(candidate.target) !== null);
 }
 
 export function isPageCaptureDoneRequest(value: unknown): value is PageCaptureDoneRequest {
-  return isEnvelope(value) && value.type === "page.capture-done" && isTabId((value as Record<string, unknown>).tabId);
+  if (!isEnvelope(value) || value.type !== "page.capture-done") return false;
+  const candidate = value as Record<string, unknown>;
+  return candidate.frameId === 0 && isTabId(candidate.tabId);
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +296,11 @@ export function isContentMessageResponse(value: unknown): value is ContentMessag
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Record<string, unknown>;
   return candidate.v === 1 && candidate.ok === true && (PAGE_SHIELD_STATES as readonly unknown[]).includes(candidate.shield);
+}
+
+/** Firefox frame ids: 0 for the top frame, a large positive integer for a subframe. */
+export function isFrameId(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
 function isTabId(value: unknown): value is number {

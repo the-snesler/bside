@@ -40,6 +40,9 @@ export const FULL_PAGE_MAX_CSS = { width: 4_000, height: 12_000 };
 /** JPEG quality, then smaller scales and qualities tried in turn while an image is over the byte cap. */
 const CAPTURE_ATTEMPTS = [{ scale: 1, quality: 70 }, { scale: 0.7, quality: 55 }, { scale: 0.5, quality: 45 }];
 
+/** Firefox's frame id for a tab's top-level document. */
+const TOP_FRAME = 0;
+
 export const AGENT_TAB_TAG_KEY = "bside.agentTab";
 export const AGENT_TAB_ROLES = ["agent", "search"] as const;
 
@@ -117,7 +120,8 @@ export interface TabControllerBrowserApi {
     captureTab?(tabId: number, options: CaptureOptions): Promise<string>;
     update(tabId: number, updateProperties: { url: string } | { active: true }): Promise<unknown>;
     goBack(tabId: number): Promise<void>;
-    sendMessage(tabId: number, message: unknown): Promise<unknown>;
+    /** Always called with a `frameId`; without one, every frame of the tab would receive the message. */
+    sendMessage(tabId: number, message: unknown, options: { frameId: number }): Promise<unknown>;
     onUpdated: {
       addListener(callback: TabUpdatedListener): void;
       removeListener(callback: TabUpdatedListener): void;
@@ -246,9 +250,9 @@ export class TabController {
    * content script applied it; one that is not loaded yet asks for the state itself when it starts.
    */
   async setShield(tabId: number, shield: PageShieldState): Promise<boolean> {
-    const request: PageShieldRequest = { v: 1, id: crypto.randomUUID(), type: "page.shield", tabId, shield };
+    const request: PageShieldRequest = { v: 1, id: crypto.randomUUID(), type: "page.shield", frameId: TOP_FRAME, tabId, shield };
     try {
-      const response = (await this.#browserApi.tabs.sendMessage(tabId, request)) as PageResponse | undefined;
+      const response = (await this.#browserApi.tabs.sendMessage(tabId, request, { frameId: TOP_FRAME })) as PageResponse | undefined;
       return response?.ok === true && response.type === "page.shield";
     } catch {
       return false;
@@ -290,7 +294,7 @@ export class TabController {
       return pageError("UNSUPPORTED_PAGE", "This page cannot be attached.");
     }
 
-    const outcome = await this.#request<PageSnapshot>(tab.id, { type: "page.snapshot", tabId: tab.id, offset: 0, maxChars: ARTIFACT_SNAPSHOT_CHARS }, "page.snapshot");
+    const outcome = await this.#request<PageSnapshot>(tab.id, { type: "page.snapshot", frameId: TOP_FRAME, tabId: tab.id, offset: 0, maxChars: ARTIFACT_SNAPSHOT_CHARS }, "page.snapshot");
     if (!outcome.ok) return outcome;
 
     this.#tabId = tab.id;
@@ -309,17 +313,17 @@ export class TabController {
 
   async snapshot(options: { offset: number; maxChars: number } = { offset: 0, maxChars: DEFAULT_SNAPSHOT_CHARS }): Promise<PageOutcome<PageSnapshot>> {
     if (this.#tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
-    return this.#request<PageSnapshot>(this.#tabId, { type: "page.snapshot", tabId: this.#tabId, ...options }, "page.snapshot");
+    return this.#request<PageSnapshot>(this.#tabId, { type: "page.snapshot", frameId: TOP_FRAME, tabId: this.#tabId, ...options }, "page.snapshot");
   }
 
   async find(query: string): Promise<PageOutcome<PageFindResult>> {
     if (this.#tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
-    return this.#request<PageFindResult>(this.#tabId, { type: "page.find", tabId: this.#tabId, query }, "page.find");
+    return this.#request<PageFindResult>(this.#tabId, { type: "page.find", frameId: TOP_FRAME, tabId: this.#tabId, query }, "page.find");
   }
 
   async searchResults(): Promise<PageOutcome<{ results: SearchResult[]; url: string; excerpt: string }>> {
     if (this.#tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
-    return this.#request(this.#tabId, { type: "page.search-results", tabId: this.#tabId }, "page.search-results");
+    return this.#request(this.#tabId, { type: "page.search-results", frameId: TOP_FRAME, tabId: this.#tabId }, "page.search-results");
   }
 
   /**
@@ -340,7 +344,7 @@ export class TabController {
     if (tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
     const capture = this.#browserApi.tabs.captureTab?.bind(this.#browserApi.tabs);
     if (!capture) return pageError("UNSUPPORTED_PAGE", "Screenshots are unavailable in this browser.");
-    const measured = await this.#request<CaptureGeometry>(tabId, { type: "page.capture-prepare", tabId, target: request.target }, "page.capture-prepare");
+    const measured = await this.#request<CaptureGeometry>(tabId, { type: "page.capture-prepare", frameId: TOP_FRAME, tabId, target: request.target }, "page.capture-prepare");
     if (!measured.ok) return measured;
     try {
       const geometry = measured.value;
@@ -365,8 +369,8 @@ export class TabController {
     } catch {
       return pageError("TAB_CHANGED", "Firefox could not capture this tab.");
     } finally {
-      const done: PageCaptureDoneRequest = { v: 1, id: crypto.randomUUID(), type: "page.capture-done", tabId };
-      await this.#browserApi.tabs.sendMessage(tabId, done).catch(() => {});
+      const done: PageCaptureDoneRequest = { v: 1, id: crypto.randomUUID(), type: "page.capture-done", frameId: TOP_FRAME, tabId };
+      await this.#browserApi.tabs.sendMessage(tabId, done, { frameId: TOP_FRAME }).catch(() => {});
     }
   }
 
@@ -396,11 +400,11 @@ export class TabController {
   async act(action: DomAction): Promise<ActionOutcome> {
     const tabId = this.#tabId;
     if (tabId === null) return { result: { ok: false, code: "UNSUPPORTED_PAGE", summary: "No page is attached." }, documentId: null };
-    const request: PageExecuteRequest = { v: 1, id: crypto.randomUUID(), type: "page.execute", tabId, action };
+    const request: PageExecuteRequest = { v: 1, id: crypto.randomUUID(), type: "page.execute", frameId: TOP_FRAME, tabId, action };
 
     let response: PageResponse | undefined;
     try {
-      response = (await this.#browserApi.tabs.sendMessage(tabId, request)) as PageResponse | undefined;
+      response = (await this.#browserApi.tabs.sendMessage(tabId, request, { frameId: TOP_FRAME })) as PageResponse | undefined;
     } catch {
       if (action.kind !== "click" && action.kind !== "press") {
         return { result: { ok: false, code: "TAB_CHANGED", summary: "Lost contact with the page." }, documentId: null };
@@ -457,7 +461,7 @@ export class TabController {
     const request = { v: 1, id: crypto.randomUUID(), ...body };
     let response: PageResponse | undefined;
     try {
-      response = (await this.#browserApi.tabs.sendMessage(tabId, request)) as PageResponse | undefined;
+      response = (await this.#browserApi.tabs.sendMessage(tabId, request, { frameId: request.frameId })) as PageResponse | undefined;
     } catch {
       return pageError("TAB_CHANGED", "The page is not available.");
     }
@@ -504,9 +508,9 @@ export class TabController {
   }
 
   async #probeHealth(tabId: number): Promise<{ url: string } | null> {
-    const request: PageHealthRequest = { v: 1, id: crypto.randomUUID(), type: "page.health" };
+    const request: PageHealthRequest = { v: 1, id: crypto.randomUUID(), type: "page.health", frameId: TOP_FRAME };
     try {
-      const response = (await this.#browserApi.tabs.sendMessage(tabId, request)) as PageResponse | undefined;
+      const response = (await this.#browserApi.tabs.sendMessage(tabId, request, { frameId: TOP_FRAME })) as PageResponse | undefined;
       if (response?.ok && response.type === "page.health") return { url: response.url };
     } catch {
       // Content script not attached yet on the new document; keep probing.

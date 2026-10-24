@@ -80,7 +80,7 @@ describe("TabController.screenshot", () => {
     const { api, controller } = setup({ geometry: { ...GEOMETRY, element: { x: 10.5, y: 400.2, width: 200, height: 40 } } });
     const ref = { kind: "ref", ref: "e5", documentId: "doc-1" } as const;
     const outcome = await (await controller()).screenshot({ ...VIEWPORT, target: ref });
-    expect(api.tabs.sendMessage).toHaveBeenCalledWith(7, expect.objectContaining({ type: "page.capture-prepare", target: ref }));
+    expect(api.tabs.sendMessage).toHaveBeenCalledWith(7, expect.objectContaining({ type: "page.capture-prepare", frameId: 0, target: ref }), { frameId: 0 });
     expect(api.tabs.captureTab).toHaveBeenCalledWith(7, expect.objectContaining({ rect: { x: 10, y: 400, width: 201, height: 41 }, scale: 1 }));
     expect(outcome.ok && outcome.value).toMatchObject({ width: 201, height: 41, cut: false });
   });
