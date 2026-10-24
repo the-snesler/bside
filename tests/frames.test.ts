@@ -2,6 +2,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { BrowserProgram, ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
 import { FRAME_LIMITS, FrameAliases, TabController } from "@/lib/background/tab-controller";
+import type { CaptureOptions, TabControllerBrowserApi } from "@/lib/background/tab-controller";
+import type { CaptureGeometry, PageRect } from "@/lib/domain/tools";
+import type { PageRequest } from "@/lib/protocol";
 import { createFramedTab, type FakeFrameSpec } from "./helpers/framed-tab";
 
 const TOP = "https://shop.example/checkout";
@@ -225,5 +228,81 @@ describe("frame refs in browser programs", () => {
     await run("return await page.snapshot();");
     const missing = await run('return await page.getByRole("button", {name: "Pay", exact: true}).click();');
     expect(missing).toMatchObject({ ok: false, code: "TARGET_MISSING", summary: expect.stringContaining('reached only by ref, like page.ref("f1:e3")') });
+  });
+});
+
+describe("screenshots of elements inside frames", () => {
+  /** Frame 600 (f2) sits in frame 500 (f1), which sits in the top document; each answers with the geometry given. */
+  function nestedFrames(inner: { viewport: PageRect; element: PageRect }) {
+    const order: string[] = [];
+    const geometry = (url: string, viewport: PageRect, element: PageRect | null): CaptureGeometry =>
+      ({ documentId: `doc-${url}`, url, title: url, viewport, page: { width: 1280, height: 4000 }, element });
+    const answers: Record<number, CaptureGeometry> = {
+      600: geometry("https://captcha.example/", inner.viewport, inner.element),
+      // Frame 600's content box in frame 500's document, and frame 500's own scroll.
+      500: geometry("https://pay.example/", { x: 0, y: 100, width: 400, height: 300 }, { x: 20, y: 120, width: 300, height: 200 }),
+      // Frame 500's content box in the top document.
+      0: geometry("https://shop.example/", { x: 0, y: 900, width: 1280, height: 800 }, { x: 200, y: 1000, width: 400, height: 300 }),
+    };
+    const sendMessage = vi.fn(async (_tabId: number, message: unknown, options: { frameId: number }) => {
+      const request = message as PageRequest;
+      expect(request.frameId).toBe(options.frameId);
+      order.push(`${request.type}@${options.frameId}${request.type === "page.capture-prepare" && request.childFrameId ? `>${request.childFrameId}` : ""}`);
+      if (request.type === "page.capture-done") return { v: 1, id: request.id, ok: true, type: "page.capture-done" };
+      if (request.type !== "page.capture-prepare") throw new Error(`unexpected ${request.type}`);
+      return { v: 1, id: request.id, ok: true, type: "page.capture-prepare", geometry: answers[options.frameId] };
+    });
+    const captureTab = vi.fn(async (_tabId: number, _options: CaptureOptions) => `data:image/jpeg;base64,${"A".repeat(400)}`);
+    const api: TabControllerBrowserApi = { tabs: {
+      query: vi.fn(async () => [{ id: 1, url: "https://shop.example/", title: "Shop" }]),
+      update: vi.fn(async () => {}), goBack: vi.fn(async () => {}), sendMessage, captureTab,
+      onUpdated: { addListener: vi.fn(), removeListener: vi.fn() },
+    } };
+    const frames = new FrameAliases();
+    frames.name(1, 500, 0);
+    frames.name(1, 600, 500);
+    return { api, frames, order, captureTab, sendMessage };
+  }
+  const target = { kind: "ref", ref: "e1", documentId: "doc-https://captcha.example/" } as const;
+
+  it("maps the element through every enclosing frame into top-document coordinates", async () => {
+    const { api, frames, order, captureTab, sendMessage } = nestedFrames({ viewport: { x: 0, y: 50, width: 300, height: 200 }, element: { x: 10, y: 60, width: 100, height: 40 } });
+    const controller = await new TabController(api, async () => false, frames).forTab(1);
+    const shot = await controller.screenshot({ area: "viewport", target, frame: 2, format: "jpeg" });
+    expect(shot.ok, JSON.stringify(shot)).toBe(true);
+    // (10, 60) in f2's document is (10, 10) in its viewport, (30, 130) in f1's document, (30, 30) in f1's viewport, (230, 1030) on the page.
+    expect(captureTab).toHaveBeenCalledWith(1, expect.objectContaining({ rect: { x: 230, y: 1030, width: 100, height: 40 }, scale: 1 }));
+    expect(order).toEqual(["page.capture-prepare@600", "page.capture-prepare@500>600", "page.capture-prepare@0>500", "page.capture-done@0"]);
+    expect(sendMessage.mock.calls[0]![1]).toMatchObject({ refPrefix: "f2:", target, childFrameId: null });
+    expect(sendMessage.mock.calls[1]![1]).toMatchObject({ refPrefix: "f1:", target: null });
+    expect(shot.ok && shot.value.url).toBe("https://shop.example/");
+  });
+
+  it("captures only the part of the element its frame shows, and refuses one scrolled out of its frame", async () => {
+    const partly = nestedFrames({ viewport: { x: 0, y: 0, width: 300, height: 200 }, element: { x: 250, y: 180, width: 100, height: 40 } });
+    const shot = await (await new TabController(partly.api, async () => false, partly.frames).forTab(1)).screenshot({ area: "viewport", target, frame: 2, format: "jpeg" });
+    expect(shot.ok).toBe(true);
+    expect(partly.captureTab).toHaveBeenCalledWith(1, expect.objectContaining({ rect: { x: 470, y: 1200, width: 50, height: 20 } }));
+
+    const hidden = nestedFrames({ viewport: { x: 0, y: 0, width: 300, height: 200 }, element: { x: 10, y: 900, width: 100, height: 40 } });
+    const refused = await (await new TabController(hidden.api, async () => false, hidden.frames).forTab(1)).screenshot({ area: "viewport", target, frame: 2, format: "jpeg" });
+    expect(refused).toMatchObject({ ok: false, error: { code: "NOT_INTERACTABLE", message: expect.stringContaining("outside the visible part of its frame") } });
+    expect(hidden.captureTab).not.toHaveBeenCalled();
+    // The top frame hid its shield for the capture, so the capture still ends.
+    expect(hidden.order.at(-1)).toBe("page.capture-done@0");
+  });
+
+  it("takes a frame ref from a program, through page.screenshot({ref}) and the locator", async () => {
+    const { api, frames, captureTab } = nestedFrames({ viewport: { x: 0, y: 50, width: 300, height: 200 }, element: { x: 10, y: 60, width: 100, height: 40 } });
+    const state = new WorkspaceState();
+    state.observed.set(1, { documentId: "doc-top", frames: { f1: "doc-https://pay.example/", f2: "doc-https://captcha.example/" } });
+    const program = new BrowserProgram(new TabController(api, async () => false, frames), { state, sessionId: "s1", files: new ScratchFiles(), maxImages: 4 }, () => {});
+    const signal = new AbortController().signal;
+    const viaOption = await program.execute('return await browser.tab("/tabs/1/page.md").screenshot({ref: "f2:e1"});', signal);
+    expect(viaOption.ok, viaOption.summary).toBe(true);
+    const viaLocator = await program.execute('return await browser.tab("/tabs/1/page.md").ref("f2:e1").screenshot();', signal);
+    expect(viaLocator.ok, viaLocator.summary).toBe(true);
+    expect(captureTab).toHaveBeenCalledTimes(2);
+    expect(captureTab).toHaveBeenLastCalledWith(1, expect.objectContaining({ rect: { x: 230, y: 1030, width: 100, height: 40 } }));
   });
 });

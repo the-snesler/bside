@@ -20,6 +20,7 @@ import {
   extractSnapshot,
   findInPage,
   measureForCapture,
+  measureFrameForCapture,
   settleDom,
 } from "@/lib/tools/page-executor";
 import { createPageShield } from "@/lib/tools/page-shield";
@@ -111,7 +112,9 @@ export default defineContentScript({
         ));
       }
       if (isPageCapturePrepareRequest(message)) {
-        const measured = measureForCapture(document, registry, message.target, { refPrefix: message.refPrefix, frameIdOf });
+        const measured = message.childFrameId !== null
+          ? measureFrameForCapture(document, registry, message.childFrameId, frameIdOf)
+          : measureForCapture(document, registry, message.target, { refPrefix: message.refPrefix, frameIdOf });
         if (!measured.ok) {
           const { code, summary } = measured.result;
           return Promise.resolve({ v: 1, id: message.id, ok: false, error: { code: code === "STALE_SNAPSHOT" || code === "TARGET_MISSING" ? code : "NOT_INTERACTABLE", message: summary, retryable: false, phase: "page" } });

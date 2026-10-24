@@ -126,9 +126,11 @@ export interface PageShieldRequest {
 
 /**
  * Measures the page for a screenshot: the viewport, the page size, and the
- * target element's box (a ref must come from the current document). The
- * page shield, if showing, is hidden until `page.capture-done` (or a short
- * timeout) so it is not in the image; it keeps blocking the user's input.
+ * target element's box (a ref must come from the current document), or with
+ * `childFrameId`, the content box of that cross-origin child frame, to place
+ * an element inside it. The page shield, if showing, is hidden until
+ * `page.capture-done` (or a short timeout) so it is not in the image; it
+ * keeps blocking the user's input.
  */
 export interface PageCapturePrepareRequest {
   v: 1;
@@ -138,6 +140,7 @@ export interface PageCapturePrepareRequest {
   tabId: number;
   refPrefix: string;
   target: ElementTarget | null;
+  childFrameId: number | null;
 }
 
 /** Ends a capture: the page shield shows again if it was hidden for it. */
@@ -298,6 +301,8 @@ export function isPageShieldRequest(value: unknown): value is PageShieldRequest 
 export function isPageCapturePrepareRequest(value: unknown): value is PageCapturePrepareRequest {
   if (!isEnvelope(value) || value.type !== "page.capture-prepare") return false;
   const candidate = value as Record<string, unknown>;
+  const measuresChild = candidate.childFrameId !== null;
+  if (measuresChild && (!isFrameId(candidate.childFrameId) || candidate.childFrameId === 0 || candidate.target !== null)) return false;
   return isFrameId(candidate.frameId) && isRefPrefix(candidate.frameId, candidate.refPrefix) && isTabId(candidate.tabId) &&
     (candidate.target === null || validateElementTarget(candidate.target) !== null);
 }

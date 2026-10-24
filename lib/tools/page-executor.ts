@@ -1269,6 +1269,44 @@ export function measureForCapture(document: Document, registry: ElementRefRegist
   };
 }
 
+/**
+ * Measures a cross-origin child frame for a screenshot of an element inside
+ * it: the frame element's content box (where the frame's own viewport is
+ * drawn) in document coordinates, found by Firefox's frame id among the
+ * frames in this document, its shadow roots, and its same-origin frames.
+ */
+export function measureFrameForCapture(document: Document, registry: ElementRefRegistry, frameId: number, frameIdOf: (frame: Element) => number):
+  { ok: true; geometry: CaptureGeometry } | { ok: false; result: ToolResult } {
+  const measured = measureForCapture(document, registry, null);
+  if (!measured.ok) return measured;
+  const frame = frameElements(document).find((candidate) => frameIdOf(candidate) === frameId);
+  if (!frame) return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: "The frame is no longer on the page. Read a fresh snapshot." } };
+  const border = documentRect(frame, document.defaultView);
+  const style = styleOf(frame);
+  const x = border.x + frame.clientLeft + (parseFloat(style?.paddingLeft ?? "") || 0);
+  const y = border.y + frame.clientTop + (parseFloat(style?.paddingTop ?? "") || 0);
+  const width = frame.clientWidth - (parseFloat(style?.paddingLeft ?? "") || 0) - (parseFloat(style?.paddingRight ?? "") || 0);
+  const height = frame.clientHeight - (parseFloat(style?.paddingTop ?? "") || 0) - (parseFloat(style?.paddingBottom ?? "") || 0);
+  return { ok: true, geometry: { ...measured.geometry, element: { x, y, width: Math.max(0, width), height: Math.max(0, height) } } };
+}
+
+/** Every iframe/frame element in a document, its shadow roots, and its same-origin frames. */
+function frameElements(root: Document | ShadowRoot): Element[] {
+  const found: Element[] = [];
+  for (const element of Array.from(root.querySelectorAll("*"))) {
+    const tag = tagOf(element);
+    if (tag === "iframe" || tag === "frame") {
+      found.push(element);
+      let inner: Document | null = null;
+      try { inner = (element as HTMLIFrameElement).contentDocument; } catch { inner = null; }
+      if (inner) found.push(...frameElements(inner));
+    }
+    const shadow = shadowRootOf(element);
+    if (shadow) found.push(...frameElements(shadow));
+  }
+  return found;
+}
+
 /** An element's border box relative to the top document, adding the offsets of the same-origin frames it is in. */
 function documentRect(element: Element, top: Window | null): PageRect {
   const box = element.getBoundingClientRect();

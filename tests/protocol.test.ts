@@ -332,8 +332,18 @@ describe("frame-scoped requests", () => {
     expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", frameId: 9, tabId: 1, refPrefix: "f2:", action: click })).toBe(true);
     expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", frameId: 9, tabId: 1, action: click })).toBe(false);
     expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", frameId: 0, tabId: 1, refPrefix: "f2:", action: click })).toBe(false);
-    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 9, tabId: 1, refPrefix: "f2:", target: null })).toBe(true);
-    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 9, tabId: 1, refPrefix: "", target: null })).toBe(false);
+    const prepare = { v: 1, id: "1", type: "page.capture-prepare", frameId: 9, tabId: 1, refPrefix: "f2:", target: null, childFrameId: null };
+    expect(isPageCapturePrepareRequest(prepare)).toBe(true);
+    expect(isPageCapturePrepareRequest({ ...prepare, refPrefix: "" })).toBe(false);
+  });
+
+  it("measures a child frame only without an element target, by a subframe's id", () => {
+    const prepare = { v: 1, id: "1", type: "page.capture-prepare", frameId: 0, tabId: 1, refPrefix: "", target: null, childFrameId: 21474836481 };
+    expect(isPageCapturePrepareRequest(prepare)).toBe(true);
+    expect(isPageCapturePrepareRequest({ ...prepare, target: { kind: "ref", ref: "e1", documentId: "doc" } })).toBe(false);
+    expect(isPageCapturePrepareRequest({ ...prepare, childFrameId: 0 })).toBe(false);
+    expect(isPageCapturePrepareRequest({ ...prepare, childFrameId: -3 })).toBe(false);
+    expect(isPageCapturePrepareRequest({ ...prepare, childFrameId: undefined })).toBe(false);
   });
 });
 
@@ -395,11 +405,11 @@ describe("page shield messages", () => {
 
   it("accepts capture requests only with a tab id and a valid target or none", () => {
     const ref = { kind: "ref", ref: "e5", documentId: "doc" };
-    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, refPrefix: "", tabId: 3, target: null })).toBe(true);
-    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, refPrefix: "", tabId: 3, target: ref })).toBe(true);
-    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, refPrefix: "", tabId: 3, target: { kind: "css", selector: "#x" } })).toBe(false);
-    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, refPrefix: "", tabId: 3 })).toBe(false);
-    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, refPrefix: "", target: null })).toBe(false);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, refPrefix: "", childFrameId: null, tabId: 3, target: null })).toBe(true);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, refPrefix: "", childFrameId: null, tabId: 3, target: ref })).toBe(true);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, refPrefix: "", childFrameId: null, tabId: 3, target: { kind: "css", selector: "#x" } })).toBe(false);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, refPrefix: "", childFrameId: null, tabId: 3 })).toBe(false);
+    expect(isPageCapturePrepareRequest({ v: 1, id: "1", type: "page.capture-prepare", frameId: 0, refPrefix: "", childFrameId: null, target: null })).toBe(false);
     expect(isPageCaptureDoneRequest({ v: 1, id: "1", type: "page.capture-done", frameId: 0, tabId: 3 })).toBe(true);
     expect(isPageCaptureDoneRequest({ v: 1, id: "1", type: "page.capture-done", frameId: 0 })).toBe(false);
   });

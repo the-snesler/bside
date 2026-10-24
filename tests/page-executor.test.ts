@@ -10,6 +10,7 @@ import {
   extractSnapshot,
   findInPage,
   measureForCapture,
+  measureFrameForCapture,
   type ElementRefRegistry,
 } from "@/lib/tools/page-executor";
 import type { DomAction, ElementTarget } from "@/lib/domain/tools";
@@ -433,6 +434,22 @@ describe("measureForCapture", () => {
     expect(measured.geometry.viewport.width).toBeGreaterThan(0);
     expect(measured.geometry.page.height).toBeGreaterThanOrEqual(measured.geometry.viewport.height);
     expect(measureForCapture(document, registry, null)).toMatchObject({ ok: true, geometry: { element: null } });
+  });
+
+  it("measures a cross-origin child frame's content box, found by frame id inside shadow roots too", () => {
+    setBody('<div id="host"></div>');
+    const root = document.getElementById("host")!.attachShadow({ mode: "open" });
+    root.innerHTML = '<iframe data-src="https://pay.example/" style="padding: 4px"></iframe>';
+    const frame = root.querySelector("iframe")!;
+    Object.defineProperty(frame, "contentDocument", { get: () => null });
+    frame.getBoundingClientRect = () => ({ left: 100, top: 200, width: 310, height: 160, right: 410, bottom: 360, x: 100, y: 200, toJSON: () => ({}) });
+    Object.defineProperties(frame, { clientLeft: { get: () => 1 }, clientTop: { get: () => 1 }, clientWidth: { get: () => 308 }, clientHeight: { get: () => 158 } });
+    window.scrollTo(0, 0);
+    const frameIdOf = (element: Element) => (element === frame ? 42 : -1);
+    expect(measureFrameForCapture(document, createElementRefRegistry("doc"), 42, frameIdOf)).toMatchObject({
+      ok: true, geometry: { documentId: "doc", element: { x: 105, y: 205, width: 300, height: 150 } },
+    });
+    expect(measureFrameForCapture(document, createElementRefRegistry("doc"), 43, frameIdOf)).toMatchObject({ ok: false, result: { code: "TARGET_MISSING" } });
   });
 
   it("rejects a ref from an earlier document and an element without a box; a disabled control is fine to look at", () => {

@@ -89,6 +89,17 @@ export class FrameAliases {
     return this.#tabs.get(tabId)?.byAlias.get(alias) ?? null;
   }
 
+  /** A named frame's name number, by Firefox's id. */
+  aliasOf(tabId: number, frameId: number): number | null {
+    return this.#tabs.get(tabId)?.byFrame.get(frameId) ?? null;
+  }
+
+  /** Firefox's id for the frame a named frame was last seen in (0 for the top document). */
+  parentOf(tabId: number, frameId: number): number | null {
+    const alias = this.aliasOf(tabId, frameId);
+    return alias === null ? null : this.lookup(tabId, alias)?.parentFrameId ?? null;
+  }
+
   /** Drops a closed tab's names. */
   forget(tabId: number): void {
     this.#tabs.delete(tabId);
@@ -494,13 +505,18 @@ export class TabController {
     if (tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
     const capture = this.#browserApi.tabs.captureTab?.bind(this.#browserApi.tabs);
     if (!capture) return pageError("UNSUPPORTED_PAGE", "Screenshots are unavailable in this browser.");
-    if (request.frame !== 0) return pageError("NOT_INTERACTABLE", "Elements inside frames cannot be captured on their own; take a viewport screenshot instead.");
-    const measured = await this.#request<CaptureGeometry>(tabId, { type: "page.capture-prepare", frameId: TOP_FRAME, tabId, refPrefix: "", target: request.target }, "page.capture-prepare");
+    const measured = request.frame !== 0 && request.target
+      ? await this.#measureInFrame(tabId, request.frame, request.target)
+      : await this.#request<CaptureGeometry>(tabId, { type: "page.capture-prepare", frameId: TOP_FRAME, tabId, refPrefix: "", target: request.target, childFrameId: null }, "page.capture-prepare");
     if (!measured.ok) return measured;
     try {
       const geometry = measured.value;
       const { rect, cut } = captureRect(geometry, request);
-      if (rect.width < 1 || rect.height < 1) return pageError("NOT_INTERACTABLE", "There is nothing visible to capture.");
+      if (rect.width < 1 || rect.height < 1) {
+        return pageError("NOT_INTERACTABLE", request.frame !== 0
+          ? "The element is outside the visible part of its frame. Click or scroll it into view first, or take a viewport screenshot."
+          : "There is nothing visible to capture.");
+      }
       const fit = Math.min(1, SCREENSHOT_MAX_DIMENSION / Math.max(rect.width, rect.height));
       for (const attempt of CAPTURE_ATTEMPTS) {
         const scale = fit * attempt.scale;
@@ -523,6 +539,38 @@ export class TabController {
       const done: PageCaptureDoneRequest = { v: 1, id: crypto.randomUUID(), type: "page.capture-done", frameId: TOP_FRAME, tabId };
       await this.#browserApi.tabs.sendMessage(tabId, done, { frameId: TOP_FRAME }).catch(() => {});
     }
+  }
+
+  /**
+   * Places an element inside a cross-origin frame in the top document: the
+   * frame measures the element in its own viewport, then each enclosing frame
+   * up to the top reports where it draws that frame (the frame element's
+   * content box). The box is clipped to every frame's viewport on the way,
+   * so only the part a user could see is captured. The top frame's answer
+   * comes last, and it hides the shield until `page.capture-done`.
+   */
+  async #measureInFrame(tabId: number, frame: number, target: ElementTarget): Promise<PageOutcome<CaptureGeometry>> {
+    const route = this.#route(tabId, frame);
+    if (!route) return pageError("TARGET_MISSING", `Frame f${frame} is not on this page. Read a fresh snapshot.`);
+    const inner = await this.#request<CaptureGeometry>(tabId, { type: "page.capture-prepare", frameId: route.frameId, tabId, refPrefix: route.refPrefix, target, childFrameId: null }, "page.capture-prepare");
+    if (!inner.ok) return inner;
+    let rect = clipRect(shiftRect(inner.value.element!, -inner.value.viewport.x, -inner.value.viewport.y), inner.value.viewport);
+    let child = route.frameId;
+    for (let hops = 0; hops < FRAME_LIMITS.depth; hops++) {
+      const parent = this.#frames.parentOf(tabId, child);
+      const parentAlias = parent === null || parent === TOP_FRAME ? null : this.#frames.aliasOf(tabId, parent);
+      if (parent === null || (parent !== TOP_FRAME && parentAlias === null)) break;
+      const refPrefix = parentAlias === null ? "" : `f${parentAlias}:`;
+      const outer = await this.#request<CaptureGeometry>(tabId, { type: "page.capture-prepare", frameId: parent, tabId, refPrefix, target: null, childFrameId: child }, "page.capture-prepare");
+      if (!outer.ok) return outer;
+      const box = outer.value.element!;
+      // The child's viewport is drawn at its content box: move into the parent's document, keeping what the box shows.
+      rect = intersectRect(shiftRect(rect, box.x, box.y), box);
+      if (parent === TOP_FRAME) return { ok: true, value: { ...outer.value, element: rect } };
+      rect = clipRect(shiftRect(rect, -outer.value.viewport.x, -outer.value.viewport.y), outer.value.viewport);
+      child = parent;
+    }
+    return pageError("TARGET_MISSING", `Frame f${frame} is no longer where the latest outline showed it. Read a fresh snapshot.`);
   }
 
   /** One capture, falling back to briefly showing a hidden tab when the capture fails or comes out blank. */
@@ -721,6 +769,22 @@ function captureRect(geometry: CaptureGeometry, request: ScreenshotRequest): { r
   const cut = (request.area === "full" && !geometry.element && (geometry.page.width > page.width || geometry.page.height > page.height)) ||
     (geometry.element !== null && (right < area.x + area.width || bottom < area.y + area.height));
   return { rect: { x, y, width: Math.max(0, right - x), height: Math.max(0, bottom - y) }, cut };
+}
+
+function shiftRect(rect: PageRect, dx: number, dy: number): PageRect {
+  return { ...rect, x: rect.x + dx, y: rect.y + dy };
+}
+
+/** The part of `rect` inside `other`; empty (zero-size) when they do not overlap. */
+function intersectRect(rect: PageRect, other: PageRect): PageRect {
+  const x = Math.max(rect.x, other.x);
+  const y = Math.max(rect.y, other.y);
+  return { x, y, width: Math.max(0, Math.min(rect.x + rect.width, other.x + other.width) - x), height: Math.max(0, Math.min(rect.y + rect.height, other.y + other.height) - y) };
+}
+
+/** The part of a viewport-relative rect inside a viewport of that size. */
+function clipRect(rect: PageRect, viewport: PageRect): PageRect {
+  return intersectRect(rect, { x: 0, y: 0, width: viewport.width, height: viewport.height });
 }
 
 /** The base64 bytes of a `data:image/…;base64,` URL in the requested format, and their decoded size. */
