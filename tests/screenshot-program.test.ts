@@ -247,6 +247,31 @@ describe("screenshots and agent memory", () => {
     expect(viewer.captures).toEqual([]);
   });
 
+  it("keeps binaries out of /memory, which holds text only", async () => {
+    const { run, files, captures } = setupProgram(3, { memory: true });
+    await files.write("/workspace/shot.jpg", { kind: "binary", mimeType: "image/jpeg", data: IMAGE_BASE64, bytes: IMAGE_BASE64.length / 4 * 3 });
+    const refused = [
+      ['await browser.tab("/tabs/1/page.md").screenshot({save: "/memory/shot.png"});', "save must be a /workspace path"],
+      ['await fs.move("/workspace/shot.jpg", "/memory/shot.md");', "Destination must be a new workspace path"],
+      ['await fs.write("/memory/shot.md", fs.read("/workspace/shot.jpg"));', "Invalid arguments for fs.write"],
+      ['await fs.write("/memory/shot.md", JSON.stringify(fs.read("/workspace/shot.jpg")));', null],
+      ['await fs.view("/memory/shot.md");', "Memory supports fs.list, fs.read, fs.write, and fs.remove"],
+    ] as const;
+    for (const [source, message] of refused) {
+      const result = await run(source);
+      if (message) {
+        expect(result.ok, source).toBe(false);
+        expect(result.summary).toContain(message);
+      }
+    }
+    expect(captures).toEqual([]);
+    // Only the metadata JSON could be written, as text: never the image bytes.
+    const saved = await listMemories();
+    expect(saved.map((entry) => entry.name)).toEqual(["shot"]);
+    expect(JSON.stringify(saved)).not.toContain(IMAGE_BASE64);
+    expect(saved[0]!.description).toContain('"mimeType":"image/jpeg"');
+  });
+
   it("shows the taint on the Ask card for a change after a screenshot", async () => {
     await saveMemorySettings({ version: 1, writes: "ask" });
     const { program } = setupProgram(3, { memory: true });
