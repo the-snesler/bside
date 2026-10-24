@@ -21,6 +21,8 @@
     "test": "vitest run",
     "lint:ext": "web-ext lint --source-dir .output/firefox-mv2",
     "check:manifest": "node scripts/check-manifest.mjs",
+    "source:archive": "node scripts/source-submission.mjs",
+    "source:verify": "node scripts/source-submission.mjs --verify",
     "postinstall": "wxt prepare"
   },
   "dependencies": {

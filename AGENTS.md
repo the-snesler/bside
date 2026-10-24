@@ -13,6 +13,8 @@ bside: a Firefox desktop extension built with WXT, Manifest V2, Preact, TypeScri
 - `pnpm zip` — create a distributable archive from the production build.
 - `pnpm lint:ext` — run `web-ext lint` on the production build; fails on errors only.
 - `pnpm check:manifest` — compare the built manifest's permissions/CSP/content-script matches/background/gecko ID against `scripts/manifest-snapshot.json` and fail on any `.map` file; after an intentional change, run `pnpm check:manifest --update` and commit the snapshot.
+- `pnpm source:archive` — archive allowlisted committed regular source files, including the lockfile/build guide, into `.output/bside-<version>-source.zip`; refuses tracked changes and excludes secrets/local/generated files. No upload.
+- `pnpm source:verify` — recreate/extract that archive, install locked dependencies with lifecycle scripts disabled, prepare types, typecheck/build/check the manifest, and compare every production file byte for byte. Requires Git and Info-ZIP unzip; see `docs/source-build.md`.
 - CI (`.github/workflows/ci.yml`) runs install, typecheck, test, build, `lint:ext`, and `check:manifest` on pushes to `main` and on all PRs.
 
 Before committing behavioral changes, run the narrow affected test file, then `pnpm typecheck`, `pnpm test`, and `pnpm build`.
@@ -22,6 +24,8 @@ Before committing behavioral changes, run the narrow affected test file, then `p
 ```text
 entrypoints/
   background.ts        Persistent MV2 background-page entrypoint and listener registration.
+  onboarding/          Local first-run page opened only on install; direct-click sidebar opening, Account link, manual sample. Revisit from History & privacy.
+  privacy/             Bundled privacy policy rendered from docs/privacy.md.
   page.content.ts      Content-script message adapter in every HTTP(S) frame (page tools and screenshot measuring for its own frame); the top frame also owns the page shield, reads the search tab's results page, and fetches PDFs for viewer tabs.
   pdf-text.ts          Unlisted worker script (`/pdf-text.js`) holding the bundled pdf.js; the background starts one per PDF to extract its text.
   sidepanel/           Native Firefox sidebar Preact surface.
@@ -49,6 +53,7 @@ lib/
     pdf.ts             `PdfReader`: per-PDF `pdf-text` worker (`workerPdfExtractor`), bounded text cache, single-flight reads.
     sidebar-hub.ts     Sidebar Port transport, snapshots, sequencing, replay buffer.
     approval-badge.ts  Toolbar "!" badge while a run awaits confirmation or the user's help.
+    onboarding.ts      Synchronous onInstalled registration; opens only the local welcome page on a fresh install, never signs in or starts a task.
     chatgpt-auth.ts    Sign in with ChatGPT: OAuth, token refresh, device-key-sealed credential.
     device-key.ts      Non-extractable AES-GCM device key; seals and opens stored credentials.
     device-key-store.ts  Thin IndexedDB adapter holding the device CryptoKey.
@@ -93,6 +98,7 @@ lib/
     HistoryDrawer.tsx  Sidebar chat history: title search, inline rename, pin, export, two-step delete.
     SkillsEditor.tsx   Options Skills page: list, create, edit, two-step delete; packaged skills read-only.
     settings/          Options-page building blocks: section labels, cards of rows, banners, select, switch (`primitives.tsx`), and the only background-request helpers (`requests.ts`).
+                       ProblemReport.tsx explicitly prepares/downloads a metadata-only local report for a selected chat.
   protocol.ts          Versioned cross-context request/event unions and type guards.
   validation.ts        Runtime validators for prompts and tool arguments.
   storage.ts           Versioned `storage.local` records: settings, sealed credentials, chunked conversation sessions, per-session message queues, history retention, memory slots and the memory write policy, MCP server state and sealed MCP tokens/registrations, legacy migration, interrupted-run recovery.
@@ -102,8 +108,14 @@ public/                Packaged static extension assets.
 tests/                 Vitest contract tests; helpers/pi-provider.ts fakes Pi streams; helpers/framed-tab.ts fakes a tab's frames with the real page executor; helpers/mcp-server.ts fakes directory OAuth and MCP servers; helpers/pdf.ts builds small valid PDFs; fixtures hold deterministic test pages (frames-page.html embeds frame-payment.html from another origin; widgets-page.html has a spanned table, an ARIA grid, a hover menu, a sortable list, a combobox, a typed-date picker, and a Ctrl+Enter note; serp/ holds sanitized results pages per engine; report.pdf is a two-page PDF).
 docs/mcp.md            MCP connections design: directory, egress, transport, auth, tool exposure and cache, trust, effects, deferred work.
 docs/automation.md     Scheduling/notification design, deliberate alarms/notifications permissions, restart and busy behavior, privacy and verification.
+docs/privacy.md        Shipped privacy policy; update with any data-flow change.
+docs/amo-reviewer-notes.md  Permission justifications, consent schema sources, bundled-code lint explanations, and review walkthrough.
+docs/release-checklist.md  Automated/manual gates and outstanding roadmap/integration work; not a claim of publication or native Firefox validation.
+docs/amo-listing-draft.md  Unpublished AMO description, accounts/payment, privacy, and limitations.
+docs/source-build.md   Exact source-submission rebuild instructions.
 scripts/
   check-manifest.mjs   Built-manifest drift and source-map guard (`pnpm check:manifest`).
+  source-submission.mjs  Committed-source ZIP and extracted-source rebuild/byte comparison; no upload.
   manifest-snapshot.json  Committed expected permissions/CSP/content scripts/background/gecko ID.
 .github/workflows/ci.yml  CI checks listed above.
 wxt.config.ts          Firefox MV2 manifest, permissions, CSP, and Preact Vite setup.
@@ -138,6 +150,7 @@ wxt.config.ts          Firefox MV2 manifest, permissions, CSP, and Preact Vite s
 - Notifications use `local:notificationSettings` (`NotificationSettingsV1`, default off), changed only by the options page. With opt-in, successful ordinary runs ≥60 seconds, scheduled terminal results, and confirmation/help pauses can show fixed generic text; never prompt/page/model excerpts, URLs, task/chat titles, tool arguments, or errors. Opaque random notification ids map to sessions in background memory only (≤64 runs); clicks open the sidebar synchronously for Firefox's user gesture, then deliberately select the session. Missing browser support and API failures never fail a run. Disabling/disposal invalidates in-flight creates and clears hints; startup clears this service's stale ids. A persisted scheduled-results unread flag drives `•` even with notifications off; opening results clears it. Approval/help `!` has priority and its toolbar click opens the relevant run's chat.
 - History retention (`local:historySettings`: `forever` | `30d` | `7d`, default `forever`) deletes unpinned sessions by index `updatedAt` at startup, when changed, and hourly from the sweep timer; never the open session or the active run's. "Delete all history" deletes every session except the active run's, pinned included, and opens a fresh empty one. Both are options-page `history.*` requests, never sidebar commands.
 - `context.export` exports one session by id. Latest-run diagnostics, model input, tool output, and scratch files appear only in the export of the session that run belongs to.
+- Problem reports are separate from the raw context export: options-only validated `problemReport.list`/`problemReport.export`, background-owned, no sidebar or content-script command and no network/upload path. `lib/domain/problem-report.ts` constructs an allowlist of numeric metadata, fixed status/error codes, and the extension version; never spread stored records into it. Exclude prompts, page/model text, tool names/arguments/results, digests/summaries, files, all URLs/titles/paths/local ids/request ids, credentials, and free-text errors. Latest-run metadata appears only for its owning session. There is no include-content bypass. The user deliberately downloads a Blob and decides whether to share it.
 - `run.retry` re-runs the open session's last failed, cancelled, or interrupted turn against its existing user message (plus any steers that attempt delivered) and never appends a user item. It is refused if that attempt committed (or, after an interruption, may have committed) a page effect or a call of an MCP tool not annotated read-only. Run checkpoints record their session, and recovery writes the interrupted marker there.
 - Talk while it works: while the active run belongs to the open session, `run.start` queues a follow-up and `run.steer` hands guidance to the run's Pi steering queue (`steeringMode: "all"`). Pi injects steers after the current round's tool results (or after a final answer, costing one more budget-checked round); the delivered steer is persisted then as a user item with `delivery: "steer"` and the queued id, and published as `steer.delivered`. A steer is part of its turn: never a turn start, compaction cut point, retry target, or title (`isTurnStart`). Follow-ups are a runtime queue, not Pi's: each becomes its own turn, dispatched oldest-first only after a completed run, keeping its queued id as its user item id. Undelivered steers become follow-ups when the run ends; after failure, cancellation, or interruption nothing auto-sends. Queues persist per session as `local:queue:<id>` (`MessageQueueV1`, ≤20), pushed as `queue.changed`; on load, entries whose id is already an item are dropped.
 - A model's reasoning efforts come from Pi's `thinkingLevelMap` (`describeModels`), derived whenever the catalog is read, never stored: the ChatGPT account catalog persists only ids and names. A saved effort the model no longer supports resets to that model's default. Pi sends GPT-6 efforts as `configuration_update` input items with a fixed top-level `reasoning.effort` (top-level for Sign in with ChatGPT).
@@ -163,6 +176,7 @@ wxt.config.ts          Firefox MV2 manifest, permissions, CSP, and Preact Vite s
 
 ## Security and privacy boundaries
 
+- Firefox desktop minimum is 140.0 for built-in data-transmission consent (Android consent metadata floor 142.0, desktop product/listing only). The manifest declares sensitive data kinds that arbitrary page/account tasks may send to OpenAI, authentication services, sites, or the user's search engine; it must not declare `none`. The manifest guard includes both minimum versions and the complete data declaration. Keep the bundled privacy policy, reviewer notes, and final permission snapshot aligned after stack integration.
 - The API key, ChatGPT tokens, and MCP tokens and client registrations live only in background memory and in `storage.local`, sealed with the device key; the API key is also entered in the options password field. Never put them in sidebar events, content-script messages, page DOM, fixtures, logs, tests, or source.
 - The device key (`lib/background/device-key.ts`) is a non-extractable AES-GCM `CryptoKey` kept in the extension's IndexedDB and loaded silently. Never store a credential in plaintext or reintroduce a PIN. A record the key cannot decrypt is deleted and reads as not connected.
 - Page content, tool output, and model output are untrusted text. Render them as Preact text nodes (model Markdown only through `lib/ui/Markdown.tsx`); do not inject HTML. Memory text is model-written: render it as text on the confirmation card and the Memory page.
