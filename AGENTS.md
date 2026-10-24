@@ -45,8 +45,8 @@ lib/
     chatgpt-auth.ts    Sign in with ChatGPT: OAuth, token refresh, device-key-sealed credential.
     device-key.ts      Non-extractable AES-GCM device key; seals and opens stored credentials.
     device-key-store.ts  Thin IndexedDB adapter holding the device CryptoKey.
-    chatgpt-browser-auth.ts  Sign-in popup; captures the loopback OAuth callback with blocking webRequest.
-  domain/              Framework-independent conversation, provider, and tool contracts; `run-digest.ts` builds and renders run digests; `usage.ts` holds run usage and totals; `instructions.ts` holds custom-instruction and site-note bounds, origin matching, and their prompt rendering; `memory.ts` holds memory bounds, the file format, the secret validator, lexical search, and the index rendering; `outline.ts` holds outline bounds, paging slices, and find, shared by the content script and the background.
+    oauth-popup.ts     Shared OAuth sign-in popup (ChatGPT, MCP); captures the loopback callback with blocking webRequest.
+  domain/              Framework-independent conversation, provider, and tool contracts; `run-digest.ts` builds and renders run digests; `usage.ts` holds run usage and totals; `instructions.ts` holds custom-instruction and site-note bounds, origin matching, and their prompt rendering; `memory.ts` holds memory bounds, the file format, the secret validator, lexical search, and the index rendering.; `outline.ts` holds outline bounds, paging slices, and find, shared by the content script and the background.
   sites/
     site-api.ts        Site API contract (closed read-only methods over one origin), injected fetch/cookie env, bounded fetch.
     youtube.ts         YouTube InnerTube client: search, metadata, transcripts (Android-client caption tracks), comments; SAPISIDHASH sign-in.

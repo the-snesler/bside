@@ -2,7 +2,7 @@
 import { createLocalJWKSet, jwtVerify, type JSONWebKeySet } from "jose";
 import type { ChatGPTStatus, ModelListing, ProviderAuth } from "@/lib/domain/provider";
 import { ProviderStreamError } from "@/lib/providers/openai";
-import { FirefoxChatGPTAuthBrowser, type ChatGPTAuthBrowser } from "@/lib/background/chatgpt-browser-auth";
+import { FirefoxOAuthPopup, type OAuthPopup } from "@/lib/background/oauth-popup";
 import { deviceKey, type DeviceKey } from "@/lib/background/device-key";
 import {
   clearChatGPTSignInNotice, deleteChatGPTCredential, deleteChatGPTRegistration, getChatGPTCredential, getChatGPTRegistration,
@@ -45,14 +45,14 @@ function parseCredential(plaintext: string): ChatGPTCredential | null {
 }
 
 export class ChatGPTAuth {
-  #browser: ChatGPTAuthBrowser;
+  #browser: OAuthPopup;
   #fetch: typeof fetch;
   #deviceKey: DeviceKey;
   #credential: ChatGPTCredential | null = null;
   #busy = false;
   #refresh: Promise<ProviderAuth> | null = null;
 
-  constructor(authBrowser: ChatGPTAuthBrowser = new FirefoxChatGPTAuthBrowser(), fetcher: typeof fetch = (...args) => fetch(...args),
+  constructor(authBrowser: OAuthPopup = new FirefoxOAuthPopup(), fetcher: typeof fetch = (...args) => fetch(...args),
     key: DeviceKey = deviceKey) {
     this.#browser = authBrowser;
     this.#fetch = fetcher;
@@ -100,7 +100,7 @@ export class ChatGPTAuth {
         scope: SCOPES, resource: RESOURCE, state, nonce, code_challenge_method: "S256", code_challenge: challenge,
         ...(!registration.clientId ? { agent_name_hint: "bside" } : {}),
       }).toString();
-      const returned = await this.#browser.authorize(url.href, redirectUri, AbortSignal.timeout(10 * 60_000));
+      const returned = await this.#browser.authorize(url.href, redirectUri, AbortSignal.timeout(10 * 60_000), "ChatGPT");
       const callback = new URL(returned);
       if (`${callback.origin}${callback.pathname}` !== redirectUri || callback.searchParams.get("state") !== state)
         throw new ProviderStreamError("ChatGPT sign-in returned an invalid callback.", "AUTHENTICATION");
