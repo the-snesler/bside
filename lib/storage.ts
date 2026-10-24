@@ -13,6 +13,7 @@
 import { storage } from "wxt/utils/storage";
 import { isSkill } from "@/lib/domain/skills";
 import { isCustomInstructionsText, isSiteNote, MAX_SITE_NOTES, type CustomInstructionsV1, type SiteNote, type SiteNotesV1 } from "@/lib/domain/instructions";
+import { DEFAULT_MEMORY_SETTINGS, isMemoryEntry, MAX_MEMORIES, MEMORY_WRITE_POLICIES, type MemoryEntry, type MemoryEntryV1, type MemorySettingsV1 } from "@/lib/domain/memory";
 import { REASONING_EFFORTS, type AppSettingsV1, type ModelListing, type ReasoningEffort } from "@/lib/domain/provider";
 import type { Conversation, ConversationIndexV1, ConversationItem, ConversationSummary, HistorySettingsV1, MessageQueueV1, QueuedMessage } from "@/lib/domain/conversation";
 import { COMPACTION_SUMMARY_MAX_CHARS, HISTORY_RETENTIONS, isTurnStart, MAX_QUEUED_MESSAGES, titleFromPrompt } from "@/lib/domain/conversation";
@@ -881,6 +882,63 @@ export function workspaceStore(sessionId: string): ScratchStore {
     write: ({ slot, ...file }) => storage.setItem(workspaceKey(sessionId, slot), { version: 2, ...file } satisfies WorkspaceFileV2),
     remove: (slot) => storage.removeItem(workspaceKey(sessionId, slot)),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Memory — the agent's global /memory, one key per entry slot like /workspace,
+// written only through `lib/background/memory.ts`. A slot record carries its
+// name; malformed records and later duplicates of a name are deleted on read.
+// ---------------------------------------------------------------------------
+
+/** One stored memory and its `local:memory:<slot>` slot (0–199). */
+export interface MemorySlot {
+  slot: number;
+  entry: MemoryEntry;
+}
+
+const memoryKey = (slot: number) => `local:memory:${slot}` as const;
+const MEMORY_KEYS = Array.from({ length: MAX_MEMORIES }, (_, slot) => memoryKey(slot));
+const memorySettingsItem = storage.defineItem<MemorySettingsV1>("local:memorySettings", { version: 1 });
+
+export async function loadMemories(): Promise<MemorySlot[]> {
+  const slots = await storage.getItems(MEMORY_KEYS);
+  const memories: MemorySlot[] = [];
+  const invalid: (typeof slots)[number]["key"][] = [];
+  for (const [slot, { key, value }] of slots.entries()) {
+    if (value === null || value === undefined) continue;
+    const record = value as { version?: unknown };
+    if (record.version === 1 && isMemoryEntry(value) && !memories.some((other) => other.entry.name === value.name)) {
+      const { name, description, body, createdAt, provenance } = value;
+      memories.push({ slot, entry: { name, description, body, createdAt, provenance } });
+    } else invalid.push(key);
+  }
+  if (invalid.length > 0) await storage.removeItems(invalid);
+  return memories;
+}
+
+export async function saveMemory({ slot, entry }: MemorySlot): Promise<void> {
+  await storage.setItem(memoryKey(slot), { version: 1, ...entry } satisfies MemoryEntryV1);
+}
+
+export async function removeMemory(slot: number): Promise<void> {
+  await storage.removeItem(memoryKey(slot));
+}
+
+export async function removeAllMemories(): Promise<void> {
+  await storage.removeItems(MEMORY_KEYS);
+}
+
+/** The memory write policy; a malformed record is deleted and reads as the default, `auto`. */
+export async function getMemorySettings(): Promise<MemorySettingsV1> {
+  const raw: unknown = await memorySettingsItem.getValue();
+  const record = raw as { version?: unknown; writes?: unknown } | null;
+  if (record?.version === 1 && Object.keys(record).length === 2 && (MEMORY_WRITE_POLICIES as readonly unknown[]).includes(record.writes)) return record as MemorySettingsV1;
+  if (raw !== null) await memorySettingsItem.removeValue();
+  return DEFAULT_MEMORY_SETTINGS;
+}
+
+export async function saveMemorySettings(settings: MemorySettingsV1): Promise<void> {
+  await memorySettingsItem.setValue({ version: 1, writes: settings.writes });
 }
 
 // ---------------------------------------------------------------------------
