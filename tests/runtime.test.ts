@@ -453,6 +453,21 @@ async function tick(times = 20): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+/**
+ * Waits until the active run has sent `count` provider requests. Before its
+ * first one a run opens the sealed credential with real WebCrypto, which
+ * finishes on the thread pool, so a fixed number of ticks can lose the race
+ * on a busy machine.
+ */
+async function untilRequested(provider: { requests: unknown[] }, count = 1): Promise<void> {
+  await vi.waitFor(() => expect(provider.requests.length).toBeGreaterThanOrEqual(count));
+}
+
+/** Waits until the active run has streamed `text` (see `untilRequested`). */
+async function untilPartial(runtime: BackgroundRuntime, text: string): Promise<void> {
+  await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun?.partialAssistantText).toBe(text));
+}
+
 beforeEach(() => {
   fakeBrowser.reset();
 });
@@ -559,7 +574,7 @@ describe("BackgroundRuntime: cancellation", () => {
     hub.handleConnect(port);
 
     const runCommand = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi" });
-    await tick();
+    await untilRequested(provider);
 
     const runningSnapshot = await runtime.getSnapshot();
     const runId = runningSnapshot.activeRun?.runId;
@@ -593,7 +608,7 @@ describe("BackgroundRuntime: cancellation", () => {
     hub.handleConnect(port);
 
     const runCommand = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi" });
-    await tick();
+    await untilPartial(runtime, "The page says");
     const runId = (await runtime.getSnapshot()).activeRun?.runId as string;
 
     await runtime.handleCommand({ v: 1, id: "2", type: "run.cancel", runId });
@@ -636,7 +651,7 @@ describe("BackgroundRuntime: cancellation", () => {
     hub.handleConnect(port);
 
     const runCommand = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi" });
-    await tick();
+    await untilPartial(runtime, "partial");
     const runId = (await runtime.getSnapshot()).activeRun?.runId as string;
 
     await runtime.handleCommand({ v: 1, id: "2", type: "run.cancel", runId });
@@ -1291,7 +1306,7 @@ describe("BackgroundRuntime: run.retry", () => {
     const { runtime } = setup(provider);
 
     const run = runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Read it" });
-    await tick();
+    await untilPartial(runtime, "The page says");
     await runtime.handleCommand({ v: 1, id: "cancel", type: "run.cancel", runId: (await runtime.getSnapshot()).activeRun!.runId });
     await run;
 
@@ -1353,7 +1368,7 @@ describe("BackgroundRuntime: run.retry", () => {
     await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Go" });
 
     const retry = runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
-    await tick();
+    await untilPartial(runtime, "Working");
     await runtime.handleCommand({ v: 1, id: "retry-again", type: "run.retry" });
     expect(provider.requests).toHaveLength(2);
     await runtime.handleCommand({ v: 1, id: "cancel", type: "run.cancel", runId: (await runtime.getSnapshot()).activeRun!.runId });
@@ -1681,7 +1696,7 @@ describe("BackgroundRuntime: closing agent tabs", () => {
     await runtime.initialize();
 
     const run = runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Wait" });
-    await tick();
+    await untilRequested(provider);
     expect((await runtime.getSnapshot()).activeRun).not.toBeNull();
     await runtime.handleCommand({ v: 1, id: "close", type: "tabs.closeAgentTabs", sessionId: owner });
     expect(tabs.map((tab) => tab.id)).toEqual([1, 5]);
@@ -2547,7 +2562,7 @@ describe("BackgroundRuntime: history drawer support", () => {
     const old = await createSessionWith(prompt("u1", "Old"));
     const running = (await runtime.getSnapshot()).conversation.id;
     const run = send({ type: "run.start", prompt: "Long task" });
-    await tick();
+    await untilRequested(provider);
     await send({ type: "session.create" });
     const open = (await runtime.getSnapshot()).conversation.id;
     vi.setSystemTime(Date.now() + 40 * DAY);
@@ -2585,7 +2600,7 @@ describe("BackgroundRuntime: history drawer support", () => {
     await updateSession(pinned, { pinned: true });
     const running = (await runtime.getSnapshot()).conversation.id;
     const run = send({ type: "run.start", prompt: "Long task" });
-    await tick();
+    await untilRequested(provider);
     await send({ type: "session.create" });
     const viewing = (await runtime.getSnapshot()).conversation.id;
 
@@ -2733,9 +2748,9 @@ describe("BackgroundRuntime: run digests and context continuity", () => {
 
   it("persists a digest for a cancelled run", async () => {
     await saveOpenAICredential("sk-test");
-    const { runtime } = setup([[programCall("p1"), done], "hang"]);
+    const { runtime, provider } = setup([[programCall("p1"), done], "hang"]);
     const run = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Go" });
-    await tick();
+    await untilRequested(provider, 2);
     await runtime.handleCommand({ v: 1, id: "2", type: "run.cancel", runId: (await runtime.getSnapshot()).activeRun!.runId });
     await run;
     expect(await digests()).toEqual([expect.objectContaining({ status: "cancelled", entries: [expect.objectContaining({ ok: true })] })]);
@@ -2826,7 +2841,7 @@ describe("BackgroundRuntime: talk while it works", () => {
     const gate = Promise.withResolvers<void>();
     scripted(provider, [{ events: program, gate: gate.promise }, { events: answer("Used tab 2.") }]);
     const run = send(runtime, { type: "run.start", prompt: "Compare prices" });
-    await tick();
+    await untilRequested(provider);
     const { activeRun, conversation } = await runtime.getSnapshot();
     await send(runtime, { type: "run.steer", runId: activeRun!.runId, text: "  Use tab 2  " });
     const [pending] = (await runtime.getSnapshot()).queue;
@@ -2852,7 +2867,7 @@ describe("BackgroundRuntime: talk while it works", () => {
     const gate = Promise.withResolvers<void>();
     scripted(provider, [{ events: answer("A done."), gate: gate.promise }, { events: answer("B done.") }]);
     const run = send(runtime, { type: "run.start", prompt: "A" });
-    await tick();
+    await untilRequested(provider);
     const first = (await runtime.getSnapshot()).conversation.id;
     await send(runtime, { type: "run.start", prompt: "B" });
     expect(await queueOf(runtime)).toEqual(["follow-up:B"]);
@@ -2879,7 +2894,7 @@ describe("BackgroundRuntime: talk while it works", () => {
     const gate = Promise.withResolvers<void>();
     scripted(provider, [{ gate: gate.promise, error: new ProviderStreamError("Rate limited.", "RATE_LIMIT") }, { events: answer("B done.") }]);
     const run = send(runtime, { type: "run.start", prompt: "A" });
-    await tick();
+    await untilRequested(provider);
     await send(runtime, { type: "run.start", prompt: "B" });
     await send(runtime, { type: "run.start", prompt: "C" });
     gate.resolve();
@@ -2899,7 +2914,7 @@ describe("BackgroundRuntime: talk while it works", () => {
     const { runtime, provider } = setup();
     scripted(provider, [{ events: answer("Never."), gate: new Promise(() => {}) }]);
     const run = send(runtime, { type: "run.start", prompt: "A" });
-    await tick();
+    await untilRequested(provider);
     const runId = (await runtime.getSnapshot()).activeRun!.runId;
     await send(runtime, { type: "run.steer", runId, text: "S" });
     await send(runtime, { type: "run.start", prompt: "F" });
@@ -2924,7 +2939,7 @@ describe("BackgroundRuntime: talk while it works", () => {
     const before = setup();
     scripted(before.provider, [{ events: answer("Never."), gate: new Promise(() => {}) }]);
     void send(before.runtime, { type: "run.start", prompt: "A" });
-    await tick();
+    await untilRequested(before.provider);
     await send(before.runtime, { type: "run.steer", runId: (await before.runtime.getSnapshot()).activeRun!.runId, text: "S" });
     await send(before.runtime, { type: "run.start", prompt: "F" });
 
@@ -2949,7 +2964,7 @@ describe("BackgroundRuntime: talk while it works", () => {
     const gate = Promise.withResolvers<void>();
     scripted(provider, [{ events: answer("A done."), gate: gate.promise }, { events: answer("B done.") }]);
     const run = send(runtime, { type: "run.start", prompt: "A" });
-    await tick();
+    await untilRequested(provider);
     await send(runtime, { type: "run.start", prompt: "B" });
     const [queued] = (await runtime.getSnapshot()).queue;
     gate.resolve();
@@ -2962,7 +2977,7 @@ describe("BackgroundRuntime: talk while it works", () => {
     const gate = Promise.withResolvers<void>();
     scripted(provider, [{ events: program, gate: gate.promise }, { error: new ProviderStreamError("Rate limited.", "RATE_LIMIT") }, { events: answer("Done.") }]);
     const run = send(runtime, { type: "run.start", prompt: "A" });
-    await tick();
+    await untilRequested(provider);
     await send(runtime, { type: "run.steer", runId: (await runtime.getSnapshot()).activeRun!.runId, text: "S" });
     gate.resolve();
     await run;
@@ -3061,7 +3076,7 @@ describe("BackgroundRuntime: usage visibility", () => {
 
   it("persists usage for failed and cancelled runs, sums a retried turn's runs, and records nothing for a run without tokens", async () => {
     await saveOpenAICredential("sk-test");
-    const { runtime, port } = setup([
+    const { runtime, port, provider } = setup([
       round([toolCall], { input: 300, output: 30, cost: cost(0.001) }),
       new ProviderStreamError("Rate limited.", "RATE_LIMIT"),
       round([text("Done.")], { input: 200, output: 20, cost: cost(0.002) }),
@@ -3077,7 +3092,7 @@ describe("BackgroundRuntime: usage visibility", () => {
     expect(turns[0]!.usage).toMatchObject({ input: 500, output: 50, costUsd: expect.closeTo(0.003, 10), pricedRuns: 2 });
 
     const run = runtime.handleCommand({ v: 1, id: "3", type: "run.start", prompt: "Go" });
-    await tick();
+    await untilRequested(provider, 5);
     await runtime.handleCommand({ v: 1, id: "4", type: "run.cancel", runId: (await runtime.getSnapshot()).activeRun!.runId });
     await run;
     expect((await usageItems()).map((item) => item.usage.input)).toEqual([300, 200, 50]);
