@@ -3,7 +3,7 @@ import preact from "@preact/preset-vite";
 import Icons from "unplugin-icons/vite";
 
 const CSP =
-  "default-src 'self'; script-src 'self'; object-src 'none'; connect-src 'self' https://api.openai.com https://auth.openai.com https://www.youtube.com; img-src 'self' data:; style-src 'self' 'unsafe-inline'";
+  "default-src 'self'; script-src 'self'; object-src 'none'; connect-src 'self' https://api.openai.com https://auth.openai.com https://www.youtube.com https://mcp.notion.com https://ai.todoist.net https://todoist.com; img-src 'self' data:; style-src 'self' 'unsafe-inline'";
 
 export default defineConfig({
   browser: "firefox",
@@ -24,6 +24,11 @@ export default defineConfig({
       "sessions",
       "https://api.openai.com/*",
       "https://auth.openai.com/*",
+      // MCP directory servers (lib/mcp/servers.ts): Notion's MCP and OAuth
+      // server, Todoist's MCP server, and Todoist's OAuth server.
+      "https://mcp.notion.com/*",
+      "https://ai.todoist.net/*",
+      "https://todoist.com/*",
       // Page content scripts, tab URLs, the sign-in callback filter, site API
       // requests, and tabs.captureTab (screenshots), which requires <all_urls>.
       "<all_urls>",
