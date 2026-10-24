@@ -415,16 +415,20 @@ export class TabController {
     if (!tab || tab.id === undefined || !isSupportedUrl(tab.url)) {
       return pageError("UNSUPPORTED_PAGE", "This page cannot be attached.");
     }
+    return this.capturePage(tab.id);
+  }
 
-    const outcome = await this.#snapshotOf(tab.id, { offset: 0, maxChars: ARTIFACT_SNAPSHOT_CHARS });
+  /** Captures the menu chip's source without activating it or falling back to the active tab. */
+  async capturePage(tabId: number): Promise<PageOutcome<{ artifact: PageArtifactSummary; snapshot: PageSnapshot }>> {
+    const outcome = await this.#snapshotOf(tabId, { offset: 0, maxChars: ARTIFACT_SNAPSHOT_CHARS });
     if (!outcome.ok) return outcome;
 
-    this.#tabId = tab.id;
+    this.#tabId = tabId;
     this.#url = outcome.value.url;
     this.#title = outcome.value.title;
 
     const artifact: PageArtifactSummary = {
-      artifactId: `page:${tab.id}:${outcome.value.documentId}`,
+      artifactId: `page:${tabId}:${outcome.value.documentId}`,
       kind: "page",
       title: outcome.value.title,
       url: outcome.value.url,

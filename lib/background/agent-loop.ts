@@ -270,7 +270,7 @@ export class AgentLoop {
     let rounds = 0;
     let limitError: NormalizedError | null = null;
     if (params.contextArtifact) this.#program.observe(params.contextArtifact.snapshot.tabId, params.contextArtifact.snapshot.documentId, params.contextArtifact.snapshot.frames);
-    // The attached page, earlier run notes, and a summary carry web content the model reads before any tool runs.
+    // The attached page, a context-menu chip, earlier run notes, and a summary carry web content the model reads before any tool runs.
     if (params.contextArtifact || renderHistory(history.transcript, model, { contextArtifact: null }).some((entry) => entry.untrusted)) this.#program.taint();
     for (const note of params.transcript.findLast(isTurnStart)?.sites ?? []) this.#surfacedSites.add(note.origin);
     const agent = this.#agent = new Agent({
@@ -321,8 +321,9 @@ export class AgentLoop {
         const steer = this.#steers.get(event.message);
         if (!steer) return;
         this.#steers.delete(event.message);
+        if (steer.ask) this.#program.taint();
         if (steer.skill) this.#skills.set(steer.skill.name, steer.skill);
-        await params.onItem({ id: steer.id, kind: "message", role: "user", text: steer.text, skill: steer.skill, context: null, delivery: "steer", at: Date.now() });
+        await params.onItem({ id: steer.id, kind: "message", role: "user", text: steer.text, skill: steer.skill, ...(steer.ask ? { ask: steer.ask } : {}), context: null, delivery: "steer", at: Date.now() });
         return;
       }
       if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
@@ -806,7 +807,7 @@ type CompactionItem = Extract<ConversationItem, { kind: "compaction" }>;
 /**
  * One replayed history message and the item it renders; `userTurn` marks a
  * user prompt, where turns start (a steer does not). `untrusted`: a run-notes
- * or summary note, which carries web content.
+ * or summary note, or a user message with a context-menu chip, which carries web content.
  */
 interface HistoryEntry {
   itemId: string;
@@ -864,7 +865,8 @@ function renderHistory(items: readonly ConversationItem[], model: Model<Api>, cu
     if (item.kind !== "message") return;
     if (item.role === "user") {
       const extras = start + offset !== latest ? [] : [...(memoryIndex ? [memoryIndex] : []), ...(artifact ? [renderPageContext(artifact)] : [])];
-      entries.push({ itemId: item.id, userTurn: isTurnStart(item), message: !extras.length
+      // A context-menu chip quotes the page (selected text, link, alt text, title).
+      entries.push({ itemId: item.id, userTurn: isTurnStart(item), ...(item.ask ? { untrusted: true } : {}), message: !extras.length
         ? { role: "user", content: renderUserPrompt(item), timestamp: item.at }
         : { role: "user", content: [renderUserPrompt(item), ...extras].map((text) => ({ type: "text" as const, text })), timestamp: item.at } });
       return;

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "preact/hooks";
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
   createEditor,
   Editor,
@@ -86,6 +86,11 @@ export function Composer(props: {
   configured: boolean;
   tabs: TabMention[];
   skills?: SkillSummary[];
+  focusVersion?: number;
+  /** A deliberate quick-action choice; inserts editable text and never sends it. */
+  draft?: { id: string; text: string } | null;
+  askId?: string;
+  placeholder?: string;
   onListSkills?: () => void;
   onListTabs: () => void;
   onSend: (text: string) => void;
@@ -106,6 +111,28 @@ export function Composer(props: {
   const [index, setIndex] = useState(0);
   const [text, setText] = useState("");
   const [skillMode, setSkillMode] = useState(false);
+  const seenDraft = useRef<string | null>(null);
+  useEffect(() => {
+    const focus = () => {
+      if (props.disabled) return;
+      ReactEditor.focus(editor);
+      if (!editor.selection) Transforms.select(editor, Editor.end(editor, []));
+    };
+    // Opening the native sidebar (including Firefox's special command) mounts/focuses this window.
+    const timer = requestAnimationFrame(focus);
+    window.addEventListener("focus", focus);
+    return () => { cancelAnimationFrame(timer); window.removeEventListener("focus", focus); };
+  }, [editor, props.disabled, props.focusVersion, props.askId]);
+  useEffect(() => {
+    if (!props.draft || props.draft.id === seenDraft.current) return;
+    seenDraft.current = props.draft.id;
+    // Preserve an existing draft; quick actions remain visible only in an empty chat.
+    if (serializeDraft(editor.children)) return;
+    Transforms.select(editor, Editor.range(editor, []));
+    Transforms.insertText(editor, props.draft.text);
+    setTarget(null);
+    ReactEditor.focus(editor);
+  }, [editor, props.draft]);
   const skillMatches = (props.skills ?? []).filter((skill) => skill.name.startsWith(search.toLowerCase())).slice(0, 8);
   const matches = props.tabs
     .filter((tab) =>
@@ -199,7 +226,7 @@ export function Composer(props: {
               ? "Connect OpenAI in settings to start."
               : props.working
                 ? "Enter queues, Ctrl/⌘+Enter steers…"
-                : "Ask a task, / for skills, @ for tabs…"
+                : props.placeholder ?? "Ask a task, / for skills, @ for tabs…"
           }
           renderElement={({ attributes, children, element }) =>
             element.type === "mention" ? (

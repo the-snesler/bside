@@ -25,6 +25,7 @@ import { buildTurns } from "@/lib/ui/turns";
 import { handleSkillsRequest } from "@/lib/background/skills";
 import { handleInstructionsRequest, handleSiteNotesRequest } from "@/lib/background/instructions";
 import { listMemories, writeMemory } from "@/lib/background/memory";
+import { buildAskContext } from "@/lib/domain/ask";
 
 type ProviderUsage = NonNullable<Extract<ScriptedProviderEvent, { type: "turn.completed" }>["usage"]>;
 
@@ -3178,5 +3179,99 @@ describe("BackgroundRuntime: usage visibility", () => {
     const runId = snapshot.activeRun!.runId;
     expect((await openConversation()).items.at(-1)).toMatchObject({ id: `usage-${runId}`, kind: "run-usage", usage: { input: 700, costUsd: 0.002 } });
     expect((await listSessions())[0]?.usage).toMatchObject({ input: 700, pricedRuns: 1 });
+  });
+});
+
+describe("BackgroundRuntime: context-menu drafts", () => {
+  const ask = (id = "ask-1", text = "Selected source text") => buildAskContext("selection", { selectionText: text }, { id: 1, url: "http://127.0.0.1:4173/agent-page.html", title: "Source page" }, id, 1)!;
+  const send = (runtime: BackgroundRuntime, command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+  const answer: ScriptedProviderEvent[] = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
+
+  it("keeps a removable draft without sending, ignores stale removals/labels, and preserves it on setup failure", async () => {
+    const provider = new FakeProvider();
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
+    runtime.setAsk(ask());
+    expect(provider.requests).toHaveLength(0);
+    expect((await runtime.getSnapshot()).conversation.items).toHaveLength(0);
+    await send(runtime, { type: "run.start", prompt: "Explain", askId: "ask-1" });
+    expect((await runtime.getSnapshot()).ask?.id).toBe("ask-1");
+    runtime.setAsk(ask("ask-2", "Replacement"));
+    await send(runtime, { type: "ask.dismiss", askId: "ask-1" });
+    runtime.updateAskAlt("ask-1", "Stale response");
+    expect((await runtime.getSnapshot()).ask).toMatchObject({ id: "ask-2", text: "Replacement" });
+    await send(runtime, { type: "run.start", prompt: "Explain", askId: "ask-1" });
+    expect(provider.requests).toHaveLength(0);
+    expect((await runtime.getSnapshot()).notice).toContain("replaced or removed");
+    await send(runtime, { type: "ask.dismiss", askId: "ask-2" });
+    expect((await runtime.getSnapshot()).ask).toBeNull();
+  });
+
+  it("attaches the source tab without querying the active one and pins its context through retry and replay", async () => {
+    await saveOpenAICredential("sk-test");
+    const controller = supportedPageTabControllerFactory();
+    const activeCapture = vi.spyOn(controller, "captureActivePage");
+    const sourceCapture = vi.spyOn(controller, "capturePage");
+    const provider = new FakeProvider();
+    let round = 0;
+    provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      if (round++ === 0) throw new ProviderStreamError("Try again", "NETWORK");
+      yield* answer;
+    } });
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider, tabControllerFactory: () => controller });
+    runtime.setAsk(ask());
+    await send(runtime, { type: "run.start", prompt: "Explain", askId: "ask-1" });
+    expect(activeCapture).not.toHaveBeenCalled();
+    expect(sourceCapture).toHaveBeenCalledWith(1);
+    expect((await runtime.getSnapshot()).ask).toBeNull();
+    runtime.setAsk(ask("next", "Different context"));
+    await send(runtime, { type: "run.retry" });
+    expect(sourceCapture).toHaveBeenCalledTimes(2);
+    const users = (await openConversation()).items.filter((item) => item.kind === "message" && item.role === "user");
+    expect(users).toHaveLength(1);
+    expect(users[0]).toMatchObject({ ask: { ...ask(), path: "/tabs/1/page.md" } });
+    expect(JSON.stringify(provider.requests[1]!.context.messages)).toContain("Selected source text");
+    expect(JSON.stringify(provider.requests[1]!.context.messages)).not.toContain("Different context");
+    expect(provider.requests[1]!.context.systemPrompt).toBe(provider.requests[0]!.context.systemPrompt);
+    expect(provider.requests[1]!.context.systemPrompt).not.toContain("Selected source text");
+    await send(runtime, { type: "run.start", prompt: "Follow up" });
+    expect(JSON.stringify(provider.requests[2]!.context.messages)).toContain("Selected source text");
+    expect((await runtime.getSnapshot()).ask?.id).toBe("next");
+  });
+
+  it.each(["follow-up", "steer"] as const)("snapshots a %s at acceptance and taints later memory writes", async (mode) => {
+    await saveOpenAICredential("sk-test");
+    const gate = Promise.withResolvers<void>();
+    const provider = new FakeProvider();
+    let round = 0;
+    provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      const current = round++;
+      if (current === 0) { await gate.promise; yield* answer; }
+      else if (current === 1) {
+        yield { type: "tool.call", call: { id: "save", name: "browser_program", arguments: { source: 'fs.write("/memory/selected.md", "Selected note\\nA useful detail");' } } } as ScriptedProviderEvent;
+        yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+      } else yield* answer;
+    } });
+    const controller = unsupportedPageTabControllerFactory();
+    const capture = vi.spyOn(controller, "capturePage");
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider, tabControllerFactory: () => controller });
+    const running = send(runtime, { type: "run.start", prompt: "Start" });
+    await untilRequested(provider);
+    runtime.setAsk(ask());
+    if (mode === "steer") await send(runtime, { type: "run.steer", runId: (await runtime.getSnapshot()).activeRun!.runId, text: "Explain", askId: "ask-1" });
+    else await send(runtime, { type: "run.start", prompt: "Explain", askId: "ask-1" });
+    const snapshot = await runtime.getSnapshot();
+    expect(snapshot.ask).toBeNull();
+    expect(snapshot.queue[0]?.ask).toMatchObject({ id: "ask-1", text: "Selected source text" });
+    expect((await loadMessageQueue(snapshot.conversation.id))[0]?.ask).toEqual(snapshot.queue[0]?.ask);
+    runtime.setAsk(ask("later", "Replacement"));
+    gate.resolve();
+    await running;
+    await vi.waitFor(() => expect(provider.requests).toHaveLength(3));
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun).toBeNull());
+    expect(JSON.stringify(provider.requests[1]!.context.messages)).toContain("Selected source text");
+    expect(JSON.stringify(provider.requests[1]!.context.messages)).not.toContain("Replacement");
+    expect((await listMemories())[0]?.provenance).toMatchObject({ by: "agent", tainted: true });
+    expect((await openConversation()).items.find((item) => item.kind === "message" && item.role === "user" && item.text === "Explain")).toMatchObject({ ask: { id: "ask-1" }, ...(mode === "steer" ? { delivery: "steer" } : {}) });
+    expect(capture).toHaveBeenCalledTimes(mode === "follow-up" ? 1 : 0);
   });
 });

@@ -9,6 +9,7 @@ import type { RunUsageV1, UsageTotals } from "@/lib/domain/usage";
 import type { Skill } from "@/lib/domain/skills";
 import type { SiteNote } from "@/lib/domain/instructions";
 import type { MemoryChange } from "@/lib/domain/memory";
+import type { AskContextV1 } from "@/lib/domain/ask";
 
 export type ConversationItem =
   | {
@@ -25,6 +26,8 @@ export type ConversationItem =
        * message was accepted. Rendered on the message, so replay stays byte-identical.
        */
       sites?: SiteNote[];
+      /** What the user right-clicked ("Ask bside about…"), sent with this message; rendered on it on every replay. */
+      ask?: AskContextV1;
       /**
        * `"steer"`: guidance sent while the turn's run was working, persisted
        * where the model received it (after a tool round). It belongs to the
@@ -75,6 +78,8 @@ export interface QueuedMessage {
   text: string;
   /** The invoked skill, snapshotted when the message was accepted. */
   skill?: Skill;
+  /** The context-menu chip sent with the message, taken when it was accepted. */
+  ask?: AskContextV1;
   at: number;
 }
 

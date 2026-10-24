@@ -49,7 +49,7 @@ export const SETTINGS_PAGES: readonly SettingsPage[] = [
     label: "General",
     group: "Personal",
     icon: Settings,
-    keywords: ["Model", "Reasoning effort", "Thinking", "Provider", "OpenAI account", "Connection"],
+    keywords: ["Model", "Reasoning effort", "Thinking", "Provider", "OpenAI account", "Connection", "Keyboard", "Shortcuts", "New chat"],
     component: GeneralPage,
   },
   {

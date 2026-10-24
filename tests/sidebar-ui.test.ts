@@ -34,7 +34,7 @@ function snapshotFor(id: string): RuntimeSnapshot {
     credential: { configured: true, maskedSuffix: null, chatgpt: { connected: false, email: null, signInAgain: false } },
     provider: OPENAI_API_KEY_PROVIDER,
     settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
-    page: null, agentTabs: { bySession: {}, watching: null, takenOver: false }, queue: [], activeRun: null, lastSeq: 0, notice: null,
+    page: null, ask: null, agentTabs: { bySession: {}, watching: null, takenOver: false }, queue: [], activeRun: null, lastSeq: 0, notice: null,
   };
 }
 
@@ -205,7 +205,7 @@ describe("sidebar UI contracts", () => {
     const usage: RunUsageV1 = {
       version: 1, runId: "r1", billing: "api-key", modelId: "gpt-5.6-terra", responses: 1, input: 4_000, cacheRead: 8_100, cacheWrite: 200, output: 1_200, reasoning: 0, costUsd: 0.0123,
     };
-    await emit({ runId: "r1", type: "run.started", payload: { prompt: "Hello", page: null, retry: false } });
+    await emit({ runId: "r1", type: "run.started", payload: { prompt: "Hello", page: null, ask: null, retry: false } });
     await emit({ runId: "r1", type: "assistant.delta", payload: { delta: "Hi." } });
     await emit({ runId: "r1", type: "run.usage", payload: { usage } });
     expect(root.querySelector(".turn-usage")).toBeNull();
@@ -358,7 +358,7 @@ describe("sidebar UI contracts", () => {
       act(() => listeners.forEach((listener) => listener({ v: 1, conversationId, seq: 1, at: 1, ...event })));
     await emit({ runId: null, type: "state.snapshot", payload: snapshotFor("s1") });
 
-    await emit({ runId: "r1", type: "run.started", payload: { prompt: "Find it", page: null, retry: false } });
+    await emit({ runId: "r1", type: "run.started", payload: { prompt: "Find it", page: null, ask: null, retry: false } });
     await emit({ runId: "r1", type: "run.failed", payload: { code: "RATE_LIMIT", message: "Rate limited.", retryable: true, phase: "provider" } });
     expect(background!.lastError?.retryable).toBe(true);
 
@@ -366,7 +366,7 @@ describe("sidebar UI contracts", () => {
     expect(posted.at(-1)).toMatchObject({ v: 1, type: "run.retry" });
     expect(isSidebarCommand(posted.at(-1))).toBe(true);
 
-    await emit({ runId: "r2", type: "run.started", payload: { prompt: "Find it", page: null, retry: true } });
+    await emit({ runId: "r2", type: "run.started", payload: { prompt: "Find it", page: null, ask: null, retry: true } });
     expect(background!.conversation.items.filter((item) => item.kind === "message" && item.role === "user")).toHaveLength(1);
     expect(background!.activeRun?.runId).toBe("r2");
     expect(background!.lastError).toBeNull();
@@ -392,7 +392,7 @@ describe("sidebar UI contracts", () => {
       act(() => listeners.forEach((listener) => listener({ v: 1, seq: 1, at: 1, ...event })));
     await emit({ runId: null, conversationId: "open", type: "state.snapshot", payload: snapshotFor("open") });
 
-    await emit({ runId: "r1", conversationId: "other", type: "run.started", payload: { prompt: "Elsewhere", page: null, retry: false } });
+    await emit({ runId: "r1", conversationId: "other", type: "run.started", payload: { prompt: "Elsewhere", page: null, ask: null, retry: false } });
     await emit({ runId: "r1", conversationId: "other", type: "assistant.delta", payload: { delta: "Working" } });
     await emit({ runId: "r1", conversationId: "other", type: "tool.requested", payload: { call: { id: "c1", name: "browser_program", arguments: {} }, display: "" } });
     expect(background!.activeRun).toMatchObject({ runId: "r1", conversationId: "other" });
@@ -447,7 +447,7 @@ describe("sidebar UI contracts", () => {
     const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) =>
       act(() => listeners.forEach((listener) => listener({ v: 1, seq: 1, at: 1, ...event })));
     await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: snapshotFor("a") });
-    await emit({ runId: "r1", conversationId: "a", type: "run.started", payload: { prompt: "Find it", page: null, retry: false } });
+    await emit({ runId: "r1", conversationId: "a", type: "run.started", payload: { prompt: "Find it", page: null, ask: null, retry: false } });
     expect(composer.props).toMatchObject({ disabled: false, running: true, working: true, canSteer: true });
 
     await act(() => (composer.props!.onSteer as (text: string) => void)("Use tab 2"));
@@ -478,7 +478,7 @@ describe("sidebar UI contracts", () => {
     expect(posted.at(-1)).toMatchObject({ type: "queue.send", sessionId: "a", messageId: "q2" });
 
     // A run in another chat keeps this chat's composer disabled.
-    await emit({ runId: "r2", conversationId: "b", type: "run.started", payload: { prompt: "Elsewhere", page: null, retry: false } });
+    await emit({ runId: "r2", conversationId: "b", type: "run.started", payload: { prompt: "Elsewhere", page: null, ask: null, retry: false } });
     expect(composer.props).toMatchObject({ disabled: true, working: false, canSteer: false });
     render(null, root);
   });
@@ -886,7 +886,7 @@ describe("history drawer", () => {
 
   it("shows a help request as a card in the turn: reason as text, Show tab, Done, and Can't help with a note", async () => {
     const { posted, emit } = await mountApp();
-    await emit({ runId: "r1", conversationId: "a", type: "run.started", payload: { prompt: "Order my groceries", page: null, retry: false } });
+    await emit({ runId: "r1", conversationId: "a", type: "run.started", payload: { prompt: "Order my groceries", page: null, ask: null, retry: false } });
     const call = { id: "help-1", name: "request_user_help" as const, arguments: { tab: "/agent-tabs/6/page.md", kind: "login", reason: "Sign in to <b>Grocer</b> with your account." } };
     await emit({ runId: "r1", conversationId: "a", type: "help.requested", payload: { call, tabId: 6, kind: "login", reason: "Sign in to <b>Grocer</b> with your account." } });
 
@@ -920,7 +920,7 @@ describe("history drawer", () => {
 
   it("asks to approve a memory change on the program's own step under the Ask policy, showing the text as text", async () => {
     const { posted, emit } = await mountApp();
-    await emit({ runId: "r1", conversationId: "a", type: "run.started", payload: { prompt: "Remember my seat", page: null, retry: false } });
+    await emit({ runId: "r1", conversationId: "a", type: "run.started", payload: { prompt: "Remember my seat", page: null, ask: null, retry: false } });
     const call = { id: "p1", name: "browser_program" as const, arguments: { source: 'fs.write("/memory/seat.md", "Seat\\nWindow");' } };
     await emit({ runId: "r1", conversationId: "a", type: "tool.requested", payload: { call, display: "Browser program" } });
     const memory = { op: "write" as const, name: "seat", description: "Seat <b>pref</b>", body: "Window", replaces: false, tainted: true };
@@ -939,7 +939,7 @@ describe("history drawer", () => {
 
   it("shows a turn's memory changes with a taint badge, View, and Undo through a validated command", async () => {
     const { posted, emit } = await mountApp();
-    await emit({ runId: "r1", conversationId: "a", type: "run.started", payload: { prompt: "Remember my seat", page: null, retry: false } });
+    await emit({ runId: "r1", conversationId: "a", type: "run.started", payload: { prompt: "Remember my seat", page: null, ask: null, retry: false } });
     const call = { id: "p1", name: "browser_program" as const, arguments: { source: 'fs.write("/memory/seat.md", "Seat\nWindow");' } };
     await emit({ runId: "r1", conversationId: "a", type: "tool.requested", payload: { call, display: "Browser program" } });
     const memory = [{ id: "m1", op: "write" as const, name: "seat", tainted: true }, { id: "m2", op: "write" as const, name: "seat", tainted: true }];
@@ -993,5 +993,47 @@ describe("history drawer", () => {
     await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession, watching: 5, takenOver: true } });
     expect(root.querySelector(".agent-tab--watched small")?.textContent).toBe("You took over");
     expect(button("Take over")).toBeUndefined();
+  });
+});
+
+describe("entry-point drafts", () => {
+  it("prepares quick actions and at most three saved skills without sending, and sends a context chip by id", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    const listeners: Array<(message: unknown) => void> = [];
+    const post = vi.fn();
+    vi.spyOn(browser.runtime, "connect").mockReturnValue({
+      postMessage: post,
+      onMessage: { addListener: (listener: (message: unknown) => void) => listeners.push(listener), removeListener: () => {} },
+      disconnect: () => {},
+    } as never);
+    const root = document.createElement("div"); document.body.append(root);
+    await act(() => render(h(App, {}), root));
+    const snapshot = snapshotFor("a");
+    snapshot.page = { tabId: 1, artifactId: "page1", kind: "page", title: "Source", url: "https://example.com/", capturedAt: 1 };
+    snapshot.skills = [{ name: "youtube", description: "Packaged", builtin: true }, ...["one", "two", "three", "four"].map((name) => ({ name, description: name, builtin: false }))];
+    const emit = (type: string, payload: unknown) => act(() => listeners.forEach((listener) => listener({ v: 1, seq: 0, at: 1, runId: null, conversationId: "a", type, payload })));
+    await emit("state.snapshot", snapshot);
+    expect(root.querySelectorAll(".quick-actions button")).toHaveLength(3);
+    expect(root.querySelectorAll(".skill-chips button")).toHaveLength(3);
+    await act(() => (root.querySelector(".quick-actions button") as HTMLButtonElement).click());
+    expect(composer.props?.draft).toMatchObject({ text: "/summarize-page Summarize this page." });
+    expect(post).not.toHaveBeenCalledWith(expect.objectContaining({ type: "run.start" }));
+    await act(() => (root.querySelector(".skill-chips button") as HTMLButtonElement).click());
+    expect(composer.props?.draft).toMatchObject({ text: "/one " });
+    const ask = { version: 1, id: "ask-1", kind: "selection", tabId: 2, path: null, pageUrl: "https://source.example/", pageTitle: "Original source", text: "<img src=x onerror=alert(1)>", at: 1 };
+    await emit("ask.changed", { ask });
+    expect(root.querySelector(".ask-chip")!.textContent).toContain("Page context · untrusted");
+    expect(root.querySelector(".ask-chip img")).toBeNull();
+    expect(root.querySelector(".context-chip")!.textContent).toContain("Original source");
+    expect(composer.props?.askId).toBe("ask-1");
+    await emit("composer.focus", null);
+    expect(composer.props?.focusVersion).toBe(1);
+    await act(() => (composer.props!.onSend as (text: string) => void)("Explain"));
+    expect(post).toHaveBeenCalledWith(expect.objectContaining({ type: "run.start", prompt: "Explain", askId: "ask-1" }));
+    await act(() => root.querySelector<HTMLButtonElement>('[aria-label="Remove page context"]')!.click());
+    expect(post).toHaveBeenCalledWith(expect.objectContaining({ type: "ask.dismiss", askId: "ask-1" }));
+    await emit("ask.changed", { ask: null });
+    expect(root.querySelector(".ask-chip")).toBeNull();
+    render(null, root);
   });
 });

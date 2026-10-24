@@ -8,6 +8,7 @@ import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { BackgroundRuntime } from "@/lib/background/runtime";
 import { ApprovalBadge } from "@/lib/background/approval-badge";
 import { registerSiteRequestHeaders } from "@/lib/sites";
+import { registerEntryPoints, type EntryPointsApi } from "@/lib/background/context-menu";
 
 export default defineBackground({
   persistent: true,
@@ -22,6 +23,12 @@ export default defineBackground({
     sidebarHub.delegate = runtime;
 
     registerSiteRequestHeaders(browser);
+    registerEntryPoints(browser as unknown as EntryPointsApi, {
+      setAsk: (ask) => runtime.setAsk(ask),
+      updateAskAlt: (id, alt) => runtime.updateAskAlt(id, alt),
+      newChat: async () => { await runtime.handleCommand({ v: 1, id: crypto.randomUUID(), type: "session.create" }); },
+      focusComposer: () => sidebarHub.focusComposer(),
+    });
 
     browser.runtime.onConnect.addListener((port) => {
       if (port.name !== SIDEBAR_PORT_NAME) return;

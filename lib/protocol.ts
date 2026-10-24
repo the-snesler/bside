@@ -36,6 +36,7 @@ import { isMemoryDraft, isMemoryName, MEMORY_WRITE_POLICIES, type MemoryApproval
 import { isMcpToolName, MCP_TRUST_LEVELS, type McpApproval, type McpServerStatus, type McpTrust } from "@/lib/domain/mcp";
 import { isMcpServerId } from "@/lib/mcp/servers";
 import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction, validateElementTarget, validateHttpUrl } from "@/lib/validation";
+import type { AskContextV1 } from "@/lib/domain/ask";
 
 // ---------------------------------------------------------------------------
 // Content script <-> background: PageRequest / PageResponse (tabs.sendMessage)
@@ -45,7 +46,7 @@ import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction, validateElementT
 // `tabs.sendMessage(tabId, request, { frameId })`; a content script answers
 // only requests naming its own frame. Snapshot, find, search results, the
 // shield, capture-done, and fetch-pdf are top-frame requests (`frameId` 0); health,
-// outline, execute, table, and capture-prepare may go to any frame. A frame other
+// outline, execute, table, capture-prepare, and menu-target may go to any frame. A frame other
 // than the top renders its refs with the prefix the background names it by
 // (`refPrefix`, e.g. `f3:`); the top frame's prefix is empty.
 // ---------------------------------------------------------------------------
@@ -184,8 +185,22 @@ export interface PageFetchPdfRequest {
   credentials: "include" | "omit";
 }
 
+/**
+ * Describes the element a context-menu click targeted (`menus.onClicked`'s
+ * `targetElementId`, which only the clicked frame's document can resolve):
+ * for "Ask bside about this image", its alt text or accessible label.
+ */
+export interface PageMenuTargetRequest {
+  v: 1;
+  id: string;
+  type: "page.menu-target";
+  frameId: number;
+  tabId: number;
+  targetElementId: number;
+}
+
 export type PageRequest = PageHealthRequest | PageSnapshotRequest | PageFindRequest | PageOutlineRequest | PageSearchResultsRequest | PageExecuteRequest |
-  PageTableRequest | PageShieldRequest | PageCapturePrepareRequest | PageCaptureDoneRequest | PageFetchPdfRequest;
+  PageTableRequest | PageShieldRequest | PageCapturePrepareRequest | PageCaptureDoneRequest | PageFetchPdfRequest | PageMenuTargetRequest;
 
 export interface PageHealthResponse {
   v: 1;
@@ -278,6 +293,15 @@ export interface PageFetchPdfResponse {
   result: PdfFetchResult;
 }
 
+/** `alt`: untrusted page text, bounded by the background (`withAlt`); `null` when the element is gone or has none. */
+export interface PageMenuTargetResponse {
+  v: 1;
+  id: string;
+  ok: true;
+  type: "page.menu-target";
+  alt: string | null;
+}
+
 export interface PageErrorResponse {
   v: 1;
   id: string;
@@ -297,6 +321,7 @@ export type PageResponse =
   | PageCapturePrepareResponse
   | PageCaptureDoneResponse
   | PageFetchPdfResponse
+  | PageMenuTargetResponse
   | PageErrorResponse;
 
 export function isPageHealthRequest(value: unknown): value is PageHealthRequest {
@@ -375,6 +400,12 @@ export function isPageFetchPdfRequest(value: unknown): value is PageFetchPdfRequ
   const candidate = value as Record<string, unknown>;
   return candidate.frameId === 0 && isTabId(candidate.tabId) && validateHttpUrl(candidate.url) !== null &&
     (candidate.credentials === "include" || candidate.credentials === "omit");
+}
+
+export function isPageMenuTargetRequest(value: unknown): value is PageMenuTargetRequest {
+  if (!isEnvelope(value) || value.type !== "page.menu-target") return false;
+  const candidate = value as Record<string, unknown>;
+  return isFrameId(candidate.frameId) && isTabId(candidate.tabId) && Number.isSafeInteger(candidate.targetElementId) && (candidate.targetElementId as number) >= 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -536,13 +567,17 @@ export type SidebarCommand =
    * session, queues the prompt as a follow-up instead: it starts the next
    * turn once that run completes (not after a failure or cancellation).
    */
-  | { v: 1; id: string; type: "run.start"; prompt: string }
+  | { v: 1; id: string; type: "run.start"; prompt: string; askId?: string }
   /**
    * Guidance for the active run, delivered as a user message at its next tool
    * boundary, within the same turn and budgets. If `runId` is no longer
    * running (finished or cancelling), handled exactly like `run.start`.
+   * `askId` (on either) sends the pending context-menu chip with the message;
+   * a chip that is no longer pending refuses the send with a notice.
    */
-  | { v: 1; id: string; type: "run.steer"; runId: string; text: string }
+  | { v: 1; id: string; type: "run.steer"; runId: string; text: string; askId?: string }
+  /** Removes the pending "Ask bside about…" chip, if it is still the one named. */
+  | { v: 1; id: string; type: "ask.dismiss"; askId: string }
   /** Discards a queued follow-up, or a steer not yet delivered, from a session's queue. */
   | { v: 1; id: string; type: "queue.remove"; sessionId: string; messageId: string }
   /** Starts a run with a queued follow-up of the open session now; refused while any run is active. */
@@ -556,6 +591,9 @@ export type SidebarCommand =
   | { v: 1; id: string; type: "help.resolve"; runId: string; callId: string; outcome: HelpOutcome; note: string };
 
 export type HelpOutcome = "done" | "unable";
+
+const isAskId = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 64;
+const isOptionalAskId = (value: unknown) => value === undefined || isAskId(value);
 
 export interface ApprovalRequest {
   call: ToolCall;
@@ -594,6 +632,8 @@ export interface RuntimeSnapshot {
   agentTabs: AgentTabsState;
   /** The open session's queued follow-ups and undelivered steers, oldest first. */
   queue: QueuedMessage[];
+  /** The pending "Ask bside about…" chip from the page's context menu, shown beside the composer of any chat. */
+  ask: AskContextV1 | null;
   /** The single active run, which may belong to a session other than the open one. */
   activeRun: {
     runId: string;
@@ -639,7 +679,10 @@ export type SidebarEvent =
   | EventBase<"agent-tabs.changed", AgentTabsState>
   /** A session's queue after it changed; `conversationId` is that session. Not run-sequenced. */
   | EventBase<"queue.changed", { messages: QueuedMessage[] }>
-  | EventBase<"run.started", { prompt: string; page: PageArtifactSummary | null; retry: boolean }>
+  /** The pending context-menu chip changed: a new click, alt text the page reported, sent, or removed. Not run-sequenced. */
+  | EventBase<"ask.changed", { ask: AskContextV1 | null }>
+  | EventBase<"composer.focus", null>
+  | EventBase<"run.started", { prompt: string; page: PageArtifactSummary | null; ask: AskContextV1 | null; retry: boolean }>
   | EventBase<"assistant.delta", { delta: string }>
   | EventBase<"tool.requested", { call: ToolCall; display: string }>
   | EventBase<"action.approval-required", ApprovalRequest>
@@ -682,8 +725,9 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (candidate.type === "state.subscribe") {
     return candidate.lastSeq === null || typeof candidate.lastSeq === "number";
   }
-  if (candidate.type === "run.start") return typeof candidate.prompt === "string";
-  if (candidate.type === "run.steer") return typeof candidate.runId === "string" && typeof candidate.text === "string";
+  if (candidate.type === "run.start") return typeof candidate.prompt === "string" && isOptionalAskId(candidate.askId);
+  if (candidate.type === "run.steer") return typeof candidate.runId === "string" && typeof candidate.text === "string" && isOptionalAskId(candidate.askId);
+  if (candidate.type === "ask.dismiss") return isAskId(candidate.askId);
   if (candidate.type === "queue.remove" || candidate.type === "queue.send") {
     return isSessionId(candidate.sessionId) && typeof candidate.messageId === "string";
   }

@@ -11,6 +11,7 @@ import {
   isPageShieldRequest,
   isPageSnapshotRequest,
   isPageTableRequest,
+  isPageMenuTargetRequest,
 } from "@/lib/protocol";
 import type { ContentMessage, PageResponse } from "@/lib/protocol";
 import {
@@ -23,6 +24,7 @@ import {
   findInPage,
   measureForCapture,
   measureFrameForCapture,
+  describeMenuTarget,
   settleDom,
 } from "@/lib/tools/page-executor";
 import { createPageShield } from "@/lib/tools/page-shield";
@@ -91,6 +93,12 @@ export default defineContentScript({
       if ((message as { frameId?: unknown } | null)?.frameId !== ownFrameId) return undefined;
       if (isPageHealthRequest(message)) {
         return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.health", url: location.href });
+      }
+      if (isPageMenuTargetRequest(message)) {
+        const menus = Reflect.get(browser, "menus") as { getTargetElement(id: number): Element | undefined };
+        let element: Element | undefined;
+        try { element = menus.getTargetElement(message.targetElementId); } catch { /* Expired target. */ }
+        return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.menu-target", alt: describeMenuTarget(element) });
       }
       // Cross-origin frames are listed with Firefox's frame id, so the background can read them through their own instance.
       if (isPageSnapshotRequest(message)) {

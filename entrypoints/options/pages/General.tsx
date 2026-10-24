@@ -79,6 +79,13 @@ export function GeneralPage({ app }: SettingsPageProps) {
           </Card>
         )}
       </SettingsSection>
+      <SettingsSection label="Keyboard shortcuts">
+        <Card>
+          <Row title="Open or close bside" description="Alt+Shift+B on Windows and Linux; Control+Shift+B on macOS. Opening focuses the message box." />
+          <Row title="New chat" description="Assign a shortcut in Firefox: Add-ons and themes → gear menu → Manage Extension Shortcuts. You can also change or clear the sidebar shortcut there." />
+          <Row title="In the message box" description="Enter sends (or queues while working). Ctrl/⌘+Enter steers a running task. Shift+Enter adds a line." />
+        </Card>
+      </SettingsSection>
     </>
   );
 }

@@ -25,6 +25,9 @@ import { SiteNoteEditor } from "@/lib/ui/SiteNoteEditor";
 import { MemoryNotice } from "@/lib/ui/MemoryNotice";
 import { memoryUndoKey } from "@/lib/ui/use-background";
 import { PROMPT_MENTION_PATTERN } from "@/lib/domain/conversation";
+import { describeAsk } from "@/lib/domain/ask";
+import { QUICK_ACTIONS } from "@/lib/domain/quick-actions";
+import { AskChip } from "@/lib/ui/AskChip";
 
 function describeAttachment(page: PageArtifactSummary): string {
   let origin = page.url;
@@ -39,7 +42,7 @@ function describeAttachment(page: PageArtifactSummary): string {
 export function App() {
   const {
     conversation,
-    page,
+    page: activePage,
     activeRun,
     notice,
     lastError,
@@ -48,7 +51,7 @@ export function App() {
     settings,
     tabs,
     listTabs,
-    skills,
+    skills = [],
     listSkills,
     focusTab,
     agentTabs,
@@ -81,9 +84,18 @@ export function App() {
     closeSiteNote,
     memoryUndo,
     undoMemory,
+    ask,
+    dismissAsk,
+    focusVersion,
   } = useBackground();
+  const page = ask ? { tabId: ask.tabId, artifactId: `ask:${ask.id}`, kind: "page" as const, title: ask.pageTitle, url: ask.pageUrl, capturedAt: ask.at } : activePage;
   const scroll = useBottomScroll();
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [draft, setDraft] = useState<{ id: string; text: string } | null>(null);
+  useEffect(() => {
+    if (ask) setDraft({ id: ask.id, text: `Tell me about this ${ask.kind}.` });
+  }, [ask?.id]);
+  useEffect(() => { setHistoryOpen(false); }, [focusVersion]);
   const historyButton = useRef<HTMLButtonElement>(null);
   const closeHistory = () => {
     setHistoryOpen(false);
@@ -196,6 +208,14 @@ export function App() {
                     {page ? "I can read this tab and open my own in the background to get things done." : "I can open tabs of my own in the background to get things done."}
                     {" Your chats stay in this browser."}
                   </p>
+                  <div class="quick-actions" aria-label="Try a task">
+                    {QUICK_ACTIONS.map((action) => <button type="button" key={action.name} disabled={composerDisabled || !page || (pageOwner !== undefined && pageOwner !== conversation.id)}
+                      onClick={() => setDraft({ id: crypto.randomUUID(), text: action.prompt })}>{action.label}</button>)}
+                  </div>
+                  {skills.some((skill) => !skill.builtin) && <div class="skill-chips" aria-label="Saved skills">
+                    {skills.filter((skill) => !skill.builtin).slice(0, 3).map((skill) => <button type="button" key={skill.name} title={skill.description} disabled={composerDisabled}
+                      onClick={() => setDraft({ id: crypto.randomUUID(), text: `/${skill.name} ` })}>/{skill.name}</button>)}
+                  </div>}
                 </div>
               ) : (
                 <ul class="timeline">
@@ -237,6 +257,7 @@ export function App() {
                                 ),
                               )}
                             </p>
+                            {turn.prompt.ask && <AskChip ask={turn.prompt.ask} />}
                           </li>
                         )}
                         {(turn.steps.length > 0 || active) && (
@@ -330,6 +351,7 @@ export function App() {
                         {message.mode === "steer" ? "Steer" : "Queued"}
                       </span>
                       <span class="queue__text" title={text}>{text}</span>
+                      {message.ask && <span class="queue__label" title={describeAsk(message.ask).text}>{describeAsk(message.ask).label}</span>}
                       {message.mode === "follow-up" && activeRun === null && (
                         <button type="button" class="icon-button" aria-label="Send now" title="Send now" onClick={() => sendQueued(message.id)}>
                           <ArrowUp />
@@ -372,6 +394,7 @@ export function App() {
                 />
               )}
               {siteNote && <SiteNoteEditor state={siteNote} onSave={saveSiteNote} onClose={closeSiteNote} />}
+              {ask && <AskChip ask={ask} onRemove={() => dismissAsk(ask.id)} />}
               {page && pageOwner === conversation.id ? (
                 <div class="context-chip context-chip--agent" title={describeAttachment(page)}>
                   <Eye />
@@ -393,15 +416,19 @@ export function App() {
                 working={runHere}
                 canSteer={runHere && activeRun.status !== "cancelling"}
                 configured={credential.configured}
+                draft={draft}
+                focusVersion={focusVersion}
+                askId={ask?.id}
+                placeholder={ask ? describeAsk(ask).placeholder : undefined}
                 tabs={tabs}
                 skills={skills ?? []}
                 onListSkills={listSkills}
                 onListTabs={listTabs}
                 onSend={(text) => {
                   scroll.scrollToBottom();
-                  sendPrompt(text);
+                  sendPrompt(text, ask?.id);
                 }}
-                onSteer={steer}
+                onSteer={(text) => steer(text, ask?.id)}
                 onStop={cancelRun}
               />
             </div>

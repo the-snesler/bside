@@ -1982,3 +1982,8 @@ function documentRect(element: Element, top: Window | null): PageRect {
   }
   return { x: x + (top?.scrollX ?? 0), y: y + (top?.scrollY ?? 0), width: box.width, height: box.height };
 }
+/** Only descriptive image text from the exact context-menu target, never bytes or executable attributes. */
+export function describeMenuTarget(element: Element | undefined): string | null {
+  if (!element || element.localName !== "img") return null;
+  return (element.getAttribute("alt") || element.getAttribute("aria-label") || "").slice(0, 300) || null;
+}

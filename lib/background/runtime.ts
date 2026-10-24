@@ -12,8 +12,9 @@
  */
 
 import { AGENT_TOOL_NAMES, AgentLoop } from "@/lib/background/agent-loop";
-import { getSkills } from "@/lib/background/skills";
+import { getSkills, sidebarSkillCatalog } from "@/lib/background/skills";
 import { captureInvokedSkill } from "@/lib/background/skill-context";
+import { isAskContext, type AskContextV1 } from "@/lib/domain/ask";
 import { skillCatalog, type Skill, type SkillSummary } from "@/lib/domain/skills";
 import { readInstructions, saveSiteNoteFromSidebar } from "@/lib/background/instructions";
 import { readMemoryIndex, runMemory, undoMemoryChanges } from "@/lib/background/memory";
@@ -207,6 +208,40 @@ export class BackgroundRuntime {
   #shieldSent: { tabId: number; shield: PageShieldState } | null = null;
   /** Each session's message queue once loaded; this cache is authoritative and written through to storage. */
   #queues = new Map<string, QueuedMessage[]>();
+  /** The last menu gesture, held only in the background until sent or removed. */
+  #ask: AskContextV1 | null = null;
+
+  setAsk(ask: AskContextV1): void {
+    if (!isAskContext(ask) || ask.path !== null) return;
+    this.#ask = structuredClone(ask);
+    this.#sidebarHub.publishAsk(this.#ask);
+    this.#sidebarHub.focusComposer();
+  }
+
+  updateAskAlt(id: string, alt: string | null): void {
+    if (this.#ask?.id !== id || this.#ask.kind !== "image" || !alt) return;
+    const next = { ...this.#ask, alt };
+    if (!isAskContext(next)) return;
+    this.#ask = next;
+    this.#sidebarHub.publishAsk(next);
+  }
+
+  #consumeAsk(id: string | undefined, sessionId: string): AskContextV1 | undefined {
+    if (!id || this.#ask?.id !== id) return undefined;
+    const ask = this.#ask;
+    const owner = this.#workspace.agentTabs.get(ask.tabId)?.sessionId;
+    const path = owner && owner !== sessionId ? null : `/${owner ? "agent-tabs" : "tabs"}/${ask.tabId}/page.md`;
+    this.#ask = null;
+    this.#sidebarHub.publishAsk(null);
+    return { ...ask, path };
+  }
+
+  #askIsCurrent(id: string | undefined): boolean {
+    if (!id || this.#ask?.id === id) return true;
+    this.#notice = "That page context was replaced or removed. Review the current chip before sending again.";
+    void this.#sidebarHub.broadcastSnapshot();
+    return false;
+  }
 
   constructor(
     sidebarHub: SidebarHub,
@@ -578,10 +613,11 @@ export class BackgroundRuntime {
       credential: { ...credential, configured: credential.chatgpt.connected || credential.configured },
       provider,
       settings,
-      skills: skillCatalog(await getSkills()),
+      skills: sidebarSkillCatalog(await getSkills()),
       page: this.#sidebarHub.currentAttachment(),
       agentTabs: this.#agentTabsState,
       queue: [...await this.#queue(conversation.id)],
+      ask: this.#ask,
       activeRun: this.#activeRun
         ? {
             runId: this.#activeRun.runId,
@@ -603,7 +639,7 @@ export class BackgroundRuntime {
   handleCommand(command: SidebarCommand): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]>;
   async handleCommand(command: SidebarCommand): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]> {
     await this.#ready;
-    if (command.type === "skills.list") return { skills: skillCatalog(await getSkills()) };
+    if (command.type === "skills.list") return { skills: sidebarSkillCatalog(await getSkills()) };
     if (command.type === "tabs.list") {
       // As the open session's runs see them: other sessions' agent tabs are left out.
       const openId = await this.#openSession();
@@ -653,12 +689,24 @@ export class BackgroundRuntime {
       return;
     }
     if (command.type === "context.export") return this.#exportSession(command.sessionId);
+    if (command.type === "ask.dismiss") {
+      if (this.#ask?.id === command.askId) {
+        this.#ask = null;
+        this.#sidebarHub.publishAsk(null);
+      }
+      return;
+    }
+    if ((command.type === "run.start" || command.type === "run.steer") && command.askId && this.#ask?.id !== command.askId) {
+      this.#notice = "That page context was replaced or removed. Review the current chip before sending again.";
+      await this.#sidebarHub.broadcastSnapshot();
+      return;
+    }
     if (command.type === "run.start") {
-      await this.#submitPrompt(command.prompt);
+      await this.#submitPrompt(command.prompt, command.askId);
       return;
     }
     if (command.type === "run.steer") {
-      await this.#steer(command.runId, command.text);
+      await this.#steer(command.runId, command.text, command.askId);
       return;
     }
     if (command.type === "queue.remove") {
@@ -1033,18 +1081,20 @@ export class BackgroundRuntime {
   }
 
   /** `run.start`: while the open session's run is active, the prompt waits as a follow-up; otherwise a run starts with it. */
-  async #submitPrompt(rawPrompt: string): Promise<void> {
+  async #submitPrompt(rawPrompt: string, askId?: string): Promise<void> {
     const sessionId = await this.#openSession();
     const queue = await this.#queue(sessionId);
     const prompt = validatePromptText(rawPrompt);
-    if (!prompt || this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, rawPrompt);
+    if (!prompt || this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, rawPrompt, undefined, undefined, askId);
     if (await this.#queueFull(queue)) return;
     const skill = await this.#captureSkill(prompt);
     if (skill === null) return;
-    if (this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, prompt, undefined, { skill });
+    if (this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, prompt, undefined, { skill }, askId);
     const current = await this.#queue(sessionId);
     if (await this.#queueFull(current)) return;
-    await this.#setQueue(sessionId, [...current, { id: crypto.randomUUID(), mode: "follow-up", text: prompt, ...(skill ? { skill } : {}), at: Date.now() }]);
+    if (!this.#askIsCurrent(askId)) return;
+    const ask = this.#consumeAsk(askId, sessionId);
+    await this.#setQueue(sessionId, [...current, { id: crypto.randomUUID(), mode: "follow-up", text: prompt, ...(skill ? { skill } : {}), ...(ask ? { ask } : {}), at: Date.now() }]);
   }
 
   async #captureSkill(text: string): Promise<Skill | undefined | null> {
@@ -1057,20 +1107,22 @@ export class BackgroundRuntime {
   }
 
   /** `run.steer`: hands guidance to the active run's agent loop and shows it as pending until delivered. */
-  async #steer(runId: string, rawText: string): Promise<void> {
+  async #steer(runId: string, rawText: string, askId?: string): Promise<void> {
     const run = this.#activeRun;
-    if (!run || run.runId !== runId) return this.#submitPrompt(rawText);
+    if (!run || run.runId !== runId) return this.#submitPrompt(rawText, askId);
     const queue = await this.#queue(run.sessionId);
     const text = validatePromptText(rawText);
     // Re-checked after loading: once a run ends or is cancelling, a steer could never be delivered.
-    if (!text || this.#activeRun !== run || run.status === "cancelling") return this.#submitPrompt(rawText);
+    if (!text || this.#activeRun !== run || run.status === "cancelling") return this.#submitPrompt(rawText, askId);
     if (await this.#queueFull(queue)) return;
     const skill = await this.#captureSkill(text);
     if (skill === null) return;
-    if (this.#activeRun !== run || run.controller.signal.aborted) return this.#submitPrompt(rawText);
+    if (this.#activeRun !== run || run.controller.signal.aborted) return this.#submitPrompt(rawText, askId);
     const current = await this.#queue(run.sessionId);
     if (await this.#queueFull(current)) return;
-    const message: QueuedMessage = { id: crypto.randomUUID(), mode: "steer", text, ...(skill ? { skill } : {}), at: Date.now() };
+    if (!this.#askIsCurrent(askId)) return;
+    const ask = this.#consumeAsk(askId, run.sessionId);
+    const message: QueuedMessage = { id: crypto.randomUUID(), mode: "steer", text, ...(skill ? { skill } : {}), ...(ask ? { ask } : {}), at: Date.now() };
     run.agentLoop.steer(message);
     await this.#setQueue(run.sessionId, [...current, message]);
   }
@@ -1090,7 +1142,7 @@ export class BackgroundRuntime {
       await this.#sidebarHub.broadcastSnapshot();
       return;
     }
-    await this.#startRun(sessionId, message.text, message.id, { skill: message.skill });
+    await this.#startRun(sessionId, message.text, message.id, { skill: message.skill, ask: message.ask });
   }
 
   /**
@@ -1101,7 +1153,7 @@ export class BackgroundRuntime {
   async #dispatchFollowUp(sessionId: string): Promise<void> {
     if (this.#activeRun || this.#sessionOpsPending > 0) return;
     const next = (await this.#queue(sessionId)).find((message) => message.mode === "follow-up");
-    if (next) await this.#startRun(sessionId, next.text, next.id, { skill: next.skill });
+    if (next) await this.#startRun(sessionId, next.text, next.id, { skill: next.skill, ask: next.ask });
   }
 
   /**
@@ -1111,7 +1163,7 @@ export class BackgroundRuntime {
    * names the queued follow-up the prompt came from; its user message keeps
    * that id, and it leaves the queue once that message is written.
    */
-  async #startRun(sessionId: string, rawPrompt: string | null, queuedId?: string, accepted?: { skill?: Skill }): Promise<void> {
+  async #startRun(sessionId: string, rawPrompt: string | null, queuedId?: string, accepted?: { skill?: Skill; ask?: AskContextV1 }, askId?: string): Promise<void> {
     const retry = rawPrompt === null;
     if (this.#activeRun || this.#sessionOpsPending > 0 || (retry && this.#retryable?.sessionId !== sessionId)) {
       await this.#sidebarHub.broadcastSnapshot();
@@ -1160,6 +1212,7 @@ export class BackgroundRuntime {
     let catalog: SkillSummary[];
     // Like skills, the run uses the custom instructions, site notes, and memory index as they are now.
     let personal: Personalization;
+    let ask: AskContextV1 | undefined;
     try {
       // Memory the run cannot read is left out of its prompt rather than stopping it.
       // Likewise for connected accounts' tools: one that cannot be read is not offered.
@@ -1176,6 +1229,8 @@ export class BackgroundRuntime {
       conversation = await getConversation(sessionId);
       if (!conversation) throw new ProviderStreamError("This chat no longer exists.", "INVALID_REQUEST");
       if (retry && !conversation.items.some(isTurnStart)) throw new ProviderStreamError("There is no turn to retry.", "INVALID_REQUEST");
+      if (!this.#askIsCurrent(askId)) throw new ProviderStreamError(this.#notice!, "INVALID_REQUEST");
+      ask = retry ? conversation.items.findLast(isTurnStart)?.ask : accepted?.ask ?? this.#consumeAsk(askId, sessionId);
     } catch (error) {
       this.#activeRun = null;
       await this.#settleSteers(sessionId);
@@ -1195,8 +1250,11 @@ export class BackgroundRuntime {
 
     // The active tab is an agent tab while the user watches one. The run's
     // own is attached under /agent-tabs; another session's stays invisible to it.
-    const captureOutcome = await tabController.captureActivePage();
-    const captured = captureOutcome.ok ? captureOutcome.value : null;
+    const askOwner = ask ? this.#workspace.agentTabs.get(ask.tabId)?.sessionId : undefined;
+    const captureOutcome = ask
+      ? askOwner && askOwner !== sessionId ? null : await tabController.capturePage(ask.tabId)
+      : await tabController.captureActivePage();
+    const captured = captureOutcome?.ok ? captureOutcome.value : null;
     const capturedOwner = captured ? this.#workspace.agentTabs.get(captured.snapshot.tabId)?.sessionId : undefined;
     const artifact: ContextArtifact | null = captured && (capturedOwner === undefined || capturedOwner === sessionId)
       ? { ...captured.artifact, target: { kind: "tab", tabId: captured.snapshot.tabId, mount: capturedOwner ? "agent-tabs" : "tabs" }, snapshot: captured.snapshot }
@@ -1205,13 +1263,14 @@ export class BackgroundRuntime {
     let items = conversation.items;
     if (!retry) {
       // Notes for the attached page and mentioned tabs ride on the message as a snapshot, so replay never changes.
-      const sites = matchSiteNotes(personal.siteNotes, [...(artifact ? [artifact.url] : []), ...[...prompt!.matchAll(PROMPT_MENTION_PATTERN)].map((match) => match[4]!)]);
+      const sites = matchSiteNotes(personal.siteNotes, [...(artifact ? [artifact.url] : []), ...(ask ? [ask.pageUrl] : []), ...[...prompt!.matchAll(PROMPT_MENTION_PATTERN)].map((match) => match[4]!)]);
       const item: UserMessageItem = {
         id: queuedId ?? crypto.randomUUID(),
         kind: "message",
         role: "user",
         text: prompt!,
         skill,
+        ...(ask ? { ask } : {}),
         ...(sites.length ? { sites } : {}),
         context: artifact ? { artifactId: artifact.artifactId, kind: "page", title: artifact.title, url: artifact.url, capturedAt: artifact.capturedAt } : null,
         at: Date.now(),
@@ -1224,7 +1283,7 @@ export class BackgroundRuntime {
     const userItem = items[userIndex] as UserMessageItem;
     this.#retryable = null;
 
-    this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt: userItem.text, page: userItem.context, retry });
+    this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt: userItem.text, page: userItem.context, ask: userItem.ask ?? null, retry });
     await this.#writeCheckpoint(run, "running", "");
 
     // Pi owns assistant/tool replay during this run. Persisted tool items are

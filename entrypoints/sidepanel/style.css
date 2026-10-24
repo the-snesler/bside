@@ -75,7 +75,7 @@ select:disabled {
   flex-direction: column;
   align-items: center;
   gap: 6px;
-  margin: 22vh 12px 0;
+  margin: clamp(24px, 10vh, 80px) 12px 0;
   text-align: center;
 }
 .sidebar__empty h2 {
@@ -91,6 +91,42 @@ select:disabled {
   font-size: 13px;
   line-height: 1.55;
 }
+.quick-actions {
+  display: grid;
+  gap: 7px;
+  width: 100%;
+  max-width: 270px;
+  margin-top: 18px;
+}
+.quick-actions button, .skill-chips button {
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 10px 12px;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.quick-actions button:hover, .skill-chips button:hover { background: var(--surface-hover); }
+.quick-actions button:disabled, .skill-chips button:disabled { opacity: 0.5; cursor: default; }
+.skill-chips { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin-top: 7px; }
+.skill-chips button { font-size: 11px; padding: 5px 8px; max-width: 100%; }
+.ask-chip {
+  margin: 8px 10px;
+  padding: 8px 10px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  font-size: 12px;
+}
+.ask-chip__heading { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.ask-chip__heading small, .ask-chip > small { color: var(--text-muted); font-size: 10px; }
+.ask-chip__heading .icon-button { margin-left: auto; width: 24px; height: 24px; }
+.ask-chip p { margin: 4px 0 0; overflow-wrap: anywhere; white-space: pre-wrap; max-height: 4.5em; overflow: auto; }
+.timeline .ask-chip { margin: 8px 0 0; }
 .timeline {
   list-style: none;
   margin: 0;

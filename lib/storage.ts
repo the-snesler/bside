@@ -12,6 +12,7 @@
 
 import { storage } from "wxt/utils/storage";
 import { isSkill } from "@/lib/domain/skills";
+import { isAskContext } from "@/lib/domain/ask";
 import { isCustomInstructionsText, isSiteNote, MAX_SITE_NOTES, type CustomInstructionsV1, type SiteNote, type SiteNotesV1 } from "@/lib/domain/instructions";
 import { DEFAULT_MCP_SERVER_STATE, isMcpServerState, type McpServerStateV1 } from "@/lib/domain/mcp";
 import { DEFAULT_MEMORY_SETTINGS, isMemoryChange, isMemoryEntry, MAX_MEMORIES, MEMORY_WRITE_POLICIES, type MemoryEntry, type MemoryEntryV1, type MemorySettingsV1 } from "@/lib/domain/memory";
@@ -146,7 +147,7 @@ function isValidConversationItem(value: unknown): value is ConversationItem {
   if (v.kind === "message") {
     if (typeof v.text !== "string") return false;
     if (v.role === "user") return (v.context === null || typeof v.context === "object") && (v.delivery === undefined || v.delivery === "steer") && (v.skill === undefined || isSkill(v.skill)) &&
-      (v.sites === undefined || (Array.isArray(v.sites) && v.sites.length <= MAX_SITE_NOTES && v.sites.every(isSiteNote)));
+      (v.sites === undefined || (Array.isArray(v.sites) && v.sites.length <= MAX_SITE_NOTES && v.sites.every(isSiteNote))) && (v.ask === undefined || isAskContext(v.ask));
     return v.role === "assistant";
   }
   if (v.kind === "tool-call") return typeof v.call === "object" && v.call !== null;
@@ -1019,7 +1020,8 @@ function isValidQueuedMessage(value: unknown): value is QueuedMessage {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
   return typeof v.id === "string" && v.id.length > 0 && v.id.length <= 64 && (v.mode === "follow-up" || v.mode === "steer") &&
-    typeof v.text === "string" && validatePromptText(v.text) === v.text && Number.isFinite(v.at) && (v.skill === undefined || isSkill(v.skill));
+    typeof v.text === "string" && validatePromptText(v.text) === v.text && Number.isFinite(v.at) && (v.skill === undefined || isSkill(v.skill)) &&
+    (v.ask === undefined || isAskContext(v.ask));
 }
 
 /** A session's queued messages, oldest first. A malformed record is deleted and reads as empty. */

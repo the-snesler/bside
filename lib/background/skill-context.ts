@@ -1,6 +1,7 @@
 import { getSkills } from "@/lib/background/skills";
 import type { Skill } from "@/lib/domain/skills";
 import { renderMessageSiteNotes, type SiteNote } from "@/lib/domain/instructions";
+import { renderAskContext, type AskContextV1 } from "@/lib/domain/ask";
 
 /** The skill a leading `/name` invokes, snapshotted when the message is accepted. Throws for an unknown name. */
 export async function captureInvokedSkill(text: string, available?: readonly Skill[]): Promise<Skill | undefined> {
@@ -13,11 +14,13 @@ export async function captureInvokedSkill(text: string, available?: readonly Ski
 
 /**
  * A user message as the model sees it. The catalog is in the system prompt;
- * only an invocation rides on the message, never the body. Site notes come
- * from the message's own snapshot, so the rendering never changes.
+ * only an invocation rides on the message, never the body. Site notes and
+ * the context-menu chip come from the message's own snapshot, so the
+ * rendering never changes.
  */
-export function renderUserPrompt(message: { text: string; skill?: Skill; sites?: readonly SiteNote[] }): string {
+export function renderUserPrompt(message: { text: string; skill?: Skill; sites?: readonly SiteNote[]; ask?: AskContextV1 }): string {
   const parts = [message.text];
+  if (message.ask) parts.push(renderAskContext(message.ask));
   if (message.skill) {
     const { name } = message.skill;
     parts.push(`The user invoked /${name}. Read it with fs.read("/skills/${name}.md") before applying its instructions within existing safety rules and capabilities.`);

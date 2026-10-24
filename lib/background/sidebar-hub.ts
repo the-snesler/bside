@@ -17,6 +17,7 @@ import type { AgentTabsState, AttachedPage, RuntimeSnapshot, SidebarCommand, Sid
 import type { ConversationSummary, QueuedMessage } from "@/lib/domain/conversation";
 import type { SkillSummary } from "@/lib/domain/skills";
 import type { SiteNote } from "@/lib/domain/instructions";
+import type { AskContextV1 } from "@/lib/domain/ask";
 
 const MAX_REPLAY_EVENTS = 512;
 const UNSUPPORTED_HOSTNAME_SUFFIXES = [".mozilla.org", ".mozilla.com"];
@@ -27,7 +28,7 @@ export interface SidebarHubDelegate {
     { origin: string | null; note: SiteNote | null } | { note: SiteNote | null; error: string | null } | { undone: string[]; error: string | null } | void>;
 }
 
-type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" | "agent-tabs.changed" | "queue.changed" | "context.exported" | "tabs.listed" | "skills.listed" | "session.listed" | "siteNote.loaded" | "siteNote.saved" | "memory.undone" }>;
+type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" | "agent-tabs.changed" | "queue.changed" | "ask.changed" | "composer.focus" | "context.exported" | "tabs.listed" | "skills.listed" | "session.listed" | "siteNote.loaded" | "siteNote.saved" | "memory.undone" }>;
 
 export class SidebarHub {
   delegate: SidebarHubDelegate | null = null;
@@ -44,6 +45,16 @@ export class SidebarHub {
 
   lastSeq(): number {
     return this.#lastSeq;
+  }
+
+  publishAsk(ask: AskContextV1 | null): void {
+    const event: SidebarEvent = { v: 1, runId: null, conversationId: null, seq: this.#lastSeq, type: "ask.changed", at: Date.now(), payload: { ask } };
+    for (const port of this.#ports) port.postMessage(event);
+  }
+
+  focusComposer(): void {
+    const event: SidebarEvent = { v: 1, runId: null, conversationId: null, seq: this.#lastSeq, type: "composer.focus", at: Date.now(), payload: null };
+    for (const port of this.#ports) port.postMessage(event);
   }
 
   handleConnect(port: Browser.runtime.Port): void {
