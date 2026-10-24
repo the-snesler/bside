@@ -146,6 +146,12 @@ describe("context controls", () => {
     expect(latestRun).toContain('"status": "completed"');
     expect(latestRun).toContain('"providerResponses": 2');
     expect(latestRun).toContain('"name": "browser_program"');
+    const report = await runtime.handleProblemReportRequest({ v: 1, id: "report", type: "problemReport.export", sessionId: (await getOpenSessionId())! });
+    expect(report.ok && report.type === "problemReport.export").toBe(true);
+    if (report.ok && report.type === "problemReport.export") {
+      expect(JSON.parse(report.json).latestRun).toMatchObject({ providerResponses: 2, toolCalls: [{ ok: true }] });
+      for (const value of ["Orchid", "Read the fixture", "agent-page.html", "doc-1", "browser_program", "sk-test"]) expect(report.json).not.toContain(value);
+    }
     const persisted = (await openConversation()).items;
     expect(JSON.stringify(persisted.filter((item) => item.kind !== "run-digest"))).not.toContain("Orchid launch moved to Friday.");
     const digest = persisted.find((item) => item.kind === "run-digest");
@@ -2405,12 +2411,19 @@ describe("BackgroundRuntime: sessions", () => {
   });
 
   it("New chat leaves the previous chat's run diagnostics in its export and starts without them", async () => {
-    const { send } = await setup(["Noted."]);
+    const { runtime, send } = await setup(["Noted."]);
     await send({ type: "run.start", prompt: "Remember this" });
     const previous = (await getOpenSessionId())!;
     await send({ type: "session.create" });
     expect((await send({ type: "context.export", sessionId: (await getOpenSessionId())! }) as { markdown: string }).markdown).toContain("No run recorded");
     expect((await send({ type: "context.export", sessionId: previous }) as { markdown: string }).markdown).toContain('"providerResponses"');
+    const reportOf = async (sessionId: string) => {
+      const response = await runtime.handleProblemReportRequest({ v: 1, id: "report", type: "problemReport.export", sessionId });
+      return response.ok && response.type === "problemReport.export" ? JSON.parse(response.json) : null;
+    };
+    expect((await reportOf(previous)).latestRun.providerResponses).toBe(1);
+    expect((await reportOf((await getOpenSessionId())!)).latestRun).toBeNull();
+    expect(await reportOf("missing")).toBeNull();
   });
 
   it("opens another session, deleting the empty one it leaves, and reopens the last session after a restart", async () => {

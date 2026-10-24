@@ -5,6 +5,8 @@ import type {
   CredentialResponse,
   HistoryRequest,
   HistoryResponse,
+  ProblemReportRequest,
+  ProblemReportResponse,
   InstructionsRequest,
   InstructionsResponse,
   McpRequest,
@@ -36,6 +38,7 @@ async function send<Request, Response>(request: RequestBody<Request>): Promise<R
 export const sendCredentialRequest = (request: RequestBody<CredentialRequest>) => send<CredentialRequest, CredentialResponse>(request);
 export const sendSettingsRequest = (request: RequestBody<SettingsRequest>) => send<SettingsRequest, SettingsResponse>(request);
 export const sendHistoryRequest = (request: RequestBody<HistoryRequest>) => send<HistoryRequest, HistoryResponse>(request);
+export const sendProblemReportRequest = (request: RequestBody<ProblemReportRequest>) => send<ProblemReportRequest, ProblemReportResponse>(request);
 export const sendSkillsRequest = (request: RequestBody<SkillsRequest>) => send<SkillsRequest, SkillsResponse>(request);
 export const sendInstructionsRequest = (request: RequestBody<InstructionsRequest>) => send<InstructionsRequest, InstructionsResponse>(request);
 export const sendSiteNotesRequest = (request: RequestBody<SiteNotesRequest>) => send<SiteNotesRequest, SiteNotesResponse>(request);

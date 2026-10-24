@@ -11,6 +11,8 @@ import { registerSiteRequestHeaders } from "@/lib/sites";
 import { registerEntryPoints, type EntryPointsApi } from "@/lib/background/context-menu";
 import { isAutomationRequest, type AutomationResponse } from "@/lib/protocol";
 import { RunNotifications } from "@/lib/background/notifications";
+import { isOptionsSender, isProblemReportRequest } from "@/lib/protocol";
+import type { ProblemReportResponse } from "@/lib/protocol";
 
 export default defineBackground({
   persistent: true,
@@ -86,9 +88,9 @@ export default defineBackground({
     // the sender's.
     const optionsUrl = browser.runtime.getURL("/options.html");
     browser.runtime.onMessage.addListener((message: unknown, sender):
-      Promise<CredentialResponse | SettingsResponse | HistoryResponse | SkillsResponse | InstructionsResponse | SiteNotesResponse | MemoryResponse | McpResponse | ContentMessageResponse | AutomationResponse> | undefined => {
+      Promise<CredentialResponse | SettingsResponse | HistoryResponse | SkillsResponse | InstructionsResponse | SiteNotesResponse | MemoryResponse | McpResponse | ContentMessageResponse | AutomationResponse | ProblemReportResponse> | undefined => {
       if (sender.id !== browser.runtime.id) return undefined;
-      if (sender.url?.replace(/#.*$/s, "") !== optionsUrl) {
+      if (!isOptionsSender(sender, browser.runtime.id, optionsUrl)) {
         const tabId = contentMessageTab(sender, browser.runtime.id);
         if (tabId === null || !isContentMessage(message)) return undefined;
         return runtime.handleContentMessage(tabId, message);
@@ -97,6 +99,7 @@ export default defineBackground({
       if (isAutomationRequest(message)) return runtime.handleAutomationRequest(message);
       if (isSettingsRequest(message)) return runtime.handleSettingsRequest(message);
       if (isHistoryRequest(message)) return runtime.handleHistoryRequest(message);
+      if (isProblemReportRequest(message)) return runtime.handleProblemReportRequest(message);
       if (isInstructionsRequest(message)) return handleInstructionsRequest(message);
       if (isSiteNotesRequest(message)) return handleSiteNotesRequest(message);
       if (isMemoryRequest(message)) return handleMemoryRequest(message);

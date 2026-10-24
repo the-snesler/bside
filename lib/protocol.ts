@@ -911,6 +911,30 @@ export type HistoryResponse =
   | { v: 1; id: string; ok: true; settings: HistorySettingsV1; sessionCount: number; notice: string | null }
   | { v: 1; id: string; ok: false; error: NormalizedError };
 
+/** Options-only, local, metadata-only diagnostics. Deliberately no include-content switch. */
+export type ProblemReportRequest =
+  | { v: 1; id: string; type: "problemReport.list" }
+  | { v: 1; id: string; type: "problemReport.export"; sessionId: string };
+
+export type ProblemReportResponse =
+  | { v: 1; id: string; ok: true; type: "problemReport.list"; sessions: { id: string; title: string }[] }
+  | { v: 1; id: string; ok: true; type: "problemReport.export"; json: string; filename: string }
+  | { v: 1; id: string; ok: false; error: NormalizedError };
+
+export function isProblemReportRequest(value: unknown): value is ProblemReportRequest {
+  if (!isEnvelope(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  const keys = candidate.type === "problemReport.list" ? ["v", "id", "type"] : ["v", "id", "type", "sessionId"];
+  if (Object.keys(candidate).some((key) => !keys.includes(key))) return false;
+  return candidate.type === "problemReport.list" ||
+    (candidate.type === "problemReport.export" && isSessionId(candidate.sessionId));
+}
+
+/** Options routes may contain a hash, but never a query or a different page. */
+export function isOptionsSender(sender: { id?: string; url?: string }, extensionId: string, optionsUrl: string): boolean {
+  return sender.id === extensionId && sender.url?.replace(/#.*$/s, "") === optionsUrl;
+}
+
 export function isHistoryRequest(value: unknown): value is HistoryRequest {
   if (!isEnvelope(value)) return false;
   const candidate = value as Record<string, unknown>;

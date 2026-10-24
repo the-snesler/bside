@@ -4,6 +4,7 @@ import type { HistoryRequest } from "@/lib/protocol";
 import { Card, Feedback, Row, Select, SettingsSection } from "@/lib/ui/settings/primitives";
 import { BACKGROUND_FAILURE, sendHistoryRequest, type RequestBody } from "@/lib/ui/settings/requests";
 import { useRefreshOnFocus } from "../state";
+import { ProblemReport } from "@/lib/ui/settings/ProblemReport";
 
 const RETENTION_LABELS: Record<HistoryRetention, string> = { forever: "Forever", "30d": "30 days", "7d": "7 days" };
 
@@ -90,6 +91,7 @@ export function HistoryPage() {
           />
         </Card>
       </SettingsSection>
+      <ProblemReport />
     </>
   );
 }

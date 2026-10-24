@@ -76,6 +76,7 @@ import type { ContextArtifact } from "@/lib/domain/tools";
 import type { Conversation, ConversationItem, ConversationSummary, QueuedMessage, UserMessageItem } from "@/lib/domain/conversation";
 import { isTurnStart, MAX_QUEUED_MESSAGES, PROMPT_MENTION_PATTERN, retentionCutoff } from "@/lib/domain/conversation";
 import { buildRunDigest } from "@/lib/domain/run-digest";
+import { buildProblemReport } from "@/lib/domain/problem-report";
 import { hasTokens, newRunUsage, type RunUsageV1 } from "@/lib/domain/usage";
 import type { AppSettingsV1, ModelDefinition, ProviderAdapter, ProviderAuth, ProviderDefinition } from "@/lib/domain/provider";
 import type {
@@ -92,6 +93,8 @@ import type {
   HelpRequest,
   HistoryRequest,
   HistoryResponse,
+  ProblemReportRequest,
+  ProblemReportResponse,
   NormalizedError,
   PageShieldState,
   RuntimeSnapshot,
@@ -1006,6 +1009,25 @@ export class BackgroundRuntime {
       return { v: 1, id: request.id, ok: true, ...await this.#getCredentialStatus(), notice };
     } catch (error) {
       return { v: 1, id: request.id, ok: false, error: toNormalizedError(error, "setup") };
+    }
+  }
+
+  /** Options-only local report. The latest diagnostics belong to exactly one chat. */
+  async handleProblemReportRequest(request: ProblemReportRequest): Promise<ProblemReportResponse> {
+    await this.#ready;
+    try {
+      if (request.type === "problemReport.list") {
+        return { v: 1, id: request.id, ok: true, type: request.type,
+          sessions: (await listSessions()).map(({ id, title }) => ({ id, title })) };
+      }
+      const conversation = await getConversation(request.sessionId);
+      if (!conversation) throw new Error("missing session");
+      return { v: 1, id: request.id, ok: true, type: request.type,
+        filename: "bside-problem-report.json",
+        json: buildProblemReport(conversation, this.#debugSessionId === request.sessionId ? this.#runRecord : null, extensionVersion()) };
+    } catch {
+      return { v: 1, id: request.id, ok: false, error: { code: "INVALID_REQUEST", phase: "persistence", retryable: false,
+        message: "Could not build this report. The chat may have been deleted; refresh and try again." } };
     }
   }
 
