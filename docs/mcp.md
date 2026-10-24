@@ -1,6 +1,8 @@
 # MCP connections
 
-bside connects to a small, reviewed set of remote MCP servers so the agent can work in the user's accounts outside the browser (notes, tasks). This note is the design. `AGENTS.md` holds the invariants that come out of it.
+bside connects to a small, reviewed set of remote MCP servers so the agent can work in the user's accounts outside the browser (notes, tasks). This note is the design as shipped. `AGENTS.md` holds the invariants that come out of it.
+
+Code map: `lib/mcp/servers.ts` (directory), `egress.ts` (fetch wrapper), `client.ts` (transport), `auth.ts` (OAuth), `tools.ts` (catalog, definitions, result wrapper), `errors.ts`; `lib/domain/mcp.ts` (limits, saved state, approval shape); `lib/background/mcp.ts` (connection manager and options requests); the agent loop's `#callMcp`; `entrypoints/options/pages/Connections.tsx`.
 
 ## Directory
 
@@ -53,13 +55,13 @@ The flow follows the MCP authorization spec (OAuth 2.1):
 
 1. **Protected-resource metadata.** Read from `/.well-known/oauth-protected-resource/<path>`, falling back to the root form. `resource` must equal the entry's `endpoint`, and `authorization_servers` must include the pinned `issuer`.
 2. **Authorization-server metadata.** Read from `/.well-known/oauth-authorization-server`, falling back to `openid-configuration`. The `issuer` must match exactly, and S256 must be supported.
-3. **Dynamic client registration.** bside registers as `client_name: "bside"` with `token_endpoint_auth_method: "none"`, the loopback redirect URI, and the `authorization_code` and `refresh_token` grants. If the server issues a client secret anyway, it is kept and sent as `client_secret_post`. The registration is reused on reconnect and redone once if the token endpoint answers `invalid_client`.
+3. **Dynamic client registration.** bside registers as `client_name: "bside"` with `token_endpoint_auth_method: "none"`, the loopback redirect URI, and the `authorization_code` and `refresh_token` grants. If the server issues a client secret anyway, it is kept and sent as `client_secret_post`. The registration is reused on reconnect while its redirect URI and issuer still match. If a reused registration is refused (`invalid_client` or `unauthorized_client` in the callback, or `invalid_client` from the token endpoint), it is deleted and the sign-in runs once more with a fresh registration. A refresh refused with `invalid_client` deletes the registration too.
 4. **Authorization code with PKCE.** The request carries S256, `state`, and RFC 8707 `resource=<endpoint>`. Scopes are the resource metadata's `scopes_supported`. The callback is checked for exact path, `state`, and `iss` (when the server sends it).
-5. **Token exchange and refresh.** These also carry `resource`. A token within 60 s of expiry is refreshed before use (single-flight). A `401` from the MCP server triggers one refresh and one retry. If the refresh fails, the server is marked *needs re-auth*, and its tokens are deleted.
+5. **Token exchange and refresh.** These also carry `resource`. A token within 60 s of expiry is refreshed before use (single-flight: concurrent callers share one request, and a caller's cancellation does not cancel it for the others). A `401` from the MCP server triggers one refresh and one retry. If the server refuses the refresh (400/401), or there is no refresh token, the tokens are deleted and the server is marked *needs re-auth*. A network failure or 5xx leaves the tokens in place. A token response without `expires_in` is used until a `401`; one without a new `refresh_token` keeps the old one.
 
 The redirect URI is `http://127.0.0.1/mozoauth2/<addon-subdomain>/mcp/<id>`. bside never listens on it. The shared OAuth popup helper, `lib/background/oauth-popup.ts`, opens an `about:blank` popup. It registers a blocking `webRequest.onBeforeRequest` listener, filtered to that popup tab, for the callback path, then navigates the popup to the authorization URL. When the callback arrives, it captures and cancels it. This is the technique ChatGPT sign-in used, generalized: ChatGPT now calls the same helper with its own redirect URI and label.
 
-Tokens and the client registration are sealed with the device key, under contexts `bside:mcp-credential:<id>:v1` and `bside:mcp-registration:<id>:v1`. Like the ChatGPT credential, a record the key cannot open is deleted and reads as disconnected. Disconnect revokes the refresh token (and the access token) at `revocation_endpoint` when there is one, deletes the tokens locally whatever the result, and says so if revocation was not confirmed. Credentials never leave the background: options pages see status only.
+Tokens and the client registration are sealed with the device key (`getMcpSecret`/`saveMcpSecret` in `lib/storage.ts`), under contexts `bside:mcp-credential:<id>:v1` and `bside:mcp-registration:<id>:v1`, so a record copied to another server or kind cannot be opened. Like the ChatGPT credential, a record the key cannot open is deleted and reads as disconnected. The sealed credential also keeps the token and revocation endpoints, so refresh and revocation need no rediscovery; they are checked against the entry's origins again on every read. Disconnect revokes the refresh token (and the access token) at `revocation_endpoint` when there is one, deletes the tokens locally whatever the result, and says so on the Connections page if revocation was not confirmed or the server has no revocation endpoint. The registration, the tool choices, and the trust level are kept; the saved tool list is cleared. Credentials never leave the background: options pages see status only.
 
 ## Tool exposure and prompt cache
 
@@ -73,7 +75,7 @@ Bounds:
 
 The tools are sent non-strict (`constrainedSampling: false`). Strict mode would turn optional parameters into required nullable ones, which MCP servers do not expect.
 
-**Cache impact.** Tool definitions are part of the cacheable prefix, together with the system prompt (fixed policy, custom instructions, skill catalog). The run snapshots the connected servers' enabled tools when it starts, with descriptions and schemas from the catalog saved at connect time. The definitions therefore change only when the user connects, disconnects, refreshes a server's tools, toggles a tool, or changes a trust level. A run never changes them, and different conversations share them. When MCP tools are present, the system prompt gets one more fixed paragraph about connected accounts. It appears and disappears with those same events.
+**Cache impact.** Tool definitions are part of the cacheable prefix, together with the system prompt (fixed policy, the connected-accounts paragraph, custom instructions, skill catalog). The run snapshots the connected servers' enabled tools when it starts, with descriptions and schemas from the catalog saved at connect time. The definitions therefore change only when the user connects, disconnects, refreshes a server's tools, toggles a tool, or changes a trust level. A run never changes them, and different conversations share them. When MCP tools are present, the system prompt gets one more fixed paragraph about connected accounts, right after the policy (`MCP_POLICY` in `agent-loop.ts`). It appears and disappears with those same events. A tool gated by "Always confirm writes" carries one more fixed sentence in its description, so changing a trust level changes that server's write tools' definitions.
 
 **Tool search.** Pi 1.3's `supportsToolSearch` only re-encodes tools added mid-conversation as a client-executed `tool_search_call` pair. It is not a deferred catalog the model can search, and using it would mean writing our own search tool and its round-trips. bside instead caps the count (above) and keeps the catalog in the prefix. This should be revisited if the directory grows.
 
@@ -83,14 +85,14 @@ The tools are sent non-strict (`constrainedSampling: false`). Strict mode would 
 - **The model's confirmation policy** covers MCP: creating, changing, deleting, sharing, or sending through a connected account is externally visible, and the fixed policy says so.
 - **Per-server trust level** is a user policy, not runtime classification. It works like the memory Ask policy:
   - `confirm-writes` (the default) gates every call to a tool whose annotations do not say `readOnlyHint: true`. The gate is the existing confirmation card (`ApprovalRequest.mcp`: server, tool, destructive flag, bounded arguments), with the same `!` badge, pause, and budget exemption. A denial fails the call, so the round's later calls are `SKIPPED`. Gated tools say so in their description, and the policy tells the model not to call `request_action_confirmation` for those calls as well.
-  - `model` leaves confirmation to the model's policy alone.
+  - `model` ("Let bside decide") leaves confirmation to the model's policy alone.
 
   Annotations are hints from the server. They decide only what this user gate covers. A server lying about `readOnlyHint` gets its call through without the gate, but still under the model's policy. This is why the directory is curated.
 
 ## Effects, retry, digest, export
 
-- **Committed effects.** A call to a tool without `readOnlyHint: true` counts as a committed effect once it was sent, unless the server rejected it with a JSON-RPC error (the request never ran). A success, an `isError` result (the tool ran and may have done part of its work), and a network failure or timeout after sending all count. This blocks `run.retry` the way a page effect does. The persisted tool-call item records `mcp: {server, tool, readOnly}`. After an interrupted run, any started non-read-only MCP call counts as possibly committed.
-- **Persistence.** As with `browser_program`, the persisted `tool-result` holds a short status only (`Notion: notion-search completed.`, or a bounded safe failure). The full result reaches the model and the debug export's tool output, never session storage. Persisted call arguments are cut to 8,000 characters.
+- **Committed effects.** A call to a tool without `readOnlyHint: true` counts as a committed effect once it was sent, unless the server never ran it: a JSON-RPC error, or a sign-in failure (not connected, refused token, egress refusal). A success, an `isError` result (the tool ran and may have done part of its work), and a network failure, server error, timeout, or cancellation after sending all count, and the model is told the call may have run. This blocks `run.retry` the way a page effect does. The persisted tool-call item records `mcp: {server, tool, readOnly}`. After an interrupted run, any started non-read-only MCP call counts as possibly committed.
+- **Persistence.** As with `browser_program`, the persisted `tool-result` holds a short status only (`Completed.`, `The tool reported an error.`, a denial, or the bounded safe failure message); the trace labels it with the server and tool (`Used Notion: notion-search`). Failures carry `TOOL_ERROR` (the tool reported an error or the server rejected the call) or `CONNECTION_ERROR` (bside could not reach or sign in to the server). The full result reaches the model and the debug export's tool output, never session storage. Persisted call arguments are cut to 8,000 characters (stored as the cut JSON text).
 - **Digest.** Each call adds an `mcp` entry: server, tool, an argument excerpt (600 characters), ok/code, and a result excerpt (1,200 characters). It is rendered inside the untrusted run notes. Tokens and headers never appear in digests, the ledger, exports, or events.
 - **Export.** MCP calls appear in "model input" and "tool output" like other tools. Credential records are never exported.
 
@@ -98,13 +100,20 @@ The tools are sent non-strict (`constrainedSampling: false`). Strict mode would 
 
 - `local:mcpServer:<id>` (`McpServerStateV1`) is non-secret: the saved tool catalog, disabled tools, trust level, a needs-re-auth flag, and the last safe error.
 - `local:mcpCredential:<id>` and `local:mcpRegistration:<id>` are sealed records (`{version, iv, ciphertext}`).
-- Options-page-only `mcp.*` requests are `mcp.list`, `mcp.connect`, `mcp.disconnect`, `mcp.refresh`, `mcp.tool.toggle`, and `mcp.trust.save`, routed like the other options requests. The sidebar Port exposes none of them.
+- Options-page-only `mcp.*` requests are `mcp.list`, `mcp.connect`, `mcp.disconnect`, `mcp.refresh`, `mcp.tool.toggle` (`server`, `tool`, `enabled`), and `mcp.trust.save` (`server`, `trust`), validated by `isMcpRequest` and routed like the other options requests (only from `options.html`). Every success answers with each server's `McpServerStatus` (status `disconnected` | `connected` | `needs-reauth` | `error`, the last safe error, trust level, saved tools with `enabled`), the enabled-tool count and cap, and a notice (e.g. revocation not confirmed). The sidebar Port exposes none of them.
+- `ApprovalRequest.mcp` (`McpApproval`) and `ToolCall.mcp` (`McpCallInfo`) are the only MCP fields on sidebar events; neither carries tokens.
+
+## Settings
+
+The Connections page (Settings › Agent › Connections) lists the directory with each server's icon, description, and status, Connect / Reconnect / Disconnect and Refresh, a Confirmation select ("Always confirm writes" / "Let bside decide"), and, once connected, a switch per tool with a Read-only, Writes, or Can delete badge (unavailable tools are shown with the reason and cannot be turned on). A banner asks to reconnect a server that signed bside out. Tool descriptions and errors are rendered as text.
 
 ## Deferred
 
 - **MCP prompts as `/` commands, and resources as `@` mentions.** Not cheap: they need composer changes and a snapshot format for remote content. The client keeps the methods out for now. It declares no capabilities and calls neither `prompts/list` nor `resources/list`.
+- **`notifications/tools/list_changed`.** Ignored; the catalog changes only when the user connects or presses Refresh, which keeps the cached prefix stable.
+- **Tool search / deferred tools.** See above; revisit if the directory grows past the 64-tool cap in practice.
 - **Images and other binary MCP content** become placeholders and are not shown to the model.
 - **More directory servers** (Linear, GitHub, Atlassian, Google) will be added by demand, each with its own CSP review.
 - **The native-messaging bridge** for local stdio servers, and bside as an MCP server, are out of this cycle.
 - **OpenAI-hosted MCP** (`type: "mcp"`) is not planned: OpenAI would hold the user's server credentials.
-- **Live verification.** No Notion or Todoist account was available while building this. Discovery and metadata were checked against the live servers, but registration, consent, token exchange, and tool calls were tested only against fakes.
+- **Live verification.** No Notion or Todoist account was available while building this. Discovery and metadata were checked against the live servers, but registration, consent, token exchange, revocation, and tool calls were tested only against fakes (`tests/helpers/mcp-server.ts`). The Connections page was tested in happy-dom, not yet in a Firefox sidebar or options tab.
