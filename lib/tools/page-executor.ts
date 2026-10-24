@@ -1287,6 +1287,75 @@ function pointerClick(element: Element): void {
   html.click();
 }
 
+/** Where a pointer at the element's center is, in its viewport. */
+function centerOf(element: Element): { clientX: number; clientY: number } {
+  const box = element.getBoundingClientRect();
+  return { clientX: box.left + box.width / 2, clientY: box.top + box.height / 2 };
+}
+
+/** Dispatches a pointer event (a `PointerEvent` for `pointer*` types where supported) or mouse event. Enter/leave events do not bubble. */
+function pointerEvent(element: Element, type: string, init: MouseEventInit): boolean {
+  const bubbles = !type.endsWith("enter") && !type.endsWith("leave");
+  const options = { bubbles, cancelable: bubbles, composed: true, view: element.ownerDocument.defaultView, ...init };
+  if (type.startsWith("pointer")) {
+    if (typeof PointerEvent !== "function") return true;
+    return element.dispatchEvent(new PointerEvent(type, { pointerId: 1, pointerType: "mouse", isPrimary: true, ...options }));
+  }
+  return element.dispatchEvent(new MouseEvent(type, options));
+}
+
+/** The element and its ancestors in its own document's flat tree, innermost first. */
+function hoverChain(element: Element): Element[] {
+  const chain: Element[] = [];
+  for (let node: Element | null = element; node && node.ownerDocument === element.ownerDocument; node = composedParent(node)) chain.push(node);
+  return chain;
+}
+
+/** The element the agent's pointer is over in each document, so the next hover (or drag) leaves it first. */
+const HOVERED = new WeakMap<Document, Element>();
+
+/**
+ * Moves the agent's pointer onto `element` the way a real pointer would:
+ * out of and leaving the element hovered before (if any), then over and
+ * entering the new one (enter/leave on each ancestor crossed), then a move.
+ */
+function movePointerTo(element: Element): void {
+  const document = element.ownerDocument;
+  const previous = HOVERED.get(document);
+  const point = centerOf(element);
+  const entered = hoverChain(element);
+  if (previous && previous !== element && previous.isConnected) {
+    const left = hoverChain(previous).filter((node) => !entered.includes(node));
+    const exit = { ...centerOf(previous), relatedTarget: element };
+    pointerEvent(previous, "pointerout", exit);
+    pointerEvent(previous, "mouseout", exit);
+    for (const node of left) {
+      pointerEvent(node, "pointerleave", exit);
+      pointerEvent(node, "mouseleave", exit);
+    }
+  }
+  if (previous !== element) {
+    const before = previous?.isConnected ? hoverChain(previous) : [];
+    const enter = { ...point, relatedTarget: previous ?? null };
+    pointerEvent(element, "pointerover", enter);
+    pointerEvent(element, "mouseover", enter);
+    for (const node of entered.filter((candidate) => !before.includes(candidate)).reverse()) {
+      pointerEvent(node, "pointerenter", enter);
+      pointerEvent(node, "mouseenter", enter);
+    }
+  }
+  pointerEvent(element, "pointermove", point);
+  pointerEvent(element, "mousemove", point);
+  HOVERED.set(document, element);
+}
+
+function hover(control: OutlineControl): Effect {
+  const element = control.proxy ?? control.element;
+  try { (element as HTMLElement).scrollIntoView?.({ block: "center", inline: "nearest" }); } catch { /* detached or unsupported */ }
+  movePointerTo(element);
+  return { ok: true, message: `Hovered over ${describe(control)}.` };
+}
+
 /** Controls a submit would leave invalid under native constraint validation. */
 function invalidFormControls(form: HTMLFormElement, outline: Outline): string[] {
   if (form.noValidate) return [];
@@ -1528,6 +1597,7 @@ export async function executeDomAction(
   let effect: Effect;
   switch (action.kind) {
     case "click": effect = click(control!, before); break;
+    case "hover": effect = hover(control!); break;
     case "fill": effect = fill(control!, action.text); break;
     case "select": effect = select(control!, action.values); break;
     case "check": effect = check(control!, action.checked); break;
@@ -1540,7 +1610,13 @@ export async function executeDomAction(
   const after = buildOutline(document, registry, options);
   const location = document.location?.href;
   const parts = [effect.message, ...(effect.notes ?? [])];
-  if (action.kind !== "scroll") parts.push(describeChanges(before.lines, after.lines));
+  if (action.kind !== "scroll") {
+    const changes = describeChanges(before.lines, after.lines);
+    parts.push(changes);
+    if (action.kind === "hover" && changes === "Page outline unchanged.") {
+      parts.push("Nothing opened. A menu that opens only by CSS :hover does not respond to the agent's pointer; try click(), or focus it and press(\"ArrowDown\").");
+    }
+  }
   if (location && location !== urlBefore) parts.push(`URL changed to ${location}`);
   return { ok: true, summary: parts.join("\n") };
 }

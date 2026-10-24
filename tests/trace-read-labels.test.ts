@@ -66,4 +66,9 @@ describe("trace read labels", () => {
     expect(describeActivity(activity(source, true), false).title).toBe("Read a table");
     expect(describeActivity(activity(source, false), false)).toMatchObject({ title: "Couldn't read a table", status: "error" });
   });
+
+  it("labels hovering, and a click after a hover as clicking", () => {
+    expect(describeActivity(activity('await page.ref("e4").hover();', true), false).title).toBe("Hovered over a page control");
+    expect(describeActivity(activity('await page.ref("e4").hover(); await page.ref("e9").click();', true), false).title).toBe("Clicked a page control");
+  });
 });

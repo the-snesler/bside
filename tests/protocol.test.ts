@@ -361,6 +361,7 @@ describe("isPageExecuteRequest: accepts the closed action union only", () => {
       { kind: "fill", target: ref, text: "x" },
       { kind: "select", target: ref, values: ["us"] },
       { kind: "check", target: ref, checked: true },
+      { kind: "hover", target: ref },
       { kind: "press", target: ref, key: "Enter" },
       { kind: "upload", target: ref, files: [{ name: "a.txt", mimeType: "text/plain", text: "hi" }] },
       { kind: "upload", target: ref, files: [{ name: "a.png", mimeType: "image/png", base64: "iVBORw0KGgo=" }] },
@@ -375,6 +376,8 @@ describe("isPageExecuteRequest: accepts the closed action union only", () => {
     for (const action of [
       { kind: "evaluate", target: ref, script: "alert(1)" },
       { kind: "click", target: ref, extra: true },
+      { kind: "hover", target: null },
+      { kind: "hover", target: ref, text: "x" },
       { kind: "click", target: { kind: "css", selector: "#email" } },
       { kind: "click", target: { kind: "ref", ref: "#email", documentId: "doc" } },
       { kind: "click", target: { kind: "ref", ref: "e1" } },

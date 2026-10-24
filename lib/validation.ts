@@ -75,6 +75,10 @@ export function validateDomAction(raw: unknown): DomAction | null {
       const t = target();
       return t && hasExactKeys(raw, ["kind", "target"]) ? { kind: "click", target: t } : null;
     }
+    case "hover": {
+      const t = target();
+      return t && hasExactKeys(raw, ["kind", "target"]) ? { kind: "hover", target: t } : null;
+    }
     case "fill": {
       const t = target();
       if (!t || !hasExactKeys(raw, ["kind", "target", "text"])) return null;

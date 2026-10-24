@@ -11,6 +11,7 @@ import FilePencil from "~icons/tabler/file-pencil";
 import FileText from "~icons/tabler/file-text";
 import Forms from "~icons/tabler/forms";
 import HandClick from "~icons/tabler/hand-click";
+import HandFinger from "~icons/tabler/hand-finger";
 import Keyboard from "~icons/tabler/keyboard";
 import List from "~icons/tabler/list";
 import LockAccess from "~icons/tabler/lock-access";
@@ -53,6 +54,7 @@ const PROGRAM_ACTIONS: [RegExp, Icon, string, string, string][] = [
   [/\.fill\(/, Forms, "Filling page fields", "Filled page fields", "Couldn't fill page fields"],
   [/\.selectOption\(/, Selector, "Selecting an option", "Selected an option", "Couldn't select an option"],
   [/\.setChecked\(|\.check\(|\.uncheck\(/, Checkbox, "Updating a checkbox", "Updated a checkbox", "Couldn't update a checkbox"],
+  [/\.hover\s*\(/, HandFinger, "Hovering over a page control", "Hovered over a page control", "Couldn't hover over a page control"],
   [/web\.search\(/, WorldSearch, "Searching the web", "Searched the web", "Web search failed"],
   [/youtube\s*\.\s*\w+\s*\(/, BrandYoutube, "Reading YouTube", "Read YouTube", "Couldn't read YouTube"],
   [/\.navigate\(|\.goBack\(|browser\.open\(/, ExternalLink, "Opening a page", "Opened a page", "Couldn't open a page"],
