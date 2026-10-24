@@ -723,7 +723,7 @@ describe("AgentLoop: help requests", () => {
   const help = (tab: string, extra: Record<string, unknown> = {}) => ({ tab, kind: "verification", reason: "Solve the CAPTCHA on the search page.", ...extra });
   const finalAnswer = () => [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }] as ScriptedProviderEvent[];
 
-  async function runHelp(rounds: ConstructorParameters<typeof ScriptedProvider>[0], onHelp: (request: HelpRequest | null, loop: AgentLoop) => void = () => {}, extra: { limits?: ConstructorParameters<typeof AgentLoop>[4]; userNotes?: () => string[]; signal?: AbortSignal } = {}) {
+  async function runHelp(rounds: ConstructorParameters<typeof ScriptedProvider>[0], onHelp: (request: HelpRequest | null, loop: AgentLoop) => void = () => {}, extra: { limits?: ConstructorParameters<typeof AgentLoop>[4]; userNotes?: () => string[]; signal?: AbortSignal; siteNotes?: SiteNote[]; instructions?: string } = {}) {
     const provider = new ScriptedProvider(rounds);
     const { tabController, sendMessageMock } = await createTabController();
     const hub = new SidebarHub();
@@ -735,7 +735,7 @@ describe("AgentLoop: help requests", () => {
       runId: "run1", conversationId: "s1", modelId: "gpt-5.6-terra", reasoningEffort: "medium", transcript: baseTranscript, contextArtifact: artifact,
       auth: AUTH, signal: extra.signal ?? new AbortController().signal, onDelta: () => {}, onItem: async () => {}, onApprovalPending: () => {},
       onHelpPending: (request) => { helpEvents.push(request); onHelp(request, loop); },
-      userNotes: extra.userNotes,
+      userNotes: extra.userNotes, siteNotes: extra.siteNotes, instructions: extra.instructions,
     });
     const toolResults = (round: number) => JSON.stringify(provider.requests[round]?.context.messages.filter((message) => message.role === "toolResult"));
     return { result, loop, port, provider, helpEvents, toolResults, sendMessageMock };
@@ -828,6 +828,35 @@ describe("AgentLoop: help requests", () => {
     expect(toolResults(1)).toContain("took over /agent-tabs/5/page.md");
     // Delivered once: the second result adds no note of its own.
     expect(toolResults(2).match(/took over/g)).toEqual(toolResults(1).match(/took over/g));
+  });
+
+  it("surfaces a site note on the program that uses the site after help, beside a takeover note, never on the help result or in the digest", async () => {
+    const note: SiteNote = { origin: "http://127.0.0.1:4173", includeSubdomains: false, text: "Sign in with the work account." };
+    let notes = ["Note: the user took over /agent-tabs/5/page.md while watching it."];
+    const { provider, loop } = await runHelp([
+      () => [toolCallEvent("help_1", "request_user_help", help("/agent-tabs/5/page.md", { kind: "login", reason: "Sign in." })), { type: "turn.completed", replayState: null }],
+      () => [toolCallEvent("read_1", "browser_program", { source: 'return await fs.read("/tabs/1/page.md");' }), { type: "turn.completed", replayState: null }],
+      finalAnswer,
+    ], (request, loop) => { if (request) queueMicrotask(() => loop.resolveHelp(request.call.id, "done", "")); },
+    { siteNotes: [note], userNotes: () => { const drained = notes; notes = []; return drained; } });
+    const [helped = "", read = ""] = provider.requests[2]!.context.messages.filter((message) => message.role === "toolResult").map((message) => JSON.stringify(message.content));
+    expect(helped).toContain("done helping");
+    expect(helped).not.toContain("User site note");
+    expect(read.indexOf("took over /agent-tabs/5/page.md")).toBeGreaterThan(0);
+    expect(read.indexOf("User site note")).toBeGreaterThan(read.indexOf("took over"));
+    expect(read).toContain(note.text);
+    const digest = JSON.stringify(loop.digestSteps());
+    expect(digest).toContain("took over");
+    expect(digest).not.toContain(note.text);
+  });
+
+  it("keeps the help-request policy in the fixed policy, ahead of the user's custom instructions", async () => {
+    const { provider } = await runHelp([finalAnswer], undefined, { instructions: "Never ask me to log in before 9am." });
+    const prompt = provider.requests[0]!.context.systemPrompt!;
+    const policy = prompt.indexOf("request_user_help(tab, kind, reason)");
+    expect(policy).toBeGreaterThan(0);
+    expect(policy).toBeLessThan(prompt.indexOf("Answer the user's question directly"));
+    expect(prompt.indexOf("<user_instructions>")).toBeGreaterThan(policy);
   });
 
   it("lists the tool and the policy in the cacheable prefix, telling the model never to ask for secrets in chat", async () => {
