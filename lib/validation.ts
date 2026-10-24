@@ -141,6 +141,11 @@ export function validateDomAction(raw: unknown): DomAction | null {
       const t = target();
       return t && hasExactKeys(raw, ["kind", "target"]) ? { kind: "hover", target: t } : null;
     }
+    case "drag": {
+      const t = target();
+      const to = validateElementTarget(raw.to);
+      return t && to && hasExactKeys(raw, ["kind", "target", "to"]) ? { kind: "drag", target: t, to } : null;
+    }
     case "fill": {
       const t = target();
       if (!t || !hasExactKeys(raw, ["kind", "target", "text"])) return null;

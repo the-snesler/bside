@@ -63,6 +63,8 @@ export type DomAction =
   | { kind: "click"; target: ElementTarget }
   /** Moves the pointer onto the element (over/enter/move events), leaving the one hovered before. */
   | { kind: "hover"; target: ElementTarget }
+  /** Drags the target onto `to`, both in one document: HTML drag and drop for a draggable source, pointer events otherwise. */
+  | { kind: "drag"; target: ElementTarget; to: ElementTarget }
   | { kind: "fill"; target: ElementTarget; text: string }
   | { kind: "select"; target: ElementTarget; values: string[] }
   | { kind: "check"; target: ElementTarget; checked: boolean }

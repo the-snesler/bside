@@ -1,5 +1,6 @@
 import { useEffect, useState } from "preact/hooks";
 import ArrowsMove from "~icons/tabler/arrows-move";
+import DragDrop from "~icons/tabler/drag-drop";
 import ArrowsVertical from "~icons/tabler/arrows-vertical";
 import Brain from "~icons/tabler/brain";
 import BrandYoutube from "~icons/tabler/brand-youtube";
@@ -50,6 +51,7 @@ function mcpLabel(activity: Activity): { Icon: Icon; label: string } | null {
 /** First matching effect wins: [source pattern, icon, running, done, failed]. */
 const PROGRAM_ACTIONS: [RegExp, Icon, string, string, string][] = [
   [/\.setInputFiles\(/, Paperclip, "Attaching a file", "Attached a file", "Couldn't attach a file"],
+  [/\.dragTo\s*\(/, DragDrop, "Dragging a page item", "Dragged a page item", "Couldn't drag a page item"],
   [/\.click\(|\.press\(/, Pointer, "Clicking a page control", "Clicked a page control", "Couldn't click a page control"],
   [/\.fill\(/, Forms, "Filling page fields", "Filled page fields", "Couldn't fill page fields"],
   [/\.selectOption\(/, Selector, "Selecting an option", "Selected an option", "Couldn't select an option"],

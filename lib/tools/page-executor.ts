@@ -90,7 +90,7 @@ const INTERACTIVE_ROLES = new Set([
 ]);
 const NAME_FROM_CONTENT_ROLES = new Set([
   "button", "link", "checkbox", "radio", "switch", "tab", "menuitem", "menuitemcheckbox", "menuitemradio",
-  "option", "treeitem", "clickable",
+  "option", "treeitem", "clickable", "draggable",
 ]);
 const CONTEXT_NAMED_ROLES = new Set(["textbox", "searchbox", "combobox", "listbox", "file", "slider", "spinbutton", "checkbox", "radio", "switch"]);
 const TEXT_INPUT_TYPES = new Set(["text", "email", "search", "tel", "url", "number", "password", "date", "datetime-local", "month", "week", "time", "color"]);
@@ -321,6 +321,8 @@ function roleOf(element: Element, style: CSSStyleDeclaration | null, parentStyle
   }
   if (isContentEditableRoot(element)) return "textbox";
   if (explicit === "none" || explicit === "presentation" || tag === "label" || tag === "body" || tag === "html") return null;
+  // Items made draggable for HTML drag and drop (sortable lists, boards) are targets for dragTo.
+  if (element.getAttribute("draggable") === "true" && !explicit) return "draggable";
   // Generic clickables: explicit handlers, keyboard focusability, or the outermost pointer cursor.
   const tabIndex = element.getAttribute("tabindex");
   if (element.hasAttribute("onclick") || (tabIndex !== null && Number(tabIndex) >= 0 && !explicit)) return "clickable";
@@ -1318,19 +1320,22 @@ function hoverChain(element: Element): Element[] {
 /** The element the agent's pointer is over in each document, so the next hover (or drag) leaves it first. */
 const HOVERED = new WeakMap<Document, Element>();
 
+/** Mouse buttons held while the pointer moves: none for a hover, the primary one during a drag. */
+type Buttons = 0 | 1;
+
 /**
  * Moves the agent's pointer onto `element` the way a real pointer would:
  * out of and leaving the element hovered before (if any), then over and
  * entering the new one (enter/leave on each ancestor crossed), then a move.
  */
-function movePointerTo(element: Element): void {
+function movePointerTo(element: Element, buttons: Buttons = 0): void {
   const document = element.ownerDocument;
   const previous = HOVERED.get(document);
-  const point = centerOf(element);
+  const point = { ...centerOf(element), buttons };
   const entered = hoverChain(element);
   if (previous && previous !== element && previous.isConnected) {
     const left = hoverChain(previous).filter((node) => !entered.includes(node));
-    const exit = { ...centerOf(previous), relatedTarget: element };
+    const exit = { ...centerOf(previous), buttons, relatedTarget: element };
     pointerEvent(previous, "pointerout", exit);
     pointerEvent(previous, "mouseout", exit);
     for (const node of left) {
@@ -1351,6 +1356,91 @@ function movePointerTo(element: Element): void {
   pointerEvent(element, "pointermove", point);
   pointerEvent(element, "mousemove", point);
   HOVERED.set(document, element);
+}
+
+/** A drag event carrying `transfer`; where `DragEvent` cannot be constructed, a mouse event with it attached. */
+function dragEvent(element: Element, type: string, transfer: DataTransfer, point: { clientX: number; clientY: number }): boolean {
+  const cancelable = type !== "dragleave" && type !== "dragend";
+  const init = { bubbles: true, cancelable, composed: true, buttons: type === "dragend" || type === "drop" ? 0 : 1, ...point };
+  let event: Event;
+  try {
+    event = new DragEvent(type, { ...init, dataTransfer: transfer });
+  } catch {
+    event = new MouseEvent(type, init);
+  }
+  if ((event as DragEvent).dataTransfer !== transfer) Object.defineProperty(event, "dataTransfer", { value: transfer });
+  return element.dispatchEvent(event);
+}
+
+/** Lets the page's handlers run (animation frames, debounced listeners) between the steps of a drag. */
+function nextFrame(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 16));
+}
+
+/** Steps a pointer move takes from the source to the target, so libraries that need a minimum distance or several moves start dragging. */
+const DRAG_STEPS = 5;
+
+/**
+ * Drags one element onto another in the same document. A draggable source
+ * (`draggable="true"` or a native draggable) gets HTML drag and drop with a
+ * shared `DataTransfer`: dragstart, drag, dragenter and dragover on the
+ * target, then drop only if the target accepted it (cancelled dragover), and
+ * dragend. Any other source gets pointer and mouse events: down on the
+ * source, moves toward the target, and up on the target, which is what
+ * pointer-based sortable and board libraries listen for.
+ */
+async function drag(control: OutlineControl, to: OutlineControl): Promise<Effect> {
+  const source = control.proxy ?? control.element;
+  const target = to.proxy ?? to.element;
+  if (source === target || source.contains(target)) return { ok: false, code: "INVALID_TOOL_ARGUMENTS", message: `Drag ${describe(control)} onto a different element outside it.` };
+  try { (source as HTMLElement).scrollIntoView?.({ block: "center", inline: "nearest" }); } catch { /* detached or unsupported */ }
+  const from = centerOf(source);
+  const end = centerOf(target);
+  const label = `${describe(control)} onto ${describe(to)}`;
+  movePointerTo(source);
+  pointerEvent(source, "pointerdown", { ...from, button: 0, buttons: 1 });
+  pointerEvent(source, "mousedown", { ...from, button: 0, buttons: 1 });
+
+  if ((source as HTMLElement).draggable === true || source.getAttribute("draggable") === "true") {
+    const transfer = new DataTransfer();
+    if (!dragEvent(source, "dragstart", transfer, from)) {
+      return { ok: false, code: "NOT_INTERACTABLE", message: `The page cancelled dragging ${describe(control)} (its dragstart handler refused it).` };
+    }
+    dragEvent(source, "drag", transfer, from);
+    await nextFrame();
+    dragEvent(target, "dragenter", transfer, end);
+    if (!source.contains(target) && !target.contains(source)) dragEvent(source, "dragleave", transfer, end);
+    // dragover repeats while the pointer rests on the target; the last one decides whether it accepts the drop.
+    dragEvent(source, "drag", transfer, end);
+    dragEvent(target, "dragover", transfer, end);
+    await nextFrame();
+    dragEvent(source, "drag", transfer, end);
+    const accepted = !dragEvent(target, "dragover", transfer, end);
+    if (!accepted) {
+      dragEvent(target, "dragleave", transfer, end);
+      dragEvent(source, "dragend", transfer, end);
+      return { ok: false, code: "NOT_INTERACTABLE", message: `Dragged ${label}, but it does not accept drops (its dragover handler did not allow one); nothing was dropped.` };
+    }
+    dragEvent(target, "drop", transfer, end);
+    dragEvent(source, "dragend", transfer, end);
+    HOVERED.set(target.ownerDocument, target);
+    return { ok: true, message: `Dragged ${label} (HTML drag and drop).` };
+  }
+
+  for (let step = 1; step < DRAG_STEPS; step++) {
+    const point = {
+      clientX: from.clientX + ((end.clientX - from.clientX) * step) / DRAG_STEPS + (step === 1 ? 10 : 0),
+      clientY: from.clientY + ((end.clientY - from.clientY) * step) / DRAG_STEPS + (step === 1 ? 10 : 0),
+    };
+    pointerEvent(source, "pointermove", { ...point, buttons: 1 });
+    pointerEvent(source, "mousemove", { ...point, buttons: 1 });
+    await nextFrame();
+  }
+  movePointerTo(target, 1);
+  await nextFrame();
+  pointerEvent(target, "pointerup", { ...end, button: 0, buttons: 0 });
+  pointerEvent(target, "mouseup", { ...end, button: 0, buttons: 0 });
+  return { ok: true, message: `Dragged ${label} (pointer events).` };
 }
 
 function hover(control: OutlineControl): Effect {
@@ -1605,12 +1695,26 @@ export function describeChanges(before: readonly string[], after: readonly strin
     else added.push(line);
   }
   const removed = [...remaining.entries()].flatMap(([line, count]) => Array<string>(count).fill(line));
-  if (!added.length && !removed.length) return "Page outline unchanged.";
+  if (!added.length && !removed.length) return describeReorder(before, after);
   const lines = [`Page changes (+${added.length} −${removed.length} lines):`];
   lines.push(...added.slice(0, MAX_DIFF_ADDED).map((line) => `+ ${clip(line, MAX_DIFF_LINE)}`));
   if (added.length > MAX_DIFF_ADDED) lines.push(`+ …${added.length - MAX_DIFF_ADDED} more added lines; read a snapshot to see them.`);
   lines.push(...removed.slice(0, MAX_DIFF_REMOVED).map((line) => `- ${clip(line, MAX_DIFF_LINE)}`));
   if (removed.length > MAX_DIFF_REMOVED) lines.push(`- …${removed.length - MAX_DIFF_REMOVED} more removed lines.`);
+  return lines.join("\n");
+}
+
+/** The same lines in a new order (a sorted table, a dragged list item): the span that changed, as it reads now. */
+function describeReorder(before: readonly string[], after: readonly string[]): string {
+  let start = 0;
+  while (start < after.length && before[start] === after[start]) start++;
+  if (start === after.length) return "Page outline unchanged.";
+  let end = after.length - 1;
+  while (end > start && before[end] === after[end]) end--;
+  const span = after.slice(start, end + 1);
+  const lines = [`Page outline reordered (${span.length} lines moved); that part now reads:`];
+  lines.push(...span.slice(0, MAX_DIFF_ADDED).map((line) => `~ ${clip(line, MAX_DIFF_LINE)}`));
+  if (span.length > MAX_DIFF_ADDED) lines.push(`~ …${span.length - MAX_DIFF_ADDED} more lines; read a snapshot to see them.`);
   return lines.join("\n");
 }
 
@@ -1634,10 +1738,17 @@ export async function executeDomAction(
     if (!resolved.ok) return resolved.result;
     control = resolved.control;
   }
+  let to: OutlineControl | null = null;
+  if (action.kind === "drag") {
+    const resolved = resolveTarget(before, registry, action.to);
+    if (!resolved.ok) return { ...resolved.result, summary: `Drop target: ${resolved.result.summary}` };
+    to = resolved.control;
+  }
   let effect: Effect;
   switch (action.kind) {
     case "click": effect = click(control!, before); break;
     case "hover": effect = hover(control!); break;
+    case "drag": effect = await drag(control!, to!); break;
     case "fill": effect = fill(control!, action.text); break;
     case "select": effect = select(control!, action.values); break;
     case "check": effect = check(control!, action.checked); break;

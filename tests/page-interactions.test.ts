@@ -139,3 +139,88 @@ describe("modifier presses", () => {
     expect(log.filter((line) => line.startsWith("keydown") && !/Left/.test(line))).toEqual(["keydown k/KeyK +M", "keydown Z/KeyZ +CS", "keydown 7/Digit7 +A"]);
   });
 });
+
+describe("drag and drop", () => {
+  beforeEach(() => { document.body.innerHTML = ""; });
+
+  /** A sortable list built on HTML drag and drop: dropping an item moves the dragged one before it. */
+  function sortable(): ElementRegistryAndLog {
+    const registry = setup('<ul id="list"><li id="a" draggable="true">Alpha</li><li id="b" draggable="true">Beta</li><li id="c" draggable="true">Gamma</li></ul>');
+    const log: string[] = [];
+    for (const item of Array.from(document.querySelectorAll("li"))) {
+      for (const type of ["dragstart", "drag", "dragenter", "dragleave", "dragover", "drop", "dragend"]) {
+        item.addEventListener(type, (event) => { if (event.currentTarget === event.target) log.push(`${item.id}:${type}`); });
+      }
+      item.addEventListener("dragstart", (event) => (event as DragEvent).dataTransfer!.setData("text/plain", item.id));
+      item.addEventListener("dragover", (event) => event.preventDefault());
+      item.addEventListener("drop", (event) => {
+        event.preventDefault();
+        const dragged = document.getElementById((event as DragEvent).dataTransfer!.getData("text/plain"))!;
+        item.before(dragged);
+      });
+    }
+    return { registry, log };
+  }
+  interface ElementRegistryAndLog { registry: ElementRegistry; log: string[] }
+  type ElementRegistry = ReturnType<typeof setup>;
+
+  const order = () => Array.from(document.querySelectorAll("li"), (item) => item.textContent).join(",");
+
+  it("lists draggable items as drag sources", () => {
+    sortable();
+    expect(buildOutline(document, createElementRefRegistry("doc")).lines).toEqual(['- [e1 draggable "Alpha"]', '- [e2 draggable "Beta"]', '- [e3 draggable "Gamma"]']);
+  });
+
+  it("drags a draggable item with HTML drag and drop, sharing one DataTransfer from dragstart to drop", async () => {
+    const { registry, log } = sortable();
+    const result = await act(registry, { kind: "drag", target: ref("e3"), to: ref("e1") });
+    expect(result).toMatchObject({ ok: true });
+    expect(result.summary).toContain('Dragged [e3 draggable "Gamma"] onto [e1 draggable "Alpha"] (HTML drag and drop).');
+    expect(order()).toBe("Gamma,Alpha,Beta");
+    expect(log).toEqual(["c:dragstart", "c:drag", "a:dragenter", "c:dragleave", "c:drag", "a:dragover", "c:drag", "a:dragover", "a:drop", "c:dragend"]);
+    expect(result.summary).toContain('Page outline reordered (3 lines moved); that part now reads:\n~ - [e3 draggable "Gamma"]\n~ - [e1 draggable "Alpha"]\n~ - [e2 draggable "Beta"]');
+  });
+
+  it("drops nothing on a target that does not accept drops, and says so", async () => {
+    document.body.innerHTML = '<div id="card" draggable="true">Card</div><button id="bin">Bin</button>';
+    const registry = createElementRefRegistry("doc");
+    buildOutline(document, registry);
+    let dropped = false;
+    document.getElementById("bin")!.addEventListener("drop", () => { dropped = true; });
+    expect(await act(registry, { kind: "drag", target: ref("e1"), to: ref("e2") })).toMatchObject({ ok: false, code: "NOT_INTERACTABLE", summary: expect.stringContaining("does not accept drops") });
+    expect(dropped).toBe(false);
+  });
+
+  it("stops when the page cancels dragstart", async () => {
+    const { registry } = sortable();
+    document.getElementById("a")!.addEventListener("dragstart", (event) => event.preventDefault());
+    expect(await act(registry, { kind: "drag", target: ref("e1"), to: ref("e2") })).toMatchObject({ ok: false, summary: expect.stringContaining("cancelled dragging") });
+    expect(order()).toBe("Alpha,Beta,Gamma");
+  });
+
+  it("drags other elements with pointer events: down on the source, moves with the button held, up on the target", async () => {
+    const registry = setup('<div id="todo"><div id="card" role="button">Write report</div></div><div id="done"><button id="drop">Done column</button></div>');
+    const log: string[] = [];
+    let dragging: Element | null = null;
+    for (const type of ["pointerdown", "mousedown", "pointermove", "mousemove", "pointerup", "mouseup"]) {
+      document.addEventListener(type, (event) => {
+        const mouse = event as MouseEvent;
+        log.push(`${(event.target as Element).id}:${type}:${mouse.buttons}`);
+        if (type === "pointerdown") dragging = event.target as Element;
+        if (type === "pointerup" && dragging) document.getElementById("done")!.append(dragging);
+      });
+    }
+    const result = await act(registry, { kind: "drag", target: ref("e1"), to: ref("e2") });
+    expect(result.summary).toContain('Dragged [e1 button "Write report"] onto [e2 button "Done column"] (pointer events).');
+    expect(document.getElementById("card")!.parentElement!.id).toBe("done");
+    expect(log.filter((line) => /down|up/.test(line))).toEqual(["card:pointerdown:1", "card:mousedown:1", "drop:pointerup:0", "drop:mouseup:0"]);
+    expect(log.filter((line) => /move:1$/.test(line)).length).toBeGreaterThanOrEqual(8);
+    expect(log).toContain("drop:pointermove:1");
+  });
+
+  it("refuses a stale drop target and dropping an element onto itself", async () => {
+    const { registry } = sortable();
+    expect(await act(registry, { kind: "drag", target: ref("e1"), to: ref("e2", "old") })).toMatchObject({ ok: false, code: "STALE_SNAPSHOT", summary: expect.stringContaining("Drop target: Ref e2 came from an earlier page load") });
+    expect(await act(registry, { kind: "drag", target: ref("e1"), to: ref("e1") })).toMatchObject({ ok: false, code: "INVALID_TOOL_ARGUMENTS" });
+  });
+});

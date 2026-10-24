@@ -71,4 +71,9 @@ describe("trace read labels", () => {
     expect(describeActivity(activity('await page.ref("e4").hover();', true), false).title).toBe("Hovered over a page control");
     expect(describeActivity(activity('await page.ref("e4").hover(); await page.ref("e9").click();', true), false).title).toBe("Clicked a page control");
   });
+
+  it("labels drags", () => {
+    expect(describeActivity(activity('await page.ref("e4").dragTo(page.ref("e9"));'), false).title).toBe("Dragging a page item");
+    expect(describeActivity(activity('await page.ref("e4").dragTo("e9");', false), false)).toMatchObject({ title: "Couldn't drag a page item", status: "error" });
+  });
 });

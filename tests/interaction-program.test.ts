@@ -69,3 +69,44 @@ describe("modifier presses in browser programs", () => {
     expect(onEffect.mock.calls.length).toBe(effects);
   });
 });
+
+describe("dragTo in browser programs", () => {
+  const LIST = '<ul><li draggable="true">Alpha</li><li draggable="true">Beta</li></ul>';
+
+  it("drags between refs or locators in one document, a frame's included", async () => {
+    const { tab, run, onEffect } = setup(LIST, LIST);
+    for (const document of [tab.frames.get(0)!.document, tab.frames.get(5)!.document]) {
+      for (const item of Array.from(document.querySelectorAll("li"))) {
+        item.addEventListener("dragstart", (event) => (event as DragEvent).dataTransfer!.setData("text/plain", item.textContent!));
+        item.addEventListener("dragover", (event) => event.preventDefault());
+        item.addEventListener("drop", () => {
+          const dragged = Array.from(document.querySelectorAll("li")).find((candidate) => candidate.textContent === "Beta")!;
+          item.before(dragged);
+        });
+      }
+    }
+    await run("await page.snapshot();");
+    const top = await run('return await page.ref("e2").dragTo(page.getByRole("draggable", {name: "Alpha"}));');
+    expect(top.ok, top.summary).toBe(true);
+    expect(top.summary).toContain("Page outline reordered");
+    expect(tab.requestsTo(0).at(-1)).toMatchObject({ action: { kind: "drag", target: { kind: "ref", ref: "e2", documentId: "doc-0" }, to: { kind: "role", role: "draggable", name: "Alpha" } } });
+
+    const framed = await run('return await page.ref("f1:e2").dragTo("f1:e1");');
+    expect(framed.ok, framed.summary).toBe(true);
+    expect(tab.requestsTo(5).at(-1)).toMatchObject({ type: "page.execute", refPrefix: "f1:", action: { kind: "drag", target: { ref: "e2", documentId: "doc-5" }, to: { ref: "e1", documentId: "doc-5" } } });
+    expect(Array.from(tab.frames.get(5)!.document.querySelectorAll("li"), (item) => item.textContent)).toEqual(["Beta", "Alpha"]);
+    expect(onEffect).toHaveBeenCalledTimes(2);
+  });
+
+  it("refuses drags across frames, to unread refs, and to other tabs' or non-locator targets, before any effect", async () => {
+    const { run, onEffect } = setup(LIST, LIST);
+    expect(await run('return await page.ref("e1").dragTo("e2");')).toMatchObject({ ok: false, code: "STALE_SNAPSHOT" });
+    await run("await page.snapshot();");
+    expect(await run('return await page.ref("e1").dragTo(page.ref("f1:e1"));')).toMatchObject({
+      ok: false, code: "INVALID_TOOL_ARGUMENTS", summary: expect.stringContaining("the dragged element is in the top page and the target is in frame f1"),
+    });
+    expect((await run('return await page.ref("e1").dragTo({ref: "e2"});')).summary).toContain("dragTo() expects a locator");
+    expect((await run('return await page.ref("e1").dragTo("#list li");')).summary).toContain("dragTo() expects a locator");
+    expect(onEffect).not.toHaveBeenCalled();
+  });
+});
