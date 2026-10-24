@@ -13,6 +13,7 @@
 import { storage } from "wxt/utils/storage";
 import { isSkill } from "@/lib/domain/skills";
 import { isCustomInstructionsText, isSiteNote, MAX_SITE_NOTES, type CustomInstructionsV1, type SiteNote, type SiteNotesV1 } from "@/lib/domain/instructions";
+import { DEFAULT_MCP_SERVER_STATE, isMcpServerState, type McpServerStateV1 } from "@/lib/domain/mcp";
 import { DEFAULT_MEMORY_SETTINGS, isMemoryChange, isMemoryEntry, MAX_MEMORIES, MEMORY_WRITE_POLICIES, type MemoryEntry, type MemoryEntryV1, type MemorySettingsV1 } from "@/lib/domain/memory";
 import { REASONING_EFFORTS, type AppSettingsV1, type ModelListing, type ReasoningEffort } from "@/lib/domain/provider";
 import type { Conversation, ConversationIndexV1, ConversationItem, ConversationSummary, HistorySettingsV1, MessageQueueV1, QueuedMessage } from "@/lib/domain/conversation";
@@ -942,6 +943,54 @@ export async function getMemorySettings(): Promise<MemorySettingsV1> {
 
 export async function saveMemorySettings(settings: MemorySettingsV1): Promise<void> {
   await memorySettingsItem.setValue({ version: 1, writes: settings.writes });
+}
+
+// ---------------------------------------------------------------------------
+// MCP connections — per directory server (lib/mcp/servers.ts): non-secret
+// state (tool catalog, the user's choices) and two device-key-sealed records,
+// the OAuth tokens and the dynamic client registration. Written only by
+// `lib/background/mcp.ts` and `lib/mcp/auth.ts`.
+// ---------------------------------------------------------------------------
+
+/** A device-key-sealed MCP record (`local:mcpCredential:<id>`, `local:mcpRegistration:<id>`). */
+export interface McpSealedRecordV1 {
+  version: 1;
+  iv: string;
+  ciphertext: string;
+}
+
+export type McpSealedKind = "credential" | "registration";
+
+const mcpServerKey = (id: string) => `local:mcpServer:${id}` as const;
+const mcpSealedKey = (kind: McpSealedKind, id: string) => `local:${kind === "credential" ? "mcpCredential" : "mcpRegistration"}:${id}` as const;
+
+/** A server's state; a malformed record is deleted and reads as the default (disconnected, writes confirmed). */
+export async function getMcpServerState(id: string): Promise<McpServerStateV1> {
+  const raw: unknown = await storage.getItem(mcpServerKey(id));
+  if (isMcpServerState(raw)) return raw;
+  if (raw !== null && raw !== undefined) await storage.removeItem(mcpServerKey(id));
+  return DEFAULT_MCP_SERVER_STATE;
+}
+
+export async function saveMcpServerState(id: string, state: McpServerStateV1): Promise<void> {
+  await storage.setItem(mcpServerKey(id), state);
+}
+
+/** Background-only. A malformed record is deleted and reads as absent. */
+export async function getMcpSealed(kind: McpSealedKind, id: string): Promise<McpSealedRecordV1 | null> {
+  const raw = await storage.getItem<McpSealedRecordV1>(mcpSealedKey(kind, id));
+  if (raw?.version === 1 && Object.keys(raw).length === 3 && typeof raw.iv === "string" && raw.iv.length === 16 &&
+    typeof raw.ciphertext === "string" && raw.ciphertext.length > 0 && raw.ciphertext.length < 200_000) return raw;
+  if (raw !== null) await storage.removeItem(mcpSealedKey(kind, id));
+  return null;
+}
+
+export async function saveMcpSealed(kind: McpSealedKind, id: string, sealed: { iv: string; ciphertext: string }): Promise<void> {
+  await storage.setItem(mcpSealedKey(kind, id), { version: 1, iv: sealed.iv, ciphertext: sealed.ciphertext } satisfies McpSealedRecordV1);
+}
+
+export async function deleteMcpSealed(kind: McpSealedKind, id: string): Promise<void> {
+  await storage.removeItem(mcpSealedKey(kind, id));
 }
 
 // ---------------------------------------------------------------------------
