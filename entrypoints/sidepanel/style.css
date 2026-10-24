@@ -404,6 +404,10 @@ summary.trace__line:focus-visible .trace__chevron,
   color: var(--ink);
   font-weight: 500;
 }
+.mcp-approval__note {
+  font-size: 12px;
+  color: var(--muted);
+}
 .help__reason {
   white-space: pre-wrap;
   overflow-wrap: anywhere;

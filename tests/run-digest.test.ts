@@ -153,3 +153,28 @@ describe("run digests: memory changes", () => {
     expect(digestFromItems(items)!.entries.at(-1)).toEqual({ type: "memory", op: "write", name: "coffee", tainted: false });
   });
 });
+
+describe("run digest: connected-account calls", () => {
+  const call = { id: "m1", name: "mcp__todoist__add-tasks" as const, arguments: { content: "Buy milk" }, mcp: { server: "todoist", tool: "add-tasks", readOnly: false } };
+
+  it("records the server's name, the tool, and bounded argument and result excerpts, and validates", () => {
+    const digest = buildRunDigest([{ call: { ...call, arguments: { content: "x".repeat(2_000) } }, result: { ok: true, summary: "y".repeat(5_000) } }], "completed")!;
+    const [entry] = digest.entries;
+    expect(entry).toMatchObject({ type: "mcp", server: "Todoist", tool: "add-tasks", ok: true, code: null });
+    expect(entry?.type === "mcp" && entry.args.length).toBe(600);
+    expect(entry?.type === "mcp" && entry.excerpt.length).toBe(1200);
+    expect(isValidRunDigest(digest)).toBe(true);
+    expect(isValidRunDigest({ ...digest, entries: [{ ...entry, token: "secret" }] })).toBe(false);
+    const note = renderDigestNote(digest);
+    expect(note).toContain("1. Todoist tool add-tasks: ok\narguments:");
+    expect(note.indexOf("BEGIN_UNTRUSTED_RUN_NOTES")).toBeLessThan(note.indexOf("Todoist tool"));
+  });
+
+  it("rebuilds an interrupted call from its persisted items", () => {
+    const digest = digestFromItems([
+      { id: "u1", kind: "message", role: "user", text: "Add milk", context: null, at: 0 },
+      { id: "i1", kind: "tool-call", call, at: 1 },
+    ])!;
+    expect(digest.entries).toEqual([{ type: "mcp", server: "Todoist", tool: "add-tasks", args: '{"content":"Buy milk"}', ok: null, code: null, excerpt: "" }]);
+  });
+});

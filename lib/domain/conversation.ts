@@ -97,7 +97,9 @@ export type RunDigestEntry =
   /** A `request_user_help` pause: `outcome` is the user's answer, `"failed"` when the call was refused (not one of the chat's agent tabs). */
   | { type: "help"; kind: HelpKind; reason: string; outcome: "done" | "unable" | "failed" | null }
   /** A memory the preceding program saved or removed; `tainted` when the run had read untrusted content first. */
-  | { type: "memory"; op: "write" | "remove"; name: string; tainted: boolean };
+  | { type: "memory"; op: "write" | "remove"; name: string; tainted: boolean }
+  /** A call of a connected account's tool: the server's name, its tool, and bounded excerpts of the arguments and result. Never tokens. */
+  | { type: "mcp"; server: string; tool: string; args: string; ok: boolean | null; code: string | null; excerpt: string };
 
 export interface RunDigestV1 {
   version: 1;

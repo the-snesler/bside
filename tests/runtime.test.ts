@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { McpConnections } from "@/lib/background/mcp";
+import { approvingPopup, fakeMcpServers } from "@/tests/helpers/mcp-server";
 import type { Browser } from "wxt/browser";
 import { AGENT_TAB_IDLE_MS, BackgroundRuntime } from "@/lib/background/runtime";
 import { ApprovalBadge } from "@/lib/background/approval-badge";
@@ -1032,7 +1034,7 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
     const snapshot = port.received.at(-1);
     if (snapshot?.type !== "state.snapshot") throw new Error("expected state.snapshot");
     expect(snapshot.payload.activeRun).toBeNull();
-    expect(snapshot.payload.notice).toContain("already changed a page");
+    expect(snapshot.payload.notice).toContain("already changed a page or a connected account");
   }
 
   function setup(provider: FakeProvider) {
@@ -1102,6 +1104,57 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
 
     await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
     refusedRetry(provider, port, 0);
+  });
+
+  it("offers connected accounts' tools from run start and refuses run.retry after a write to one", async () => {
+    await saveOpenAICredential("sk-test");
+    const fake = fakeMcpServers({ tools: { notion: [{ name: "notion-search", annotations: { readOnlyHint: true } }, { name: "notion-create-pages", annotations: { destructiveHint: false } }] } });
+    const mcp = new McpConnections({ popup: approvingPopup(), fetcher: fake.fetcher });
+    await mcp.connect("notion");
+    await mcp.setTrust("notion", "model");
+    const provider = new FakeProvider();
+    let round = 0;
+    provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      if (round++ > 0) throw new ProviderStreamError("Rate limited.", "RATE_LIMIT");
+      yield { type: "tool.call", call: { id: "call_1", name: "mcp__notion__notion-create-pages", arguments: { title: "Plan" } } } as ScriptedProviderEvent;
+      yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+    } });
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: supportedPageTabControllerFactory, mcp });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Add a Notion page" });
+    expect(provider.requests[0]!.context.tools!.map((tool) => tool.name)).toContain("mcp__notion__notion-create-pages");
+    expect(fake.requests.some((request) => request.body.includes('"tools/call"') && request.body.includes("notion-create-pages"))).toBe(true);
+    expect(port.received.find((event) => event.type === "run.failed")?.payload).toMatchObject({ code: "RATE_LIMIT", retryable: false });
+
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    refusedRetry(provider, port, 2);
+  });
+
+  it("refuses run.retry after an interrupted attempt that had started a write to a connected account, not a read", async () => {
+    await saveOpenAICredential("sk-test");
+    await seed({ id: "u1", kind: "message", role: "user", text: "Add a task", context: null, at: 1 });
+    await seed({ id: "c1", kind: "tool-call", call: { id: "call_1", name: "mcp__todoist__add-tasks", arguments: {}, mcp: { server: "todoist", tool: "add-tasks", readOnly: false } }, at: 2 });
+    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
+    const provider = new FakeProvider();
+    const { runtime, port } = setup(provider);
+    await runtime.initialize();
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    refusedRetry(provider, port, 0);
+  });
+
+  it("keeps an interrupted attempt retryable when it only read from a connected account", async () => {
+    await saveOpenAICredential("sk-test");
+    await seed({ id: "u1", kind: "message", role: "user", text: "Find my tasks", context: null, at: 1 });
+    await seed({ id: "c1", kind: "tool-call", call: { id: "call_1", name: "mcp__todoist__find-tasks", arguments: {}, mcp: { server: "todoist", tool: "find-tasks", readOnly: true } }, at: 2 });
+    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
+    const provider = new FakeProvider();
+    const { runtime } = setup(provider);
+    await runtime.initialize();
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    expect(provider.requests).toHaveLength(1);
   });
 
   it("keeps a turn retryable across a failed retry that committed no page effect", async () => {

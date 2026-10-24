@@ -2,9 +2,11 @@ import { useEffect, useState } from "preact/hooks";
 import ArrowsMove from "~icons/tabler/arrows-move";
 import ArrowsVertical from "~icons/tabler/arrows-vertical";
 import Brain from "~icons/tabler/brain";
+import BrandNotion from "~icons/tabler/brand-notion";
 import BrandYoutube from "~icons/tabler/brand-youtube";
 import Camera from "~icons/tabler/camera";
 import Checkbox from "~icons/tabler/checkbox";
+import Checklist from "~icons/tabler/checklist";
 import Clock from "~icons/tabler/clock";
 import ExternalLink from "~icons/tabler/external-link";
 import FilePencil from "~icons/tabler/file-pencil";
@@ -17,6 +19,7 @@ import LockAccess from "~icons/tabler/lock-access";
 import Login from "~icons/tabler/login";
 import Paperclip from "~icons/tabler/paperclip";
 import Photo from "~icons/tabler/photo";
+import PlugConnected from "~icons/tabler/plug-connected";
 import Pointer from "~icons/tabler/pointer";
 import Search from "~icons/tabler/search";
 import Selector from "~icons/tabler/selector";
@@ -28,6 +31,7 @@ import WorldSearch from "~icons/tabler/world-search";
 import { PROMPT_MENTION_PATTERN } from "@/lib/domain/conversation";
 import type { HelpKind } from "@/lib/domain/tools";
 import { MAX_HELP_NOTE_CHARS } from "@/lib/domain/tools";
+import { findMcpServer, type McpServerIcon } from "@/lib/mcp/servers";
 import type { AgentTabSummary, ApprovalRequest, HelpOutcome, HelpRequest } from "@/lib/protocol";
 import { Markdown } from "@/lib/ui/Markdown";
 import { Mascot, type MascotMood } from "@/lib/ui/Mascot";
@@ -35,6 +39,17 @@ import { Trace, TraceLine, type TraceStatus } from "@/lib/ui/Trace";
 import { formatDuration, type Activity, type Turn, type TurnStep } from "@/lib/ui/turns";
 
 type Icon = typeof Pointer;
+
+/** Bundled icons for directory servers (no remote assets). */
+export const MCP_SERVER_ICONS: Record<McpServerIcon, Icon> = { "brand-notion": BrandNotion, checklist: Checklist };
+
+/** A connected account's tool call: the server's icon and "Notion: notion-search". */
+function mcpLabel(activity: Activity): { Icon: Icon; label: string } | null {
+  const mcp = activity.call.mcp;
+  if (!mcp) return null;
+  const server = findMcpServer(mcp.server);
+  return { Icon: server ? MCP_SERVER_ICONS[server.icon] : PlugConnected, label: `${server?.name ?? mcp.server}: ${mcp.tool}` };
+}
 
 /** First matching effect wins: [source pattern, icon, running, done, failed]. */
 const PROGRAM_ACTIONS: [RegExp, Icon, string, string, string][] = [
@@ -78,19 +93,28 @@ function helpKind(activity: Activity): { Icon: Icon; label: string } {
 }
 
 /**
- * A denied confirmation or help the user could not give is the user's
+ * A denied confirmation (a gated MCP call's included) or help the user could not give is the user's
  * decision, and a skipped call never ran: none is a failed step. A help
  * request fails only when it was refused (not one of the chat's agent tabs).
  */
 function failed(activity: Activity): boolean {
   if (!activity.result || activity.result.ok || activity.result.code === "SKIPPED") return false;
   if (activity.call.name === "request_user_help") return activity.result.code === "INVALID_TOOL_ARGUMENTS";
-  return !(activity.call.name === "request_action_confirmation" && activity.result.code === "ACTION_DENIED");
+  return !((activity.call.name === "request_action_confirmation" || activity.call.mcp) && activity.result.code === "ACTION_DENIED");
 }
 
 /** Icon, status, and a title that states that status in words. `approval` is the request pending on this step, if any. */
 export function describeActivity(activity: Activity, pending: boolean, approval?: ApprovalRequest | null): { Icon: Icon; title: string; status?: TraceStatus } {
   if (pending && approval?.memory) return { Icon: Brain, title: `Waiting for approval: ${approval.display}`, status: "pending" };
+  const mcp = mcpLabel(activity);
+  if (mcp) {
+    const { Icon, label } = mcp;
+    if (pending) return { Icon, title: `Waiting for approval: ${label}`, status: "pending" };
+    if (!activity.result) return { Icon, title: `Using ${label}`, status: "running" };
+    if (activity.result.code === "SKIPPED") return { Icon, title: `Skipped using ${label}` };
+    if (activity.result.code === "ACTION_DENIED") return { Icon, title: `Denied: ${label}` };
+    return activity.result.ok ? { Icon, title: `Used ${label}` } : { Icon, title: `Couldn't use ${label}`, status: "error" };
+  }
   if (activity.call.name === "request_action_confirmation") {
     const title = stringArg(activity, "title") || "an action";
     if (pending) return { Icon: Shield, title: `Waiting for approval: ${title}`, status: "pending" };
@@ -180,6 +204,22 @@ function MemoryApprovalCard(props: { change: NonNullable<ApprovalRequest["memory
   );
 }
 
+/** A connected account's call the server's "Always confirm writes" trust level holds for approval. */
+function McpApprovalCard(props: { request: NonNullable<ApprovalRequest["mcp"]> }) {
+  const { request } = props;
+  return (
+    <>
+      <p>
+        {request.destructive
+          ? `bside wants to use ${request.serverName}'s ${request.tool} tool, which may change or delete data in your account:`
+          : `bside wants to use ${request.serverName}'s ${request.tool} tool, which may change data in your account:`}
+      </p>
+      <pre class="tool-call">{request.arguments}</pre>
+      <p class="mcp-approval__note">You asked to confirm writes on {request.serverName}. You can change this in Settings › Connections.</p>
+    </>
+  );
+}
+
 function ActivityLine(props: {
   activity: Activity;
   pending: boolean;
@@ -194,6 +234,7 @@ function ActivityLine(props: {
   const { activity, pending } = props;
   const { Icon, title, status } = describeActivity(activity, pending, props.approval);
   const memoryApproval = pending ? props.approval?.memory : undefined;
+  const mcpApproval = pending ? props.approval?.mcp : undefined;
   const elapsed = activity.endedAt === null ? 0 : activity.endedAt - activity.startedAt;
   const isConfirmation = activity.call.name === "request_action_confirmation";
   const isHelp = activity.call.name === "request_user_help";
@@ -209,6 +250,10 @@ function ActivityLine(props: {
     >
       {memoryApproval ? (
         <MemoryApprovalCard change={memoryApproval} />
+      ) : mcpApproval ? (
+        <McpApprovalCard request={mcpApproval} />
+      ) : activity.call.mcp ? (
+        <pre class="tool-call">{typeof activity.call.arguments === "string" ? activity.call.arguments : JSON.stringify(activity.call.arguments, null, 2)}</pre>
       ) : isConfirmation ? (
         <>
           <p>{stringArg(activity, "message")}</p>

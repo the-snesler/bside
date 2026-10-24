@@ -11,7 +11,7 @@
  * persistence) and everything outside an active run (credentials, settings).
  */
 
-import { AgentLoop } from "@/lib/background/agent-loop";
+import { AGENT_TOOL_NAMES, AgentLoop } from "@/lib/background/agent-loop";
 import { getSkills } from "@/lib/background/skills";
 import { captureInvokedSkill } from "@/lib/background/skill-context";
 import { skillCatalog, type Skill, type SkillSummary } from "@/lib/domain/skills";
@@ -20,6 +20,7 @@ import { readMemoryIndex, runMemory, undoMemoryChanges } from "@/lib/background/
 import { matchSiteNotes, pageOrigin, siteNoteForPage, type SiteNote } from "@/lib/domain/instructions";
 import type { ApprovalBadge } from "@/lib/background/approval-badge";
 import type { McpConnections } from "@/lib/background/mcp";
+import type { McpToolDefinition } from "@/lib/mcp/tools";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
 import type { AgentTab } from "@/lib/background/browser-program";
@@ -113,11 +114,12 @@ const SYSTEM_CLOCK: RuntimeClock = { now: () => Date.now(), setInterval: (callba
 
 type RunLifecycleStatus = "running" | "awaiting-approval" | "awaiting-help" | "cancelling";
 
-/** The user's instructions and site notes, and the memory index, snapshotted when a run starts. */
+/** The user's instructions and site notes, the memory index, and connected accounts' tools, snapshotted when a run starts. */
 interface Personalization {
   instructions: string;
   siteNotes: SiteNote[];
   memoryIndex: string | null;
+  mcpTools: McpToolDefinition[];
 }
 
 /** Run-level diagnostics for context export; held in memory only. */
@@ -244,7 +246,7 @@ export class BackgroundRuntime {
         .then(() => recoverInterruptedRun())
         .then(async (sessionId) => {
           if (!sessionId) return;
-          this.#retryable = { sessionId, hadPageEffect: lastTurnRanProgram((await getConversation(sessionId))?.items ?? []) };
+          this.#retryable = { sessionId, hadPageEffect: lastTurnMayHaveCommitted((await getConversation(sessionId))?.items ?? []) };
         })
         .finally(() => this.#openSession())
         .finally(() => restored.catch(() => {}))
@@ -1112,7 +1114,7 @@ export class BackgroundRuntime {
       return;
     }
     if (retry && this.#retryable?.hadPageEffect) {
-      this.#notice = "The last attempt already changed a page, so retrying it could repeat that change. Send a new message to continue.";
+      this.#notice = "The last attempt already changed a page or a connected account, so retrying it could repeat that change. Send a new message to continue.";
       await this.#sidebarHub.broadcastSnapshot();
       return;
     }
@@ -1156,7 +1158,9 @@ export class BackgroundRuntime {
     let personal: Personalization;
     try {
       // Memory the run cannot read is left out of its prompt rather than stopping it.
-      personal = { ...await readInstructions(), memoryIndex: await readMemoryIndex().catch(() => null) };
+      // Likewise for connected accounts' tools: one that cannot be read is not offered.
+      personal = { ...await readInstructions(), memoryIndex: await readMemoryIndex().catch(() => null),
+        mcpTools: await this.#mcp?.toolDefinitions(AGENT_TOOL_NAMES).catch(() => []) ?? [] };
       const available = await getSkills();
       catalog = skillCatalog(available);
       for (const skill of available) scope.skills.set(skill.name, skill);
@@ -1278,6 +1282,7 @@ export class BackgroundRuntime {
       instructions: personal.instructions,
       siteNotes: personal.siteNotes,
       memoryIndex: personal.memoryIndex,
+      ...(personal.mcpTools.length && this.#mcp ? { mcp: { tools: personal.mcpTools, call: this.#mcp.call.bind(this.#mcp) } } : {}),
       contextArtifact: artifact,
       auth,
       onContext: (context) => { this.#latestContext = context; },
@@ -1490,8 +1495,10 @@ type SessionCommand = Extract<SidebarCommand, { type: "session.create" | "sessio
  * Whether the last turn started a browser program. Run checkpoints record no
  * effects, so after an interruption any started program may have committed one.
  */
-function lastTurnRanProgram(items: readonly ConversationItem[]): boolean {
-  return items.slice(items.findLastIndex(isTurnStart) + 1).some((item) => item.kind === "tool-call" && item.call.name === "browser_program");
+/** After an interruption: the last turn ran a browser program, or started a call of a connected account's tool not marked read-only. */
+function lastTurnMayHaveCommitted(items: readonly ConversationItem[]): boolean {
+  return items.slice(items.findLastIndex(isTurnStart) + 1).some((item) => item.kind === "tool-call" &&
+    (item.call.name === "browser_program" || (item.call.mcp !== undefined && !item.call.mcp.readOnly)));
 }
 
 function toAgentTabSummary(id: number, tab: AgentTab, snapshot: TabSnapshot): AgentTabSummary {

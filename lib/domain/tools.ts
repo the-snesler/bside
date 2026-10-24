@@ -72,7 +72,8 @@ export type PageErrorCode =
 
 export interface ToolResult {
   ok: boolean;
-  code?: PageErrorCode | "ACTION_DENIED" | "LIMIT_EXCEEDED" | "INVALID_TOOL_ARGUMENTS" | "SKIPPED";
+  /** `TOOL_ERROR`: a connected account's tool reported failure or the server rejected the call; `CONNECTION_ERROR`: bside could not reach or sign in to the server. */
+  code?: PageErrorCode | "ACTION_DENIED" | "LIMIT_EXCEEDED" | "INVALID_TOOL_ARGUMENTS" | "SKIPPED" | "TOOL_ERROR" | "CONNECTION_ERROR";
   summary: string;
   data?: JsonValue;
 }

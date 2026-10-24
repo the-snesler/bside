@@ -1,7 +1,7 @@
 /**
  * Run digests: a compact, bounded record of what a run's tools actually did
  * (programs and their sources, URLs read, result excerpts, failures,
- * confirmations, requests for the user's help, memory changes), built by the background from the tool ledger rather than
+ * confirmations, requests for the user's help, memory changes, connected-account tool calls), built by the background from the tool ledger rather than
  * from model text. Later runs see digests as untrusted notes, so a follow-up
  * like "what was the 3rd result?" works without browsing again.
  */
@@ -10,6 +10,7 @@ import type { ConversationItem, RunDigestEntry, RunDigestStatus, RunDigestV1 } f
 import { isTurnStart } from "@/lib/domain/conversation";
 import { HELP_KINDS, type ToolCall, type ToolResult } from "@/lib/domain/tools";
 import { isMemoryName, memoryPath, type MemoryChange } from "@/lib/domain/memory";
+import { findMcpServer } from "@/lib/mcp/servers";
 
 export const DIGEST_SOURCE_CHARS = 600;
 export const DIGEST_EXCERPT_CHARS = 1200;
@@ -20,6 +21,7 @@ export const DIGEST_MAX_ENTRIES = 16;
 /** Bound on an entry list's text; the newest entries that fit are kept. */
 export const DIGEST_MAX_CHARS = 6000;
 const DIGEST_ERROR_CHARS = 300;
+const DIGEST_SERVER_CHARS = 60;
 
 /** One executed tool call. `result` is `null` when the run ended before it produced one. */
 export interface DigestStep {
@@ -38,6 +40,7 @@ function clip(text: string, max: number): string {
 function entryChars(entry: RunDigestEntry): number {
   if (entry.type === "program") return entry.source.length + entry.excerpt.length + entry.urls.reduce((sum, url) => sum + url.length, 0);
   if (entry.type === "memory") return entry.name.length;
+  if (entry.type === "mcp") return entry.args.length + entry.excerpt.length;
   return entry.type === "help" ? entry.reason.length : entry.title.length;
 }
 
@@ -53,6 +56,15 @@ function toEntry(step: DigestStep): RunDigestEntry | null {
     const code = step.result?.code;
     const outcome = !step.result ? null : step.result.ok ? "done" : code === "ACTION_DENIED" ? "unable" : code === "INVALID_TOOL_ARGUMENTS" ? "failed" : null;
     return { type: "help", kind, reason: clip(typeof record.reason === "string" ? record.reason.trim() : "", DIGEST_TITLE_CHARS), outcome };
+  }
+  if (step.call.mcp) {
+    const { server, tool } = step.call.mcp;
+    const args = typeof step.call.arguments === "string" ? step.call.arguments : JSON.stringify(step.call.arguments) ?? "";
+    return {
+      type: "mcp", server: clip(findMcpServer(server)?.name ?? server, DIGEST_SERVER_CHARS), tool: clip(tool, DIGEST_TITLE_CHARS),
+      args: clip(args, DIGEST_SOURCE_CHARS), ok: step.result ? step.result.ok : null, code: step.result?.code ?? null,
+      excerpt: clip(step.result?.summary ?? "", DIGEST_EXCERPT_CHARS),
+    };
   }
   if (typeof record.source !== "string") return null;
   const urls = [...new Set(step.urls ?? [])].filter((url) => /^https?:\/\//i.test(url)).slice(0, DIGEST_MAX_URLS).map((url) => clip(url, DIGEST_URL_CHARS));
@@ -138,6 +150,12 @@ export function renderDigestNote(digest: RunDigestV1): string {
       lines.push(`${n}. ${entry.op === "write" ? "saved" : "removed"} memory ${memoryPath(entry.name)}${entry.tainted ? " (after reading web content)" : ""}`);
       return;
     }
+    if (entry.type === "mcp") {
+      lines.push(`${n}. ${entry.server} tool ${entry.tool}: ${entry.ok === null ? "no result recorded" : entry.ok ? "ok" : `failed${entry.code ? ` (${entry.code})` : ""}`}`);
+      lines.push(`arguments:\n${entry.args}`);
+      if (entry.excerpt) lines.push(`result (first ${DIGEST_EXCERPT_CHARS} characters):\n${entry.excerpt}`);
+      return;
+    }
     lines.push(`${n}. browser_program: ${entry.ok === null ? "no result recorded" : entry.ok ? "ok" : `failed${entry.code ? ` (${entry.code})` : ""}`}`);
     lines.push(`source:\n${entry.source}`);
     if (entry.urls.length) lines.push(`visited: ${entry.urls.join(" ")}`);
@@ -164,6 +182,11 @@ function isDigestEntry(value: unknown): value is RunDigestEntry {
   const v = value as Record<string, unknown>;
   if (v.type === "confirmation") return typeof v.title === "string" && v.title.length <= DIGEST_TITLE_CHARS && (v.approved === null || typeof v.approved === "boolean");
   if (v.type === "memory") return Object.keys(v).length === 4 && (v.op === "write" || v.op === "remove") && isMemoryName(v.name) && typeof v.tainted === "boolean";
+  if (v.type === "mcp") {
+    return Object.keys(v).length === 7 && typeof v.server === "string" && v.server.length <= DIGEST_SERVER_CHARS && typeof v.tool === "string" && v.tool.length <= DIGEST_TITLE_CHARS &&
+      typeof v.args === "string" && v.args.length <= DIGEST_SOURCE_CHARS && (v.ok === null || typeof v.ok === "boolean") &&
+      (v.code === null || (typeof v.code === "string" && v.code.length <= 64)) && typeof v.excerpt === "string" && v.excerpt.length <= DIGEST_EXCERPT_CHARS;
+  }
   if (v.type === "help") {
     return (HELP_KINDS as readonly unknown[]).includes(v.kind) && typeof v.reason === "string" && v.reason.length <= DIGEST_TITLE_CHARS &&
       (v.outcome === null || v.outcome === "done" || v.outcome === "unable" || v.outcome === "failed");
