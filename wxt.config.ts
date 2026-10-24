@@ -12,7 +12,17 @@ export default defineConfig({
     plugins: [preact(), Icons({ compiler: "jsx", jsx: "preact" })],
   }),
   manifest: {
-    browser_specific_settings: { gecko: { id: "bside@tsuni.dev" } },
+    browser_specific_settings: { gecko: {
+      id: "bside@tsuni.dev",
+      // Firefox's built-in data-transmission consent starts at desktop 140.
+      // Tasks can include sensitive page/account content: see docs/privacy.md.
+      strict_min_version: "140.0",
+      data_collection_permissions: { required: [
+        "authenticationInfo", "browsingActivity", "financialAndPaymentInfo",
+        "healthInfo", "locationInfo", "personalCommunications",
+        "personallyIdentifyingInfo", "searchTerms", "websiteActivity", "websiteContent",
+      ] },
+    }, gecko_android: { strict_min_version: "142.0" } },
     icons: { "32": "icon.svg" },
     permissions: [
       "storage",

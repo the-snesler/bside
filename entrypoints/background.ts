@@ -13,6 +13,7 @@ import { isAutomationRequest, type AutomationResponse } from "@/lib/protocol";
 import { RunNotifications } from "@/lib/background/notifications";
 import { isOptionsSender, isProblemReportRequest } from "@/lib/protocol";
 import type { ProblemReportResponse } from "@/lib/protocol";
+import { registerOnboarding } from "@/lib/background/onboarding";
 
 export default defineBackground({
   persistent: true,
@@ -43,6 +44,7 @@ export default defineBackground({
     });
 
     browser.alarms.onAlarm.addListener((alarm) => { void runtime.handleAlarm(alarm.name); });
+    registerOnboarding(browser);
 
     browser.runtime.onConnect.addListener((port) => {
       if (port.name !== SIDEBAR_PORT_NAME) return;

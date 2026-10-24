@@ -90,6 +90,7 @@ export function HistoryPage() {
             description="Chats are saved only in this Firefox profile and are never synced. They contain your prompts, bside's answers, and text from pages bside read for you, such as page titles, addresses, and excerpts."
           />
         </Card>
+        <p class="settings-note"><a href="/privacy.html">Read the privacy policy</a> · <a href="/onboarding.html">Getting started</a></p>
       </SettingsSection>
       <ProblemReport />
     </>

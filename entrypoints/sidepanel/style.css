@@ -1275,6 +1275,8 @@ summary.trace__line:focus-visible .trace__chevron,
   padding: 6px 8px;
   border: 1px solid color-mix(in srgb, var(--muted) 25%, transparent);
   text-align: left;
+  /* Keep words legible in narrow columns; the table can scroll instead. */
+  overflow-wrap: normal;
 }
 .markdown hr {
   border: 0;

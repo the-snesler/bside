@@ -55,6 +55,18 @@ afterEach(() => {
 });
 
 describe("sidebar UI contracts", () => {
+  it("makes wide Markdown tables and code blocks keyboard reachable", () => {
+    const root = document.createElement("div"); document.body.append(root);
+    render(h(Markdown, { text: "| Column | Value |\n|---|---|\n| Example | Result |\n\n```\nlong code\n```" }), root);
+    for (const selector of ["table", "pre"]) {
+      const element = root.querySelector<HTMLElement>(selector)!;
+      expect(element.tabIndex).toBe(0);
+      element.focus();
+      expect(document.activeElement).toBe(element);
+      expect(element.getAttribute("aria-label")).toBeTruthy();
+    }
+    render(null, root);
+  });
   it("renders Markdown without executable HTML, unsafe links, or remote image requests", () => {
     const root = document.createElement("div");
     document.body.append(root);
