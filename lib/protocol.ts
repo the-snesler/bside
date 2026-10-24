@@ -348,6 +348,13 @@ export type SidebarCommand =
    * revalidates it. Answered with `siteNote.saved` to the requesting sidebar only.
    */
   | { v: 1; id: string; type: "siteNote.save"; note: SiteNote }
+  /**
+   * The trace's Undo for memory changes runs made (the ids on their tool
+   * results), newest first, each only while the entry is as that change left
+   * it. The sidebar's only memory write. Answered with `memory.undone` to the
+   * requesting sidebar only.
+   */
+  | { v: 1; id: string; type: "memory.undo"; changeIds: string[] }
   /** Exports one session with its scratch files; run diagnostics, model input, and tool output are included only for the latest run's session. Answered with `context.exported` to the requesting sidebar only. */
   | { v: 1; id: string; type: "context.export"; sessionId: string }
   | { v: 1; id: string; type: "state.subscribe"; lastSeq: number | null }
@@ -460,6 +467,8 @@ export type SidebarEvent =
   | EventBase<"siteNote.loaded", { requestId: string; origin: string | null; note: SiteNote | null }>
   /** `note` as saved, or `null` with a safe `error`. */
   | EventBase<"siteNote.saved", { requestId: string; note: SiteNote | null; error: string | null }>
+  /** The change ids undone, and a safe `error` for any that were not. */
+  | EventBase<"memory.undone", { requestId: string; undone: string[]; error: string | null }>
   | EventBase<"state.snapshot", RuntimeSnapshot>
   | EventBase<"session.listed", { sessions: ConversationSummary[] }>
   | EventBase<"page.attached", AttachedPage | null>
@@ -494,6 +503,10 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (candidate.type === "settings.save") return isAppSettings(candidate.settings);
   if (candidate.type === "siteNote.get") return typeof candidate.url === "string" && candidate.url.length <= 8_192;
   if (candidate.type === "siteNote.save") return isSiteNote(candidate.note);
+  if (candidate.type === "memory.undo") {
+    return Array.isArray(candidate.changeIds) && candidate.changeIds.length > 0 && candidate.changeIds.length <= 64 &&
+      candidate.changeIds.every((id) => typeof id === "string" && id.length > 0 && id.length <= 64);
+  }
   if (candidate.type === "context.export") return isSessionId(candidate.sessionId);
   if (candidate.type === "session.create" || candidate.type === "session.list") return true;
   if (candidate.type === "session.open") return isSessionId(candidate.sessionId);

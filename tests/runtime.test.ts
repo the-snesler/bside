@@ -384,6 +384,22 @@ describe("BackgroundRuntime: memory", () => {
     // The saved change is on the persisted program result, for the trace and Undo.
     expect((await openConversation()).items.find((item) => item.kind === "tool-result" && item.callId === "save")).toMatchObject({ memory: [{ op: "write", name: "seat", tainted: false }] });
   });
+
+  it("undoes a run's change from the sidebar, replying only to the requesting sidebar", async () => {
+    const change = await writeMemory({ name: "seat", description: "Seat", body: "Window" }, { sessionId: "s", runId: "r", tainted: true });
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const [asking, other] = [fakePort(), fakePort()];
+    hub.handleConnect(asking);
+    hub.handleConnect(other);
+    await asking.send({ v: 1, id: "undo", type: "memory.undo", changeIds: [change.id] });
+    await asking.send({ v: 1, id: "bad", type: "memory.undo", changeIds: [] });
+    await vi.waitFor(() => expect(asking.received.filter((event) => event.type === "memory.undone")).toHaveLength(1));
+    expect(asking.received.find((event) => event.type === "memory.undone")?.payload).toEqual({ requestId: "undo", undone: [change.id], error: null });
+    expect(other.received.some((event) => event.type === "memory.undone")).toBe(false);
+    expect(await listMemories()).toEqual([]);
+  });
 });
 
 class FakeProvider implements ProviderAdapter {

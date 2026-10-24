@@ -22,6 +22,8 @@ import { HistoryDrawer } from "@/lib/ui/HistoryDrawer";
 import { Mascot } from "@/lib/ui/Mascot";
 import { AgentTabsPanel, AgentTabsToggle } from "@/lib/ui/AgentTabsTray";
 import { SiteNoteEditor } from "@/lib/ui/SiteNoteEditor";
+import { MemoryNotice } from "@/lib/ui/MemoryNotice";
+import { memoryUndoKey } from "@/lib/ui/use-background";
 import { PROMPT_MENTION_PATTERN } from "@/lib/domain/conversation";
 
 function describeAttachment(page: PageArtifactSummary): string {
@@ -77,6 +79,8 @@ export function App() {
     rememberSite,
     saveSiteNote,
     closeSiteNote,
+    memoryUndo,
+    undoMemory,
   } = useBackground();
   const scroll = useBottomScroll();
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -247,6 +251,15 @@ export function App() {
                               agentTabs={chatAgentTabs}
                               onShowTab={watchTab}
                               onResolveHelp={resolveHelp}
+                            />
+                          </li>
+                        )}
+                        {turn.memory.length > 0 && (
+                          <li class="timeline__item timeline__item--memory">
+                            <MemoryNotice
+                              changes={turn.memory}
+                              undo={memoryUndo[memoryUndoKey(turn.memory.map((change) => change.id))]}
+                              onUndo={() => undoMemory(turn.memory.map((change) => change.id))}
                             />
                           </li>
                         )}

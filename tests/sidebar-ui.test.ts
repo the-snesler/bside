@@ -937,6 +937,49 @@ describe("history drawer", () => {
     expect(posted.at(-1)).toMatchObject({ type: "action.approve", runId: "r1", callId: "p1" });
   });
 
+  it("shows a turn's memory changes with a taint badge, View, and Undo through a validated command", async () => {
+    const { posted, emit } = await mountApp();
+    await emit({ runId: "r1", conversationId: "a", type: "run.started", payload: { prompt: "Remember my seat", page: null, retry: false } });
+    const call = { id: "p1", name: "browser_program" as const, arguments: { source: 'fs.write("/memory/seat.md", "Seat\nWindow");' } };
+    await emit({ runId: "r1", conversationId: "a", type: "tool.requested", payload: { call, display: "Browser program" } });
+    const memory = [{ id: "m1", op: "write" as const, name: "seat", tainted: true }, { id: "m2", op: "write" as const, name: "seat", tainted: true }];
+    await emit({ runId: "r1", conversationId: "a", type: "tool.result", payload: { callId: "p1", result: { ok: true, summary: "Browser program completed." }, memory } });
+
+    const notice = root.querySelector(".memory-notice")!;
+    expect(notice.querySelector(".memory-notice__line > span")?.textContent).toBe("Saved 1 memory");
+    expect(notice.querySelector(".memory-notice__badge")?.textContent).toBe("after web content");
+    expect(notice.querySelector("a")?.getAttribute("href")).toMatch(/\/options\.html#\/memory\/seat$/);
+    await act(() => button("Undo")!.click());
+    const command = posted.at(-1)!;
+    expect(command).toMatchObject({ type: "memory.undo", changeIds: ["m1", "m2"] });
+    expect(isSidebarCommand(command)).toBe(true);
+    expect(button("Undoing…")?.disabled).toBe(true);
+    // A reply to some other request changes nothing.
+    await emit({ runId: null, conversationId: null, type: "memory.undone", payload: { requestId: "other", undone: [], error: "No." } });
+    expect(button("Undoing…")).toBeDefined();
+    await emit({ runId: null, conversationId: null, type: "memory.undone", payload: { requestId: command.id as string, undone: ["m2", "m1"], error: null } });
+    expect(root.querySelector(".memory-notice__done")?.textContent).toBe("· Undone");
+    expect(button("Undo")).toBeUndefined();
+  });
+
+  it("explains an Undo the background refused and lets the user try again", async () => {
+    const { posted, emit } = await mountApp();
+    const items: ConversationItem[] = [
+      { id: "u", kind: "message", role: "user", text: "Forget my seat", context: null, at: 0 },
+      { id: "c", kind: "tool-call", call: { id: "p1", name: "browser_program", arguments: { source: "x" } }, at: 1 },
+      { id: "r", kind: "tool-result", callId: "p1", result: { ok: true, summary: "Browser program completed." }, memory: [{ id: "m1", op: "remove", name: "seat", tainted: false }], at: 2 },
+      { id: "a", kind: "message", role: "assistant", text: "Done.", at: 3 },
+    ];
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), conversation: { ...snapshotFor("a").conversation, items } } });
+    expect(root.querySelector(".memory-notice__line > span")?.textContent).toBe("Removed 1 memory");
+    expect(root.querySelector(".memory-notice__badge")).toBeNull();
+    expect(root.querySelector(".memory-notice a")?.getAttribute("href")).toMatch(/#\/memory$/);
+    await act(() => button("Undo")!.click());
+    await emit({ runId: null, conversationId: null, type: "memory.undone", payload: { requestId: posted.at(-1)!.id as string, undone: [], error: "This change can no longer be undone here." } });
+    expect(root.querySelector(".memory-notice__error")?.textContent).toBe("This change can no longer be undone here.");
+    expect(button("Undo")?.disabled).toBe(false);
+  });
+
   it("states the watched tab's shield in the tray and offers Take over until the user takes over", async () => {
     const { posted, emit, bySession } = await mountApp();
     await act(() => root.querySelector<HTMLButtonElement>(".agent-tabs-toggle")!.click());

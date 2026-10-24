@@ -16,7 +16,7 @@ import { getSkills } from "@/lib/background/skills";
 import { captureInvokedSkill } from "@/lib/background/skill-context";
 import { skillCatalog, type Skill, type SkillSummary } from "@/lib/domain/skills";
 import { readInstructions, saveSiteNoteFromSidebar } from "@/lib/background/instructions";
-import { readMemoryIndex, runMemory } from "@/lib/background/memory";
+import { readMemoryIndex, runMemory, undoMemoryChanges } from "@/lib/background/memory";
 import { matchSiteNotes, pageOrigin, siteNoteForPage, type SiteNote } from "@/lib/domain/instructions";
 import type { ApprovalBadge } from "@/lib/background/approval-badge";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
@@ -633,6 +633,7 @@ export class BackgroundRuntime {
       return { origin, note: origin ? siteNoteForPage((await readInstructions()).siteNotes, command.url) : null };
     }
     if (command.type === "siteNote.save") return saveSiteNoteFromSidebar(command.note);
+    if (command.type === "memory.undo") return undoMemoryChanges(command.changeIds);
     if (command.type === "session.list") return { sessions: await listSessions() };
     if (command.type === "session.create" || command.type === "session.open" || command.type === "session.delete" ||
       command.type === "session.rename" || command.type === "session.pin") {

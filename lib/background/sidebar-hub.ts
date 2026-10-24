@@ -24,10 +24,10 @@ const UNSUPPORTED_HOSTNAME_SUFFIXES = [".mozilla.org", ".mozilla.com"];
 export interface SidebarHubDelegate {
   getSnapshot(): Promise<RuntimeSnapshot>;
   handleCommand(command: SidebarCommand): Promise<{ markdown: string; filename: string } | { tabs: TabMention[] } | { skills: SkillSummary[] } | { sessions: ConversationSummary[] } |
-    { origin: string | null; note: SiteNote | null } | { note: SiteNote | null; error: string | null } | void>;
+    { origin: string | null; note: SiteNote | null } | { note: SiteNote | null; error: string | null } | { undone: string[]; error: string | null } | void>;
 }
 
-type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" | "agent-tabs.changed" | "queue.changed" | "context.exported" | "tabs.listed" | "skills.listed" | "session.listed" | "siteNote.loaded" | "siteNote.saved" }>;
+type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" | "agent-tabs.changed" | "queue.changed" | "context.exported" | "tabs.listed" | "skills.listed" | "session.listed" | "siteNote.loaded" | "siteNote.saved" | "memory.undone" }>;
 
 export class SidebarHub {
   delegate: SidebarHubDelegate | null = null;
@@ -165,8 +165,11 @@ export class SidebarHub {
     if (message.type === "siteNote.get" && result && "origin" in result) port.postMessage({
       v: 1, type: "siteNote.loaded", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: { requestId: message.id, ...result },
     } satisfies SidebarEvent);
-    if (message.type === "siteNote.save" && result && "error" in result) port.postMessage({
+    if (message.type === "siteNote.save" && result && "note" in result && "error" in result) port.postMessage({
       v: 1, type: "siteNote.saved", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: { requestId: message.id, ...result },
+    } satisfies SidebarEvent);
+    if (message.type === "memory.undo" && result && "undone" in result) port.postMessage({
+      v: 1, type: "memory.undone", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: { requestId: message.id, ...result },
     } satisfies SidebarEvent);
     if (message.type === "context.export" && result && "markdown" in result) port.postMessage({
       v: 1, type: "context.exported", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(),

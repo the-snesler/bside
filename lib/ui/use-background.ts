@@ -31,6 +31,15 @@ export interface SiteNoteEditorState {
   error: string | null;
 }
 
+/** The trace's Undo for one turn's memory changes, keyed by `memoryUndoKey`. */
+export interface MemoryUndoState {
+  status: "undoing" | "undone" | "failed";
+  /** Why some or all were not undone. */
+  error: string | null;
+}
+
+export const memoryUndoKey = (changeIds: readonly string[]) => changeIds.join(" ");
+
 export interface BackgroundState extends RuntimeSnapshot {
   tabs: TabMention[];
   /** The session index, pinned first, then most recent. Requested on connect and pushed by the background whenever it changes. */
@@ -38,6 +47,7 @@ export interface BackgroundState extends RuntimeSnapshot {
   lastError: NormalizedError | null;
   /** The open "Remember something about this site" editor, if any. */
   siteNote: SiteNoteEditorState | null;
+  memoryUndo: Record<string, MemoryUndoState>;
 }
 
 export interface BackgroundActions {
@@ -79,6 +89,8 @@ export interface BackgroundActions {
   /** Saves the open editor's note; the background revalidates it. */
   saveSiteNote(note: SiteNote): void;
   closeSiteNote(): void;
+  /** Undoes memory changes a turn made; the background reverts each only if nothing changed it since. */
+  undoMemory(changeIds: string[]): void;
 }
 
 const EMPTY_CONVERSATION: Conversation = {
@@ -101,6 +113,7 @@ const INITIAL_STATE: BackgroundState = {
   notice: null,
   lastError: null,
   siteNote: null,
+  memoryUndo: {},
 };
 
 type Port = Browser.runtime.Port;
@@ -112,6 +125,8 @@ export function useBackground(): BackgroundState & BackgroundActions {
   const exportRequestRef = useRef<string | null>(null);
   /** The site-note request awaiting its reply; replies to an older or closed editor are dropped. */
   const siteNoteRequestRef = useRef<string | null>(null);
+  /** Undo requests awaiting their reply, by request id. */
+  const undoRequestsRef = useRef(new Map<string, string>());
   const conversationIdRef = useRef("");
   conversationIdRef.current = state.conversation.id;
 
@@ -141,6 +156,14 @@ export function useBackground(): BackgroundState & BackgroundActions {
         setState((prev) => !prev.siteNote ? prev : { ...prev, siteNote: "origin" in reply
           ? { origin: reply.origin, note: reply.note, status: "ready", error: null }
           : reply.note ? { ...prev.siteNote, note: reply.note, status: "saved", error: null } : { ...prev.siteNote, status: "ready", error: reply.error } });
+        return;
+      }
+      if (event.type === "memory.undone") {
+        const key = undoRequestsRef.current.get(event.payload.requestId);
+        if (key === undefined) return;
+        undoRequestsRef.current.delete(event.payload.requestId);
+        const { undone, error } = event.payload;
+        setState((prev) => ({ ...prev, memoryUndo: { ...prev.memoryUndo, [key]: { status: undone.length ? "undone" : "failed", error } } }));
         return;
       }
       applyEvent(message as SidebarEvent, setState, activeRunIdRef);
@@ -250,6 +273,14 @@ export function useBackground(): BackgroundState & BackgroundActions {
     setState((prev) => ({ ...prev, siteNote: null }));
   }, []);
 
+  const undoMemory = useCallback((changeIds: string[]) => {
+    const id = crypto.randomUUID();
+    const key = memoryUndoKey(changeIds);
+    undoRequestsRef.current.set(id, key);
+    setState((prev) => ({ ...prev, memoryUndo: { ...prev.memoryUndo, [key]: { status: "undoing", error: null } } }));
+    portRef.current?.postMessage({ v: 1, id, type: "memory.undo", changeIds } satisfies SidebarCommand);
+  }, []);
+
   const listTabs = useCallback(() => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "tabs.list" } satisfies SidebarCommand);
   }, []);
@@ -274,7 +305,7 @@ export function useBackground(): BackgroundState & BackgroundActions {
 
   return {
     ...state, sendPrompt, steer, removeQueued, sendQueued, retryRun, cancelRun, approveAction, denyAction, resolveHelp, newChat, listSessions, openSession, renameSession, pinSession,
-    deleteSession, downloadContext, rememberSite, saveSiteNote, closeSiteNote, listTabs, listSkills: () => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "skills.list" } satisfies SidebarCommand), focusTab, closeAgentTabs, watchTab, unwatchTab, takeOverTab, saveSettings,
+    deleteSession, downloadContext, rememberSite, saveSiteNote, closeSiteNote, undoMemory, listTabs, listSkills: () => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "skills.list" } satisfies SidebarCommand), focusTab, closeAgentTabs, watchTab, unwatchTab, takeOverTab, saveSettings,
   };
 }
 
@@ -437,6 +468,7 @@ function applyEvent(
         kind: "tool-result",
         callId: event.payload.callId,
         result: event.payload.result,
+        ...(event.payload.memory ? { memory: event.payload.memory } : {}),
         at: event.at,
       };
       const stillPending = prev.activeRun.pendingApproval?.call.id === event.payload.callId ? null : prev.activeRun.pendingApproval;

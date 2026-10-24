@@ -1,6 +1,7 @@
 import { isTurnStart, type ConversationItem, type RunDigestStatus, type UserMessageItem } from "@/lib/domain/conversation";
 import type { ToolCall, ToolResult } from "@/lib/domain/tools";
 import { addRunUsage, EMPTY_USAGE, type UsageTotals } from "@/lib/domain/usage";
+import type { MemoryChange } from "@/lib/domain/memory";
 
 export type Activity = {
   kind: "activity";
@@ -26,6 +27,8 @@ export type Turn = {
   usage: UsageTotals | null;
   /** How the turn's latest run that used tools ended, from its digest; `null` if none recorded one. */
   outcome: RunDigestStatus | null;
+  /** Memories the turn's programs saved or removed, in order. */
+  memory: MemoryChange[];
   startedAt: number;
   endedAt: number;
 };
@@ -62,6 +65,7 @@ export function buildTurns(items: ConversationItem[], running: boolean): Turn[] 
         summary: compaction?.kind === "compaction" && compaction.firstKeptItemId === item.id ? compaction.summary : null,
         usage: null,
         outcome: null,
+        memory: [],
         startedAt: item.at,
         endedAt: item.at,
       };
@@ -76,6 +80,7 @@ export function buildTurns(items: ConversationItem[], running: boolean): Turn[] 
       activities.set(item.call.id, activity);
       turn.steps.push(activity);
     } else {
+      if (item.memory) turn.memory.push(...item.memory);
       const activity = activities.get(item.callId);
       if (activity) {
         activity.result = item.result;

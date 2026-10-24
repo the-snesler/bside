@@ -134,6 +134,53 @@ select:disabled {
 .timeline__item--usage {
   margin-top: -12px;
 }
+.timeline__item--memory {
+  margin-top: -8px;
+}
+.memory-notice {
+  color: var(--muted);
+  font-size: 12px;
+}
+.memory-notice__line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  margin: 0;
+}
+.memory-notice__icon {
+  width: 14px;
+  height: 14px;
+}
+.memory-notice__badge {
+  padding: 0 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--error) 14%, transparent);
+  color: var(--error);
+  font-size: 11px;
+  line-height: 17px;
+}
+.memory-notice__action {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: none;
+  cursor: pointer;
+}
+.memory-notice__action:hover {
+  text-decoration: underline;
+}
+.memory-notice__action:disabled {
+  color: var(--muted);
+  cursor: default;
+  text-decoration: none;
+}
+.memory-notice__error {
+  margin: 4px 0 0;
+  color: var(--error);
+}
 .turn-usage {
   margin: 0;
   color: var(--muted);
