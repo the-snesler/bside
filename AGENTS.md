@@ -10,7 +10,7 @@ bside: a Firefox desktop extension built with WXT, Manifest V2, Preact, TypeScri
 - `pnpm typecheck` — strict TypeScript check (`tsc --noEmit`).
 - `pnpm test` — run all Vitest tests.
 - `pnpm build` — build the Firefox MV2 production bundle into `.output/firefox-mv2/`.
-- `pnpm zip` — create a distributable archive from the production build.
+- `pnpm zip` — create a distributable archive from the production build. WXT's default working-tree source ZIP is disabled; use the committed allowlist below for source submission.
 - `pnpm lint:ext` — run `web-ext lint` on the production build; fails on errors only.
 - `pnpm check:manifest` — compare the built manifest's permissions/CSP/content-script matches/background/gecko ID against `scripts/manifest-snapshot.json` and fail on any `.map` file; after an intentional change, run `pnpm check:manifest --update` and commit the snapshot.
 - `pnpm source:archive` — archive allowlisted committed regular source files, including the lockfile/build guide, into `.output/bside-<version>-source.zip`; refuses tracked changes and excludes secrets/local/generated files. No upload.

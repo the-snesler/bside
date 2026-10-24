@@ -8,6 +8,9 @@ const CSP =
 export default defineConfig({
   browser: "firefox",
   manifestVersion: 2,
+  // WXT's default Firefox source ZIP globs the working tree. Release sources
+  // must come only from scripts/source-submission.mjs's committed allowlist.
+  zip: { zipSources: false },
   vite: () => ({
     plugins: [preact(), Icons({ compiler: "jsx", jsx: "preact" })],
   }),
