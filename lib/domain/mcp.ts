@@ -73,6 +73,22 @@ export interface McpServerStatus {
   toolsAt: number | null;
 }
 
+/**
+ * A call the server's "Always confirm writes" trust level holds on the
+ * confirmation card. `arguments` is the call's JSON, bounded; it is model
+ * output, rendered as text.
+ */
+export interface McpApproval {
+  server: string;
+  serverName: string;
+  tool: string;
+  destructive: boolean;
+  arguments: string;
+}
+
+/** Characters of a gated call's arguments shown on the confirmation card. */
+export const MAX_MCP_APPROVAL_ARGS = 4_000;
+
 export function isMcpToolName(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= MAX_MCP_TOOL_NAME;
 }

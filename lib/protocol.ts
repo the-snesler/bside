@@ -31,6 +31,8 @@ import type { RunUsageV1 } from "@/lib/domain/usage";
 import { isSkill, isSkillName, type Skill, type SkillSummary } from "@/lib/domain/skills";
 import { isCustomInstructionsText, isSiteNote, isSiteOrigin, type SiteNote } from "@/lib/domain/instructions";
 import { isMemoryDraft, isMemoryName, MEMORY_WRITE_POLICIES, type MemoryApproval, type MemoryChange, type MemoryDraft, type MemoryEntry, type MemorySettingsV1 } from "@/lib/domain/memory";
+import { isMcpToolName, MCP_TRUST_LEVELS, type McpApproval, type McpServerStatus, type McpTrust } from "@/lib/domain/mcp";
+import { isMcpServerId } from "@/lib/mcp/servers";
 import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction, validateElementTarget } from "@/lib/validation";
 
 // ---------------------------------------------------------------------------
@@ -503,6 +505,11 @@ export interface ApprovalRequest {
    * (`call`) is making, rather than a `request_action_confirmation` call.
    */
   memory?: MemoryApproval;
+  /**
+   * Set when the server's "Always confirm writes" trust level gates a call
+   * (`call`) of a connected account's tool that is not marked read-only.
+   */
+  mcp?: McpApproval;
 }
 
 /** A run paused on `request_user_help`. `reason` is untrusted model text: render it as text only. */
@@ -719,6 +726,32 @@ export function isMemoryRequest(value: unknown): value is MemoryRequest {
     return typeof settings === "object" && settings !== null && Object.keys(settings).length === 2 && settings.version === 1 &&
       (MEMORY_WRITE_POLICIES as readonly unknown[]).includes(settings.writes);
   }
+  return false;
+}
+
+/** MCP connections; options page only. Tokens never appear in a request or response. */
+export type McpRequest =
+  | { v: 1; id: string; type: "mcp.list" }
+  /** Opens the server's sign-in popup, then lists its tools. */
+  | { v: 1; id: string; type: "mcp.connect"; server: string }
+  /** Revokes the tokens where supported and deletes them; the tool choices and trust level are kept. */
+  | { v: 1; id: string; type: "mcp.disconnect"; server: string }
+  /** Lists the server's tools again. */
+  | { v: 1; id: string; type: "mcp.refresh"; server: string }
+  | { v: 1; id: string; type: "mcp.tool.toggle"; server: string; tool: string; enabled: boolean }
+  | { v: 1; id: string; type: "mcp.trust.save"; server: string; trust: McpTrust };
+
+export type McpResponse =
+  | { v: 1; id: string; ok: true; servers: McpServerStatus[]; enabledTools: number; maxTools: number; notice: string | null }
+  | { v: 1; id: string; ok: false; error: NormalizedError };
+
+export function isMcpRequest(value: unknown): value is McpRequest {
+  if (!isEnvelope(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.type === "mcp.list") return Object.keys(candidate).length === 3;
+  if (candidate.type === "mcp.connect" || candidate.type === "mcp.disconnect" || candidate.type === "mcp.refresh") return Object.keys(candidate).length === 4 && isMcpServerId(candidate.server);
+  if (candidate.type === "mcp.tool.toggle") return Object.keys(candidate).length === 6 && isMcpServerId(candidate.server) && isMcpToolName(candidate.tool) && typeof candidate.enabled === "boolean";
+  if (candidate.type === "mcp.trust.save") return Object.keys(candidate).length === 5 && isMcpServerId(candidate.server) && (MCP_TRUST_LEVELS as readonly unknown[]).includes(candidate.trust);
   return false;
 }
 

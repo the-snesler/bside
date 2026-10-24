@@ -15,8 +15,17 @@ export type JsonValue =
 
 export interface ToolCall {
   id: string;
-  name: "browser_program" | "request_action_confirmation" | "request_user_help" | "current_time";
+  /** A built-in tool, or a connected account's tool exposed as `mcp__<server>__<tool>`. */
+  name: "browser_program" | "request_action_confirmation" | "request_user_help" | "current_time" | `mcp__${string}`;
   arguments: JsonValue;
+  /** For an MCP tool: the directory server, the server's own tool name, and whether it is annotated read-only (a call of any other counts as a committed effect). */
+  mcp?: McpCallInfo;
+}
+
+export interface McpCallInfo {
+  server: string;
+  tool: string;
+  readOnly: boolean;
 }
 
 /** What `request_user_help` asks the user to do in an agent tab. */

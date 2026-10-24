@@ -1,8 +1,9 @@
-import { contentMessageTab, isContentMessage, isCredentialRequest, isHistoryRequest, isInstructionsRequest, isMemoryRequest, isSettingsRequest, isSiteNotesRequest, isSkillsRequest, SIDEBAR_PORT_NAME } from "@/lib/protocol";
-import type { ContentMessageResponse, CredentialResponse, HistoryResponse, InstructionsResponse, MemoryResponse, SettingsResponse, SiteNotesResponse, SkillsResponse } from "@/lib/protocol";
+import { contentMessageTab, isContentMessage, isCredentialRequest, isHistoryRequest, isInstructionsRequest, isMcpRequest, isMemoryRequest, isSettingsRequest, isSiteNotesRequest, isSkillsRequest, SIDEBAR_PORT_NAME } from "@/lib/protocol";
+import type { ContentMessageResponse, CredentialResponse, HistoryResponse, InstructionsResponse, McpResponse, MemoryResponse, SettingsResponse, SiteNotesResponse, SkillsResponse } from "@/lib/protocol";
 import { handleSkillsRequest } from "@/lib/background/skills";
 import { handleInstructionsRequest, handleSiteNotesRequest } from "@/lib/background/instructions";
 import { handleMemoryRequest } from "@/lib/background/memory";
+import { handleMcpRequest, McpConnections } from "@/lib/background/mcp";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { BackgroundRuntime } from "@/lib/background/runtime";
 import { ApprovalBadge } from "@/lib/background/approval-badge";
@@ -16,7 +17,8 @@ export default defineBackground({
     // on every load, which MV2 persistent background pages require.
     const sidebarHub = new SidebarHub();
     const approvalBadge = new ApprovalBadge(browser.browserAction);
-    const runtime = new BackgroundRuntime(sidebarHub, { approvalBadge });
+    const mcp = new McpConnections({ clientVersion: browser.runtime.getManifest().version });
+    const runtime = new BackgroundRuntime(sidebarHub, { approvalBadge, mcp });
     sidebarHub.delegate = runtime;
 
     registerSiteRequestHeaders(browser);
@@ -53,7 +55,8 @@ export default defineBackground({
     });
 
     // Only the extension's own options page may read/write credentials,
-    // settings, history retention, skills, custom instructions, or memory; the
+    // settings, history retention, skills, custom instructions, memory, or MCP
+    // connections; the
     // sidebar Port never exposes these methods. Its user-authored writes are a
     // single site note (`siteNote.save`) and undoing a run's memory change
     // (`memory.undo`), revalidated like these. The options page is matched
@@ -63,7 +66,7 @@ export default defineBackground({
     // the sender's.
     const optionsUrl = browser.runtime.getURL("/options.html");
     browser.runtime.onMessage.addListener((message: unknown, sender):
-      Promise<CredentialResponse | SettingsResponse | HistoryResponse | SkillsResponse | InstructionsResponse | SiteNotesResponse | MemoryResponse | ContentMessageResponse> | undefined => {
+      Promise<CredentialResponse | SettingsResponse | HistoryResponse | SkillsResponse | InstructionsResponse | SiteNotesResponse | MemoryResponse | McpResponse | ContentMessageResponse> | undefined => {
       if (sender.id !== browser.runtime.id) return undefined;
       if (sender.url?.replace(/#.*$/s, "") !== optionsUrl) {
         const tabId = contentMessageTab(sender, browser.runtime.id);
@@ -76,6 +79,7 @@ export default defineBackground({
       if (isInstructionsRequest(message)) return handleInstructionsRequest(message);
       if (isSiteNotesRequest(message)) return handleSiteNotesRequest(message);
       if (isMemoryRequest(message)) return handleMemoryRequest(message);
+      if (isMcpRequest(message)) return handleMcpRequest(mcp, message);
       if (isSkillsRequest(message)) return handleSkillsRequest(message).then(async (response) => {
         if (response.ok && message.type !== "skills.list") await sidebarHub.broadcastSnapshot();
         return response;

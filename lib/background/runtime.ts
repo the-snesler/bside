@@ -19,6 +19,7 @@ import { readInstructions, saveSiteNoteFromSidebar } from "@/lib/background/inst
 import { readMemoryIndex, runMemory, undoMemoryChanges } from "@/lib/background/memory";
 import { matchSiteNotes, pageOrigin, siteNoteForPage, type SiteNote } from "@/lib/domain/instructions";
 import type { ApprovalBadge } from "@/lib/background/approval-badge";
+import type { McpConnections } from "@/lib/background/mcp";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
 import type { AgentTab } from "@/lib/background/browser-program";
@@ -158,6 +159,8 @@ export class BackgroundRuntime {
   #tabControllerFactory: () => TabController;
   #sites: SiteEnv;
   #approvalBadge: ApprovalBadge | null;
+  /** Connected accounts' tools; none when absent. */
+  #mcp: McpConnections | null;
   #activeRun: ActiveRun | null = null;
   #notice: string | null = null;
   #clock: RuntimeClock;
@@ -204,7 +207,7 @@ export class BackgroundRuntime {
 
   constructor(
     sidebarHub: SidebarHub,
-    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController; sites?: SiteEnv; approvalBadge?: ApprovalBadge; clock?: RuntimeClock } = {},
+    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController; sites?: SiteEnv; approvalBadge?: ApprovalBadge; clock?: RuntimeClock; mcp?: McpConnections } = {},
   ) {
     this.#sidebarHub = sidebarHub;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
@@ -219,6 +222,7 @@ export class BackgroundRuntime {
     this.#tabControllerFactory = options.tabControllerFactory ?? (() => new TabController(browser as unknown as TabControllerBrowserApi, undefined, frameAliases));
     this.#sites = options.sites ?? browserSiteEnv();
     this.#approvalBadge = options.approvalBadge ?? null;
+    this.#mcp = options.mcp ?? null;
     this.#workspace.onOwnershipChange = () => void this.#queueAgentTabSync();
   }
 
