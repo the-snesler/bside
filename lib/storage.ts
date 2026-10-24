@@ -976,20 +976,36 @@ export async function saveMcpServerState(id: string, state: McpServerStateV1): P
   await storage.setItem(mcpServerKey(id), state);
 }
 
-/** Background-only. A malformed record is deleted and reads as absent. */
-export async function getMcpSealed(kind: McpSealedKind, id: string): Promise<McpSealedRecordV1 | null> {
+/** Sealing context: binds a record to its kind and server, so one cannot be opened as another. */
+const mcpSealContext = (kind: McpSealedKind, id: string) => `bside:mcp-${kind}:${id}:v1`;
+
+/**
+ * Background-only: a server's sealed record, opened. A malformed record, or
+ * one the device key cannot open for this kind and server (lost key,
+ * tampering), is deleted and reads as absent; if the key store itself is
+ * unavailable the record is kept and also reads as absent.
+ */
+export async function getMcpSecret(kind: McpSealedKind, id: string, key: DeviceKey = deviceKey): Promise<string | null> {
   const raw = await storage.getItem<McpSealedRecordV1>(mcpSealedKey(kind, id));
-  if (raw?.version === 1 && Object.keys(raw).length === 3 && typeof raw.iv === "string" && raw.iv.length === 16 &&
-    typeof raw.ciphertext === "string" && raw.ciphertext.length > 0 && raw.ciphertext.length < 200_000) return raw;
-  if (raw !== null) await storage.removeItem(mcpSealedKey(kind, id));
-  return null;
+  if (raw === null) return null;
+  if (!(typeof raw === "object" && raw.version === 1 && Object.keys(raw).length === 3 && typeof raw.iv === "string" && raw.iv.length === 16 &&
+    typeof raw.ciphertext === "string" && raw.ciphertext.length > 0 && raw.ciphertext.length < 200_000)) {
+    await storage.removeItem(mcpSealedKey(kind, id));
+    return null;
+  }
+  let plaintext: string | null;
+  try { plaintext = await key.open(raw, mcpSealContext(kind, id)); }
+  catch { return null; }
+  if (plaintext === null) await storage.removeItem(mcpSealedKey(kind, id));
+  return plaintext;
 }
 
-export async function saveMcpSealed(kind: McpSealedKind, id: string, sealed: { iv: string; ciphertext: string }): Promise<void> {
+export async function saveMcpSecret(kind: McpSealedKind, id: string, plaintext: string, key: DeviceKey = deviceKey): Promise<void> {
+  const sealed = await key.seal(plaintext, mcpSealContext(kind, id));
   await storage.setItem(mcpSealedKey(kind, id), { version: 1, iv: sealed.iv, ciphertext: sealed.ciphertext } satisfies McpSealedRecordV1);
 }
 
-export async function deleteMcpSealed(kind: McpSealedKind, id: string): Promise<void> {
+export async function deleteMcpSecret(kind: McpSealedKind, id: string): Promise<void> {
   await storage.removeItem(mcpSealedKey(kind, id));
 }
 
