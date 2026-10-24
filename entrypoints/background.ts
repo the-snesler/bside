@@ -1,4 +1,4 @@
-import { isContentMessage, isCredentialRequest, isHistoryRequest, isInstructionsRequest, isMemoryRequest, isSettingsRequest, isSiteNotesRequest, isSkillsRequest, SIDEBAR_PORT_NAME } from "@/lib/protocol";
+import { contentMessageTab, isContentMessage, isCredentialRequest, isHistoryRequest, isInstructionsRequest, isMemoryRequest, isSettingsRequest, isSiteNotesRequest, isSkillsRequest, SIDEBAR_PORT_NAME } from "@/lib/protocol";
 import type { ContentMessageResponse, CredentialResponse, HistoryResponse, InstructionsResponse, MemoryResponse, SettingsResponse, SiteNotesResponse, SkillsResponse } from "@/lib/protocol";
 import { handleSkillsRequest } from "@/lib/background/skills";
 import { handleInstructionsRequest, handleSiteNotesRequest } from "@/lib/background/instructions";
@@ -58,15 +58,16 @@ export default defineBackground({
     // single site note (`siteNote.save`) and undoing a run's memory change
     // (`memory.undo`), revalidated like these. The options page is matched
     // without its `#/page` route, which deep links (`#/memory/<name>`) carry.
-    // The top-frame content script in an HTTP(S) tab may only ask for its own
-    // tab's page shield or report "Take over"; the tab is the sender's.
+    // The top-frame content script in an HTTP(S) tab (never a subframe's) may
+    // only ask for its own tab's page shield or report "Take over"; the tab is
+    // the sender's.
     const optionsUrl = browser.runtime.getURL("/options.html");
     browser.runtime.onMessage.addListener((message: unknown, sender):
       Promise<CredentialResponse | SettingsResponse | HistoryResponse | SkillsResponse | InstructionsResponse | SiteNotesResponse | MemoryResponse | ContentMessageResponse> | undefined => {
       if (sender.id !== browser.runtime.id) return undefined;
       if (sender.url?.replace(/#.*$/s, "") !== optionsUrl) {
-        const tabId = sender.tab?.id;
-        if (tabId === undefined || sender.frameId !== 0 || !/^https?:/.test(sender.url ?? "") || !isContentMessage(message)) return undefined;
+        const tabId = contentMessageTab(sender, browser.runtime.id);
+        if (tabId === null || !isContentMessage(message)) return undefined;
         return runtime.handleContentMessage(tabId, message);
       }
       if (isCredentialRequest(message)) return runtime.handleCredentialRequest(message);

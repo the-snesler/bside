@@ -337,6 +337,27 @@ export function isContentMessage(value: unknown): value is ContentMessage {
   return isEnvelope(value) && (value.type === "shield.sync" || value.type === "shield.takeover");
 }
 
+/** The fields of a `runtime.onMessage` sender that decide whether a content message is accepted. */
+export interface ContentMessageSender {
+  id?: string;
+  url?: string;
+  frameId?: number;
+  tab?: { id?: number };
+}
+
+/**
+ * The tab a content message may act on: the sender's own tab, when it is this
+ * extension's content script in the top frame of an HTTP(S) tab; null for any
+ * other sender. The content script runs in every frame, but only the top
+ * frame's instance messages the background, so a subframe (whose page may be
+ * another origin) never reaches the shield.
+ */
+export function contentMessageTab(sender: ContentMessageSender, extensionId: string): number | null {
+  const tabId = sender.tab?.id;
+  if (sender.id !== extensionId || sender.frameId !== 0 || !/^https?:/.test(sender.url ?? "")) return null;
+  return Number.isSafeInteger(tabId) && (tabId as number) >= 0 ? tabId as number : null;
+}
+
 export function isContentMessageResponse(value: unknown): value is ContentMessageResponse {
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Record<string, unknown>;

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { validateDomAction } from "@/lib/validation";
 import {
+  contentMessageTab,
   isContentMessage,
   isContentMessageResponse,
   isCredentialRequest,
@@ -420,6 +421,20 @@ describe("page shield messages", () => {
     expect(isContentMessage({ v: 1, id: "1", type: "page.shield", tabId: 1, shield: "off" })).toBe(false);
     expect(isContentMessage({ v: 1, type: "shield.sync" })).toBe(false);
     expect(isContentMessage({ v: 1, id: "1", type: "credentials.openai.status" })).toBe(false);
+  });
+
+  it("takes content messages only from this extension's top-frame content script in an HTTP(S) tab, for the sender's tab", () => {
+    const top = { id: "bside@tsuni.dev", url: "https://shop.example/checkout", frameId: 0, tab: { id: 7 } };
+    expect(contentMessageTab(top, "bside@tsuni.dev")).toBe(7);
+    expect(contentMessageTab({ ...top, url: "http://127.0.0.1:4173/frames-page.html" }, "bside@tsuni.dev")).toBe(7);
+    // A cross-origin payment frame's content script runs in the same tab, but may not touch the shield.
+    expect(contentMessageTab({ ...top, url: "https://pay.example/card", frameId: 21474836481 }, "bside@tsuni.dev")).toBeNull();
+    expect(contentMessageTab({ ...top, frameId: undefined }, "bside@tsuni.dev")).toBeNull();
+    expect(contentMessageTab({ ...top, id: "other@example.com" }, "bside@tsuni.dev")).toBeNull();
+    expect(contentMessageTab({ ...top, url: "moz-extension://abc/sidepanel.html" }, "bside@tsuni.dev")).toBeNull();
+    expect(contentMessageTab({ ...top, url: undefined }, "bside@tsuni.dev")).toBeNull();
+    expect(contentMessageTab({ ...top, tab: undefined }, "bside@tsuni.dev")).toBeNull();
+    expect(contentMessageTab({ ...top, tab: { id: -1 } }, "bside@tsuni.dev")).toBeNull();
   });
 
   it("reads a background answer only when it carries a known shield state", () => {
