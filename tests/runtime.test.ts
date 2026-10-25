@@ -3550,7 +3550,26 @@ describe("BackgroundRuntime: scheduled automation", () => {
 
 describe("BackgroundRuntime: selected MCP content", () => {
   const answer: ScriptedProviderEvent[] = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
-  async function fixture(provider = new FakeProvider()) {
+  const ask = (id = "ask-1", text = "Selected source text") => buildAskContext("selection", { selectionText: text }, { id: 1, url: "http://127.0.0.1:4173/agent-page.html", title: "Source page" }, id, 1)!;
+  /** Hold the real queue/message write, not the runtime's admission helpers. */
+  function holdAdmission(sessionId: string, text: string, reject: boolean) {
+    const writing = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    const originalSet = browser.storage.local.set.bind(browser.storage.local);
+    let held = false;
+    const spy = vi.spyOn(browser.storage.local, "set").mockImplementation(async items => {
+      const records = items as Record<string, unknown>;
+      const queue = records[`queue:${sessionId}`] as { messages?: Array<{ text: string }> } | undefined;
+      const chunk = records[`conversation:${sessionId}:items:0`] as { items?: ConversationItem[] } | undefined;
+      if (!held && (queue?.messages?.some(item => item.text === text) || chunk?.items?.some(item => item.kind === "message" && item.role === "user" && item.text === text))) {
+        held = true; writing.resolve(); await resume.promise;
+        if (reject) throw new Error("private storage error");
+      }
+      await originalSet(items);
+    });
+    return { writing: writing.promise, resume: () => resume.resolve(), restore: () => spy.mockRestore() };
+  }
+  async function fixture(provider = new FakeProvider(), tabControllerFactory = unsupportedPageTabControllerFactory) {
     const remote = { text: "Original remote snapshot" };
     const fake = fakeMcpServers({ capabilities: { tools: {}, prompts: {}, resources: {} }, content: (_server, method) => {
       if (method === "prompts/list") return { prompts: [{ name: "summarize", arguments: [{ name: "topic", required: true }] }] };
@@ -3561,19 +3580,68 @@ describe("BackgroundRuntime: selected MCP content", () => {
     const mcp = new McpConnections({ fetcher: fake.fetcher, popup: approvingPopup() });
     await mcp.connect("notion");
     const hub = new SidebarHub();
-    const runtime = new BackgroundRuntime(hub, { provider, mcp, tabControllerFactory: unsupportedPageTabControllerFactory });
+    const runtime = new BackgroundRuntime(hub, { provider, mcp, tabControllerFactory });
     const owner = {};
     const sessionId = (await runtime.getSnapshot()).conversation.id;
     const send = (command: Record<string, unknown>, sender = owner) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand, sender);
-    const prepare = async (kind: "prompt" | "resource" = "prompt") => {
-      const list = await send({ type: "mcp.content.list", kind, sessionId });
+    const prepare = async (kind: "prompt" | "resource" = "prompt", sender = owner) => {
+      const list = await send({ type: "mcp.content.list", kind, sessionId }, sender);
       if (!list || !("contentReply" in list) || !list.contentReply.ok || !("choices" in list.contentReply)) throw new Error("Missing catalog");
-      const result = await send({ type: "mcp.content.prepare", sessionId, choiceId: list.contentReply.choices[0]!.id, arguments: { topic: "planning" } });
+      const result = await send({ type: "mcp.content.prepare", sessionId, choiceId: list.contentReply.choices[0]!.id, arguments: { topic: "planning" } }, sender);
       if (!result || !("contentReply" in result) || !result.contentReply.ok || !("snapshot" in result.contentReply)) throw new Error("Missing snapshot");
       return result.contentReply.snapshot;
     };
     return { runtime, mcp, hub, provider, remote, sessionId, send, prepare, owner };
   }
+
+  it("settles an accepted second-sidebar steer when the initial message cannot be saved after capture", async () => {
+    await saveOpenAICredential("sk-test");
+    const controller = supportedPageTabControllerFactory();
+    const capture = controller.captureActivePage.bind(controller);
+    const capturing = Promise.withResolvers<void>();
+    const resumeCapture = Promise.withResolvers<void>();
+    const heldCapture = vi.spyOn(controller, "captureActivePage").mockImplementationOnce(async () => {
+      capturing.resolve(); await resumeCapture.promise;
+      return capture();
+    });
+    const f = await fixture(undefined, () => controller);
+    f.hub.delegate = f.runtime;
+    f.provider.script = answer;
+    const first = fakePort(); f.hub.handleConnect(first);
+    const originalSet = browser.storage.local.set.bind(browser.storage.local);
+    const fail = vi.spyOn(browser.storage.local, "set").mockImplementation(async items => {
+      const chunk = (items as Record<string, unknown>)[`conversation:${f.sessionId}:items:0`] as { items?: ConversationItem[] } | undefined;
+      if (chunk?.items?.some(item => item.kind === "message" && item.role === "user" && item.text === "Start")) throw new Error("private storage error");
+      await originalSet(items);
+    });
+    const starting = first.send({ v: 1, id: "start", type: "run.start", prompt: "Start" });
+    try {
+      await capturing.promise;
+      const second = fakePort(); f.hub.handleConnect(second);
+      await second.send({ v: 1, id: "subscribe", type: "state.subscribe", lastSeq: 0 });
+      const runId = (await f.runtime.getSnapshot()).activeRun!.runId;
+      const prepared = await f.prepare("resource", second);
+      await second.send({ v: 1, id: "steer", type: "run.steer", runId, text: "Explain", sessionId: f.sessionId, contentIds: [prepared.id] });
+      const [pending] = await loadMessageQueue(f.sessionId);
+      expect(pending).toMatchObject({ mode: "steer", content: [prepared] });
+      resumeCapture.resolve(); await starting;
+      const snapshot = await f.runtime.getSnapshot();
+      expect(snapshot.activeRun).toBeNull();
+      expect(snapshot.queue).toEqual([{ ...pending, mode: "follow-up" }]);
+      expect(await loadMessageQueue(f.sessionId)).toEqual(snapshot.queue);
+      expect(f.provider.requests).toHaveLength(0);
+      const idle = second.received.findLast(event => event.type === "state.snapshot");
+      expect(idle?.payload).toMatchObject({ activeRun: null, queue: snapshot.queue });
+      fail.mockRestore();
+      await second.send({ v: 1, id: "send", type: "queue.send", sessionId: f.sessionId, messageId: pending!.id });
+      expect((await getConversation(f.sessionId))!.items.filter(isTurnStart)).toMatchObject([{ id: pending!.id, text: "Explain", content: [prepared] }]);
+      expect(await loadMessageQueue(f.sessionId)).toEqual([]);
+      expect(second.received.filter(event => event.type === "mcp.content.accepted")).toHaveLength(1);
+    } finally {
+      resumeCapture.resolve(); fail.mockRestore(); heldCapture.mockRestore();
+      await starting;
+    }
+  });
 
   it("keeps failed-send chips available, refuses other sidebars/session and duplicate sends, and replays exact bytes after disconnect", async () => {
     const f = await fixture();
@@ -3732,29 +3800,93 @@ describe("BackgroundRuntime: selected MCP content", () => {
     }
   });
 
-  it("retains prepared chips if queue persistence fails and accepts them once on retry", async () => {
+  it.each([
+    { mode: "initial", withContent: true },
+    { mode: "follow-up", withContent: true },
+    { mode: "steer", withContent: true },
+    { mode: "follow-up", withContent: false },
+  ] as const)("retains $mode drafts when persistence fails, then accepts them exactly once (MCP: $withContent)", async ({ mode, withContent }) => {
+    await saveOpenAICredential("sk-test");
+    const f = await fixture();
+    const first = fakePort(); const second = fakePort();
+    f.hub.handleConnect(first); f.hub.handleConnect(second);
+    const gate = Promise.withResolvers<void>();
+    let round = 0;
+    f.provider.script = () => ({ [Symbol.asyncIterator]: async function* () { if (mode !== "initial" && round++ === 0) await gate.promise; yield* answer; } });
+    const running = mode === "initial" ? Promise.resolve() : f.send({ type: "run.start", prompt: "Start" });
+    if (mode !== "initial") await untilRequested(f.provider);
+    const prepared = withContent ? await f.prepare("prompt", first) : undefined;
+    const competing = withContent ? await f.prepare("resource", second) : undefined;
+    const source = ask(); f.runtime.setAsk(source);
+    const runId = (await f.runtime.getSnapshot()).activeRun?.runId;
+    const command = { type: mode === "steer" ? "run.steer" : "run.start", runId, prompt: "Explain", text: "Explain", askId: source.id, sessionId: f.sessionId, contentIds: prepared ? [prepared.id] : undefined };
+    const competingCommand = { ...command, contentIds: competing ? [competing.id] : undefined };
+    const expected = { ask: { ...source, path: "/tabs/1/page.md" }, ...(prepared ? { content: [prepared] } : {}) };
+    const held = holdAdmission(f.sessionId, "Explain", true);
+    const sending = f.send(command, first);
+    try {
+      await held.writing;
+      const visibleWhileSaving = first.received.filter(event => event.type === "ask.changed").at(-1)?.payload;
+      // A distinct capability in a second sidebar cannot admit the same Ask twice.
+      const competingSend = f.send(competingCommand, second);
+      await tick();
+      held.resume(); await Promise.all([sending, competingSend]);
+      expect(visibleWhileSaving).toEqual({ ask: source });
+      expect((await f.runtime.getSnapshot()).ask).toEqual(source);
+      expect((await f.runtime.getSnapshot()).queue).toEqual([]);
+      expect(await loadMessageQueue(f.sessionId)).toEqual([]);
+      expect(first.received.some(event => event.type === "mcp.content.accepted")).toBe(false);
+      expect(f.provider.requests).toHaveLength(mode === "initial" ? 0 : 1);
+      held.restore();
+      await Promise.all([f.send(command, first), f.send(command, first)]);
+      await f.send(competingCommand, second);
+      expect((await f.runtime.getSnapshot()).ask).toBeNull();
+      if (mode !== "initial") expect((await loadMessageQueue(f.sessionId))).toMatchObject([expected]);
+      gate.resolve(); await running;
+      await vi.waitFor(async () => {
+        const snapshot = await f.runtime.getSnapshot();
+        expect(snapshot.activeRun).toBeNull(); expect(snapshot.queue).toEqual([]);
+      });
+      const users = (await getConversation(f.sessionId))!.items.filter(item => item.kind === "message" && item.role === "user" && item.text === "Explain");
+      expect(users).toMatchObject([expected]);
+      expect(first.received.filter(event => event.type === "mcp.content.accepted")).toHaveLength(withContent ? 1 : 0);
+      expect(first.received.filter(event => event.type === "ask.changed" && event.payload.ask === null)).toHaveLength(1);
+      expect(second.received.some(event => event.type === "mcp.content.accepted")).toBe(false);
+    } finally {
+      held.resume(); held.restore(); gate.resolve();
+      await sending; await running;
+    }
+  });
+
+  it.each([
+    { mode: "initial", change: "replace", reject: false },
+    { mode: "follow-up", change: "replace", reject: true },
+    { mode: "steer", change: "dismiss", reject: true },
+  ] as const)("preserves a concurrent Ask $change during $mode admission (rejected: $reject)", async ({ mode, change, reject }) => {
     await saveOpenAICredential("sk-test");
     const f = await fixture();
     const gate = Promise.withResolvers<void>();
-    f.provider.script = () => ({ [Symbol.asyncIterator]: async function* () { await gate.promise; yield* answer; } });
-    const running = f.send({ type: "run.start", prompt: "Start" });
-    await untilRequested(f.provider);
+    let round = 0;
+    f.provider.script = () => ({ [Symbol.asyncIterator]: async function* () { if (mode !== "initial" && round++ === 0) await gate.promise; yield* answer; } });
+    const running = mode === "initial" ? Promise.resolve() : f.send({ type: "run.start", prompt: "Start" });
+    if (mode !== "initial") await untilRequested(f.provider);
     const prepared = await f.prepare();
-    const originalSet = browser.storage.local.set.bind(browser.storage.local);
-    const fail = vi.spyOn(browser.storage.local, "set").mockImplementation(async items => {
-      if (Object.hasOwn(items, `queue:${f.sessionId}`)) throw new Error("private storage error");
-      await originalSet(items);
-    });
-    const command = { type: "run.start", prompt: "Explain", sessionId: f.sessionId, contentIds: [prepared.id] };
-    await f.send(command);
-    expect((await f.runtime.getSnapshot()).queue).toHaveLength(0);
-    fail.mockRestore();
-    await f.send(command);
-    expect((await loadMessageQueue(f.sessionId))[0]!.content).toEqual([prepared]);
-    f.provider.script = answer;
-    gate.resolve();
-    await running;
-    await vi.waitFor(async () => expect((await f.runtime.getSnapshot()).activeRun).toBeNull());
+    f.runtime.setAsk(ask());
+    const runId = (await f.runtime.getSnapshot()).activeRun?.runId;
+    const held = holdAdmission(f.sessionId, "Explain", reject);
+    const sending = f.send({ type: mode === "steer" ? "run.steer" : "run.start", runId, prompt: "Explain", text: "Explain", askId: "ask-1", sessionId: f.sessionId, contentIds: [prepared.id] });
+    try {
+      await held.writing;
+      if (change === "replace") f.runtime.setAsk(ask("newer", "New menu gesture"));
+      else await f.send({ type: "ask.dismiss", askId: "ask-1" });
+      held.resume(); await sending;
+      expect((await f.runtime.getSnapshot()).ask).toEqual(change === "replace" ? ask("newer", "New menu gesture") : null);
+      const users = (await getConversation(f.sessionId))!.items.filter(item => item.kind === "message" && item.role === "user" && item.text === "Explain");
+      expect(users).toMatchObject(reject ? [] : [{ ask: { ...ask(), path: "/tabs/1/page.md" }, content: [prepared] }]);
+    } finally {
+      held.resume(); held.restore(); gate.resolve();
+      await sending; await running;
+    }
   });
 
   it("refuses stale preparation after session switch or connection refresh and accepts only native sidebar senders", async () => {
