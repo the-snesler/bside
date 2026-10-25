@@ -27,6 +27,7 @@ entrypoints/
   sidepanel/           Native Firefox sidebar Preact surface.
   options/             Options-page settings app: searchable grouped sidebar, `#/<id>` hash routes, one page per registry entry.
     pages/index.ts     `SETTINGS_PAGES` registry (id, label, group, icon, keywords, component); adding a page is one entry.
+    pages/Automation.tsx  Scheduled task CRUD/enabling, cadence/status/results, and opt-in private notification settings.
     pages/*.tsx        General (model, effort), Account (ChatGPT, API key), Instructions (custom instructions), Site notes (search, inline edit, two-step delete), Memory (write policy, search, view/edit/delete, provenance and taint badge, JSON export, "Forget everything"), Connections (directory servers: Connect/Disconnect, status, refresh, per-tool switches with read-only/write badges, trust level), History & privacy; Skills is `lib/ui/SkillsEditor.tsx`.
     state.ts           Shared credential/settings state for pages, refreshed on focus.
     navigation.ts      Hash route parsing (`#/<id>`, plus `#/<id>/<item>` deep links such as `#/memory/<name>`) and sidebar search over labels and keywords.

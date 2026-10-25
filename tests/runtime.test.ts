@@ -3285,7 +3285,7 @@ describe("BackgroundRuntime: scheduled automation", () => {
   const draft: TaskDraft = { name: "Morning check", prompt: "Check this page", url: "https://example.test/", enabled: true, schedule: { kind: "interval", minutes: 5 } };
   const runtimes: BackgroundRuntime[] = [];
   afterEach(() => { for (const runtime of runtimes.splice(0)) runtime.dispose(); });
-  async function setup(provider = new FakeProvider(), notifications?: RunNotifications) {
+  async function setup(provider = new FakeProvider(), notifications?: RunNotifications, mcp?: McpConnections) {
     await saveOpenAICredential("sk-test");
     const openId = await ensureOpenSession();
     const { clock, advance } = manualClock(Date.now());
@@ -3301,7 +3301,7 @@ describe("BackgroundRuntime: scheduled automation", () => {
     const badge = new ApprovalBadge({ setBadgeText: ({ text }) => { texts.push(text); }, setBadgeBackgroundColor: () => {} });
     const hub = new SidebarHub();
     const alarms = { create: vi.fn(), clear: vi.fn(async () => true) };
-    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory, clock, alarms, approvalBadge: badge, notifications });
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory, clock, alarms, approvalBadge: badge, notifications, mcp });
     runtimes.push(runtime); hub.delegate = runtime;
     await runtime.initialize();
     const saved = await runtime.handleAutomationRequest({ v: 1, id: "save", type: "automation.save", taskId: null, task: draft });
@@ -3357,6 +3357,45 @@ describe("BackgroundRuntime: scheduled automation", () => {
     expect(await getOpenSessionId()).toBe(openId);
     advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); await ended(taskId);
     expect(provider.requests).toHaveLength(2);
+  });
+
+  it("keeps an unsent context-menu draft separate from an automatic run", async () => {
+    const provider = new FakeProvider(); provider.script = [{ type: "turn.completed", replayState: null }];
+    const { runtime, advance, taskId } = await setup(provider);
+    const ask = buildAskContext("selection", { selectionText: "PRIVATE_UNSENT_SELECTION" }, { id: 1, url: "https://private-user-page.test/", title: "Source" }, "unsent", 1)!;
+    runtime.setAsk(ask);
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); await ended(taskId);
+    expect((await runtime.getSnapshot()).ask).toEqual(ask);
+    expect(JSON.stringify(provider.requests)).not.toContain("PRIVATE_UNSENT_SELECTION");
+  });
+
+  it("keeps scheduled help pending until a user response", async () => {
+    const provider = new FakeProvider();
+    scripted(provider, [[{ type: "tool.call", call: { id: "help", name: "request_user_help", arguments: { tab: "/agent-tabs/100/page.md", kind: "verification", reason: "Clear verification in the tab." } } }, { type: "turn.completed", replayState: null }], [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }]]);
+    const { runtime, advance, taskId, texts } = await setup(provider);
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun?.status).toBe("awaiting-help"));
+    const active = (await runtime.getSnapshot()).activeRun!;
+    expect((await getScheduledTasks())[0]!.lastRun?.status).toBe("awaiting-help");
+    expect(provider.requests).toHaveLength(1); expect(texts.at(-1)).toBe("!");
+    await runtime.handleCommand({ v: 1, id: "done", type: "help.resolve", runId: active.runId, callId: "help", outcome: "done", note: "" });
+    expect((await ended(taskId)).lastRun?.status).toBe("completed");
+  });
+
+  it("preserves confirm-writes MCP gates on unattended runs", async () => {
+    const fake = fakeMcpServers({ tools: { notion: [{ name: "create-page", annotations: { readOnlyHint: false } }] } });
+    const mcp = new McpConnections({ popup: approvingPopup(), fetcher: fake.fetcher });
+    await mcp.connect("notion");
+    const provider = new FakeProvider();
+    scripted(provider, [[{ type: "tool.call", call: { id: "write", name: "mcp__notion__create-page", arguments: { title: "Draft" } } }, { type: "turn.completed", replayState: null }], [{ type: "text.delta", delta: "Denied." }, { type: "turn.completed", replayState: null }]]);
+    const { runtime, advance, taskId } = await setup(provider, undefined, mcp);
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun?.pendingApproval?.mcp?.tool).toBe("create-page"));
+    const active = (await runtime.getSnapshot()).activeRun!;
+    expect(fake.requests.some((request) => request.body.includes('"tools/call"'))).toBe(false);
+    await runtime.handleCommand({ v: 1, id: "deny", type: "action.deny", runId: active.runId, callId: "write" });
+    await ended(taskId);
+    expect(fake.requests.some((request) => request.body.includes('"tools/call"'))).toBe(false);
   });
 
   it("never runs two due tasks simultaneously", async () => {
