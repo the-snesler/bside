@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const run = (command, args, cwd = root) => execFileSync(command, args, { cwd, stdio: "inherit", env: { ...process.env, NO_COLOR: "1" } });
 const git = (...args) => execFileSync("git", args, { cwd: root, encoding: "utf8" });
-const top = new Set(["AGENTS.md", "README.md", "LICENSE", "LICENSE.md", "package.json", "pnpm-lock.yaml", "tsconfig.json", "vitest.config.ts", "wxt.config.ts"]);
+const top = new Set(["AGENTS.md", "README.md", "LICENSE", "LICENSE.md", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "tsconfig.json", "vitest.config.ts", "wxt.config.ts"]);
 const roots = new Set(["entrypoints", "lib", "styles", "public", "scripts", "docs", "tests"]);
 const allowed = (path) => {
   const parts = path.split("/");
@@ -43,7 +43,7 @@ try {
   if (process.argv.slice(2).some((arg) => arg !== "--verify")) throw new Error("Usage: source-submission.mjs [--verify]");
   if (git("status", "--porcelain", "--untracked-files=no").trim()) throw new Error("Commit tracked changes before making the release source archive.");
   const files = git("ls-files", "-z").split("\0").filter((path) => path && allowed(path)).sort();
-  for (const required of ["package.json", "pnpm-lock.yaml", "wxt.config.ts", "docs/source-build.md", "scripts/manifest-snapshot.json"]) {
+  for (const required of ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "wxt.config.ts", "docs/source-build.md", "scripts/manifest-snapshot.json"]) {
     if (!files.includes(required)) throw new Error(`Required source file is not tracked: ${required}`);
   }
   for (const path of files) if (!lstatSync(join(root, path)).isFile()) throw new Error(`Source must be a regular file: ${path}`);
