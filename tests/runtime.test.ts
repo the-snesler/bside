@@ -3382,6 +3382,32 @@ describe("BackgroundRuntime: scheduled automation", () => {
     expect(JSON.stringify(provider.requests)).not.toContain("PRIVATE_UNSENT_SELECTION");
   });
 
+  it("leaves prepared MCP attachments private to their manual chat while automatic runs use ordinary context", async () => {
+    const fake = fakeMcpServers({ capabilities: { tools: {}, resources: {} }, content: (_server, method) => method === "resources/list"
+      ? { resources: [{ name: "PRIVATE_PENDING_NAME", uri: "internal://private-pending-uri" }] }
+      : { contents: [{ uri: "internal://private-pending-uri", text: "PRIVATE_PENDING_MCP_TEXT" }] } });
+    const mcp = new McpConnections({ fetcher: fake.fetcher, popup: approvingPopup() });
+    await mcp.connect("notion");
+    const provider = new FakeProvider(); provider.script = [{ type: "turn.completed", replayState: null }];
+    const { runtime, advance, taskId, openId } = await setup(provider, undefined, mcp);
+    const owner = {};
+    const catalog = await runtime.handleCommand({ v: 1, id: "catalog", type: "mcp.content.list", sessionId: openId, kind: "resource" }, owner);
+    if (!catalog || !("contentReply" in catalog) || !catalog.contentReply.ok || !("choices" in catalog.contentReply)) throw new Error("Missing resource catalog");
+    const prepared = await runtime.handleCommand({ v: 1, id: "prepare", type: "mcp.content.prepare", sessionId: openId, choiceId: catalog.contentReply.choices[0]!.id, arguments: {} }, owner);
+    if (!prepared || !("contentReply" in prepared) || !prepared.contentReply.ok || !("snapshot" in prepared.contentReply)) throw new Error("Missing resource preview");
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
+    const task = await ended(taskId);
+    expect(JSON.stringify(provider.requests)).not.toMatch(/PRIVATE_PENDING|private-pending-uri/);
+    const scheduled = (await getConversation(task.sessionId!))!.items.find(isTurnStart)!;
+    expect(scheduled.scheduled?.taskId).toBe(taskId);
+    expect(scheduled.content).toBeUndefined();
+    await runtime.handleCommand({ v: 1, id: "manual", type: "run.start", prompt: "Read my selected attachment", sessionId: openId, contentIds: [prepared.contentReply.snapshot.id] }, owner);
+    expect(JSON.stringify(provider.requests.at(-1))).toContain("PRIVATE_PENDING_MCP_TEXT");
+    const report = await runtime.handleProblemReportRequest({ v: 1, id: "report", type: "problemReport.export", sessionId: openId });
+    expect(report.ok).toBe(true);
+    expect(JSON.stringify(report)).not.toMatch(/PRIVATE_PENDING|private-pending-uri/);
+  });
+
   it("keeps scheduled help pending until a user response", async () => {
     const provider = new FakeProvider();
     scripted(provider, [[{ type: "tool.call", call: { id: "help", name: "request_user_help", arguments: { tab: "/agent-tabs/100/page.md", kind: "verification", reason: "Clear verification in the tab." } } }, { type: "turn.completed", replayState: null }], [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }]]);
@@ -3576,6 +3602,9 @@ describe("BackgroundRuntime: selected MCP content", () => {
     const exported = await f.runtime.handleCommand({ v: 1, id: "export", type: "context.export", sessionId: f.sessionId });
     expect(exported!.markdown).toContain("Original remote snapshot");
     expect(exported!.markdown).not.toContain("Remote replacement");
+    const report = await f.runtime.handleProblemReportRequest({ v: 1, id: "metadata", type: "problemReport.export", sessionId: f.sessionId });
+    expect(report.ok).toBe(true);
+    expect(JSON.stringify(report)).not.toMatch(/Original remote snapshot|Remote replacement|summarize|mcp:notion/);
   });
 
   it("taints first-turn memory reads and accepts no MCP write/effect merely for selecting content", async () => {
@@ -3628,6 +3657,79 @@ describe("BackgroundRuntime: selected MCP content", () => {
     expect(JSON.stringify(f.provider.requests[1]!.context.messages)).not.toContain("Remote replacement");
     expect((await listMemories())[0]?.provenance).toMatchObject({ tainted: true });
     expect((await getConversation(f.sessionId))!.items.find(i => i.kind === "message" && i.role === "user" && i.text === "Explain")).toMatchObject({ content: [prepared], ...(mode === "steer" ? { delivery: "steer" } : {}) });
+  });
+
+  it.each(["removal", "delivery", "settlement"] as const)("serializes %s while attachment acceptance is persisting without resurrecting queued messages", async mode => {
+    await saveOpenAICredential("sk-test");
+    const f = await fixture();
+    const observer = fakePort(); f.hub.handleConnect(observer);
+    const firstRound = Promise.withResolvers<void>();
+    const secondRound = Promise.withResolvers<void>();
+    let round = 0;
+    f.provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      const current = round++;
+      if (current === 0) await firstRound.promise;
+      if (current === 1 && mode === "delivery") await secondRound.promise;
+      yield* answer;
+    } });
+    const running = f.send({ type: "run.start", prompt: "Start" });
+    await untilRequested(f.provider);
+    const runId = (await f.runtime.getSnapshot()).activeRun!.runId;
+    await f.send(mode === "removal" ? { type: "run.start", prompt: "A" } : { type: "run.steer", runId, text: "A" });
+    const a = (await loadMessageQueue(f.sessionId))[0]!;
+    const prepared = await f.prepare("resource");
+    const writing = Promise.withResolvers<void>();
+    const resumeWrite = Promise.withResolvers<void>();
+    const originalSet = browser.storage.local.set.bind(browser.storage.local);
+    let held = false;
+    const spy = vi.spyOn(browser.storage.local, "set").mockImplementation(async items => {
+      const queue = (items as Record<string, unknown>)[`queue:${f.sessionId}`] as { messages?: Array<{ content?: Array<{ id: string }> }> } | undefined;
+      if (!held && queue?.messages?.some(message => message.content?.some(item => item.id === prepared.id))) {
+        held = true; writing.resolve(); await resumeWrite.promise;
+      }
+      await originalSet(items);
+    });
+    const accepting = f.send({ type: "run.start", prompt: "B", sessionId: f.sessionId, contentIds: [prepared.id] });
+    try {
+      await writing.promise;
+      let removing: Promise<unknown> | undefined;
+      if (mode === "removal") removing = f.send({ type: "queue.remove", sessionId: f.sessionId, messageId: a.id }, {});
+      else if (mode === "delivery") {
+        firstRound.resolve();
+        await vi.waitFor(async () => expect((await getConversation(f.sessionId))!.items.some(item => item.id === a.id && item.kind === "message" && item.role === "user" && item.delivery === "steer")).toBe(true));
+      } else {
+        await f.send({ type: "run.cancel", runId });
+        firstRound.resolve();
+        await vi.waitFor(async () => expect((await f.runtime.getSnapshot()).activeRun).toBeNull());
+      }
+      // Let the competing command/delivery reach the held acceptance boundary.
+      await tick();
+      resumeWrite.resolve();
+      await accepting;
+      await removing;
+      if (mode === "settlement") await running;
+      const expected = mode === "settlement" ? ["A", "B"] : ["B"];
+      await vi.waitFor(async () => expect((await f.runtime.getSnapshot()).queue.map(message => message.text)).toEqual(expected));
+      await vi.waitFor(async () => expect((await loadMessageQueue(f.sessionId)).map(message => message.text)).toEqual(expected));
+      if (mode === "delivery") {
+        await vi.waitFor(() => expect(observer.received.some(event => event.type === "steer.delivered" && event.payload.item.id === a.id)).toBe(true));
+        const delivery = observer.received.findIndex(event => event.type === "steer.delivered" && event.payload.item.id === a.id);
+        const updates = observer.received.slice(delivery + 1).filter(event => event.type === "queue.changed");
+        expect(updates.every(event => !event.payload.messages.some(message => message.id === a.id))).toBe(true);
+      }
+      expect((await loadMessageQueue(f.sessionId)).every(message => message.mode === "follow-up")).toBe(true);
+      firstRound.resolve(); secondRound.resolve();
+      await running;
+      if (mode === "settlement") await f.send({ type: "queue.send", sessionId: f.sessionId, messageId: a.id });
+      await vi.waitFor(async () => expect((await f.runtime.getSnapshot()).activeRun).toBeNull());
+      const users = (await getConversation(f.sessionId))!.items.filter(item => item.kind === "message" && item.role === "user");
+      expect(users.filter(item => item.text === "A")).toHaveLength(mode === "removal" ? 0 : 1);
+      expect(users.filter(item => item.text === "B")).toHaveLength(1);
+      expect(await loadMessageQueue(f.sessionId)).toEqual([]);
+    } finally {
+      resumeWrite.resolve(); firstRound.resolve(); secondRound.resolve(); spy.mockRestore();
+      await accepting; await running;
+    }
   });
 
   it("retains prepared chips if queue persistence fails and accepts them once on retry", async () => {

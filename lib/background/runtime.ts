@@ -185,7 +185,8 @@ export class BackgroundRuntime {
   #notifications: RunNotifications | null;
   #sweepTimer: unknown;
   #disposed = false;
-  #queueAcceptOps: Promise<unknown> = Promise.resolve();
+  #queueOps: Promise<unknown> = Promise.resolve();
+  #queueClaims = new Set<string>();
   #preparedContent = new PreparedMcpContent();
 
   releaseContentOwner(owner: object): void { this.#preparedContent.releaseOwner(owner); }
@@ -774,11 +775,11 @@ export class BackgroundRuntime {
       return;
     }
     if (command.type === "queue.remove") {
-      const queue = await this.#queue(command.sessionId);
-      // A pending steer is already on its way to the model, so only follow-ups can be withdrawn.
-      if (queue.some((message) => message.id === command.messageId && message.mode === "follow-up")) {
-        await this.#setQueue(command.sessionId, queue.filter((message) => message.id !== command.messageId));
-      }
+      await this.#changeQueue(command.sessionId, queue => {
+        // A steer or claimed follow-up is already being delivered.
+        return !this.#queueClaims.has(command.messageId) && queue.some(message => message.id === command.messageId && message.mode === "follow-up")
+          ? queue.filter(message => message.id !== command.messageId) : queue;
+      });
       return;
     }
     if (command.type === "queue.send") {
@@ -931,7 +932,14 @@ export class BackgroundRuntime {
     // The queued detach runs before a subsequent settings read or alarm.
     void this.#scheduler.forgetSessions(ids).then(() => this.#syncScheduleBadge()).catch(() => {});
     if (this.#retryable && ids.includes(this.#retryable.sessionId)) this.#retryable = null;
-    for (const id of ids) this.#queues.delete(id);
+    await this.#withQueueLock(async () => {
+      for (const id of ids) {
+        for (const message of this.#queues.get(id) ?? []) this.#queueClaims.delete(message.id);
+        this.#queues.delete(id);
+        // An admission already in flight may have written after session deletion.
+        await saveMessageQueue(id, []).catch(() => {});
+      }
+    });
     if (this.#debugSessionId !== null && ids.includes(this.#debugSessionId)) this.#clearDebugBuffers();
     const owned = (tab: AgentTab) => ids.includes(tab.sessionId);
     if (![...this.#workspace.agentTabs.values()].some(owned)) return;
@@ -1230,7 +1238,19 @@ export class BackgroundRuntime {
    * id as its item id, so one the restart caught between writing its item and
    * leaving the queue is dropped here rather than sent twice.
    */
-  async #queue(sessionId: string): Promise<QueuedMessage[]> {
+  #withQueueLock<T>(task: () => Promise<T>): Promise<T> {
+    const operation = this.#queueOps.then(task);
+    this.#queueOps = operation.then(() => undefined, () => undefined);
+    return operation;
+  }
+
+  #queue(sessionId: string): Promise<QueuedMessage[]> {
+    const cached = this.#queues.get(sessionId);
+    return cached ? Promise.resolve(cached) : this.#withQueueLock(() => this.#readQueue(sessionId));
+  }
+
+  /** Queue cache initialization; called only while holding the queue lock. */
+  async #readQueue(sessionId: string): Promise<QueuedMessage[]> {
     const cached = this.#queues.get(sessionId);
     if (cached) return cached;
     let stored = await loadMessageQueue(sessionId).catch(() => []);
@@ -1238,31 +1258,40 @@ export class BackgroundRuntime {
       const delivered = new Set((await getConversation(sessionId).catch(() => null))?.items.map((item) => item.id));
       stored = stored.filter((message) => !delivered.has(message.id));
     }
-    // A concurrent caller may have loaded and changed it meanwhile.
-    const queue = this.#queues.get(sessionId) ?? stored.map((message) => ({ ...message, mode: "follow-up" as const }));
+    const queue = stored.map((message) => ({ ...message, mode: "follow-up" as const }));
     this.#queues.set(sessionId, queue);
     return queue;
   }
 
-  /** Replaces a session's queue (synchronously in memory), pushes it to every sidebar, and persists it. */
-  async #setQueue(sessionId: string, messages: QueuedMessage[], requirePersistence = false): Promise<void> {
+  /** Caller holds the queue lock through persistence and publication. Never call a locking helper here. */
+  async #writeQueue(sessionId: string, messages: QueuedMessage[], requirePersistence = false): Promise<void> {
     if (requirePersistence) await saveMessageQueue(sessionId, messages);
     this.#queues.set(sessionId, messages);
     this.#sidebarHub.publishQueue(sessionId, messages);
     if (!requirePersistence) await saveMessageQueue(sessionId, messages).catch(() => console.warn("[bside] Could not save queued messages."));
   }
 
-  /** Serialize queue admissions so concurrent sidebars cannot overwrite an accepted message. */
-  #appendQueued(sessionId: string, message: QueuedMessage, selection?: ContentAcceptance): Promise<boolean> {
-    const operation = this.#queueAcceptOps.then(async () => {
-      const current = await this.#queue(sessionId);
-      if (await this.#queueFull(current)) return false;
-      await this.#setQueue(sessionId, [...current, message], !!selection);
+  #changeQueue(sessionId: string, change: (queue: QueuedMessage[]) => QueuedMessage[], after?: () => void): Promise<void> {
+    return this.#withQueueLock(async () => {
+      const queue = await this.#readQueue(sessionId);
+      const next = change(queue);
+      if (next !== queue) await this.#writeQueue(sessionId, next);
+      after?.();
+    });
+  }
+
+  /** All admissions, removals, delivery, and settlement share the same lock. */
+  async #appendQueued(sessionId: string, message: QueuedMessage, selection?: ContentAcceptance): Promise<boolean> {
+    const accepted = await this.#withQueueLock(async () => {
+      const current = await this.#readQueue(sessionId);
+      if (current.length >= MAX_QUEUED_MESSAGES) return false;
+      await this.#writeQueue(sessionId, [...current, message], !!selection);
       selection?.commit();
       return true;
     });
-    this.#queueAcceptOps = operation.then(() => undefined, () => undefined);
-    return operation;
+    // Snapshot construction may load another chat's queue, so publish outside the lock.
+    if (!accepted) { this.#notice = `Up to ${MAX_QUEUED_MESSAGES} messages can wait at once.`; await this.#sidebarHub.broadcastSnapshot(); }
+    return accepted;
   }
 
   /** Refuses a queue at capacity with a notice. */
@@ -1327,31 +1356,32 @@ export class BackgroundRuntime {
 
   /** Steers the run never delivered become follow-ups: kept visible, and sent next only if the run completed. */
   async #settleSteers(sessionId: string): Promise<void> {
-    const queue = await this.#queue(sessionId);
-    if (queue.some((message) => message.mode === "steer")) {
-      await this.#setQueue(sessionId, queue.map((message) => ({ ...message, mode: "follow-up" })));
-    }
+    await this.#changeQueue(sessionId, queue => queue.some(message => message.mode === "steer")
+      ? queue.map(message => ({ ...message, mode: "follow-up" })) : queue);
   }
 
-  /** `queue.send`: starts a run with a queued follow-up of the open session now. */
+  /** Claim under the queue lock, then start outside it: a run itself delivers/removes queue entries. */
+  async #runQueued(sessionId: string, messageId?: string): Promise<boolean> {
+    const message = await this.#withQueueLock(async () => {
+      if (this.#activeRun || this.#queueClaims.size || this.#sessionOpsPending > 0 || this.#scheduledStarting) return undefined;
+      const candidate = (await this.#readQueue(sessionId)).find(item => item.mode === "follow-up" && (messageId === undefined || item.id === messageId));
+      if (candidate) this.#queueClaims.add(candidate.id);
+      return candidate;
+    });
+    if (!message) return false;
+    try { await this.#startRun(sessionId, message.text, message.id, { skill: message.skill, ask: message.ask, content: message.content }); }
+    finally { await this.#withQueueLock(async () => { this.#queueClaims.delete(message.id); }); }
+    return true;
+  }
+
+  /** `queue.send`: only an unclaimed follow-up of the open session can start. */
   async #sendQueued(sessionId: string, messageId: string): Promise<void> {
-    const message = (await this.#queue(sessionId)).find((candidate) => candidate.id === messageId && candidate.mode === "follow-up");
-    if (!message || sessionId !== await this.#openSession()) {
-      await this.#sidebarHub.broadcastSnapshot();
-      return;
-    }
-    await this.#startRun(sessionId, message.text, message.id, { skill: message.skill, ask: message.ask, content: message.content });
+    if (sessionId !== await this.#openSession() || !await this.#runQueued(sessionId, messageId)) await this.#sidebarHub.broadcastSnapshot();
   }
 
-  /**
-   * After a completed run, starts the next turn with the oldest queued
-   * follow-up of its session, open or not. Follow-ups wait after a failed,
-   * cancelled, or interrupted run until the user sends them.
-   */
+  /** Completed runs dispatch oldest first; failed/cancelled runs leave follow-ups pending. */
   async #dispatchFollowUp(sessionId: string): Promise<void> {
-    if (this.#activeRun || this.#sessionOpsPending > 0) return;
-    const next = (await this.#queue(sessionId)).find((message) => message.mode === "follow-up");
-    if (next) await this.#startRun(sessionId, next.text, next.id, { skill: next.skill, ask: next.ask, content: next.content });
+    await this.#runQueued(sessionId);
   }
 
   /**
@@ -1414,6 +1444,7 @@ export class BackgroundRuntime {
     let personal: Personalization;
     let ask: AskContextV1 | undefined;
     try {
+      if (!retry && !hasPreparedMcpPrompt(prompt!, selection?.content ?? accepted?.content)) throw new ProviderStreamError("MCP prompts require a prepared preview in a sidebar message. Use ordinary text for a scheduled task.", "INVALID_REQUEST");
       // Memory the run cannot read is left out of its prompt rather than stopping it.
       // Likewise for connected accounts' tools: one that cannot be read is not offered.
       personal = { ...await readInstructions(), memoryIndex: await readMemoryIndex().catch(() => null),
@@ -1500,7 +1531,10 @@ export class BackgroundRuntime {
       }
       selection?.commit();
       items = [...items, item];
-      if (queuedId) await this.#setQueue(sessionId, (await this.#queue(sessionId)).filter((message) => message.id !== queuedId));
+      if (queuedId) await this.#changeQueue(sessionId, queue => {
+        this.#queueClaims.delete(queuedId);
+        return queue.filter(message => message.id !== queuedId);
+      });
     }
     const userIndex = items.findLastIndex(isTurnStart);
     const userItem = items[userIndex] as UserMessageItem;
@@ -1642,9 +1676,10 @@ export class BackgroundRuntime {
         if (item.kind === "message" && item.role === "assistant") run.partialAssistantText = "";
         if (item.kind === "message" && item.role === "user") {
           // A delivered steer: shown inline in the turn and no longer pending.
-          flushDelta();
-          this.#sidebarHub.publishRunEvent(runId, "steer.delivered", { item });
-          await this.#setQueue(run.sessionId, (await this.#queue(run.sessionId)).filter((message) => message.id !== item.id));
+          await this.#changeQueue(run.sessionId, queue => queue.filter(message => message.id !== item.id), () => {
+            flushDelta();
+            this.#sidebarHub.publishRunEvent(runId, "steer.delivered", { item });
+          });
         }
         await this.#writeCheckpoint(run, run.status, run.partialAssistantText);
         // No run event carries a compaction; a snapshot shows its marker at once.
