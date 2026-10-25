@@ -66,6 +66,43 @@ describe("MCP catalogs and preparations", () => {
     await expect(connections.prepareContent(choice.id, {}, "s1")).rejects.toThrow("no longer available");
   });
 
+  it.each(["prompt", "resource"] as const)("keeps refreshed %s choices usable when an obsolete listing finishes last", async kind => {
+    const held = Promise.withResolvers<Response>();
+    const started = Promise.withResolvers<void>();
+    let oldId: number | undefined;
+    const listMethod = kind === "prompt" ? "prompts/list" : "resources/list";
+    const fake = fakeMcpServers({ capabilities: { tools: {}, prompts: {}, resources: {} },
+      override: request => {
+        if (!request.body.startsWith("{")) return;
+        const rpc = JSON.parse(request.body);
+        if (rpc.method === listMethod && oldId === undefined) {
+          oldId = rpc.id;
+          started.resolve();
+          return held.promise;
+        }
+      },
+      content: (_server, method, params) => method === "prompts/list" ? { prompts: [{ ...prompt, name: "new-prompt" }] }
+        : method === "resources/list" ? { resources: [{ name: "New document", uri: "internal://new" }] }
+        : method === "prompts/get" ? { messages: [{ role: "user", content: { type: "text", text: "New prompt" } }] }
+        : { contents: [{ uri: params.uri, text: "New document" }] },
+    });
+    const connections = new McpConnections({ fetcher: fake.fetcher, popup: approvingPopup() });
+    await connections.connect("notion");
+    const obsolete = connections.contentCatalog(kind);
+    await started.promise;
+    await connections.refresh("notion");
+    const current = await connections.contentCatalog(kind);
+    const choice = current.choices[0]!;
+    expect(current.errors).toEqual([]);
+    held.resolve(new Response(JSON.stringify({ jsonrpc: "2.0", id: oldId, result: kind === "prompt"
+      ? { prompts: [{ ...prompt, name: "old-prompt" }] }
+      : { resources: [{ name: "Old document", uri: "internal://old" }] } }), { headers: { "Content-Type": "application/json" } }));
+    expect((await obsolete).choices).toEqual([]);
+    expect(await connections.contentCatalog(kind)).toEqual(current);
+    const prepared = await connections.prepareContent(choice.id, kind === "prompt" ? { topic: "x" } : {}, "s1");
+    expect(prepared.text).toBe(kind === "prompt" ? "New prompt" : "New document");
+  });
+
   it("claims atomically for the owning sidebar and session, releases failed sends, and refuses duplicate consumption", () => {
     const prepared = new PreparedMcpContent();
     const owner = {};

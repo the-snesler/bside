@@ -64,4 +64,43 @@ describe("MCP selected content client", () => {
     expect(error).toMatchObject({ code: "PROVIDER_RESPONSE_FAILED" });
     expect(JSON.stringify(error)).not.toMatch(/RAW BODY|fixture-token/);
   });
+
+  it("does not let an initialization from before reset replace the current session", async () => {
+    const held = Promise.withResolvers<Response>();
+    const started = Promise.withResolvers<void>();
+    const fresh = Promise.withResolvers<Response>();
+    const freshStarted = Promise.withResolvers<void>();
+    let oldId: number | undefined;
+    let freshId: number | undefined;
+    const fake = client({ capabilities: { resources: {} }, override: request => {
+      if (!request.body.startsWith("{")) return;
+      const rpc = JSON.parse(request.body);
+      if (rpc.method === "initialize" && oldId === undefined) {
+        oldId = rpc.id;
+        started.resolve();
+        return held.promise;
+      }
+      if (rpc.method === "initialize" && freshId === undefined) {
+        freshId = rpc.id;
+        freshStarted.resolve();
+        return fresh.promise;
+      }
+    }, content: (_server, method) => method === "resources/list" ? { resources: [{ name: "Current", uri: "internal://current" }] }
+      : { contents: [{ uri: "internal://current", text: "Current document" }] } });
+    const obsolete = fake.client.listResources(signal()).then(() => null, error => error);
+    await started.promise;
+    fake.client.reset();
+    const current = fake.client.listResources(signal());
+    await freshStarted.promise;
+    held.resolve(new Response(JSON.stringify({ jsonrpc: "2.0", id: oldId, result: { protocolVersion: "2025-06-18", capabilities: { resources: {} } } }),
+      { headers: { "Content-Type": "application/json", "Mcp-Session-Id": "obsolete-session" } }));
+    expect(await obsolete).toMatchObject({ code: "PROTOCOL" });
+    const concurrent = fake.client.listResources(signal());
+    fresh.resolve(new Response(JSON.stringify({ jsonrpc: "2.0", id: freshId, result: { protocolVersion: "2025-06-18", capabilities: { resources: {} } } }),
+      { headers: { "Content-Type": "application/json", "Mcp-Session-Id": "current-session" } }));
+    expect(await current).toEqual(await concurrent);
+    expect(fake.requests.filter(request => JSON.parse(request.body).method === "initialize")).toHaveLength(2);
+    expect(await fake.client.readResource("internal://current", signal())).toBe("Current document");
+    expect(fake.requests.at(-1)!.headers["Mcp-Session-Id"]).toBe("current-session");
+  });
 });

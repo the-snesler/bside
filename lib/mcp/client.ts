@@ -63,6 +63,7 @@ export class McpClient {
   #nextId = 1;
   #prompts: McpPrompt[] = [];
   #resources: McpResource[] = [];
+  #generation = 0;
 
   constructor(server: McpServer, fetcher: Fetcher, tokens: McpTokenSource, clientVersion = "0") {
     this.#server = server;
@@ -73,6 +74,7 @@ export class McpClient {
 
   /** Explicit connection/catalog reset (refresh, connect, disconnect). HTTP session recovery keeps authorization. */
   reset(): void {
+    this.#generation++;
     this.#session = null;
     this.#opening = null;
     this.#prompts = [];
@@ -98,11 +100,17 @@ export class McpClient {
   }
 
   async listPrompts(signal: AbortSignal): Promise<McpPrompt[]> {
-    return this.#prompts = await this.#listContent("prompts", readMcpPrompt, signal);
+    const generation = this.#generation;
+    const prompts = await this.#listContent("prompts", readMcpPrompt, signal);
+    if (generation !== this.#generation) throw this.#protocol("changed its catalog while loading; choose it again");
+    return this.#prompts = prompts;
   }
 
   async listResources(signal: AbortSignal): Promise<McpResource[]> {
-    return this.#resources = await this.#listContent("resources", readMcpResource, signal);
+    const generation = this.#generation;
+    const resources = await this.#listContent("resources", readMcpResource, signal);
+    if (generation !== this.#generation) throw this.#protocol("changed its catalog while loading; choose it again");
+    return this.#resources = resources;
   }
 
   async #listContent<T extends McpPrompt | McpResource>(kind: "prompts" | "resources", read: (v: unknown) => T | null, signal: AbortSignal): Promise<T[]> {
@@ -183,11 +191,18 @@ export class McpClient {
 
   #open(signal: AbortSignal): Promise<Session> {
     if (this.#session) return Promise.resolve(this.#session);
-    this.#opening ??= this.#initialize(signal).then((session) => {
+    if (this.#opening) return this.#opening;
+    const generation = this.#generation;
+    const pending: Promise<Session> = this.#initialize(signal).then((session) => {
+      if (generation !== this.#generation) throw this.#protocol("changed its connection while opening; try again");
       this.#session = session;
       return session;
-    }).finally(() => { this.#opening = null; });
-    return this.#opening;
+    }).finally(() => {
+      // An obsolete initialization must not clear a newer single-flight request.
+      if (this.#opening === pending) this.#opening = null;
+    });
+    this.#opening = pending;
+    return pending;
   }
 
   async #initialize(signal: AbortSignal): Promise<Session> {
