@@ -4,12 +4,12 @@ This is preparation for review, not an AMO submission or a claim that the comple
 
 ## Integration and roadmap coverage
 
-- [ ] Restack `feat/release-prep` onto the completed `feat/automation`, which includes search/PDF and entry points; rebuild the final snapshot without broadening permissions/CSP. Do not change sibling feature branches.
+- [x] Restack `feat/release-prep` onto `feat/automation` at `7b8b830`, including search/PDF and entry points. The combined manifest preserves the intended permissions, data declaration, and restricted CSP.
 - [ ] Integrate the final Phase 5 MCP prompt/resource layer above release prep. **Outstanding in this layer:** MCP prompts as `/` invocations and resources as `@` mentions. Those are roadmap scope, not optional completed work. Update the conditional privacy/reviewer/listing copy after the implementation is present and tested.
 - [ ] Re-audit the assembled stack and record final SHA and checks. Unit tests and browser previews are evidence for their tested boundaries; they are not native API verification or AMO approval.
 - [x] Phase 6.3 preparation: privacy policy and guarded manifest data declaration; native first-run page and revisit links; narrow layout/keyboard changes; reproducible source submission; reviewer permission notes and listing draft.
 - [x] Phase 6.4 implementation: options-only, background-owned, validated local problem reports with an explicit metadata allowlist; no content opt-in or sender; separate raw export remains sensitive.
-- [ ] Phase 6.1/6.2 final integration: persistent alarms/scheduled sessions and opt-in local notifications (sibling automation layer). Verify unattended confirmation never auto-approves and opt-in survives restart.
+- [x] Phase 6.1/6.2 integration: persistent alarms, dedicated results sessions, and opt-in local notifications. Contract tests cover confirmation/help pauses, MCP write gates, restart recovery, and isolation from unsent menu drafts. Native Firefox checks remain below.
 
 Earlier foundations, device-key credentials, sessions/history/compaction/steering/usage, instructions/site notes/skills/memory, screenshot/frame/table/page-action support, and MCP directory/OAuth/tools have contract tests in the stack. This release-prep task did not rerun the live benchmark or measure prompt-cache cost on the seven benchmark tasks; those roadmap evidence items remain manual. Search through the default engine, bundled PDF text extraction, menu/shortcut entry points, and quick actions are implemented by sibling layers, and need assembled-stack checks.
 

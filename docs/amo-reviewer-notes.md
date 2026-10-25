@@ -17,7 +17,7 @@ The full [privacy policy](privacy.md) is bundled as `privacy.html`, linked from 
 
 ## Permission justifications
 
-The parent is integrating search/PDF, entry points, and automation below this layer. Check the final built snapshot after restacking; the explanations below include those sibling features and do not assert that native APIs have been exercised in Firefox.
+Search/PDF, entry points, and automation are integrated below this layer. The explanations below match the combined manifest; they do not assert that native APIs have been exercised in Firefox.
 
 - **`<all_urls>`**: content scripts run only in HTTP(S) documents/frames to read outlines and perform the closed action union; Firefox's `tabs.captureTab` requires this permission for bounded screenshots. Also permits tab URL inspection and the scoped OAuth callback. In the PDF layer, a content script fetches only the URL of a tab already showing a PDF; same-origin fetch can include that site's normal session credentials, cross-origin fetch is anonymous. This avoids widening the background's `connect-src`. No arbitrary URL fetch or generated JavaScript reaches the content script.
 - **`webRequest` / `webRequestBlocking`**: (1) intercept/cancel the exact loopback OAuth callback path, `main_frame` only, filtered to and rechecked against the sign-in popup's tab; the listener is removed on completion/cancel. (2) on this extension's own background XHR to `www.youtube.com` only, replace `Origin: moz-extension://…` with the YouTube origin and remove the extension Referer. The header rewrite checks `tabId === -1` and the exact extension Origin; page requests and other extensions are left alone. These are the two uses; do not describe the entire permission as popup-only.
@@ -35,7 +35,7 @@ The parent is integrating search/PDF, entry points, and automation below this la
 
 ## Bundled code and lint findings
 
-`lint:ext` must pass with zero errors; **warnings remain and must be reviewed**, not described as warning-free. The pre-integration build has bundled DOM-sink/Function/dynamic-import warnings. The sibling PDF build adds similar PDF.js warnings; record the final count in the release checklist after restacking.
+The integrated release layer passes `lint:ext` with **zero errors and nine warnings**: bundled DOM sinks, Function constructors, and dynamic imports, including PDF.js. These warnings remain for reviewer inspection. Record the count again after integrating the final MCP content layer.
 
 - Preact's renderer contains `innerHTML` support for its `dangerouslySetInnerHTML` API. bside does not use that API for page/model/MCP text. JSX text nodes and `Markdown` with `skipHtml`, no raw-HTML plugin, restricted link protocols, and disabled remote images render those inputs.
 - The Markdown bundle's `innerHTML` comes from `decode-named-character-reference`: a temporary element decodes an entity token between `&` and `;`, then reads textContent. The `document().write` warning maps to `mdast-util-from-markdown`/micromark's `parse(options).document().write(...)`: `document()` returns a Markdown tokenizer, not the browser Document. It does not write HTML into the page. Keep these findings visible for upstream-source review; application raw-HTML rendering remains disabled.
