@@ -65,4 +65,3 @@ describe("MCP selected content client", () => {
     expect(JSON.stringify(error)).not.toMatch(/RAW BODY|fixture-token/);
   });
 });
-
