@@ -35,7 +35,7 @@ Search/PDF, entry points, and automation are integrated below this layer. The ex
 
 ## Bundled code and lint findings
 
-The integrated release layer passes `lint:ext` with **zero errors and nine warnings**: bundled DOM sinks, Function constructors, and dynamic imports, including PDF.js. These warnings remain for reviewer inspection. Record the count again after integrating the final MCP content layer.
+The integrated release layer passes `lint:ext` with **zero errors and nine warnings**: bundled DOM sinks, Function constructors, and dynamic imports, including PDF.js. These warnings remain for reviewer inspection. MCP previews render plain text only and introduce no additional remote origins, executable assets, or permission categories.
 
 - Preact's renderer contains `innerHTML` support for its `dangerouslySetInnerHTML` API. bside does not use that API for page/model/MCP text. JSX text nodes and `Markdown` with `skipHtml`, no raw-HTML plugin, restricted link protocols, and disabled remote images render those inputs.
 - The Markdown bundle's `innerHTML` comes from `decode-named-character-reference`: a temporary element decodes an entity token between `&` and `;`, then reads textContent. The `document().write` warning maps to `mdast-util-from-markdown`/micromark's `parse(options).document().write(...)`: `document()` returns a Markdown tokenizer, not the browser Document. It does not write HTML into the page. Keep these findings visible for upstream-source review; application raw-HTML rendering remains disabled.
@@ -50,6 +50,6 @@ Production CSP is `default-src 'self'; script-src 'self'; object-src 'none'` wit
 1. Install in Firefox desktop 140+ and inspect the data-transmission prompt. Confirm one local welcome tab on install and none on restart/update.
 2. Follow Account settings and connect with a dedicated reviewer account or API key. Open the sidebar via a real click. Use a public fixture for the sample task.
 3. Check narrow keyboard navigation, history confirmations, page-attachment labels, table/code scrolling, stop/retry, and manual help/approval pauses.
-4. Use Notion/Todoist dedicated accounts to inspect read-only/write choices, confirmation, disconnect, and expiry behavior. MCP resources/prompts are outstanding Phase 5 work in this layer and are being implemented above it.
-5. Download Report a problem for a chosen chat; inspect metadata-only JSON. No network request is made. Compare the separate raw chat export, which deliberately carries sensitive conversation content.
+4. Use Notion/Todoist dedicated accounts to inspect read-only/write choices, confirmation, disconnect, and expiry behavior. Open `/` for namespaced account prompts beside saved skills, fill required/optional string arguments, and prepare a preview; open `@` for resources beside tabs. Nothing auto-sends. Inspect source labels and text-only previews, disconnect/refresh invalidation of unsent items, preserved accepted snapshots on retry/history, and safe refusal of arbitrary resource URIs.
+5. Download Report a problem for a chosen chat; inspect metadata-only JSON. Attachment names, URIs, arguments and text must be absent, including accepted snapshots and namespaced command text. No network request is made. Compare the separate raw chat export, which deliberately carries sensitive conversation content.
 6. Follow [source-build.md](source-build.md) to reproduce the build and compare bytes. Complete [release-checklist.md](release-checklist.md) before any manual submission.

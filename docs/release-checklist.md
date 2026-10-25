@@ -5,7 +5,7 @@ This is preparation for review, not an AMO submission or a claim that the comple
 ## Integration and roadmap coverage
 
 - [x] Restack `feat/release-prep` onto `feat/automation` at `7b8b830`, including search/PDF and entry points. The combined manifest preserves the intended permissions, data declaration, and restricted CSP.
-- [ ] Integrate the final Phase 5 MCP prompt/resource layer above release prep. **Outstanding in this layer:** MCP prompts as `/` invocations and resources as `@` mentions. Those are roadmap scope, not optional completed work. Update the conditional privacy/reviewer/listing copy after the implementation is present and tested.
+- [x] Integrate the final Phase 5 MCP prompt/resource layer above release prep at `f994ef4`: namespaced `/` prompts, `@` resources, bounded previews, immutable snapshots, memory taint, sidebar/session ownership, and scheduler/report isolation. Privacy/reviewer/listing copy describes the implemented data flows.
 - [ ] Re-audit the assembled stack and record final SHA and checks. Unit tests and browser previews are evidence for their tested boundaries; they are not native API verification or AMO approval.
 - [x] Phase 6.3 preparation: privacy policy and guarded manifest data declaration; native first-run page and revisit links; narrow layout/keyboard changes; reproducible source submission; reviewer permission notes and listing draft.
 - [x] Phase 6.4 implementation: options-only, background-owned, validated local problem reports with an explicit metadata allowlist; no content opt-in or sender; separate raw export remains sensitive.
@@ -13,7 +13,7 @@ This is preparation for review, not an AMO submission or a claim that the comple
 
 Earlier foundations, device-key credentials, sessions/history/compaction/steering/usage, instructions/site notes/skills/memory, screenshot/frame/table/page-action support, and MCP directory/OAuth/tools have contract tests in the stack. This release-prep task did not rerun the live benchmark or measure prompt-cache cost on the seven benchmark tasks; those roadmap evidence items remain manual. Search through the default engine, bundled PDF text extraction, menu/shortcut entry points, and quick actions are implemented by sibling layers, and need assembled-stack checks.
 
-**Optional/deferred work:** OpenAI-hosted `web_search` fallback remains unimplemented; user search is the default-engine path. No third-party hosted search or bside backend is planned. Native stdio MCP bridge/bside-as-MCP-server, arbitrary MCP URLs, cloud sync, additional providers, and Chrome/MV3 are outside this release. MCP resources/prompts are separately outstanding required roadmap work, tracked above. Do not advertise them as shipped until that layer lands.
+**Optional/deferred work:** OpenAI-hosted `web_search` fallback remains unimplemented; user search is the default-engine path. No third-party hosted search or bside backend is planned. Native stdio MCP bridge/bside-as-MCP-server, arbitrary MCP URLs, cloud sync, additional providers, and Chrome/MV3 are outside this release. MCP resource mentions and prompt invocations are implemented and covered by the integration item above; live authenticated service checks remain below.
 
 ## Automated release gates
 
@@ -48,8 +48,8 @@ The release-prep environment has **no Firefox executable**: WXT launch returned 
 - [ ] Search with Google/Bing/DuckDuckGo as the user's default; test fresh-profile consent/CAPTCHA and no silent engine switch. Read the bundled PDF fixture in Firefox with and without another eligible content-script tab, test private/authenticated PDFs, navigation invalidation, large/password/scanned PDFs, and packaged worker CSP.
 - [ ] Exercise context-menu entry points, sidebar keyboard command, draft-only sample/quick actions, and correct attached-tab semantics.
 - [ ] Test a scheduled read task, browser downtime/restart, busy-run handling, pause for confirmation/help, and notification preference opt-in/off and OS permission denial/revocation. Notification text must not expose task/page content.
-- [ ] Connect/refresh/disconnect Notion and Todoist with dedicated accounts; test origin enforcement, denied writes, token expiry, and final prompt/resource selection once integrated.
-- [ ] Put distinctive private page text and a dummy token/URL in a fixture/chat. Download the redacted report for that chat and another: no content, titles, URLs, tool names/payloads, request IDs or tokens; latest-run diagnostics appear only for their owning chat. Check the download is local and no transmission occurs. Raw history export is separately labeled sensitive.
+- [ ] Connect/refresh/disconnect Notion and Todoist with dedicated accounts; test origin enforcement, denied writes, token expiry, and prompt/resource arguments, text previews, disconnect/refresh invalidation, replay after remote edits, and binary placeholders.
+- [ ] Put distinctive private page text and a dummy token/URL in a fixture/chat. Download the redacted report for that chat and another: no content, selected MCP attachment names/URIs/text, titles, URLs, tool names/payloads, request IDs or tokens; latest-run diagnostics appear only for their owning chat. Check the download is local and no transmission occurs. Raw history export is separately labeled sensitive.
 
 ## Manual AMO steps (external, not automated)
 

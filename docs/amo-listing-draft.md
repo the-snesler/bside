@@ -1,6 +1,6 @@
 # AMO listing draft — bside
 
-Status: review copy for the assembled desktop release. Not submitted. Search/PDF, entry points, and automation are sibling layers below this one; final MCP resources/prompts are still pending above it. Remove any feature not in the final tested package before submission.
+Status: review copy for the assembled desktop release. Not submitted. Search/PDF, entry points, automation, and MCP prompt/resource selection are integrated in this candidate. Native Firefox validation and manual AMO review/publication remain required.
 
 **Name:** bside
 
@@ -10,7 +10,7 @@ Status: review copy for the assembled desktop release. Not submitted. Search/PDF
 
 Keep an assistant beside the page you are working on. Ask bside to summarize an article, compare information across tabs, extract a table, or help with a form. Its trace shows its work; you can stop a run, watch its agent tabs, or take over when it needs your hands. Review confirmations before consequential actions.
 
-Separate chats keep their own history and workspace. Add custom instructions, site notes, and reusable Markdown skills. Local memory can be automatic, ask before saving, or off. Connect Notion and Todoist through their MCP services, choose which tools are available, and keep write confirmations enabled if you prefer.
+Separate chats keep their own history and workspace. Add custom instructions, site notes, and reusable Markdown skills. Local memory can be automatic, ask before saving, or off. Connect Notion and Todoist through their MCP services, choose which tools are available, and keep write confirmations enabled if you prefer. Choose a connected-account prompt with `/` or attach a resource with `@`; review its source-labeled text preview before sending.
 
 In the assembled release, search uses your own Firefox default engine, text-based PDFs use a bundled local parser, context-menu and keyboard entry points help draft a request, and optional schedules run in their own sessions. Desktop notifications are opt-in. Scheduled tasks still pause for user confirmation; they never approve themselves.
 
@@ -18,7 +18,7 @@ In the assembled release, search uses your own Firefox default engine, text-base
 
 **Privacy:** Your prompts, relevant page content and URLs, screenshots/tool results, selected connected-account data, and saved context used for a task are sent to OpenAI. Website actions and connected-account calls send data to those websites/services. Search queries go to your default search engine. Cookies are read directly only for the YouTube site API; ordinary websites use your normal browser session. Chats, memory and workspace are stored in this Firefox profile; credentials are device-key sealed. There is no bside-operated backend, cloud sync, telemetry, or automatic problem-report upload. Reports can be downloaded locally with conversation content excluded. Read the full privacy policy before use.
 
-**Compatibility and limits:** Firefox desktop 140+ only; Firefox restricted pages cannot be controlled. AI can be wrong: inspect answers and consequential changes. PDF reading extracts text, not OCR, and may require another eligible web tab; password-protected/oversize files are refused. Synthetic interactions do not trigger browser shortcuts, and CSS-only hover menus are unsupported. One run is active at a time. OpenAI-hosted search fallback, arbitrary MCP servers, native local-server bridge, and Chrome/MV3 are not included. MCP resource mentions and prompt invocations must be added to this copy only after the final Phase 5 layer is integrated and tested.
+**Compatibility and limits:** Firefox desktop 140+ only; Firefox restricted pages cannot be controlled. AI can be wrong: inspect answers and consequential changes. PDF reading extracts text, not OCR, and may require another eligible web tab; password-protected/oversize files are refused. Synthetic interactions do not trigger browser shortcuts, and CSS-only hover menus are unsupported. One run is active at a time. OpenAI-hosted search fallback, arbitrary MCP servers, native local-server bridge, and Chrome/MV3 are not included. Selected MCP text is bounded; binary/image content is represented by placeholders, and resource URIs are never fetched directly.
 
 **Support/source:** https://github.com/the-snesler/bside (never attach sensitive raw exports to public issues).
 

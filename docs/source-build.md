@@ -18,7 +18,7 @@ corepack pnpm check:manifest
 
 The install needs access to the npm registry and may need to obtain the exact pinned pnpm release through Corepack. All package versions and integrity hashes come from the lockfile. Dependency lifecycle scripts are disabled; `wxt prepare` is the explicit local type-generation step. No API key, account, `.env`, local file, network service, or Firefox installation is needed to build or run the deterministic fake-provider tests. WXT/Vitest need a usable local port in the build environment.
 
-The production extension is `.output/firefox-mv2/`. WXT bundles Preact/TypeScript, Pi, and the other lockfile dependencies. On a stack that includes PDF support, PDF.js and its worker are bundled locally as well. The runtime CSP forbids remote executable code, eval, and Function construction; no remote worker is fetched. `check:manifest` checks the reviewed permissions, CSP, content-script frames, minimum Firefox version, and data-transmission declaration, and rejects source maps and sourceMappingURL comments.
+The production extension is `.output/firefox-mv2/`. WXT bundles Preact/TypeScript, Pi, and the other lockfile dependencies. PDF.js and its worker are bundled locally as well. The runtime CSP forbids remote executable code, eval, and Function construction; no remote worker is fetched. `check:manifest` checks the reviewed permissions, CSP, content-script frames, minimum Firefox version, and data-transmission declaration, and rejects source maps and sourceMappingURL comments.
 
 For maintainers, from the **clean release checkout** after the production build:
 

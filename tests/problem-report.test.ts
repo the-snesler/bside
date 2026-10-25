@@ -10,7 +10,7 @@ describe("local problem reports", () => {
     // Unknown future fields deliberately carry sensitive text too: adding a
     // field to raw exports must not silently add it to this report.
     const conversation = { id: privateText, title: privateText, lastModelId: privateText, items: [
-      { kind: "message", role: "user", text: privateText, skill: { body: privateText }, context: { url: privateText }, sites: [{ text: privateText }] },
+      { kind: "message", role: "user", text: privateText, skill: { body: privateText }, context: { url: privateText }, sites: [{ text: privateText }], content: [{ version: 1, kind: "resource", name: "MCP_PRIVATE_NAME", uri: "mcp-private://document", text: "MCP_PRIVATE_BODY", arguments: privateText }] },
       { kind: "message", role: "assistant", text: privateText },
       { kind: "tool-call", call: { name: privateText, arguments: { source: privateText } } },
       { kind: "tool-result", result: { summary: privateText }, memory: [{ name: privateText }] },
@@ -24,7 +24,7 @@ describe("local problem reports", () => {
         durationMs: 20, ok: false, outputChars: 500, truncatedOutput: true, output: privateText }],
     } as unknown as ProblemRun;
     const text = buildProblemReport(conversation, run, "0.1.0");
-    for (const secret of ["Orchid", "sk-fixture", "https:", "password", "example.test", "private?", "PAGE_PRIVATE"]) expect(text).not.toContain(secret);
+    for (const secret of ["Orchid", "sk-fixture", "https:", "password", "example.test", "private?", "PAGE_PRIVATE", "MCP_PRIVATE_NAME", "mcp-private://", "MCP_PRIVATE_BODY"]) expect(text).not.toContain(secret);
     expect(JSON.parse(text)).toMatchObject({ contentIncluded: false, extensionVersion: "0.1.0",
       conversation: { itemCounts: { message: 2, "tool-call": 1, compaction: 1 } },
       latestRun: { durationMs: 150, providerResponses: 3, error: { code: "TIMEOUT", status: 504 },
