@@ -4,6 +4,7 @@
  * `Conversation` is the materialized view the sidebar renders.
  */
 
+import type { McpContentSnapshot } from "@/lib/domain/mcp-content";
 import type { HelpKind, PageArtifactSummary, ToolCall, ToolResult } from "@/lib/domain/tools";
 import type { RunUsageV1, UsageTotals } from "@/lib/domain/usage";
 import type { Skill } from "@/lib/domain/skills";
@@ -31,6 +32,8 @@ export type ConversationItem =
       ask?: AskContextV1;
       /** User-authored schedule metadata snapshotted at the tick, never a permission grant. */
       scheduled?: ScheduledSource;
+      /** Immutable user-selected remote data, never elevated messages. */
+      content?: McpContentSnapshot[];
       /**
        * `"steer"`: guidance sent while the turn's run was working, persisted
        * where the model received it (after a tool round). It belongs to the
@@ -83,6 +86,7 @@ export interface QueuedMessage {
   skill?: Skill;
   /** The context-menu chip sent with the message, taken when it was accepted. */
   ask?: AskContextV1;
+  content?: McpContentSnapshot[];
   at: number;
 }
 

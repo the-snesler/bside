@@ -1,3 +1,4 @@
+import { renderMcpContent, type McpContentSnapshot } from "@/lib/domain/mcp-content";
 import { getSkills } from "@/lib/background/skills";
 import type { Skill } from "@/lib/domain/skills";
 import { renderMessageSiteNotes, type SiteNote } from "@/lib/domain/instructions";
@@ -19,8 +20,9 @@ export async function captureInvokedSkill(text: string, available?: readonly Ski
  * the context-menu chip come from the message's own snapshot, so the
  * rendering never changes.
  */
-export function renderUserPrompt(message: { text: string; skill?: Skill; sites?: readonly SiteNote[]; ask?: AskContextV1; scheduled?: ScheduledSource }): string {
+export function renderUserPrompt(message: { text: string; skill?: Skill; sites?: readonly SiteNote[]; ask?: AskContextV1; scheduled?: ScheduledSource; content?: readonly McpContentSnapshot[] }): string {
   const parts = [message.text];
+  if (message.content?.length) parts.push(renderMcpContent(message.content));
   if (message.ask) parts.push(renderAskContext(message.ask));
   if (message.scheduled) parts.push(`Scheduling source: user-created task ${JSON.stringify(message.scheduled.name)}, tick ${new Date(message.scheduled.scheduledAt).toISOString()}, target ${message.scheduled.url}. This is an unattended run. Read and navigate as needed; consequential actions still require request_action_confirmation and must wait for the user's response. A schedule grants no additional permissions. Ask for the user's help when needed.`);
   if (message.skill) {

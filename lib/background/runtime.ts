@@ -11,6 +11,9 @@
  * persistence) and everything outside an active run (credentials, settings).
  */
 
+import { PreparedMcpContent, type ContentAcceptance } from "@/lib/background/mcp-content";
+import { hasPreparedMcpPrompt, type McpContentSnapshot } from "@/lib/domain/mcp-content";
+import { McpError, toNormalizedMcpError } from "@/lib/mcp/errors";
 import { AGENT_TOOL_NAMES, AgentLoop } from "@/lib/background/agent-loop";
 import { getSkills, sidebarSkillCatalog } from "@/lib/background/skills";
 import { captureInvokedSkill } from "@/lib/background/skill-context";
@@ -182,6 +185,11 @@ export class BackgroundRuntime {
   #notifications: RunNotifications | null;
   #sweepTimer: unknown;
   #disposed = false;
+  #queueAcceptOps: Promise<unknown> = Promise.resolve();
+  #preparedContent = new PreparedMcpContent();
+
+  releaseContentOwner(owner: object): void { this.#preparedContent.releaseOwner(owner); }
+
   #activeRun: ActiveRun | null = null;
   #notice: string | null = null;
   #clock: RuntimeClock;
@@ -672,9 +680,21 @@ export class BackgroundRuntime {
 
   handleCommand(command: Extract<SidebarCommand, { type: "context.export" }>): Promise<{ markdown: string; filename: string } | undefined>;
   handleCommand(command: { v: 1; id: string; type: "session.list" }): Promise<{ sessions: ConversationSummary[] }>;
-  handleCommand(command: SidebarCommand): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]>;
-  async handleCommand(command: SidebarCommand): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]> {
+  handleCommand(command: SidebarCommand, owner?: object): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]>;
+  async handleCommand(command: SidebarCommand, owner: object = this): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]> {
     await this.#ready;
+    if (command.type === "mcp.content.list" || command.type === "mcp.content.prepare" || command.type === "mcp.content.dismiss") {
+      try {
+        if (command.sessionId !== await this.#openSession()) throw new McpError("PROTOCOL", "This chat changed. Open the picker again.");
+        if (command.type === "mcp.content.dismiss") { this.#preparedContent.dismiss(command.contentIds, owner); return; }
+        if (!this.#mcp) throw new McpError("NOT_CONNECTED", "Connect an account in settings first.");
+        if (command.type === "mcp.content.list") return { contentReply: { ok: true, ...await this.#mcp.contentCatalog(command.kind) } };
+        const snapshot = await this.#mcp.prepareContent(command.choiceId, command.arguments, command.sessionId);
+        if (command.sessionId !== await this.#openSession()) throw new McpError("PROTOCOL", "This chat changed while preparing content. Choose it again.");
+        this.#preparedContent.add(snapshot, owner);
+        return { contentReply: { ok: true, snapshot } };
+      } catch (error) { return { contentReply: { ok: false, error: toNormalizedMcpError(error) } }; }
+    }
     if (command.type === "skills.list") return { skills: sidebarSkillCatalog(await getSkills()) };
     if (command.type === "tabs.list") {
       // As the open session's runs see them: other sessions' agent tabs are left out.
@@ -737,12 +757,20 @@ export class BackgroundRuntime {
       await this.#sidebarHub.broadcastSnapshot();
       return;
     }
-    if (command.type === "run.start") {
-      await this.#submitPrompt(command.prompt, command.askId);
-      return;
-    }
-    if (command.type === "run.steer") {
-      await this.#steer(command.runId, command.text, command.askId);
+    if (command.type === "run.start" || command.type === "run.steer") {
+      let claim: ReturnType<PreparedMcpContent["claim"]> | undefined;
+      try {
+        if (command.contentIds?.length) {
+          if (command.sessionId !== await this.#openSession()) throw new McpError("PROTOCOL", "The chat changed. Review the selected attachments before sending.");
+          claim = this.#preparedContent.claim(command.contentIds, command.sessionId, owner, () => this.#sidebarHub.contentAccepted(owner, command.contentIds!));
+          if (!this.#mcp || !(await Promise.all(claim.accepted.content.map(item => this.#mcp!.contentAvailable(item)))).every(Boolean)) throw new McpError("NOT_CONNECTED", "A selected account changed or disconnected. Choose its attachment again.");
+        }
+        if (command.type === "run.start") await this.#submitPrompt(command.prompt, command.askId, claim?.accepted);
+        else await this.#steer(command.runId, command.text, command.askId, claim?.accepted);
+      } catch (error) {
+        this.#notice = toNormalizedMcpError(error).message;
+        await this.#sidebarHub.broadcastSnapshot();
+      } finally { claim?.release(); }
       return;
     }
     if (command.type === "queue.remove") {
@@ -1217,10 +1245,24 @@ export class BackgroundRuntime {
   }
 
   /** Replaces a session's queue (synchronously in memory), pushes it to every sidebar, and persists it. */
-  async #setQueue(sessionId: string, messages: QueuedMessage[]): Promise<void> {
+  async #setQueue(sessionId: string, messages: QueuedMessage[], requirePersistence = false): Promise<void> {
+    if (requirePersistence) await saveMessageQueue(sessionId, messages);
     this.#queues.set(sessionId, messages);
     this.#sidebarHub.publishQueue(sessionId, messages);
-    await saveMessageQueue(sessionId, messages).catch(() => console.warn("[bside] Could not save queued messages."));
+    if (!requirePersistence) await saveMessageQueue(sessionId, messages).catch(() => console.warn("[bside] Could not save queued messages."));
+  }
+
+  /** Serialize queue admissions so concurrent sidebars cannot overwrite an accepted message. */
+  #appendQueued(sessionId: string, message: QueuedMessage, selection?: ContentAcceptance): Promise<boolean> {
+    const operation = this.#queueAcceptOps.then(async () => {
+      const current = await this.#queue(sessionId);
+      if (await this.#queueFull(current)) return false;
+      await this.#setQueue(sessionId, [...current, message], !!selection);
+      selection?.commit();
+      return true;
+    });
+    this.#queueAcceptOps = operation.then(() => undefined, () => undefined);
+    return operation;
   }
 
   /** Refuses a queue at capacity with a notice. */
@@ -1232,20 +1274,22 @@ export class BackgroundRuntime {
   }
 
   /** `run.start`: while the open session's run is active, the prompt waits as a follow-up; otherwise a run starts with it. */
-  async #submitPrompt(rawPrompt: string, askId?: string): Promise<void> {
+  async #submitPrompt(rawPrompt: string, askId?: string, selection?: ContentAcceptance): Promise<void> {
     const sessionId = await this.#openSession();
+    if (selection?.content.some(item => item.sessionId !== sessionId)) throw new McpError("PROTOCOL", "The chat changed. Choose the attachments again.");
     const queue = await this.#queue(sessionId);
     const prompt = validatePromptText(rawPrompt);
-    if (!prompt || this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, rawPrompt, undefined, undefined, askId);
+    if (prompt && !hasPreparedMcpPrompt(prompt, selection?.content)) throw new McpError("PROTOCOL", "Choose the MCP prompt from / and prepare its preview before sending.");
+    if (!prompt || this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, rawPrompt, undefined, undefined, askId, selection);
     if (await this.#queueFull(queue)) return;
     const skill = await this.#captureSkill(prompt);
     if (skill === null) return;
-    if (this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, prompt, undefined, { skill }, askId);
+    if (this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, prompt, undefined, { skill }, askId, selection);
     const current = await this.#queue(sessionId);
     if (await this.#queueFull(current)) return;
     if (!this.#askIsCurrent(askId)) return;
     const ask = this.#consumeAsk(askId, sessionId);
-    await this.#setQueue(sessionId, [...current, { id: crypto.randomUUID(), mode: "follow-up", text: prompt, ...(skill ? { skill } : {}), ...(ask ? { ask } : {}), at: Date.now() }]);
+    await this.#appendQueued(sessionId, { id: crypto.randomUUID(), mode: "follow-up", text: prompt, ...(skill ? { skill } : {}), ...(ask ? { ask } : {}), ...(selection?.content.length ? { content: selection.content } : {}), at: Date.now() }, selection);
   }
 
   async #captureSkill(text: string): Promise<Skill | undefined | null> {
@@ -1258,24 +1302,27 @@ export class BackgroundRuntime {
   }
 
   /** `run.steer`: hands guidance to the active run's agent loop and shows it as pending until delivered. */
-  async #steer(runId: string, rawText: string, askId?: string): Promise<void> {
+  async #steer(runId: string, rawText: string, askId?: string, selection?: ContentAcceptance): Promise<void> {
     const run = this.#activeRun;
-    if (!run || run.runId !== runId) return this.#submitPrompt(rawText, askId);
+    if (!run || run.runId !== runId) return this.#submitPrompt(rawText, askId, selection);
+    if (selection?.content.some(item => item.sessionId !== run.sessionId)) throw new McpError("PROTOCOL", "Those attachments belong to another chat.");
     const queue = await this.#queue(run.sessionId);
     const text = validatePromptText(rawText);
+    if (text && !hasPreparedMcpPrompt(text, selection?.content)) throw new McpError("PROTOCOL", "Choose the MCP prompt from / and prepare its preview before sending.");
     // Re-checked after loading: once a run ends or is cancelling, a steer could never be delivered.
-    if (!text || this.#activeRun !== run || run.status === "cancelling") return this.#submitPrompt(rawText, askId);
+    if (!text || this.#activeRun !== run || run.status === "cancelling") return this.#submitPrompt(rawText, askId, selection);
     if (await this.#queueFull(queue)) return;
     const skill = await this.#captureSkill(text);
     if (skill === null) return;
-    if (this.#activeRun !== run || run.controller.signal.aborted) return this.#submitPrompt(rawText, askId);
+    if (this.#activeRun !== run || run.controller.signal.aborted) return this.#submitPrompt(rawText, askId, selection);
     const current = await this.#queue(run.sessionId);
     if (await this.#queueFull(current)) return;
     if (!this.#askIsCurrent(askId)) return;
     const ask = this.#consumeAsk(askId, run.sessionId);
-    const message: QueuedMessage = { id: crypto.randomUUID(), mode: "steer", text, ...(skill ? { skill } : {}), ...(ask ? { ask } : {}), at: Date.now() };
-    run.agentLoop.steer(message);
-    await this.#setQueue(run.sessionId, [...current, message]);
+    const message: QueuedMessage = { id: crypto.randomUUID(), mode: "steer", text, ...(skill ? { skill } : {}), ...(ask ? { ask } : {}), ...(selection?.content.length ? { content: selection.content } : {}), at: Date.now() };
+    if (!await this.#appendQueued(run.sessionId, message, selection)) return;
+    if (this.#activeRun === run && !run.controller.signal.aborted) run.agentLoop.steer(message);
+    else await this.#settleSteers(run.sessionId);
   }
 
   /** Steers the run never delivered become follow-ups: kept visible, and sent next only if the run completed. */
@@ -1293,7 +1340,7 @@ export class BackgroundRuntime {
       await this.#sidebarHub.broadcastSnapshot();
       return;
     }
-    await this.#startRun(sessionId, message.text, message.id, { skill: message.skill, ask: message.ask });
+    await this.#startRun(sessionId, message.text, message.id, { skill: message.skill, ask: message.ask, content: message.content });
   }
 
   /**
@@ -1304,7 +1351,7 @@ export class BackgroundRuntime {
   async #dispatchFollowUp(sessionId: string): Promise<void> {
     if (this.#activeRun || this.#sessionOpsPending > 0) return;
     const next = (await this.#queue(sessionId)).find((message) => message.mode === "follow-up");
-    if (next) await this.#startRun(sessionId, next.text, next.id, { skill: next.skill, ask: next.ask });
+    if (next) await this.#startRun(sessionId, next.text, next.id, { skill: next.skill, ask: next.ask, content: next.content });
   }
 
   /**
@@ -1314,7 +1361,7 @@ export class BackgroundRuntime {
    * names the queued follow-up the prompt came from; its user message keeps
    * that id, and it leaves the queue once that message is written.
    */
-  async #startRun(sessionId: string, rawPrompt: string | null, queuedId?: string, accepted?: { skill?: Skill; ask?: AskContextV1; scheduled?: ScheduledSource; runId?: string }, askId?: string): Promise<void> {
+  async #startRun(sessionId: string, rawPrompt: string | null, queuedId?: string, accepted?: { skill?: Skill; ask?: AskContextV1; scheduled?: ScheduledSource; runId?: string; content?: McpContentSnapshot[] }, askId?: string, selection?: ContentAcceptance): Promise<void> {
     if (this.#disposed) return;
     const retry = rawPrompt === null;
     if (this.#activeRun || (!accepted?.scheduled && (this.#sessionOpsPending > 0 || this.#scheduledStarting)) || (retry && this.#retryable?.sessionId !== sessionId)) {
@@ -1437,11 +1484,21 @@ export class BackgroundRuntime {
         skill,
         ...(ask ? { ask } : {}),
         ...(run.scheduled ? { scheduled: run.scheduled } : {}),
+        ...((selection?.content ?? accepted?.content)?.length ? { content: selection?.content ?? accepted?.content } : {}),
         ...(sites.length ? { sites } : {}),
         context: artifact ? { artifactId: artifact.artifactId, kind: "page", title: artifact.title, url: artifact.url, capturedAt: artifact.capturedAt } : null,
         at: Date.now(),
       };
-      await appendConversationItem(sessionId, item);
+      try { await appendConversationItem(sessionId, item); }
+      catch (error) {
+        if (run.scheduled) throw error;
+        this.#activeRun = null;
+        this.#refreshShield();
+        this.#notice = "Could not save this message. Its prepared attachments are still available; try sending again.";
+        await this.#sidebarHub.broadcastSnapshot();
+        return;
+      }
+      selection?.commit();
       items = [...items, item];
       if (queuedId) await this.#setQueue(sessionId, (await this.#queue(sessionId)).filter((message) => message.id !== queuedId));
     }
@@ -1449,7 +1506,7 @@ export class BackgroundRuntime {
     const userItem = items[userIndex] as UserMessageItem;
     this.#retryable = null;
 
-    this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt: userItem.text, page: userItem.context, ask: userItem.ask ?? null, retry, ...(userItem.scheduled ? { scheduled: userItem.scheduled } : {}) });
+    this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt: userItem.text, page: userItem.context, ask: userItem.ask ?? null, content: userItem.content, retry, ...(userItem.scheduled ? { scheduled: userItem.scheduled } : {}) });
     await this.#writeCheckpoint(run, "running", "");
 
     // Pi owns assistant/tool replay during this run. Persisted tool items are

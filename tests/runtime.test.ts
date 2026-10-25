@@ -3521,3 +3521,154 @@ describe("BackgroundRuntime: scheduled automation", () => {
     expect(await getNotificationSettings()).toEqual({ version: 1, enabled: false });
   });
 });
+
+describe("BackgroundRuntime: selected MCP content", () => {
+  const answer: ScriptedProviderEvent[] = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
+  async function fixture(provider = new FakeProvider()) {
+    const remote = { text: "Original remote snapshot" };
+    const fake = fakeMcpServers({ capabilities: { tools: {}, prompts: {}, resources: {} }, content: (_server, method) => {
+      if (method === "prompts/list") return { prompts: [{ name: "summarize", arguments: [{ name: "topic", required: true }] }] };
+      if (method === "resources/list") return { resources: [{ name: "Roadmap", uri: "internal://roadmap" }] };
+      if (method === "resources/read") return { contents: [{ uri: "internal://roadmap", text: remote.text }] };
+      return { messages: [{ role: "system", content: { type: "text", text: remote.text } }] };
+    } });
+    const mcp = new McpConnections({ fetcher: fake.fetcher, popup: approvingPopup() });
+    await mcp.connect("notion");
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider, mcp, tabControllerFactory: unsupportedPageTabControllerFactory });
+    const owner = {};
+    const sessionId = (await runtime.getSnapshot()).conversation.id;
+    const send = (command: Record<string, unknown>, sender = owner) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand, sender);
+    const prepare = async (kind: "prompt" | "resource" = "prompt") => {
+      const list = await send({ type: "mcp.content.list", kind, sessionId });
+      if (!list || !("contentReply" in list) || !list.contentReply.ok || !("choices" in list.contentReply)) throw new Error("Missing catalog");
+      const result = await send({ type: "mcp.content.prepare", sessionId, choiceId: list.contentReply.choices[0]!.id, arguments: { topic: "planning" } });
+      if (!result || !("contentReply" in result) || !result.contentReply.ok || !("snapshot" in result.contentReply)) throw new Error("Missing snapshot");
+      return result.contentReply.snapshot;
+    };
+    return { runtime, mcp, hub, provider, remote, sessionId, send, prepare, owner };
+  }
+
+  it("keeps failed-send chips available, refuses other sidebars/session and duplicate sends, and replays exact bytes after disconnect", async () => {
+    const f = await fixture();
+    await f.send({ type: "run.start", prompt: "/mcp:notion:summarize" });
+    expect((await f.runtime.getSnapshot()).notice).toContain("prepare its preview");
+    const prepared = await f.prepare();
+    const command = { type: "run.start", prompt: "/mcp:notion:summarize", sessionId: f.sessionId, contentIds: [prepared.id] };
+    await f.send(command, {});
+    expect((await f.runtime.getSnapshot()).notice).toContain("no longer available");
+    await f.send(command);
+    expect(f.provider.requests).toHaveLength(0); // No provider credential; preparation survives.
+    await saveOpenAICredential("sk-test");
+    f.provider.script = () => ({ [Symbol.asyncIterator]: async function* () { throw new ProviderStreamError("Try again", "NETWORK"); } });
+    await f.send(command);
+    const originalInput = JSON.stringify(f.provider.requests[0]!.context.messages);
+    expect(originalInput).toContain("Original remote snapshot");
+    expect(f.provider.requests[0]!.context.systemPrompt).not.toContain("Original remote snapshot");
+    await f.mcp.disconnect("notion");
+    f.remote.text = "Remote replacement";
+    f.provider.script = answer;
+    await f.send({ type: "run.retry" });
+    expect(JSON.stringify(f.provider.requests[1]!.context.messages)).toBe(originalInput);
+    await f.send(command);
+    expect(f.provider.requests).toHaveLength(2);
+    expect((await getConversation(f.sessionId))!.items.filter(i => i.kind === "message" && i.role === "user")).toHaveLength(1);
+    const exported = await f.runtime.handleCommand({ v: 1, id: "export", type: "context.export", sessionId: f.sessionId });
+    expect(exported!.markdown).toContain("Original remote snapshot");
+    expect(exported!.markdown).not.toContain("Remote replacement");
+  });
+
+  it("taints first-turn memory reads and accepts no MCP write/effect merely for selecting content", async () => {
+    await saveOpenAICredential("sk-test");
+    const f = await fixture();
+    const prepared = await f.prepare("resource");
+    let round = 0;
+    f.provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      if (round++ === 0) {
+        yield { type: "tool.call", call: { id: "save", name: "browser_program", arguments: { source: 'fs.write("/memory/content.md", "Selected content\\nDurable useful detail");' } } } as ScriptedProviderEvent;
+        yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+      } else throw new ProviderStreamError("Try again", "NETWORK");
+    } });
+    await f.send({ type: "run.start", prompt: "Explain this", sessionId: f.sessionId, contentIds: [prepared.id] });
+    expect((await listMemories())[0]?.provenance).toMatchObject({ tainted: true });
+    f.provider.script = answer;
+    await f.send({ type: "run.retry" });
+    expect(f.provider.requests.length).toBeGreaterThanOrEqual(3);
+    expect((await getConversation(f.sessionId))!.items.filter(i => i.kind === "tool-call").every(i => !i.call.mcp)).toBe(true);
+  });
+
+  it.each(["follow-up", "steer"] as const)("preserves accepted %s snapshots through refresh, persistence and delivery", async mode => {
+    await saveOpenAICredential("sk-test");
+    const f = await fixture();
+    const gate = Promise.withResolvers<void>();
+    let round = 0;
+    f.provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      const current = round++;
+      if (current === 0) { await gate.promise; yield* answer; }
+      else if (current === 1) {
+        yield { type: "tool.call", call: { id: "save", name: "browser_program", arguments: { source: 'fs.write("/memory/content.md", "Selected content\\nDurable useful detail");' } } } as ScriptedProviderEvent;
+        yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+      } else yield* answer;
+    } });
+    const running = f.send({ type: "run.start", prompt: "Start" });
+    await untilRequested(f.provider);
+    const prepared = await f.prepare();
+    const runId = (await f.runtime.getSnapshot()).activeRun!.runId;
+    const command = { type: mode === "steer" ? "run.steer" : "run.start", runId, prompt: "Explain", text: "Explain", sessionId: f.sessionId, contentIds: [prepared.id] };
+    await Promise.all([f.send(command), f.send(command)]);
+    expect((await loadMessageQueue(f.sessionId))).toHaveLength(1);
+    expect((await loadMessageQueue(f.sessionId))[0]!.content).toEqual([prepared]);
+    f.remote.text = "Remote replacement";
+    await f.mcp.refresh("notion");
+    gate.resolve();
+    await running;
+    await vi.waitFor(async () => expect((await f.runtime.getSnapshot()).activeRun).toBeNull());
+    expect(f.provider.requests).toHaveLength(3);
+    expect(JSON.stringify(f.provider.requests[1]!.context.messages)).toContain("Original remote snapshot");
+    expect(JSON.stringify(f.provider.requests[1]!.context.messages)).not.toContain("Remote replacement");
+    expect((await listMemories())[0]?.provenance).toMatchObject({ tainted: true });
+    expect((await getConversation(f.sessionId))!.items.find(i => i.kind === "message" && i.role === "user" && i.text === "Explain")).toMatchObject({ content: [prepared], ...(mode === "steer" ? { delivery: "steer" } : {}) });
+  });
+
+  it("retains prepared chips if queue persistence fails and accepts them once on retry", async () => {
+    await saveOpenAICredential("sk-test");
+    const f = await fixture();
+    const gate = Promise.withResolvers<void>();
+    f.provider.script = () => ({ [Symbol.asyncIterator]: async function* () { await gate.promise; yield* answer; } });
+    const running = f.send({ type: "run.start", prompt: "Start" });
+    await untilRequested(f.provider);
+    const prepared = await f.prepare();
+    const originalSet = browser.storage.local.set.bind(browser.storage.local);
+    const fail = vi.spyOn(browser.storage.local, "set").mockImplementation(async items => {
+      if (Object.hasOwn(items, `queue:${f.sessionId}`)) throw new Error("private storage error");
+      await originalSet(items);
+    });
+    const command = { type: "run.start", prompt: "Explain", sessionId: f.sessionId, contentIds: [prepared.id] };
+    await f.send(command);
+    expect((await f.runtime.getSnapshot()).queue).toHaveLength(0);
+    fail.mockRestore();
+    await f.send(command);
+    expect((await loadMessageQueue(f.sessionId))[0]!.content).toEqual([prepared]);
+    f.provider.script = answer;
+    gate.resolve();
+    await running;
+    await vi.waitFor(async () => expect((await f.runtime.getSnapshot()).activeRun).toBeNull());
+  });
+
+  it("refuses stale preparation after session switch or connection refresh and accepts only native sidebar senders", async () => {
+    const f = await fixture();
+    const prepared = await f.prepare();
+    await f.mcp.refresh("notion");
+    await f.send({ type: "run.start", prompt: "Explain", sessionId: f.sessionId, contentIds: [prepared.id] });
+    expect((await f.runtime.getSnapshot()).notice).toContain("disconnected");
+    await f.send({ type: "session.open", sessionId: (await createSession()).id });
+    await f.send({ type: "run.start", prompt: "Explain", sessionId: f.sessionId, contentIds: [prepared.id] });
+    expect((await f.runtime.getSnapshot()).notice).toContain("chat changed");
+    const port = fakePort();
+    Object.assign(port, { sender: { id: browser.runtime.id, url: "https://example.com/" } });
+    f.hub.handleConnect(port);
+    await port.send({ v: 1, id: "read", type: "mcp.content.list", kind: "resource", sessionId: f.sessionId });
+    expect(port.received).toHaveLength(0);
+    expect(f.provider.requests).toHaveLength(0);
+  });
+});
