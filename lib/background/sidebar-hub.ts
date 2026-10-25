@@ -24,11 +24,12 @@ const UNSUPPORTED_HOSTNAME_SUFFIXES = [".mozilla.org", ".mozilla.com"];
 
 export interface SidebarHubDelegate {
   getSnapshot(): Promise<RuntimeSnapshot>;
-  handleCommand(command: SidebarCommand): Promise<{ markdown: string; filename: string } | { tabs: TabMention[] } | { skills: SkillSummary[] } | { sessions: ConversationSummary[] } |
-    { origin: string | null; note: SiteNote | null } | { note: SiteNote | null; error: string | null } | { undone: string[]; error: string | null } | void>;
+  releaseContentOwner?(owner: object): void;
+  handleCommand(command: SidebarCommand, owner?: object): Promise<{ markdown: string; filename: string } | { tabs: TabMention[] } | { skills: SkillSummary[] } | { sessions: ConversationSummary[] } |
+    { origin: string | null; note: SiteNote | null } | { note: SiteNote | null; error: string | null } | { undone: string[]; error: string | null } | { contentReply: import("@/lib/protocol").McpContentReply } | void>;
 }
 
-type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" | "agent-tabs.changed" | "queue.changed" | "ask.changed" | "composer.focus" | "context.exported" | "tabs.listed" | "skills.listed" | "session.listed" | "siteNote.loaded" | "siteNote.saved" | "memory.undone" }>;
+type RunEvent = Exclude<SidebarEvent, { type: "mcp.content.reply" | "mcp.content.accepted" | "state.snapshot" | "page.attached" | "agent-tabs.changed" | "queue.changed" | "ask.changed" | "composer.focus" | "context.exported" | "tabs.listed" | "skills.listed" | "session.listed" | "siteNote.loaded" | "siteNote.saved" | "memory.undone" }>;
 
 export class SidebarHub {
   delegate: SidebarHubDelegate | null = null;
@@ -52,6 +53,12 @@ export class SidebarHub {
     for (const port of this.#ports) port.postMessage(event);
   }
 
+  contentAccepted(owner: object, ids: string[]): void {
+    for (const port of this.#ports) if (port === owner) port.postMessage({
+      v: 1, type: "mcp.content.accepted", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: { ids },
+    } satisfies SidebarEvent);
+  }
+
   focusComposer(): void {
     const event: SidebarEvent = { v: 1, runId: null, conversationId: null, seq: this.#lastSeq, type: "composer.focus", at: Date.now(), payload: null };
     for (const port of this.#ports) port.postMessage(event);
@@ -59,10 +66,13 @@ export class SidebarHub {
 
   handleConnect(port: Browser.runtime.Port): void {
     if (port.name !== SIDEBAR_PORT_NAME) return;
+    // A page/content script cannot impersonate the native sidebar Port.
+    if (port.sender && (port.sender.id !== browser.runtime.id || port.sender.url?.replace(/#.*$/s, "") !== browser.runtime.getURL("/sidepanel.html"))) return;
     this.#ports.add(port);
     port.onMessage.addListener((message: unknown) => this.#handleMessage(port, message));
     port.onDisconnect.addListener(() => {
       this.#ports.delete(port);
+      this.delegate?.releaseContentOwner?.(port);
     });
     this.#sendAttachment(port, this.#attachment);
   }
@@ -163,7 +173,10 @@ export class SidebarHub {
       await this.#handleSubscribe(port, message.lastSeq);
       return;
     }
-    const result = await this.delegate.handleCommand(message);
+    const result = await this.delegate.handleCommand(message, port);
+    if (result && "contentReply" in result) port.postMessage({
+      v: 1, type: "mcp.content.reply", runId: null, conversationId: "sessionId" in message ? message.sessionId ?? null : null, seq: this.#lastSeq, at: Date.now(), payload: { requestId: message.id, result: result.contentReply },
+    } satisfies SidebarEvent);
     if (message.type === "skills.list" && result && "skills" in result) port.postMessage({
       v: 1, type: "skills.listed", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: result,
     } satisfies SidebarEvent);
