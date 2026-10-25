@@ -1188,6 +1188,7 @@ export class BackgroundRuntime {
           await this.#scheduler.updateRun(task.id, runId, "failed").catch(() => {});
           await this.#syncScheduleBadge();
           await this.#publishSessions();
+          await this.#settleSteers(sessionId);
           this.#activeRun = null;
           this.#refreshShield();
           void this.#notifications?.finished(runId, sessionId, { scheduled: true, durationMs: 0, status: "failed" });

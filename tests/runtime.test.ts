@@ -3320,7 +3320,7 @@ describe("BackgroundRuntime: scheduled automation", () => {
     const saved = await runtime.handleAutomationRequest({ v: 1, id: "save", type: "automation.save", taskId: null, task: draft });
     if (!saved.ok) throw new Error(saved.error.message);
     const taskId = saved.tasks[0]!.id;
-    return { runtime, provider, advance, api, tags, taskId, openId, badge, texts, alarms };
+    return { runtime, provider, advance, api, tags, taskId, openId, badge, texts, alarms, hub };
   }
   const ended = async (taskId: string) => {
     await vi.waitFor(async () => expect((await getScheduledTasks()).find((t) => t.id === taskId)?.lastRun?.endedAt).toBeTypeOf("number"));
@@ -3406,6 +3406,70 @@ describe("BackgroundRuntime: scheduled automation", () => {
     const report = await runtime.handleProblemReportRequest({ v: 1, id: "report", type: "problemReport.export", sessionId: openId });
     expect(report.ok).toBe(true);
     expect(JSON.stringify(report)).not.toMatch(/PRIVATE_PENDING|private-pending-uri/);
+  });
+
+  it("keeps accepted steers as usable follow-ups when a scheduled initial save fails", async () => {
+    const fake = fakeMcpServers({ capabilities: { tools: {}, resources: {} }, content: (_server, method) => method === "resources/list"
+      ? { resources: [{ name: "Roadmap", uri: "internal://roadmap" }] }
+      : { contents: [{ uri: "internal://roadmap", text: "Original scheduled steer attachment" }] } });
+    const mcp = new McpConnections({ fetcher: fake.fetcher, popup: approvingPopup() });
+    await mcp.connect("notion");
+    const provider = new FakeProvider();
+    provider.script = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
+    const { runtime, advance, api, taskId, hub } = await setup(provider, undefined, mcp);
+    const capturing = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    const sendMessage = api.tabs.sendMessage.getMockImplementation()!;
+    api.tabs.sendMessage.mockImplementation(async (tabId, message) => {
+      if ((message as { type: string }).type === "page.snapshot") {
+        capturing.resolve(); await resume.promise;
+      }
+      return sendMessage(tabId, message);
+    });
+    let failed = false;
+    const originalSet = browser.storage.local.set.bind(browser.storage.local);
+    const fail = vi.spyOn(browser.storage.local, "set").mockImplementation(async items => {
+      const chunks = Object.entries(items).filter(([key]) => key.startsWith("conversation:") && key.endsWith(":items:0"));
+      if (!failed && chunks.some(([, value]) => (value as { items: ConversationItem[] }).items.some(item => isTurnStart(item) && item.text === draft.prompt))) {
+        failed = true;
+        throw new Error("private storage error");
+      }
+      await originalSet(items);
+    });
+    try {
+      advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
+      await capturing.promise;
+      const sessionId = (await getScheduledTasks()).find(task => task.id === taskId)!.sessionId!;
+      await runtime.openResultsSession(sessionId);
+      const port = fakePort(); hub.handleConnect(port);
+      await port.send({ v: 1, id: "subscribe", type: "state.subscribe", lastSeq: 0 });
+      const runId = (await runtime.getSnapshot()).activeRun!.runId;
+      const catalog = await runtime.handleCommand({ v: 1, id: "catalog", type: "mcp.content.list", sessionId, kind: "resource" }, port);
+      if (!catalog || !("contentReply" in catalog) || !catalog.contentReply.ok || !("choices" in catalog.contentReply)) throw new Error("Missing resource catalog");
+      const result = await runtime.handleCommand({ v: 1, id: "prepare", type: "mcp.content.prepare", sessionId, choiceId: catalog.contentReply.choices[0]!.id, arguments: {} }, port);
+      if (!result || !("contentReply" in result) || !result.contentReply.ok || !("snapshot" in result.contentReply)) throw new Error("Missing resource preview");
+      const prepared = result.contentReply.snapshot;
+      await port.send({ v: 1, id: "steer", type: "run.steer", runId, text: "Explain the attachment", sessionId, contentIds: [prepared.id] });
+      await port.send({ v: 1, id: "remove-later", type: "run.steer", runId, text: "Remove this guidance later" });
+      const pending = await loadMessageQueue(sessionId);
+      expect(pending).toMatchObject([{ mode: "steer", content: [prepared] }, { mode: "steer" }]);
+      resume.resolve();
+      expect((await ended(taskId)).lastRun?.status).toBe("failed");
+      await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun).toBeNull());
+      const queue = pending.map(message => ({ ...message, mode: "follow-up" }));
+      expect((await runtime.getSnapshot()).queue).toEqual(queue);
+      expect(await loadMessageQueue(sessionId)).toEqual(queue);
+      expect(provider.requests).toHaveLength(0);
+      expect(port.received.findLast(event => event.type === "state.snapshot")?.payload).toMatchObject({ activeRun: null, queue });
+      await port.send({ v: 1, id: "remove", type: "queue.remove", sessionId, messageId: pending[1]!.id });
+      expect(await loadMessageQueue(sessionId)).toEqual([queue[0]]);
+      await port.send({ v: 1, id: "send", type: "queue.send", sessionId, messageId: pending[0]!.id });
+      expect((await getConversation(sessionId))!.items.filter(isTurnStart)).toMatchObject([{ id: pending[0]!.id, text: "Explain the attachment", content: [prepared] }]);
+      expect(provider.requests).toHaveLength(1);
+      expect(JSON.stringify(provider.requests)).toContain(prepared.text);
+      expect(await loadMessageQueue(sessionId)).toEqual([]);
+      expect(port.received.filter(event => event.type === "mcp.content.accepted")).toHaveLength(1);
+    } finally { resume.resolve(); fail.mockRestore(); }
   });
 
   it("keeps scheduled help pending until a user response", async () => {
