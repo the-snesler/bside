@@ -71,7 +71,7 @@ export class McpClient {
     this.#clientVersion = clientVersion;
   }
 
-  /** Forgets the session; the next request initializes again. */
+  /** Explicit connection/catalog reset (refresh, connect, disconnect). HTTP session recovery keeps authorization. */
   reset(): void {
     this.#session = null;
     this.#opening = null;
@@ -171,7 +171,12 @@ export class McpClient {
       } catch (error) {
         // The server dropped the session: start a new one, once.
         if (!(error instanceof SessionExpired) || attempt > 0) throw error instanceof SessionExpired ? this.#protocol("ended the session") : error;
-        if (this.#session === session) this.reset();
+        if (this.#session === session) {
+          // Protocol sessions expire independently of the directory catalog.
+          // Keep the authorized selections; explicit reset (refresh/disconnect) revokes them.
+          this.#session = null;
+          this.#opening = null;
+        }
       }
     }
   }

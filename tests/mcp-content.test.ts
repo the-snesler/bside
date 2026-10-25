@@ -37,6 +37,35 @@ describe("MCP catalogs and preparations", () => {
     expect((await connections.contentCatalog("prompt")).choices).toEqual([]);
   });
 
+  it.each(["prompt", "resource"] as const)("recovers an expired HTTP session without stranding cached %s choices", async kind => {
+    let expire = false;
+    const fake = fakeMcpServers({ capabilities: { tools: {}, prompts: {}, resources: {} },
+      override: request => {
+        if (expire && JSON.parse(request.body || "{}").method === (kind === "prompt" ? "prompts/get" : "resources/read")) {
+          expire = false; return new Response(null, { status: 404 });
+        }
+      },
+      content: (_server, method) => method === "prompts/list" ? { prompts: [prompt] }
+        : method === "resources/list" ? { resources: [{ name: "Plan", uri: "internal://plan" }] }
+        : method === "prompts/get" ? { messages: [{ role: "user", content: { type: "text", text: "Recovered prompt" } }] }
+        : { contents: [{ uri: "internal://plan", text: "Recovered resource" }] },
+    });
+    const connections = new McpConnections({ fetcher: fake.fetcher, popup: approvingPopup() });
+    await connections.connect("notion");
+    const catalog = await connections.contentCatalog(kind);
+    const choice = catalog.choices[0]!;
+    expire = true;
+    const first = await connections.prepareContent(choice.id, kind === "prompt" ? { topic: "x" } : {}, "s1");
+    expect(first.text).toBe(`Recovered ${kind}`);
+    expect(fake.requests.filter(request => request.body.startsWith("{") && JSON.parse(request.body).method === "initialize")).toHaveLength(2);
+    const reopened = await connections.contentCatalog(kind);
+    expect(reopened.choices[0]!.id).toBe(choice.id);
+    const second = await connections.prepareContent(reopened.choices[0]!.id, kind === "prompt" ? { topic: "x" } : {}, "s1");
+    expect(second.text).toBe(first.text);
+    await connections.refresh("notion");
+    await expect(connections.prepareContent(choice.id, {}, "s1")).rejects.toThrow("no longer available");
+  });
+
   it("claims atomically for the owning sidebar and session, releases failed sends, and refuses duplicate consumption", () => {
     const prepared = new PreparedMcpContent();
     const owner = {};
