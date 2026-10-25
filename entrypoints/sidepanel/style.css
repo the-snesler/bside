@@ -99,7 +99,7 @@ select:disabled {
   margin-top: 18px;
 }
 .quick-actions button, .skill-chips button {
-  border: 1px solid var(--border);
+  border: 1px solid var(--hairline);
   border-radius: 9px;
   background: var(--surface);
   color: var(--text);
@@ -117,7 +117,7 @@ select:disabled {
   margin: 8px 10px;
   padding: 8px 10px;
   min-width: 0;
-  border: 1px solid var(--border);
+  border: 1px solid var(--hairline);
   border-radius: 8px;
   background: var(--surface);
   font-size: 12px;
@@ -1400,3 +1400,22 @@ summary.trace__line:focus-visible .trace__chevron,
     animation: none !important;
   }
 }
+
+.mcp-content-chip {
+  display: flex;
+  gap: 8px;
+  align-items: start;
+  padding: 8px;
+  margin-block: 6px;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.mcp-content-chip details { min-width: 0; flex: 1; }
+.mcp-content-chip summary { cursor: pointer; font-size: 12px; }
+.mcp-content-chip small { display: block; margin-block: 6px; }
+.mcp-content-chip pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 200px; overflow: auto; font: inherit; font-size: 12px; }
+.mcp-prompt-form { display: grid; gap: 8px; padding: 12px; border: 1px solid var(--hairline); border-radius: 8px; overflow-wrap: anywhere; }
+.mcp-prompt-form label { display: grid; gap: 4px; }
+.mcp-prompt-form input { width: 100%; min-width: 0; box-sizing: border-box; }

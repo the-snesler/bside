@@ -1,3 +1,4 @@
+import { McpContentChip } from "@/lib/ui/McpContentChip";
 import { Fragment } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import History from "~icons/tabler/history";
@@ -61,6 +62,7 @@ export function App() {
     takeOverTab,
     saveSettings,
     sendPrompt,
+    listMcpContent, prepareMcpContent, dismissMcpContent, mcpAttachments,
     steer,
     queue,
     removeQueued,
@@ -259,6 +261,7 @@ export function App() {
                               )}
                             </p>
                             {turn.prompt.ask && <AskChip ask={turn.prompt.ask} />}
+                            {turn.prompt.content?.map(item => <McpContentChip key={item.id} item={item} />)}
                           </li>
                         )}
                         {(turn.steps.length > 0 || active) && (
@@ -352,6 +355,7 @@ export function App() {
                         {message.mode === "steer" ? "Steer" : "Queued"}
                       </span>
                       <span class="queue__text" title={text}>{text}</span>
+                      {message.content?.map(item => <McpContentChip key={item.id} item={item} />)}
                       {message.ask && <span class="queue__label" title={describeAsk(message.ask).text}>{describeAsk(message.ask).label}</span>}
                       {message.mode === "follow-up" && activeRun === null && (
                         <button type="button" class="icon-button" aria-label="Send now" title="Send now" onClick={() => sendQueued(message.id)}>
@@ -412,6 +416,11 @@ export function App() {
                 </div>
               )}
               <Composer
+                sessionId={conversation.id}
+                attachments={mcpAttachments.filter(item => item.sessionId === conversation.id)}
+                onListMcpContent={listMcpContent}
+                onPrepareMcpContent={prepareMcpContent}
+                onDismissMcpContent={dismissMcpContent}
                 disabled={composerDisabled}
                 running={!!activeRun}
                 working={runHere}
@@ -427,9 +436,9 @@ export function App() {
                 onListTabs={listTabs}
                 onSend={(text) => {
                   scroll.scrollToBottom();
-                  sendPrompt(text, ask?.id);
+                  sendPrompt(text, ask?.id, mcpAttachments.filter(item => item.sessionId === conversation.id).map(item => item.id));
                 }}
-                onSteer={(text) => steer(text, ask?.id)}
+                onSteer={(text) => steer(text, ask?.id, mcpAttachments.filter(item => item.sessionId === conversation.id).map(item => item.id))}
                 onStop={cancelRun}
               />
             </div>

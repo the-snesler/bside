@@ -1,3 +1,5 @@
+import { MCP_CONTENT_LIMITS, type McpContentChoice, type McpContentSnapshot } from "@/lib/domain/mcp-content";
+import { McpContentChip } from "@/lib/ui/McpContentChip";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
   createEditor,
@@ -76,6 +78,11 @@ export function composerKeyAction(
 }
 
 export function Composer(props: {
+  sessionId?: string;
+  attachments?: McpContentSnapshot[];
+  onListMcpContent?: (kind: "prompt" | "resource") => Promise<{ choices: McpContentChoice[]; errors: { message: string }[] }>;
+  onPrepareMcpContent?: (id: string, args: Record<string, string>) => Promise<void>;
+  onDismissMcpContent?: (id: string) => void;
   disabled: boolean;
   /** Any run is active: Stop is shown. */
   running: boolean;
@@ -111,6 +118,46 @@ export function Composer(props: {
   const [index, setIndex] = useState(0);
   const [text, setText] = useState("");
   const [skillMode, setSkillMode] = useState(false);
+  const [remoteChoices, setRemoteChoices] = useState<McpContentChoice[]>([]);
+  const [remoteError, setRemoteError] = useState("");
+  const [loadingContent, setLoadingContent] = useState(false);
+  const [preparing, setPreparing] = useState(false);
+  const [selectedPrompt, setSelectedPrompt] = useState<Extract<McpContentChoice, { kind: "prompt" }> | null>(null);
+  const [args, setArgs] = useState<Record<string, string>>({});
+  const discoveryVersion = useRef(0);
+  const currentSession = useRef(props.sessionId);
+  currentSession.current = props.sessionId;
+  useEffect(() => {
+    discoveryVersion.current++;
+    setRemoteChoices([]); setSelectedPrompt(null); setRemoteError(""); setLoadingContent(false); setPreparing(false); setTarget(null);
+  }, [props.sessionId]);
+  const discover = (kind: "prompt" | "resource") => {
+    const version = ++discoveryVersion.current;
+    setRemoteChoices([]); setRemoteError("");
+    if (!props.onListMcpContent) return;
+    setLoadingContent(true);
+    void props.onListMcpContent(kind).then(result => {
+      if (version !== discoveryVersion.current) return;
+      setRemoteChoices(result.choices);
+      setRemoteError(result.errors.map(error => error.message).join(" "));
+    }).catch(error => { if (version === discoveryVersion.current) setRemoteError(error instanceof Error ? error.message : "Could not list connected-account content."); })
+      .finally(() => { if (version === discoveryVersion.current) setLoadingContent(false); });
+  };
+  const prepare = async (choice: McpContentChoice, arguments_: Record<string, string>) => {
+    if (!props.onPrepareMcpContent || preparing) return;
+    const sessionId = props.sessionId;
+    setPreparing(true); setRemoteError("");
+    try {
+      await props.onPrepareMcpContent(choice.id, arguments_);
+      if (currentSession.current !== sessionId) return;
+      if (choice.kind === "prompt") {
+        Transforms.insertText(editor, `/${choice.command} `);
+        setSelectedPrompt(null);
+      }
+      ReactEditor.focus(editor);
+    } catch (error) { if (currentSession.current === sessionId) setRemoteError(error instanceof Error ? error.message : "Could not prepare MCP content."); }
+    finally { if (currentSession.current === sessionId) setPreparing(false); }
+  };
   const seenDraft = useRef<string | null>(null);
   useEffect(() => {
     const focus = () => {
@@ -139,18 +186,28 @@ export function Composer(props: {
       `${tab.title} ${tab.url}`.toLowerCase().includes(search.toLowerCase()),
     )
     .slice(0, 8);
-  const matchCount = skillMode ? skillMatches.length : matches.length;
-  const selectMatch = () => {
-    if (!skillMode) return mention(matches[index]!);
-    if (!target || !skillMatches[index]) return;
+  const remoteMatches = remoteChoices.filter(choice => choice.kind === (skillMode ? "prompt" : "resource") &&
+    `${choice.command} ${choice.name} ${choice.server}`.toLowerCase().includes(search.toLowerCase())).slice(0, 8);
+  type Option = { kind: "skill"; skill: SkillSummary } | { kind: "tab"; tab: TabMention } | { kind: "remote"; choice: McpContentChoice };
+  const options: Option[] = [...(skillMode ? skillMatches.map(skill => ({ kind: "skill" as const, skill })) : matches.map(tab => ({ kind: "tab" as const, tab }))), ...remoteMatches.map(choice => ({ kind: "remote" as const, choice }))];
+  const matchCount = options.length;
+  const selectOption = (option: Option) => {
+    if (!target) return;
+    if (option.kind === "tab") return mention(option.tab);
     Transforms.select(editor, target);
-    Transforms.insertText(editor, `/${skillMatches[index]!.name} `);
+    if (option.kind === "skill") Transforms.insertText(editor, `/${option.skill.name} `);
+    else {
+      Transforms.delete(editor);
+      if (option.choice.kind === "prompt") { setArgs({}); setSelectedPrompt(option.choice); }
+      else void prepare(option.choice, {});
+    }
     setTarget(null);
-    ReactEditor.focus(editor);
+    if (option.kind === "skill") ReactEditor.focus(editor);
   };
+  const selectMatch = () => { if (options[index]) selectOption(options[index]!); };
   const send = (steer = false) => {
     const value = serializeDraft(editor.children);
-    if (!value || value.length > 16000 || props.disabled) return;
+    if (!value || value.length > 16000 || props.disabled || preparing || selectedPrompt) return;
     if (steer) props.onSteer(value);
     else props.onSend(value);
     Transforms.select(editor, Editor.range(editor, []));
@@ -183,7 +240,7 @@ export function Composer(props: {
             anchor: start,
             focus: selection.anchor,
           });
-          const skillMatch = /^\/([a-z0-9-]*)$/.exec(before);
+          const skillMatch = /^\/([^\s]*)$/.exec(before);
           const atStart = Editor.isStart(editor, start, []);
           const isSkill = !!skillMatch && atStart;
           const match = isSkill ? skillMatch : /(?:^|\s)@([^@\n]*)$/.exec(before);
@@ -193,6 +250,7 @@ export function Composer(props: {
               offset: selection.anchor.offset - match[1]!.length - 1,
             };
             if (!target || skillMode !== isSkill) {
+              discover(isSkill ? "prompt" : "resource");
               if (isSkill) props.onListSkills?.();
               else props.onListTabs();
             }
@@ -206,6 +264,22 @@ export function Composer(props: {
         setTarget(null);
       }}
     >
+      {(props.attachments ?? []).map(item => <McpContentChip key={item.id} item={item} onRemove={() => props.onDismissMcpContent?.(item.id)} />)}
+      {selectedPrompt && <form class="mcp-prompt-form" aria-label={`Prepare ${selectedPrompt.server} prompt`} onSubmit={event => { event.preventDefault(); void prepare(selectedPrompt, args); }}>
+        <strong>{selectedPrompt.server} · /{selectedPrompt.command}</strong>
+        <p>{selectedPrompt.description}</p>
+        <small>Arguments are sent to this connected account. Do not enter passwords, tokens, or verification codes.</small>
+        {selectedPrompt.arguments.map((arg, i) => <label key={arg.name}>
+          {arg.name} ({arg.required ? "required" : "optional"})
+          <small id={`mcp-arg-help-${i}`}>{arg.description}</small>
+          <input autoFocus={i === 0} name={arg.name} required={arg.required} maxLength={MCP_CONTENT_LIMITS.argumentChars} aria-describedby={`mcp-arg-help-${i}`} value={args[arg.name] ?? ""}
+            onInput={event => setArgs({ ...args, [arg.name]: event.currentTarget.value })} disabled={preparing} />
+        </label>)}
+        <button type="submit" autoFocus={selectedPrompt.arguments.length === 0} disabled={preparing || (props.attachments?.length ?? 0) >= MCP_CONTENT_LIMITS.attachments}>{preparing ? "Preparing…" : "Prepare preview"}</button>
+        <button type="button" disabled={preparing} onClick={() => { setSelectedPrompt(null); ReactEditor.focus(editor); }}>Cancel</button>
+      </form>}
+      {remoteError && <p role="alert" class="sidebar__error">{remoteError}</p>}
+      {preparing && !selectedPrompt && <p role="status">Preparing resource preview…</p>}
       <div class="composer__editor-row">
         <Editable
           className="composer__editor"
@@ -218,7 +292,7 @@ export function Composer(props: {
           aria-controls={target ? "tab-suggestions" : undefined}
           aria-activedescendant={
             target && matchCount > index
-              ? skillMode ? `skill-option-${skillMatches[index]!.name}` : `tab-option-${matches[index]!.id}`
+              ? `composer-option-${index}`
               : undefined
           }
           placeholder={
@@ -226,7 +300,7 @@ export function Composer(props: {
               ? "Connect OpenAI in settings to start."
               : props.working
                 ? "Enter queues, Ctrl/⌘+Enter steers…"
-                : props.placeholder ?? "Ask a task, / for skills, @ for tabs…"
+                : props.placeholder ?? "Ask a task, / for prompts or skills, @ for resources or tabs…"
           }
           renderElement={({ attributes, children, element }) =>
             element.type === "mention" ? (
@@ -312,7 +386,7 @@ export function Composer(props: {
             type="button"
             aria-label="Send message"
             title="Send message"
-            disabled={props.disabled || !text || text.length > 16000}
+            disabled={props.disabled || preparing || !!selectedPrompt || !text || text.length > 16000}
             onClick={() => send()}
           >
             <ArrowUp />
@@ -329,41 +403,18 @@ export function Composer(props: {
           class="tab-suggestions"
           id="tab-suggestions"
           role="listbox"
-          aria-label={skillMode ? "Saved skills" : "Open tabs"}
+          aria-label={skillMode ? "Skills and connected-account prompts" : "Tabs and connected-account resources"}
         >
-          <div class="tab-suggestions__heading">{skillMode ? "Invoke a skill" : "Mention a tab"}</div>
-          {skillMode ? skillMatches.length ? skillMatches.map((skill, i) => (
-            <div key={skill.name} role="option" id={`skill-option-${skill.name}`} aria-selected={index === i} class="tab-suggestions__option"
-              onMouseDown={(event) => {
-                event.preventDefault();
-                if (!target) return;
-                Transforms.select(editor, target);
-                Transforms.insertText(editor, `/${skill.name} `);
-                setTarget(null);
-                ReactEditor.focus(editor);
-              }}>
-              <strong>/{skill.name}</strong><small>{skill.description}</small>
-            </div>
-          )) : <p>No matching skills. Add one in Settings → Skills.</p> : matches.length ? (
-            matches.map((tab, i) => (
-              <div
-                key={tab.id}
-                role="option"
-                id={`tab-option-${tab.id}`}
-                aria-selected={index === i}
-                class="tab-suggestions__option"
-                onMouseDown={(event) => {
-                  event.preventDefault();
-                  mention(tab);
-                }}
-              >
-                <strong>{tab.title || tab.url}</strong>
-                <small>{tab.url}</small>
-              </div>
-            ))
-          ) : (
-            <p>No matching tabs</p>
-          )}
+          <div class="tab-suggestions__heading">{skillMode ? "Skills and MCP prompts" : "Tabs and MCP resources"}</div>
+          {options.map((option, i) => <div key={i} role="option" id={`composer-option-${i}`} aria-selected={index === i} class="tab-suggestions__option"
+            onMouseDown={event => { event.preventDefault(); selectOption(option); }}>
+            {option.kind === "skill" ? <><strong>/{option.skill.name}</strong><small>Saved skill · {option.skill.description}</small></>
+              : option.kind === "tab" ? <><strong>{option.tab.title || option.tab.url}</strong><small>Tab · {option.tab.url}</small></>
+              : <><strong>{skillMode ? `/${option.choice.command}` : option.choice.name}</strong><small>{option.choice.server} · MCP {option.choice.kind} · {option.choice.description}</small></>}
+          </div>)}
+          {loadingContent && <p role="status">Loading connected-account content…</p>}
+          {!options.length && !loadingContent && <p>No matching {skillMode ? "skills or prompts" : "tabs or resources"}.</p>}
+
         </div>
       )}
     </Slate>
