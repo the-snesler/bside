@@ -95,4 +95,86 @@ describe("run digests", () => {
     expect(isValidRunDigest({ ...valid, entries: [{ type: "program", source: "x".repeat(DIGEST_SOURCE_CHARS + 1), ok: true, code: null, urls: [], excerpt: "" }] })).toBe(false);
     expect(isValidRunDigest({ ...valid, entries: [{ type: "shell", command: "rm" }] })).toBe(false);
   });
+
+  it("records help requests and the user's answer, not page effects, and renders them as untrusted notes", () => {
+    const help = (id: string, result: DigestStep["result"], kind = "login"): DigestStep =>
+      ({ call: { id, name: "request_user_help", arguments: { tab: "/agent-tabs/5/page.md", kind, reason: "  Sign in to Grocer.  " } }, result });
+    const digest = buildRunDigest([
+      help("h1", { ok: true, summary: "done" }),
+      help("h2", { ok: false, code: "ACTION_DENIED", summary: "could not help" }, "permission"),
+      help("h3", { ok: false, code: "INVALID_TOOL_ARGUMENTS", summary: "not one of this chat's agent tabs" }),
+      help("h4", { ok: false, summary: "Cancelled before the user answered." }, "nonsense"),
+      help("h5", null),
+    ], "completed")!;
+    expect(digest.entries).toEqual([
+      { type: "help", kind: "login", reason: "Sign in to Grocer.", outcome: "done" },
+      { type: "help", kind: "permission", reason: "Sign in to Grocer.", outcome: "unable" },
+      { type: "help", kind: "login", reason: "Sign in to Grocer.", outcome: "failed" },
+      { type: "help", kind: "other", reason: "Sign in to Grocer.", outcome: null },
+      { type: "help", kind: "login", reason: "Sign in to Grocer.", outcome: null },
+    ]);
+    expect(isValidRunDigest(digest)).toBe(true);
+    const note = renderDigestNote(digest);
+    expect(note).toContain('1. asked the user for help (login) "Sign in to Grocer.": the user reported done');
+    expect(note).toContain("2. asked the user for help (permission)");
+    expect(note).toContain(": the user could not help");
+    expect(note).toContain("no answer recorded");
+    expect(note.indexOf("BEGIN_UNTRUSTED_RUN_NOTES")).toBeLessThan(note.indexOf("asked the user"));
+    expect(isValidRunDigest({ ...digest, entries: [{ type: "help", kind: "bribe", reason: "x", outcome: "done" }] })).toBe(false);
+    expect(isValidRunDigest({ ...digest, entries: [{ type: "help", kind: "login", reason: "x", outcome: "maybe" }] })).toBe(false);
+  });
+});
+
+describe("run digests: memory changes", () => {
+  const changes = [
+    { id: "m1", op: "write" as const, name: "coffee", tainted: false },
+    { id: "m2", op: "remove" as const, name: "old-trip", tainted: true },
+  ];
+
+  it("records each change after its program, by name and taint only", () => {
+    const digest = buildRunDigest([{ ...program("p1", 'fs.write("/memory/coffee.md", "Oat flat white");', { ok: true, summary: "Saved." }), memory: changes }], "completed")!;
+    expect(digest.entries.slice(1)).toEqual([
+      { type: "memory", op: "write", name: "coffee", tainted: false },
+      { type: "memory", op: "remove", name: "old-trip", tainted: true },
+    ]);
+    expect(isValidRunDigest(digest)).toBe(true);
+    const note = renderDigestNote(digest);
+    expect(note).toContain("2. saved memory /memory/coffee.md\n3. removed memory /memory/old-trip.md (after reading web content)");
+    expect(isValidRunDigest({ ...digest, entries: [{ type: "memory", op: "write", name: "Bad Name", tainted: false }] })).toBe(false);
+    expect(isValidRunDigest({ ...digest, entries: [{ type: "memory", op: "write", name: "x", tainted: false, body: "leak" }] })).toBe(false);
+  });
+
+  it("rebuilds them from the persisted tool results after an interruption", () => {
+    const items: ConversationItem[] = [
+      { id: "u", kind: "message", role: "user", text: "Remember my coffee", context: null, at: 0 },
+      { id: "c", kind: "tool-call", call: { id: "p1", name: "browser_program", arguments: { source: 'fs.write("/memory/coffee.md", "x");' } }, at: 1 },
+      { id: "r", kind: "tool-result", callId: "p1", result: { ok: true, summary: "Browser program completed." }, memory: [changes[0]!], at: 2 },
+    ];
+    expect(digestFromItems(items)!.entries.at(-1)).toEqual({ type: "memory", op: "write", name: "coffee", tainted: false });
+  });
+});
+
+describe("run digest: connected-account calls", () => {
+  const call = { id: "m1", name: "mcp__todoist__add-tasks" as const, arguments: { content: "Buy milk" }, mcp: { server: "todoist", tool: "add-tasks", readOnly: false } };
+
+  it("records the server's name, the tool, and bounded argument and result excerpts, and validates", () => {
+    const digest = buildRunDigest([{ call: { ...call, arguments: { content: "x".repeat(2_000) } }, result: { ok: true, summary: "y".repeat(5_000) } }], "completed")!;
+    const [entry] = digest.entries;
+    expect(entry).toMatchObject({ type: "mcp", server: "Todoist", tool: "add-tasks", ok: true, code: null });
+    expect(entry?.type === "mcp" && entry.args.length).toBe(600);
+    expect(entry?.type === "mcp" && entry.excerpt.length).toBe(1200);
+    expect(isValidRunDigest(digest)).toBe(true);
+    expect(isValidRunDigest({ ...digest, entries: [{ ...entry, token: "secret" }] })).toBe(false);
+    const note = renderDigestNote(digest);
+    expect(note).toContain("1. Todoist tool add-tasks: ok\narguments:");
+    expect(note.indexOf("BEGIN_UNTRUSTED_RUN_NOTES")).toBeLessThan(note.indexOf("Todoist tool"));
+  });
+
+  it("rebuilds an interrupted call from its persisted items", () => {
+    const digest = digestFromItems([
+      { id: "u1", kind: "message", role: "user", text: "Add milk", context: null, at: 0 },
+      { id: "i1", kind: "tool-call", call, at: 1 },
+    ])!;
+    expect(digest.entries).toEqual([{ type: "mcp", server: "Todoist", tool: "add-tasks", args: '{"content":"Buy milk"}', ok: null, code: null, excerpt: "" }]);
+  });
 });

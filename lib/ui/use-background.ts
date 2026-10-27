@@ -12,18 +12,43 @@
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import type { Browser } from "wxt/browser";
 import { RUN_CANCELLED_SUFFIX, SIDEBAR_PORT_NAME } from "@/lib/protocol";
-import type { NormalizedError, RuntimeSnapshot, SidebarCommand, SidebarEvent } from "@/lib/protocol";
+import type { HelpOutcome, NormalizedError, RuntimeSnapshot, SidebarCommand, SidebarEvent } from "@/lib/protocol";
 import type { Conversation, ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
 import type { AppSettingsV1 } from "@/lib/domain/provider";
 import type { TabMention } from "@/lib/protocol";
 import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
 import { EMPTY_USAGE } from "@/lib/domain/usage";
+import type { SiteNote } from "@/lib/domain/instructions";
+
+/** The sidebar's "Remember something about this site" editor, for one page's site. */
+export interface SiteNoteEditorState {
+  /** The page's origin; `null` when its site cannot have a note. */
+  origin: string | null;
+  /** The note covering the page: its own origin's, or a parent's that includes subdomains. */
+  note: SiteNote | null;
+  status: "loading" | "ready" | "saving" | "saved";
+  /** Why the last save was refused. */
+  error: string | null;
+}
+
+/** The trace's Undo for one turn's memory changes, keyed by `memoryUndoKey`. */
+export interface MemoryUndoState {
+  status: "undoing" | "undone" | "failed";
+  /** Why some or all were not undone. */
+  error: string | null;
+}
+
+export const memoryUndoKey = (changeIds: readonly string[]) => changeIds.join(" ");
 
 export interface BackgroundState extends RuntimeSnapshot {
+  focusVersion: number;
   tabs: TabMention[];
   /** The session index, pinned first, then most recent. Requested on connect and pushed by the background whenever it changes. */
   sessions: ConversationSummary[];
   lastError: NormalizedError | null;
+  /** The open "Remember something about this site" editor, if any. */
+  siteNote: SiteNoteEditorState | null;
+  memoryUndo: Record<string, MemoryUndoState>;
 }
 
 export interface BackgroundActions {
@@ -36,17 +61,22 @@ export interface BackgroundActions {
   watchTab(tabId: number): void;
   /** Goes back to the tab the user watched from, hiding the watched tab again. */
   unwatchTab(): void;
+  /** Removes the page shield from the watched agent tab until watching ends. */
+  takeOverTab(tabId: number): void;
   saveSettings(settings: AppSettingsV1): void;
   /** Starts a run, or queues a follow-up while this chat's run is working. */
-  sendPrompt(prompt: string): void;
+  sendPrompt(prompt: string, askId?: string): void;
   /** Guidance for the running turn, delivered at its next tool boundary. */
-  steer(text: string): void;
+  steer(text: string, askId?: string): void;
+  dismissAsk(askId: string): void;
   removeQueued(messageId: string): void;
   sendQueued(messageId: string): void;
   retryRun(): void;
   cancelRun(): void;
   approveAction(callId: string): void;
   denyAction(callId: string): void;
+  /** Answers the run's pending help request; `note` is optional (empty for none). */
+  resolveHelp(callId: string, outcome: HelpOutcome, note: string): void;
   newChat(): void;
   listSessions(): void;
   openSession(sessionId: string): void;
@@ -56,6 +86,13 @@ export interface BackgroundActions {
   deleteSession(sessionId: string, closeAgentTabs: boolean): void;
   /** Downloads one session's context export. */
   downloadContext(sessionId: string): void;
+  /** Opens the site-note editor for a page, loading the note that covers it. */
+  rememberSite(pageUrl: string): void;
+  /** Saves the open editor's note; the background revalidates it. */
+  saveSiteNote(note: SiteNote): void;
+  closeSiteNote(): void;
+  /** Undoes memory changes a turn made; the background reverts each only if nothing changed it since. */
+  undoMemory(changeIds: string[]): void;
 }
 
 const EMPTY_CONVERSATION: Conversation = {
@@ -63,6 +100,8 @@ const EMPTY_CONVERSATION: Conversation = {
 };
 
 const INITIAL_STATE: BackgroundState = {
+  ask: null,
+  focusVersion: 0,
   skills: [],
   tabs: [],
   sessions: [],
@@ -71,12 +110,14 @@ const INITIAL_STATE: BackgroundState = {
   provider: OPENAI_PROVIDER,
   settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
   page: null,
-  agentTabs: { bySession: {}, watching: null },
+  agentTabs: { bySession: {}, watching: null, takenOver: false },
   queue: [],
   activeRun: null,
   lastSeq: 0,
   notice: null,
   lastError: null,
+  siteNote: null,
+  memoryUndo: {},
 };
 
 type Port = Browser.runtime.Port;
@@ -86,6 +127,10 @@ export function useBackground(): BackgroundState & BackgroundActions {
   const portRef = useRef<Port | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
   const exportRequestRef = useRef<string | null>(null);
+  /** The site-note request awaiting its reply; replies to an older or closed editor are dropped. */
+  const siteNoteRequestRef = useRef<string | null>(null);
+  /** Undo requests awaiting their reply, by request id. */
+  const undoRequestsRef = useRef(new Map<string, string>());
   const conversationIdRef = useRef("");
   conversationIdRef.current = state.conversation.id;
 
@@ -108,6 +153,23 @@ export function useBackground(): BackgroundState & BackgroundActions {
         setTimeout(() => URL.revokeObjectURL(url), 60_000);
         return;
       }
+      if (event.type === "siteNote.loaded" || event.type === "siteNote.saved") {
+        if (event.payload.requestId !== siteNoteRequestRef.current) return;
+        siteNoteRequestRef.current = null;
+        const reply = event.payload;
+        setState((prev) => !prev.siteNote ? prev : { ...prev, siteNote: "origin" in reply
+          ? { origin: reply.origin, note: reply.note, status: "ready", error: null }
+          : reply.note ? { ...prev.siteNote, note: reply.note, status: "saved", error: null } : { ...prev.siteNote, status: "ready", error: reply.error } });
+        return;
+      }
+      if (event.type === "memory.undone") {
+        const key = undoRequestsRef.current.get(event.payload.requestId);
+        if (key === undefined) return;
+        undoRequestsRef.current.delete(event.payload.requestId);
+        const { undone, error } = event.payload;
+        setState((prev) => ({ ...prev, memoryUndo: { ...prev.memoryUndo, [key]: { status: undone.length ? "undone" : "failed", error } } }));
+        return;
+      }
       applyEvent(message as SidebarEvent, setState, activeRunIdRef);
     };
     port.onMessage.addListener(onMessage);
@@ -123,17 +185,17 @@ export function useBackground(): BackgroundState & BackgroundActions {
     };
   }, []);
 
-  const sendPrompt = useCallback((prompt: string) => {
-    const command: SidebarCommand = { v: 1, id: crypto.randomUUID(), type: "run.start", prompt };
+  const sendPrompt = useCallback((prompt: string, askId?: string) => {
+    const command: SidebarCommand = { v: 1, id: crypto.randomUUID(), type: "run.start", prompt, ...(askId ? { askId } : {}) };
     portRef.current?.postMessage(command);
   }, []);
 
-  const steer = useCallback((text: string) => {
+  const steer = useCallback((text: string, askId?: string) => {
     const runId = activeRunIdRef.current;
     // With no run to steer, the background treats the text as a normal prompt.
     portRef.current?.postMessage(runId
-      ? { v: 1, id: crypto.randomUUID(), type: "run.steer", runId, text } satisfies SidebarCommand
-      : { v: 1, id: crypto.randomUUID(), type: "run.start", prompt: text } satisfies SidebarCommand);
+      ? { v: 1, id: crypto.randomUUID(), type: "run.steer", runId, text, ...(askId ? { askId } : {}) } satisfies SidebarCommand
+      : { v: 1, id: crypto.randomUUID(), type: "run.start", prompt: text, ...(askId ? { askId } : {}) } satisfies SidebarCommand);
   }, []);
   const removeQueued = useCallback((messageId: string) => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "queue.remove", sessionId: conversationIdRef.current, messageId } satisfies SidebarCommand);
@@ -167,6 +229,12 @@ export function useBackground(): BackgroundState & BackgroundActions {
     portRef.current?.postMessage(command);
   }, []);
 
+  const resolveHelp = useCallback((callId: string, outcome: HelpOutcome, note: string) => {
+    const runId = activeRunIdRef.current;
+    if (!runId) return;
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "help.resolve", runId, callId, outcome, note } satisfies SidebarCommand);
+  }, []);
+
   const newChat = useCallback(() => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.create" } satisfies SidebarCommand);
   }, []);
@@ -192,6 +260,31 @@ export function useBackground(): BackgroundState & BackgroundActions {
     portRef.current?.postMessage({ v: 1, id, type: "context.export", sessionId } satisfies SidebarCommand);
   }, []);
 
+  const rememberSite = useCallback((url: string) => {
+    const id = crypto.randomUUID();
+    siteNoteRequestRef.current = id;
+    setState((prev) => ({ ...prev, siteNote: { origin: null, note: null, status: "loading", error: null } }));
+    portRef.current?.postMessage({ v: 1, id, type: "siteNote.get", url } satisfies SidebarCommand);
+  }, []);
+  const saveSiteNote = useCallback((note: SiteNote) => {
+    const id = crypto.randomUUID();
+    siteNoteRequestRef.current = id;
+    setState((prev) => prev.siteNote ? { ...prev, siteNote: { ...prev.siteNote, status: "saving", error: null } } : prev);
+    portRef.current?.postMessage({ v: 1, id, type: "siteNote.save", note } satisfies SidebarCommand);
+  }, []);
+  const closeSiteNote = useCallback(() => {
+    siteNoteRequestRef.current = null;
+    setState((prev) => ({ ...prev, siteNote: null }));
+  }, []);
+
+  const undoMemory = useCallback((changeIds: string[]) => {
+    const id = crypto.randomUUID();
+    const key = memoryUndoKey(changeIds);
+    undoRequestsRef.current.set(id, key);
+    setState((prev) => ({ ...prev, memoryUndo: { ...prev.memoryUndo, [key]: { status: "undoing", error: null } } }));
+    portRef.current?.postMessage({ v: 1, id, type: "memory.undo", changeIds } satisfies SidebarCommand);
+  }, []);
+
   const listTabs = useCallback(() => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "tabs.list" } satisfies SidebarCommand);
   }, []);
@@ -207,13 +300,17 @@ export function useBackground(): BackgroundState & BackgroundActions {
   const unwatchTab = useCallback(() => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "tabs.unwatch" } satisfies SidebarCommand);
   }, []);
+  const takeOverTab = useCallback((tabId: number) => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "tabs.takeOver", tabId } satisfies SidebarCommand);
+  }, []);
   const saveSettings = useCallback((settings: AppSettingsV1) => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "settings.save", settings } satisfies SidebarCommand);
   }, []);
 
   return {
-    ...state, sendPrompt, steer, removeQueued, sendQueued, retryRun, cancelRun, approveAction, denyAction, newChat, listSessions, openSession, renameSession, pinSession,
-    deleteSession, downloadContext, listTabs, listSkills: () => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "skills.list" } satisfies SidebarCommand), focusTab, closeAgentTabs, watchTab, unwatchTab, saveSettings,
+    ...state, sendPrompt, steer, removeQueued, sendQueued, retryRun, cancelRun, approveAction, denyAction, resolveHelp, newChat, listSessions, openSession, renameSession, pinSession,
+    dismissAsk: (askId: string) => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "ask.dismiss", askId } satisfies SidebarCommand),
+    deleteSession, downloadContext, rememberSite, saveSiteNote, closeSiteNote, undoMemory, listTabs, listSkills: () => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "skills.list" } satisfies SidebarCommand), focusTab, closeAgentTabs, watchTab, unwatchTab, takeOverTab, saveSettings,
   };
 }
 
@@ -255,6 +352,14 @@ function applyEvent(
   setState: (updater: (prev: BackgroundState) => BackgroundState) => void,
   activeRunIdRef: { current: string | null },
 ): void {
+  if (event.type === "ask.changed") {
+    setState((prev) => ({ ...prev, ask: event.payload.ask }));
+    return;
+  }
+  if (event.type === "composer.focus") {
+    setState((prev) => ({ ...prev, focusVersion: prev.focusVersion + 1 }));
+    return;
+  }
   if (event.type === "skills.listed") {
     setState((prev) => ({ ...prev, skills: event.payload.skills }));
     return;
@@ -310,13 +415,15 @@ function applyEvent(
         role: "user",
         text: event.payload.prompt,
         context: event.payload.page,
+        ...(event.payload.ask ? { ask: event.payload.ask } : {}),
+        ...(event.payload.scheduled ? { scheduled: event.payload.scheduled } : {}),
         at: event.at,
       };
       const conversationId = event.conversationId!;
       return {
         ...prev,
         lastError: null,
-        activeRun: { runId: event.runId as string, conversationId, status: "running", partialAssistantText: "", pendingApproval: null, usage: null },
+        activeRun: { runId: event.runId as string, conversationId, status: "running", partialAssistantText: "", pendingApproval: null, pendingHelp: null, usage: null },
         // A retry re-runs the turn's existing user message rather than adding one.
         conversation: event.payload.retry ? prev.conversation : appendItem(prev, conversationId, userItem, event.at),
       };
@@ -344,10 +451,25 @@ function applyEvent(
     setState((prev) => {
       const committed = commitPendingText(prev, event.conversationId);
       if (!committed.activeRun) return committed;
+      // A memory change under the Ask policy pauses a browser program whose call is already shown.
+      const shown = committed.conversation.items.some((item) => item.kind === "tool-call" && item.call.id === event.payload.call.id);
       const callItem: ConversationItem = { id: `${event.payload.call.id}-call`, kind: "tool-call", call: event.payload.call, at: event.at };
       return {
         ...committed,
         activeRun: { ...committed.activeRun, status: "awaiting-approval", pendingApproval: event.payload },
+        conversation: shown ? committed.conversation : appendItem(committed, event.conversationId, callItem),
+      };
+    });
+    return;
+  }
+  if (event.type === "help.requested") {
+    setState((prev) => {
+      const committed = commitPendingText(prev, event.conversationId);
+      if (!committed.activeRun) return committed;
+      const callItem: ConversationItem = { id: `${event.payload.call.id}-call`, kind: "tool-call", call: event.payload.call, at: event.at };
+      return {
+        ...committed,
+        activeRun: { ...committed.activeRun, status: "awaiting-help", pendingHelp: event.payload },
         conversation: appendItem(committed, event.conversationId, callItem),
       };
     });
@@ -361,15 +483,18 @@ function applyEvent(
         kind: "tool-result",
         callId: event.payload.callId,
         result: event.payload.result,
+        ...(event.payload.memory ? { memory: event.payload.memory } : {}),
         at: event.at,
       };
       const stillPending = prev.activeRun.pendingApproval?.call.id === event.payload.callId ? null : prev.activeRun.pendingApproval;
+      const helpPending = prev.activeRun.pendingHelp?.call.id === event.payload.callId ? null : prev.activeRun.pendingHelp;
       return {
         ...prev,
         activeRun: {
           ...prev.activeRun,
-          status: stillPending ? "awaiting-approval" : "running",
+          status: stillPending ? "awaiting-approval" : helpPending ? "awaiting-help" : "running",
           pendingApproval: stillPending,
+          pendingHelp: helpPending,
         },
         conversation: appendItem(prev, event.conversationId, resultItem),
       };

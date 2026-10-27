@@ -7,6 +7,8 @@ export interface Skill {
 export interface SkillSummary {
   name: string;
   description: string;
+  /** Sidebar metadata; excluded from the model's catalog rendering. */
+  builtin?: boolean;
 }
 
 export const MAX_SKILL_DESCRIPTION = 160;

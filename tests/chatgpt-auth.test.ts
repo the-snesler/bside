@@ -3,7 +3,7 @@ import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { DeviceKey } from "@/lib/background/device-key";
 import { MemoryDeviceKeyStore } from "@/tests/helpers/memory-key-store";
-import type { ChatGPTAuthBrowser } from "@/lib/background/chatgpt-browser-auth";
+import type { OAuthPopup } from "@/lib/background/oauth-popup";
 import { getChatGPTCredential, getChatGPTRegistration, saveChatGPTRegistration, saveOpenAICredential, getOpenAICredential } from "@/lib/storage";
 
 let keys: Awaited<ReturnType<typeof generateKeyPair>>;
@@ -14,7 +14,7 @@ beforeEach(() => { fakeBrowser.reset(); vi.restoreAllMocks(); vi.spyOn(console, 
 function harness(options: { callback?: (url: URL) => void; nonce?: string; scopes?: string; refreshStatus?: number; revokeStatus?: number; issuer?: string; audience?: string; browserError?: string } = {}) {
   let authorization: URL;
   const tokenRequests: URLSearchParams[] = [];
-  const authBrowser: ChatGPTAuthBrowser = {
+  const authBrowser: OAuthPopup = {
     getRedirectURL: () => "https://test-addon.extensions.allizom.org/",
     authorize: vi.fn(async (url, redirectUri) => {
       if (options.browserError) throw { message: options.browserError };

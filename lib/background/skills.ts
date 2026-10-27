@@ -2,11 +2,21 @@ import { storage } from "wxt/utils/storage";
 import { isSkill, type Skill } from "@/lib/domain/skills";
 import { isSkillsRequest, type SkillsRequest, type SkillsResponse } from "@/lib/protocol";
 import youtubeBody from "@/lib/skills/youtube.md?raw";
+import summarizeBody from "@/lib/skills/summarize-page.md?raw";
+import tableBody from "@/lib/skills/extract-table.md?raw";
+import formBody from "@/lib/skills/fill-form.md?raw";
 
-/** Packaged skills, listed before saved ones; each guides one site API in `lib/sites`. */
+/** Packaged procedures, listed before saved ones; reserved names and read-only bodies. */
 export const BUILTIN_SKILLS: readonly Skill[] = [
   { name: "youtube", description: "Search YouTube, read video metadata and transcripts, and inspect comments through youtube.* calls, without opening YouTube pages.", body: youtubeBody },
+  { name: "summarize-page", description: "Summarize the attached page's main point and useful details.", body: summarizeBody },
+  { name: "extract-table", description: "Extract a page's structured table with headers, rows, and paging.", body: tableBody },
+  { name: "fill-form", description: "Fill a form from information the user supplies, asking about missing or ambiguous values.", body: formBody },
 ];
+
+export const sidebarSkillCatalog = (skills: readonly Skill[]) => skills.map(({ name, description }) => ({
+  name, description, builtin: BUILTIN_SKILLS.some((skill) => skill.name === name),
+}));
 
 let mutations: Promise<unknown> = Promise.resolve();
 

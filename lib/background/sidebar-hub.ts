@@ -16,16 +16,19 @@ import { isSidebarCommand, SIDEBAR_PORT_NAME } from "@/lib/protocol";
 import type { AgentTabsState, AttachedPage, RuntimeSnapshot, SidebarCommand, SidebarEvent, TabMention } from "@/lib/protocol";
 import type { ConversationSummary, QueuedMessage } from "@/lib/domain/conversation";
 import type { SkillSummary } from "@/lib/domain/skills";
+import type { SiteNote } from "@/lib/domain/instructions";
+import type { AskContextV1 } from "@/lib/domain/ask";
 
 const MAX_REPLAY_EVENTS = 512;
 const UNSUPPORTED_HOSTNAME_SUFFIXES = [".mozilla.org", ".mozilla.com"];
 
 export interface SidebarHubDelegate {
   getSnapshot(): Promise<RuntimeSnapshot>;
-  handleCommand(command: SidebarCommand): Promise<{ markdown: string; filename: string } | { tabs: TabMention[] } | { skills: SkillSummary[] } | { sessions: ConversationSummary[] } | void>;
+  handleCommand(command: SidebarCommand): Promise<{ markdown: string; filename: string } | { tabs: TabMention[] } | { skills: SkillSummary[] } | { sessions: ConversationSummary[] } |
+    { origin: string | null; note: SiteNote | null } | { note: SiteNote | null; error: string | null } | { undone: string[]; error: string | null } | void>;
 }
 
-type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" | "agent-tabs.changed" | "queue.changed" | "context.exported" | "tabs.listed" | "skills.listed" | "session.listed" }>;
+type RunEvent = Exclude<SidebarEvent, { type: "state.snapshot" | "page.attached" | "agent-tabs.changed" | "queue.changed" | "ask.changed" | "composer.focus" | "context.exported" | "tabs.listed" | "skills.listed" | "session.listed" | "siteNote.loaded" | "siteNote.saved" | "memory.undone" }>;
 
 export class SidebarHub {
   delegate: SidebarHubDelegate | null = null;
@@ -42,6 +45,16 @@ export class SidebarHub {
 
   lastSeq(): number {
     return this.#lastSeq;
+  }
+
+  publishAsk(ask: AskContextV1 | null): void {
+    const event: SidebarEvent = { v: 1, runId: null, conversationId: null, seq: this.#lastSeq, type: "ask.changed", at: Date.now(), payload: { ask } };
+    for (const port of this.#ports) port.postMessage(event);
+  }
+
+  focusComposer(): void {
+    const event: SidebarEvent = { v: 1, runId: null, conversationId: null, seq: this.#lastSeq, type: "composer.focus", at: Date.now(), payload: null };
+    for (const port of this.#ports) port.postMessage(event);
   }
 
   handleConnect(port: Browser.runtime.Port): void {
@@ -159,6 +172,15 @@ export class SidebarHub {
     } satisfies SidebarEvent);
     if (message.type === "session.list" && result && "sessions" in result) port.postMessage({
       v: 1, type: "session.listed", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: result,
+    } satisfies SidebarEvent);
+    if (message.type === "siteNote.get" && result && "origin" in result) port.postMessage({
+      v: 1, type: "siteNote.loaded", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: { requestId: message.id, ...result },
+    } satisfies SidebarEvent);
+    if (message.type === "siteNote.save" && result && "note" in result && "error" in result) port.postMessage({
+      v: 1, type: "siteNote.saved", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: { requestId: message.id, ...result },
+    } satisfies SidebarEvent);
+    if (message.type === "memory.undo" && result && "undone" in result) port.postMessage({
+      v: 1, type: "memory.undone", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: { requestId: message.id, ...result },
     } satisfies SidebarEvent);
     if (message.type === "context.export" && result && "markdown" in result) port.postMessage({
       v: 1, type: "context.exported", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(),

@@ -6,9 +6,18 @@
  * The outline walks the composed tree in document order: open and closed
  * shadow roots, slot assignments, and same-origin frames. Interactive
  * elements are inlined as `[e12 button "Save"]` tokens whose refs stay bound
- * to the same element for the document's lifetime. Hidden radios, checkboxes,
+ * to the same element for the document's lifetime. A cross-origin frame is a
+ * placeholder line (`ChildFrame`) for the background to fill in with that
+ * frame's own outline, whose refs carry a frame prefix (`f3:e12`). Data tables
+ * and ARIA grids get a ref and a size line (`[table e12 "Caption" 340 rows ×
+ * 6 cols]`) for `extractTable` to read them as JSON. Hidden radios, checkboxes,
  * and file inputs with a visible label are exposed and operated through that
  * label; other hidden elements are never targetable.
+ *
+ * Elements registered with `excludeFromOutline` (bside's own page shield) are
+ * skipped entirely. Effects are dispatched straight to the resolved element;
+ * nothing here hit-tests by coordinates (no `elementFromPoint`), so an overlay
+ * never redirects or blocks an agent action.
  *
  * This file never touches `browser.*` APIs and never receives credentials or
  * generated JavaScript — it only ever sees a `Document`, opaque refs, and
@@ -16,7 +25,13 @@
  * they also hold for elements from same-origin frames (other realms).
  */
 
-import type { DomAction, ElementTarget, PageFindResult, PageSnapshot, SearchResult, ToolResult } from "@/lib/domain/tools";
+import { TABLE_LIMITS } from "@/lib/domain/tools";
+import type {
+  CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, KeyModifier, PageFindResult, PageRect, PageSnapshot, PageTable, PressKey,
+  TableRole, ToolResult, UploadFile,
+} from "@/lib/domain/tools";
+import { formatKeyChord } from "@/lib/validation";
+import { boundOutline, findInOutline, sliceOutline } from "@/lib/domain/outline";
 
 // ---------------------------------------------------------------------------
 // Ref registry
@@ -43,6 +58,14 @@ function randomId(): string {
 
 const MAX_REGISTERED_REFS = 20_000;
 
+/** Extension-owned elements left out of every outline, find, and change diff. */
+const OUTLINE_EXCLUDED = new WeakSet<Element>();
+
+/** Keeps an element bside itself put on the page (the page shield) out of what the agent observes. */
+export function excludeFromOutline(element: Element): void {
+  OUTLINE_EXCLUDED.add(element);
+}
+
 function refFor(registry: ElementRefRegistry, element: Element): string {
   const existing = registry.byElement.get(element);
   if (existing) return existing;
@@ -67,7 +90,7 @@ const INTERACTIVE_ROLES = new Set([
 ]);
 const NAME_FROM_CONTENT_ROLES = new Set([
   "button", "link", "checkbox", "radio", "switch", "tab", "menuitem", "menuitemcheckbox", "menuitemradio",
-  "option", "treeitem", "clickable",
+  "option", "treeitem", "clickable", "draggable",
 ]);
 const CONTEXT_NAMED_ROLES = new Set(["textbox", "searchbox", "combobox", "listbox", "file", "slider", "spinbutton", "checkbox", "radio", "switch"]);
 const TEXT_INPUT_TYPES = new Set(["text", "email", "search", "tel", "url", "number", "password", "date", "datetime-local", "month", "week", "time", "color"]);
@@ -143,11 +166,11 @@ function composedParent(element: Element): Element | null {
   }
 }
 
-function trimText(text: string): string {
+export function trimText(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
 
-function clip(text: string, limit: number): string {
+export function clip(text: string, limit: number): string {
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
 }
 
@@ -158,7 +181,7 @@ function isLocallyHidden(element: Element, style: CSSStyleDeclaration | null): b
 }
 
 /** Whether the element is rendered: it and every flat-tree ancestor are displayed and not aria-hidden. */
-function isRendered(element: Element): boolean {
+export function isRendered(element: Element): boolean {
   if (!element.isConnected) return false;
   const style = styleOf(element);
   if (style && (style.visibility === "hidden" || style.visibility === "collapse")) return false;
@@ -185,7 +208,7 @@ function rootLookup(element: Element, id: string): Element | null {
 }
 
 /** Visible text of a subtree in the flat tree, including image alt text, bounded. */
-function composedText(element: Element, limit: number, exclude?: Element): string {
+export function composedText(element: Element, limit: number, exclude?: Element): string {
   const parts: string[] = [];
   let size = 0;
   let budget = 600;
@@ -298,6 +321,8 @@ function roleOf(element: Element, style: CSSStyleDeclaration | null, parentStyle
   }
   if (isContentEditableRoot(element)) return "textbox";
   if (explicit === "none" || explicit === "presentation" || tag === "label" || tag === "body" || tag === "html") return null;
+  // Items made draggable for HTML drag and drop (sortable lists, boards) are targets for dragTo.
+  if (element.getAttribute("draggable") === "true" && !explicit) return "draggable";
   // Generic clickables: explicit handlers, keyboard focusability, or the outermost pointer cursor.
   const tabIndex = element.getAttribute("tabindex");
   if (element.hasAttribute("onclick") || (tabIndex !== null && Number(tabIndex) >= 0 && !explicit)) return "clickable";
@@ -327,6 +352,8 @@ function controlValue(element: Element): string {
 
 export interface OutlineControl {
   ref: string;
+  /** The ref as the model sees it: `e12`, or `f3:e12` in a cross-origin frame. */
+  label: string;
   role: string;
   name: string;
   element: Element;
@@ -342,7 +369,8 @@ type Segment =
   | { t: "break" }
   | { t: "prefix"; text: string }
   | { t: "cell" }
-  | { t: "control"; control: OutlineControl };
+  | { t: "control"; control: OutlineControl }
+  | { t: "frame"; frame: Omit<ChildFrame, "line"> };
 
 export interface Outline {
   lines: string[];
@@ -351,7 +379,21 @@ export interface Outline {
   controls: OutlineControl[];
   byElement: Map<Element, OutlineControl>;
   byRef: Map<string, OutlineControl>;
+  /** Data tables and ARIA grids by ref, for `extractTable`; they are read, never operated. */
+  tables: Map<string, OutlineControl>;
+  /** Cross-origin frames whose placeholder lines are in `lines`. */
+  frames: ChildFrame[];
+  /** Prefix of this frame's ref labels. */
+  refPrefix: string;
   scanLimited: boolean;
+}
+
+/** How a content script renders its frame's outline. */
+export interface OutlineOptions {
+  /** Prefix for this frame's ref labels: "" in the top frame, `f3:` in the frame the background calls f3. */
+  refPrefix?: string;
+  /** Firefox's frame id for a frame element (`runtime.getFrameId`), or -1. Without it, cross-origin frames stay opaque. */
+  frameIdOf?: (frame: Element) => number;
 }
 
 interface WalkContext {
@@ -365,11 +407,12 @@ class OutlineBuilder {
   readonly segments: Segment[] = [];
   readonly controls: OutlineControl[] = [];
   readonly byElement = new Map<Element, OutlineControl>();
+  readonly tables = new Map<string, OutlineControl>();
   visited = 0;
   scanLimited = false;
   #lastText = "";
 
-  constructor(private registry: ElementRefRegistry, private pageUrl: string) {}
+  constructor(private registry: ElementRefRegistry, private pageUrl: string, private options: OutlineOptions) {}
 
   text(text: string): void {
     if (!text) return;
@@ -403,6 +446,7 @@ class OutlineBuilder {
   }
 
   #element(element: Element, context: WalkContext): void {
+    if (OUTLINE_EXCLUDED.has(element)) return;
     const tag = tagOf(element);
     if (tag === "slot") {
       for (const child of composedChildren(element)) this.walk(child, context);
@@ -417,9 +461,7 @@ class OutlineBuilder {
     const display = style?.display ?? "";
 
     if (tag === "iframe" || tag === "frame") {
-      // Tracking pixels and ad beacons are 0–1 px frames.
-      const tiny = [style?.width, style?.height].some((size) => size?.endsWith("px") && parseFloat(size) < 2);
-      if (visible && !tiny) this.#frame(element as HTMLIFrameElement, context);
+      if (visible && !isTrackerFrame(element, style)) this.#frame(element as HTMLIFrameElement, context);
       return;
     }
     if (tag.startsWith("svg:")) {
@@ -468,6 +510,7 @@ class OutlineBuilder {
     }
 
     if (visible) this.#dataValue(element);
+    if (visible) this.#table(element);
 
     if (role && visible) {
       const descend = this.#control(element, role);
@@ -567,11 +610,29 @@ class OutlineBuilder {
     if (proxy) details.push("via-label");
     if (optionsDetail) details.push(optionsDetail);
 
-    const control: OutlineControl = { ref: refFor(this.registry, element), role, name, element, proxy, disabled, details, ...(href ? { href } : {}) };
+    const ref = refFor(this.registry, element);
+    const control: OutlineControl = { ref, label: `${this.options.refPrefix ?? ""}${ref}`, role, name, element, proxy, disabled, details, ...(href ? { href } : {}) };
     this.controls.push(control);
     this.byElement.set(element, control);
     this.segments.push({ t: "control", control });
     return descend;
+  }
+
+  /** A data table or ARIA grid gets a ref and a size line before its rows, so the model can read it with `page.table`. */
+  #table(element: Element): void {
+    const role = tableRole(element);
+    if (!role) return;
+    const rows = tableRows(element);
+    if (!rows) return;
+    const ref = refFor(this.registry, element);
+    const name = tableName(element);
+    const table: OutlineControl = { ref, label: `${this.options.refPrefix ?? ""}${ref}`, role, name, element, proxy: null, disabled: false, details: [] };
+    this.tables.set(ref, table);
+    const count = Math.min(rows.body.length, TABLE_LIMITS.maxScanRows);
+    const columns = Math.max(0, ...[...rows.head, ...rows.body.slice(0, 5)].map((row) => cellsOf(row, tagOf(element) !== "table").reduce((sum, cell) => sum + cell.colSpan, 0)));
+    this.break();
+    this.segments.push({ t: "text", text: `[${role} ${table.label}${name ? ` ${JSON.stringify(name)}` : ""} ${count}${rows.body.length > count ? "+" : ""} row${count === 1 ? "" : "s"} × ${columns} col${columns === 1 ? "" : "s"}]` });
+    this.break();
   }
 
   /** Hidden native radios/checkboxes/file inputs stay operable through a visible label. */
@@ -597,7 +658,10 @@ class OutlineBuilder {
     this.break();
     const label = `${title ? ` ${JSON.stringify(title)}` : ""}`;
     if (!frameDocument?.body) {
-      this.text(`[frame${label} cross-origin → ${clip(src, 200)}]`);
+      // Its own content script reads it; the background splices that outline in here.
+      const frameId = this.options.frameIdOf?.(frame) ?? -1;
+      if (frameId > 0) this.segments.push({ t: "frame", frame: { frameId, title, url: clip(src, 500) } });
+      else this.text(`[frame${label} (${clip(src, 200)}) not readable: its content is not available to bside]`);
       this.break();
       return;
     }
@@ -645,15 +709,34 @@ function displayHref(href: string, pageUrl: string): string {
   }
 }
 
+/**
+ * Tracking pixels, ad beacons, and parked frames: 0–1 px, or laid out
+ * entirely above or left of the page. Left out of the outline.
+ */
+function isTrackerFrame(frame: Element, style: CSSStyleDeclaration | null): boolean {
+  if ([style?.width, style?.height].some((size) => size?.endsWith("px") && parseFloat(size) < 2)) return true;
+  const box = frame.getBoundingClientRect();
+  // A box with no size at all means no layout ran (or the frame is display: contents); judge by style alone.
+  if (!box.width && !box.height) return false;
+  if (box.width < 2 || box.height < 2) return true;
+  const view = frame.ownerDocument.defaultView;
+  return box.right + (view?.scrollX ?? 0) <= 0 || box.bottom + (view?.scrollY ?? 0) <= 0;
+}
+
+/** A cross-origin frame's placeholder line; the background replaces it with the frame's outline. */
+function renderFrame(frame: Omit<ChildFrame, "line">): string {
+  return `[frame${frame.title ? ` ${JSON.stringify(frame.title)}` : ""} → ${clip(frame.url, 200)}]`;
+}
+
 function renderControl(control: OutlineControl): string {
-  const parts = [control.ref, control.role];
+  const parts = [control.label, control.role];
   if (control.name) parts.push(JSON.stringify(control.name));
   if (control.href) parts.push(`→ ${control.href}`);
   parts.push(...control.details);
   return `[${parts.join(" ")}]`;
 }
 
-function render(segments: Segment[]): string[] {
+function render(segments: Segment[], frames: ChildFrame[]): string[] {
   const lines: string[] = [];
   let current = "";
   let prefixOnly = false;
@@ -671,7 +754,11 @@ function render(segments: Segment[]): string[] {
     if (segment.t === "text") append(segment.text);
     else if (segment.t === "control") append(renderControl(segment.control));
     else if (segment.t === "break") flush();
-    else if (segment.t === "prefix") {
+    else if (segment.t === "frame") {
+      flush();
+      frames.push({ ...segment.frame, line: lines.length });
+      lines.push(renderFrame(segment.frame));
+    } else if (segment.t === "prefix") {
       flush();
       current = segment.text;
       prefixOnly = true;
@@ -697,48 +784,36 @@ function dropRedundantLinks(segments: Segment[]): Segment[] {
   return drop.size ? segments.filter((_, index) => !drop.has(index)) : segments;
 }
 
-export function buildOutline(document: Document, registry: ElementRefRegistry): Outline {
-  const builder = new OutlineBuilder(registry, document.location?.href ?? "");
+export function buildOutline(document: Document, registry: ElementRefRegistry, options: OutlineOptions = {}): Outline {
+  const builder = new OutlineBuilder(registry, document.location?.href ?? "", options);
   if (document.body) builder.walk(document.body, { visible: true, pre: false, inControl: false, parentStyle: null });
   const segments = dropRedundantLinks(builder.segments);
   const kept = new Set(segments.flatMap((segment) => (segment.t === "control" ? [segment.control] : [])));
   const controls = builder.controls.filter((control) => kept.has(control));
-  let lines = render(segments);
+  const rendered: ChildFrame[] = [];
+  const lines = render(segments, rendered);
   if (builder.scanLimited) lines.push("[Page too large: outline scan stopped early. Use page.find() for specific content.]");
-  const offsets: number[] = [];
-  let total = 0;
-  const bounded: string[] = [];
-  for (const line of lines) {
-    if (total + line.length > MAX_OUTLINE_CHARS) { bounded.push("[Outline truncated: page exceeds the outline size limit]"); offsets.push(total); break; }
-    offsets.push(total);
-    bounded.push(line);
-    total += line.length + 1;
-  }
-  lines = bounded;
+  const { lines: bounded, offsets } = boundOutline(lines, MAX_OUTLINE_CHARS, "[Outline truncated: page exceeds the outline size limit]");
+  const frames = rendered.filter((frame) => frame.line < bounded.length && bounded[frame.line] === lines[frame.line]);
   const byElement = new Map(controls.map((control) => [control.element, control]));
   const byRef = new Map(controls.map((control) => [control.ref, control]));
-  return { lines, offsets, controls, byElement, byRef, scanLimited: builder.scanLimited };
+  return { lines: bounded, offsets, controls, byElement, byRef, tables: builder.tables, frames, refPrefix: options.refPrefix ?? "", scanLimited: builder.scanLimited };
 }
 
 // ---------------------------------------------------------------------------
 // Snapshot, find, and search-result extraction
 // ---------------------------------------------------------------------------
 
+/** One slice of the outline. Pass `outline` when it is already built. */
 export function extractSnapshot(
   document: Document,
   tabId: number,
   registry: ElementRefRegistry,
   options: { offset: number; maxChars: number } = { offset: 0, maxChars: 16_000 },
+  outline: Outline = buildOutline(document, registry),
 ): PageSnapshot {
-  const outline = buildOutline(document, registry);
   const text = outline.lines.join("\n");
-  let start = Math.min(Math.max(options.offset, 0), text.length);
-  if (start > 0 && text[start - 1] !== "\n") start = text.lastIndexOf("\n", start - 1) + 1;
-  let end = Math.min(text.length, start + options.maxChars);
-  if (end < text.length) {
-    const cut = text.lastIndexOf("\n", end);
-    if (cut > start) end = cut;
-  }
+  const { start, end } = sliceOutline(text, options.offset, options.maxChars);
   return {
     version: 2,
     tabId,
@@ -749,89 +824,304 @@ export function extractSnapshot(
     offset: start,
     end,
     totalChars: text.length,
-    selectionText: trimText(document.getSelection?.()?.toString() ?? "").slice(0, 2000),
+    selectionText: selectionText(document),
   };
 }
 
-const MAX_FIND_MATCHES = 30;
-const FIND_LINE_LIMIT = 400;
-
-export function findInPage(document: Document, registry: ElementRefRegistry, query: string): PageFindResult {
-  const outline = buildOutline(document, registry);
-  const needle = trimText(query).toLowerCase();
-  const matches: PageFindResult["matches"] = [];
-  let count = 0;
-  outline.lines.forEach((line, index) => {
-    const position = line.toLowerCase().indexOf(needle);
-    if (position < 0) return;
-    count++;
-    if (matches.length >= MAX_FIND_MATCHES) return;
-    let text = line;
-    if (line.length > FIND_LINE_LIMIT) {
-      const from = Math.max(0, position - 180);
-      text = `${from > 0 ? "…" : ""}${line.slice(from, from + FIND_LINE_LIMIT)}${from + FIND_LINE_LIMIT < line.length ? "…" : ""}`;
-    }
-    // A short preceding line (often a label or heading) gives the match context.
-    const previous = outline.lines[index - 1];
-    if (previous && previous.length <= 120 && !previous.toLowerCase().includes(needle)) text = `${previous}\n${text}`;
-    matches.push({ offset: outline.offsets[index] ?? 0, text });
-  });
-  return { documentId: registry.documentId, url: document.location?.href ?? "", query, count, matches };
+function selectionText(document: Document): string {
+  return trimText(document.getSelection?.()?.toString() ?? "").slice(0, 2000);
 }
 
-const SEARCH_ENGINE_HOSTS = ["duckduckgo.com", "bing.com", "google.com", "search.yahoo.com", "startpage.com"];
-
-function isSearchEngineHost(hostname: string): boolean {
-  return SEARCH_ENGINE_HOSTS.some((host) => hostname === host || hostname.endsWith(`.${host}`));
+/** Outline lines matching `query`, with context. Pass `outline` when it is already built. */
+export function findInPage(document: Document, registry: ElementRefRegistry, query: string, outline: Outline = buildOutline(document, registry)): PageFindResult {
+  return { documentId: registry.documentId, url: document.location?.href ?? "", query, ...findInOutline(outline.lines, outline.offsets, query) };
 }
 
-/** Unwraps a search engine's redirect link into its destination URL. */
-function resultDestination(href: string): string | null {
-  let url: URL;
-  try {
-    url = new URL(href);
-  } catch {
-    return null;
+/**
+ * This frame's whole outline, at most `maxChars`, for the background to
+ * compose with its cross-origin frames' outlines.
+ */
+export function extractFrameOutline(document: Document, registry: ElementRefRegistry, maxChars: number, options: OutlineOptions): FrameOutline {
+  const outline = buildOutline(document, registry, options);
+  const { lines } = boundOutline(outline.lines, maxChars, "[Frame outline truncated: it exceeds the frame size limit]");
+  const frames = outline.frames.filter((frame) => frame.line < lines.length && lines[frame.line] === outline.lines[frame.line]);
+  return { documentId: registry.documentId, url: document.location?.href ?? "", title: document.title ?? "", lines, frames, selectionText: selectionText(document) };
+}
+
+// ---------------------------------------------------------------------------
+// Tables
+// ---------------------------------------------------------------------------
+
+const TABLE_ROLES = new Set<string>(["table", "grid", "treegrid"]);
+const ARIA_CELL_ROLES = new Set(["cell", "gridcell", "columnheader", "rowheader"]);
+/** Elements one ARIA grid's row or cell search visits at most. */
+const MAX_TABLE_NODES = 200_000;
+/** Rowspan/colspan beyond these are clamped, as browsers do. */
+const MAX_ROW_SPAN = 65_534;
+const MAX_COL_SPAN = 1_000;
+
+function explicitRole(element: Element): string | null {
+  return element.getAttribute("role")?.trim().split(/\s+/)[0]?.toLowerCase() || null;
+}
+
+/**
+ * The role of a data table: ARIA tables and grids, and native tables that
+ * hold data (a caption, header cells, or at least two rows and columns
+ * without a nested table). Layout tables and role=presentation are not.
+ */
+function tableRole(element: Element): TableRole | null {
+  const role = explicitRole(element);
+  if (role && TABLE_ROLES.has(role)) return role as TableRole;
+  if (tagOf(element) !== "table" || role === "presentation" || role === "none") return null;
+  if (element.hasAttribute("summary") || Array.from(element.children).some((child) => tagOf(child) === "caption" || tagOf(child) === "thead")) return "table";
+  const rows = nativeRows(element);
+  const all = [...rows.head, ...rows.body];
+  if (all.some((row) => Array.from(row.children).some((cell) => tagOf(cell) === "th"))) return "table";
+  return all.length >= 2 && all.some((row) => cellsOf(row, false).length >= 2) && !element.querySelector("table") ? "table" : null;
+}
+
+function tableName(element: Element): string {
+  const named = element.getAttribute("aria-labelledby") || element.getAttribute("aria-label") ? accessibleName(element, "table") : "";
+  if (named) return named;
+  const caption = Array.from(element.children).find((child) => tagOf(child) === "caption");
+  return caption ? composedText(caption, NAME_LIMIT) : trimText(element.getAttribute("title") ?? "");
+}
+
+function isHiddenRow(row: Element): boolean {
+  return isLocallyHidden(row, styleOf(row));
+}
+
+/** A native table's own rows (not a nested table's): thead, then tbody and bare rows in order, then tfoot. */
+function nativeRows(table: Element): { head: Element[]; body: Element[] } {
+  const head: Element[] = [];
+  const body: Element[] = [];
+  const foot: Element[] = [];
+  const rowsOf = (section: Element) => Array.from(section.children).filter((row) => tagOf(row) === "tr");
+  for (const child of Array.from(table.children)) {
+    const tag = tagOf(child);
+    if (tag === "thead") head.push(...rowsOf(child));
+    else if (tag === "tfoot") foot.push(...rowsOf(child));
+    else if (tag === "tbody") body.push(...rowsOf(child));
+    else if (tag === "tr") body.push(child);
   }
-  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
-  if (isSearchEngineHost(url.hostname)) {
-    const wrapped = url.searchParams.get("uddg") ?? (url.pathname === "/url" ? url.searchParams.get("q") ?? url.searchParams.get("url") : null);
-    if (wrapped) return resultDestination(wrapped);
-    const bing = url.searchParams.get("u");
-    if (bing?.startsWith("a1")) {
-      try {
-        return resultDestination(atob(bing.slice(2).replace(/-/g, "+").replace(/_/g, "/")));
-      } catch {
-        return null;
+  return { head, body: [...body, ...foot] };
+}
+
+/** Elements under `root` in the flat tree matching `match`, not descending into matches or into elements `stop` accepts. */
+function composedDescendants(root: Element, match: (element: Element) => boolean, stop: (element: Element) => boolean, budget: { nodes: number }): Element[] {
+  const found: Element[] = [];
+  const visit = (node: Node) => {
+    for (const child of composedChildren(node)) {
+      if (child.nodeType !== 1 || budget.nodes-- <= 0) continue;
+      const element = child as Element;
+      if (OUTLINE_EXCLUDED.has(element)) continue;
+      if (match(element)) found.push(element);
+      else if (!stop(element)) visit(element);
+    }
+  };
+  visit(root);
+  return found;
+}
+
+function isTableElement(element: Element): boolean {
+  return tagOf(element) === "table" || TABLE_ROLES.has(explicitRole(element) ?? "");
+}
+
+/** An ARIA grid's own rows, header rows being the leading rows whose cells are all column headers. */
+function ariaRows(grid: Element): { head: Element[]; body: Element[] } {
+  const budget = { nodes: MAX_TABLE_NODES };
+  const rows = composedDescendants(grid, (element) => explicitRole(element) === "row", isTableElement, budget);
+  let headers = 0;
+  while (headers < rows.length) {
+    const cells = cellsOf(rows[headers]!, true);
+    if (!cells.length || !cells.every((cell) => cell.header)) break;
+    headers++;
+  }
+  return { head: rows.slice(0, headers), body: rows.slice(headers) };
+}
+
+/**
+ * Rendered header and data rows. A native table without a thead takes its
+ * leading all-`th` rows as headers. Null when it has no rows at all.
+ */
+function tableRows(table: Element): { head: Element[]; body: Element[] } | null {
+  let rows: { head: Element[]; body: Element[] };
+  if (tagOf(table) === "table") {
+    rows = nativeRows(table);
+    if (!rows.head.length) {
+      let headers = 0;
+      while (headers < rows.body.length - 1 || (headers < rows.body.length && rows.body.length === 1)) {
+        const cells = Array.from(rows.body[headers]!.children).filter((cell) => tagOf(cell) === "td" || tagOf(cell) === "th");
+        if (!cells.length || !cells.every((cell) => tagOf(cell) === "th")) break;
+        headers++;
+      }
+      rows = { head: rows.body.slice(0, headers), body: rows.body.slice(headers) };
+    }
+  } else rows = ariaRows(table);
+  const head = rows.head.filter((row) => !isHiddenRow(row));
+  const body = rows.body.filter((row) => !isHiddenRow(row));
+  return head.length || body.length ? { head, body } : null;
+}
+
+interface TableCell { element: Element; colSpan: number; rowSpan: number; header: boolean }
+
+function span(element: Element, attribute: string, aria: string, fallback: number, max: number): number {
+  const raw = element.getAttribute(attribute) ?? element.getAttribute(aria);
+  if (raw === null || !/^\s*\d+\s*$/.test(raw)) return fallback;
+  const value = Number(raw);
+  return Math.min(value, max);
+}
+
+/** One row's cells, native (`td`/`th`) or ARIA (cell, gridcell, columnheader, rowheader). A rowspan of 0 spans the rest of the rows. */
+function cellsOf(row: Element, aria: boolean): TableCell[] {
+  const elements = aria
+    ? composedDescendants(row, (element) => ARIA_CELL_ROLES.has(explicitRole(element) ?? ""), (element) => explicitRole(element) === "row" || isTableElement(element), { nodes: 5_000 })
+    : Array.from(row.children).filter((cell) => tagOf(cell) === "td" || tagOf(cell) === "th");
+  return elements.filter((cell) => !isLocallyHidden(cell, styleOf(cell))).map((cell) => ({
+    element: cell,
+    colSpan: Math.max(1, span(cell, aria ? "aria-colspan" : "colspan", "aria-colspan", 1, MAX_COL_SPAN)),
+    rowSpan: span(cell, aria ? "aria-rowspan" : "rowspan", "aria-rowspan", 1, MAX_ROW_SPAN),
+    header: aria ? explicitRole(cell) === "columnheader" : tagOf(cell) === "th" && (cell.getAttribute("scope") ?? "").toLowerCase() !== "row",
+  }));
+}
+
+/**
+ * Lays out rows into columns, expanding row and column spans: each grid row
+ * lists, per column, the cell element covering it. Only the first `count`
+ * rows are laid out; spans never cross from `rows` into another group.
+ */
+function layoutRows(rows: Element[], count: number, aria: boolean): Element[][] {
+  const grid: Element[][] = [];
+  const carry: { element: Element; remaining: number }[] = [];
+  for (let index = 0; index < Math.min(count, rows.length); index++) {
+    const line: Element[] = [];
+    let column = 0;
+    const fillCarried = () => {
+      while (column < TABLE_LIMITS.maxColumns + 1 && (carry[column]?.remaining ?? 0) > 0) {
+        line[column] = carry[column]!.element;
+        carry[column]!.remaining--;
+        column++;
+      }
+    };
+    for (const cell of cellsOf(rows[index]!, aria)) {
+      fillCarried();
+      const rowSpan = cell.rowSpan === 0 ? rows.length - index : cell.rowSpan;
+      for (let k = 0; k < cell.colSpan && column + k <= TABLE_LIMITS.maxColumns; k++) {
+        line[column + k] = cell.element;
+        if (rowSpan > 1) carry[column + k] = { element: cell.element, remaining: rowSpan - 1 };
+        else delete carry[column + k];
+      }
+      column += cell.colSpan;
+    }
+    for (; column < carry.length; column++) {
+      if ((carry[column]?.remaining ?? 0) > 0) {
+        line[column] = carry[column]!.element;
+        carry[column]!.remaining--;
       }
     }
-    return null;
+    grid.push(line);
   }
-  return url.href;
+  return grid;
 }
 
-/** Generic organic-result extraction: external destinations with a title and nearby snippet text. */
-export function extractSearchResults(document: Document, limit = 10): SearchResult[] {
-  const results = new Map<string, SearchResult>();
-  for (const anchor of Array.from(document.querySelectorAll("a[href]"))) {
-    if (results.size >= limit) break;
-    const destination = resultDestination((anchor as HTMLAnchorElement).href);
-    if (!destination || results.has(destination) || !isRendered(anchor)) continue;
-    const title = composedText(anchor, 200);
-    if (title.length < 3 || /^https?:\/\//.test(title)) continue;
-    let snippet = "";
-    let container: Element | null = anchor.parentElement;
-    for (let depth = 0; container && depth < 5; depth++, container = container.parentElement) {
-      if (container.querySelectorAll("a[href]").length > 8) break;
-      const text = composedText(container, 600);
-      if (text.length >= title.length + 40) {
-        snippet = trimText(text.replace(title, ""));
-        break;
-      }
-    }
-    results.set(destination, { title, url: destination, snippet: clip(snippet, 300) });
+/** A cell's visible text, bounded, followed by the refs of up to three controls inside it (`Alice [e14 link]`). */
+function cellText(cell: Element, outline: Outline): string {
+  const text = composedText(cell, TABLE_LIMITS.cellChars);
+  const controls: string[] = [];
+  const own = outline.byElement.get(cell);
+  if (own) controls.push(`[${own.label} ${own.role}]`);
+  for (const element of composedDescendants(cell, (candidate) => outline.byElement.has(candidate), () => false, { nodes: 500 })) {
+    if (controls.length >= 3) break;
+    const control = outline.byElement.get(element)!;
+    controls.push(`[${control.label} ${control.role}]`);
   }
-  return [...results.values()];
+  return clip([text, ...controls].filter(Boolean).join(" "), TABLE_LIMITS.cellChars + 120);
+}
+
+/**
+ * Reads one page of a table's data rows as JSON. The target is resolved like
+ * an action's against a fresh outline, so a ref from an earlier document is
+ * stale; it must name a table or grid from the outline.
+ */
+export function extractTable(
+  document: Document,
+  registry: ElementRefRegistry,
+  target: ElementTarget,
+  page: { offset: number; limit: number },
+  options: OutlineOptions = {},
+): { ok: true; table: PageTable } | { ok: false; result: ToolResult } {
+  const outline = buildOutline(document, registry, options);
+  const resolved = resolveTarget(outline, registry, target, { allowDisabled: true, accept: "tables" });
+  if (!resolved.ok) return resolved;
+  const { control } = resolved;
+  const role = control.role as TableRole;
+  const aria = tagOf(control.element) !== "table";
+  const rows = tableRows(control.element) ?? { head: [], body: [] };
+  const notes: string[] = [];
+  let body = rows.body;
+  if (body.length > TABLE_LIMITS.maxScanRows) {
+    notes.push(`Only the first ${TABLE_LIMITS.maxScanRows} rows are counted and readable.`);
+    body = body.slice(0, TABLE_LIMITS.maxScanRows);
+  }
+  const offset = Math.min(page.offset, body.length);
+  const limit = Math.min(Math.max(1, page.limit), TABLE_LIMITS.maxRows);
+  const headerGrid = layoutRows(rows.head, rows.head.length, aria);
+  const bodyGrid = layoutRows(body, offset + limit, aria).slice(offset);
+  const fullWidth = Math.max(0, ...[...headerGrid, ...bodyGrid].map((line) => line.length));
+  const width = Math.min(fullWidth, TABLE_LIMITS.maxColumns);
+  if (fullWidth > width) notes.push(`Only the first ${TABLE_LIMITS.maxColumns} columns are shown.`);
+
+  const texts = new Map<Element, string>();
+  const textOf = (cell: Element | undefined) => {
+    if (!cell) return "";
+    let text = texts.get(cell);
+    if (text === undefined) texts.set(cell, text = cellText(cell, outline));
+    return text;
+  };
+  const headers = headerGrid.length
+    ? Array.from({ length: width }, (_, column) => {
+      const parts: string[] = [];
+      let previous: Element | undefined;
+      for (const line of headerGrid) {
+        const cell = line[column];
+        if (!cell || cell === previous) continue;
+        previous = cell;
+        const text = textOf(cell);
+        if (text && parts.at(-1) !== text) parts.push(text);
+      }
+      return parts.join(" / ");
+    })
+    : [];
+  const out: string[][] = [];
+  let chars = 0;
+  for (const line of bodyGrid) {
+    const row = Array.from({ length: width }, (_, column) => textOf(line[column]));
+    const size = row.reduce((sum, cell) => sum + cell.length + 4, 0);
+    if (out.length && chars + size > TABLE_LIMITS.maxChars) break;
+    chars += size;
+    out.push(row);
+  }
+  const end = offset + out.length;
+  const declared = Number(control.element.getAttribute("aria-rowcount"));
+  if (aria && Number.isSafeInteger(declared) && declared > rows.head.length + rows.body.length) {
+    notes.push(`The grid reports ${declared} rows, but only ${rows.head.length + rows.body.length} are on the page; it loads the others as you scroll.`);
+  }
+  return {
+    ok: true,
+    table: {
+      documentId: registry.documentId,
+      url: document.location?.href ?? "",
+      ref: control.label,
+      role,
+      caption: control.name,
+      headers,
+      rows: out,
+      totalRows: body.length,
+      offset,
+      nextOffset: end < body.length ? end : null,
+      ...(notes.length ? { note: notes.join(" ") } : {}),
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -863,7 +1153,7 @@ export function settleDom(document: Document): Promise<void> {
 type Resolved = { ok: true; control: OutlineControl } | { ok: false; result: ToolResult };
 
 function describe(control: OutlineControl): string {
-  return `[${[control.ref, control.role, ...(control.name ? [JSON.stringify(control.name)] : [])].join(" ")}]`;
+  return `[${[control.label, control.role, ...(control.name ? [JSON.stringify(control.name)] : [])].join(" ")}]`;
 }
 
 function candidatesText(controls: OutlineControl[], limit = 8): string {
@@ -871,22 +1161,42 @@ function candidatesText(controls: OutlineControl[], limit = 8): string {
   return controls.length > limit ? `${shown}; …+${controls.length - limit} more` : shown;
 }
 
-function resolveTarget(outline: Outline, registry: ElementRefRegistry, target: ElementTarget): Resolved {
+interface ResolveOptions {
+  /** Resolves a disabled control too (looking at one is fine; operating it is not). */
+  allowDisabled?: boolean;
+  /** What the target may be: an operable control (default), a table or grid to read, or either (a screenshot). */
+  accept?: "controls" | "tables" | "any";
+}
+
+function resolveTarget(outline: Outline, registry: ElementRefRegistry, target: ElementTarget, options: ResolveOptions = {}): Resolved {
+  const accept = options.accept ?? "controls";
+  const checked = (control: OutlineControl): Resolved => {
+    const table = TABLE_ROLES.has(control.role) && outline.tables.get(control.ref) === control;
+    if (table && accept === "controls") {
+      return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `${describe(control)} is a table; read it with page.table(${JSON.stringify(control.label)}), and act on the refs inside it.` } };
+    }
+    if (!table && accept === "tables") {
+      return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `${describe(control)} is not a table. Tables and grids appear in the outline as [table eN …] or [grid eN …].` } };
+    }
+    if (control.disabled && !options.allowDisabled) return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `${describe(control)} is disabled.` } };
+    return { ok: true, control };
+  };
   if (target.kind === "ref") {
+    const ref = `${outline.refPrefix}${target.ref}`;
     if (target.documentId !== registry.documentId) {
-      return { ok: false, result: { ok: false, code: "STALE_SNAPSHOT", summary: `Ref ${target.ref} came from an earlier page load; this tab now shows a different document. Read a fresh snapshot.` } };
+      const where = outline.refPrefix ? `frame ${outline.refPrefix.slice(0, -1)}` : "this tab";
+      return { ok: false, result: { ok: false, code: "STALE_SNAPSHOT", summary: `Ref ${ref} came from an earlier page load; ${where} now shows a different document. Read a fresh snapshot.` } };
     }
-    const control = outline.byRef.get(target.ref);
-    if (control) {
-      if (control.disabled) return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `${describe(control)} is disabled.` } };
-      return { ok: true, control };
-    }
+    const control = outline.byRef.get(target.ref) ?? outline.tables.get(target.ref);
+    if (control) return checked(control);
     const element = registry.byRef.get(target.ref);
-    if (element?.isConnected) return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `Ref ${target.ref} is currently hidden or not an interactive element.` } };
-    return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: `Ref ${target.ref} is no longer on the page. Read a fresh snapshot.` } };
+    if (element?.isConnected) return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `Ref ${ref} is currently hidden or not an interactive element.` } };
+    return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: `Ref ${ref} is no longer on the page. Read a fresh snapshot.` } };
   }
   const wanted = target.name === null ? null : trimText(target.name);
-  const sameRole = outline.controls.filter((control) => target.role === "*" || control.role === target.role ||
+  // Tables are found by their own roles; every other locator searches the controls.
+  const pool = TABLE_ROLES.has(target.role) ? [...outline.tables.values()] : outline.controls;
+  const sameRole = pool.filter((control) => target.role === "*" || control.role === target.role ||
     (target.role === "textbox" && control.role === "searchbox"));
   let matches = sameRole.filter((control) => {
     if (wanted === null) return true;
@@ -897,21 +1207,19 @@ function resolveTarget(outline: Outline, registry: ElementRefRegistry, target: E
     const whole = matches.filter((control) => control.name.toLowerCase() === wanted.toLowerCase());
     if (whole.length === 1) matches = whole;
   }
-  if (matches.length === 1) {
-    const control = matches[0]!;
-    if (control.disabled) return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `${describe(control)} is disabled.` } };
-    return { ok: true, control };
-  }
+  if (matches.length === 1) return checked(matches[0]!);
   const label = `${target.role === "*" ? "element" : target.role}${wanted === null ? "" : ` ${target.exact ? "named exactly" : "with name containing"} ${JSON.stringify(wanted)}`}`;
+  // Locators search this document only; another frame's elements are reached by their refs.
+  const inFrames = outline.frames.length ? ` Elements inside cross-origin frames are reached only by ref, like page.ref("f1:e3").` : "";
   if (matches.length > 1) {
-    return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: `Locator ${label} matched ${matches.length} elements: ${candidatesText(matches)}. Use page.ref("eN") for the intended one.` } };
+    return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: `Locator ${label} matched ${matches.length} elements: ${candidatesText(matches)}. Use page.ref("eN") for the intended one.${inFrames}` } };
   }
   const similar = wanted
-    ? outline.controls.filter((control) => control.name.toLowerCase().includes(wanted.toLowerCase().slice(0, 24)))
+    ? pool.filter((control) => control.name.toLowerCase().includes(wanted.toLowerCase().slice(0, 24)))
     : [];
   const kind = target.role === "*" ? "Interactive" : target.role;
   const hint = similar.length ? ` Similar controls: ${candidatesText(similar)}.` : sameRole.length ? ` ${kind} controls on the page: ${candidatesText(sameRole)}.` : ` No ${kind} controls are visible.`;
-  return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: `Locator ${label} matched 0 elements.${hint} Use page.ref("eN") from a snapshot.` } };
+  return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: `Locator ${label} matched 0 elements.${hint} Use page.ref("eN") from a snapshot.${inFrames}` } };
 }
 
 function dispatch(element: Element, type: string, init: EventInit = {}): boolean {
@@ -928,6 +1236,163 @@ function pointerClick(element: Element): void {
   if (typeof PointerEvent === "function") element.dispatchEvent(new PointerEvent("pointerup", { ...init, buttons: 0 }));
   element.dispatchEvent(new MouseEvent("mouseup", { ...init, buttons: 0 }));
   html.click();
+}
+
+/** Where a pointer at the element's center is, in its viewport. */
+function centerOf(element: Element): { clientX: number; clientY: number } {
+  const box = element.getBoundingClientRect();
+  return { clientX: box.left + box.width / 2, clientY: box.top + box.height / 2 };
+}
+
+/** Dispatches a pointer event (a `PointerEvent` for `pointer*` types where supported) or mouse event. Enter/leave events do not bubble. */
+function pointerEvent(element: Element, type: string, init: MouseEventInit): boolean {
+  const bubbles = !type.endsWith("enter") && !type.endsWith("leave");
+  const options = { bubbles, cancelable: bubbles, composed: true, view: element.ownerDocument.defaultView, ...init };
+  if (type.startsWith("pointer")) {
+    if (typeof PointerEvent !== "function") return true;
+    return element.dispatchEvent(new PointerEvent(type, { pointerId: 1, pointerType: "mouse", isPrimary: true, ...options }));
+  }
+  return element.dispatchEvent(new MouseEvent(type, options));
+}
+
+/** The element and its ancestors in its own document's flat tree, innermost first. */
+function hoverChain(element: Element): Element[] {
+  const chain: Element[] = [];
+  for (let node: Element | null = element; node && node.ownerDocument === element.ownerDocument; node = composedParent(node)) chain.push(node);
+  return chain;
+}
+
+/** The element the agent's pointer is over in each document, so the next hover (or drag) leaves it first. */
+const HOVERED = new WeakMap<Document, Element>();
+
+/** Mouse buttons held while the pointer moves: none for a hover, the primary one during a drag. */
+type Buttons = 0 | 1;
+
+/**
+ * Moves the agent's pointer onto `element` the way a real pointer would:
+ * out of and leaving the element hovered before (if any), then over and
+ * entering the new one (enter/leave on each ancestor crossed), then a move.
+ */
+function movePointerTo(element: Element, buttons: Buttons = 0): void {
+  const document = element.ownerDocument;
+  const previous = HOVERED.get(document);
+  const point = { ...centerOf(element), buttons };
+  const entered = hoverChain(element);
+  if (previous && previous !== element && previous.isConnected) {
+    const left = hoverChain(previous).filter((node) => !entered.includes(node));
+    const exit = { ...centerOf(previous), buttons, relatedTarget: element };
+    pointerEvent(previous, "pointerout", exit);
+    pointerEvent(previous, "mouseout", exit);
+    for (const node of left) {
+      pointerEvent(node, "pointerleave", exit);
+      pointerEvent(node, "mouseleave", exit);
+    }
+  }
+  if (previous !== element) {
+    const before = previous?.isConnected ? hoverChain(previous) : [];
+    const enter = { ...point, relatedTarget: previous ?? null };
+    pointerEvent(element, "pointerover", enter);
+    pointerEvent(element, "mouseover", enter);
+    for (const node of entered.filter((candidate) => !before.includes(candidate)).reverse()) {
+      pointerEvent(node, "pointerenter", enter);
+      pointerEvent(node, "mouseenter", enter);
+    }
+  }
+  pointerEvent(element, "pointermove", point);
+  pointerEvent(element, "mousemove", point);
+  HOVERED.set(document, element);
+}
+
+/** A drag event carrying `transfer`; where `DragEvent` cannot be constructed, a mouse event with it attached. */
+function dragEvent(element: Element, type: string, transfer: DataTransfer, point: { clientX: number; clientY: number }): boolean {
+  const cancelable = type !== "dragleave" && type !== "dragend";
+  const init = { bubbles: true, cancelable, composed: true, buttons: type === "dragend" || type === "drop" ? 0 : 1, ...point };
+  let event: Event;
+  try {
+    event = new DragEvent(type, { ...init, dataTransfer: transfer });
+  } catch {
+    event = new MouseEvent(type, init);
+  }
+  if ((event as DragEvent).dataTransfer !== transfer) Object.defineProperty(event, "dataTransfer", { value: transfer });
+  return element.dispatchEvent(event);
+}
+
+/** Lets the page's handlers run (animation frames, debounced listeners) between the steps of a drag. */
+function nextFrame(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 16));
+}
+
+/** Steps a pointer move takes from the source to the target, so libraries that need a minimum distance or several moves start dragging. */
+const DRAG_STEPS = 5;
+
+/**
+ * Drags one element onto another in the same document. A draggable source
+ * (`draggable="true"` or a native draggable) gets HTML drag and drop with a
+ * shared `DataTransfer`: dragstart, drag, dragenter and dragover on the
+ * target, then drop only if the target accepted it (cancelled dragover), and
+ * dragend. Any other source gets pointer and mouse events: down on the
+ * source, moves toward the target, and up on the target, which is what
+ * pointer-based sortable and board libraries listen for.
+ */
+async function drag(control: OutlineControl, to: OutlineControl): Promise<Effect> {
+  const source = control.proxy ?? control.element;
+  const target = to.proxy ?? to.element;
+  if (source === target || source.contains(target)) return { ok: false, code: "INVALID_TOOL_ARGUMENTS", message: `Drag ${describe(control)} onto a different element outside it.` };
+  try { (source as HTMLElement).scrollIntoView?.({ block: "center", inline: "nearest" }); } catch { /* detached or unsupported */ }
+  const from = centerOf(source);
+  const end = centerOf(target);
+  const label = `${describe(control)} onto ${describe(to)}`;
+  movePointerTo(source);
+  pointerEvent(source, "pointerdown", { ...from, button: 0, buttons: 1 });
+  pointerEvent(source, "mousedown", { ...from, button: 0, buttons: 1 });
+
+  if ((source as HTMLElement).draggable === true || source.getAttribute("draggable") === "true") {
+    const transfer = new DataTransfer();
+    if (!dragEvent(source, "dragstart", transfer, from)) {
+      return { ok: false, code: "NOT_INTERACTABLE", message: `The page cancelled dragging ${describe(control)} (its dragstart handler refused it).` };
+    }
+    dragEvent(source, "drag", transfer, from);
+    await nextFrame();
+    dragEvent(target, "dragenter", transfer, end);
+    if (!source.contains(target) && !target.contains(source)) dragEvent(source, "dragleave", transfer, end);
+    // dragover repeats while the pointer rests on the target; the last one decides whether it accepts the drop.
+    dragEvent(source, "drag", transfer, end);
+    dragEvent(target, "dragover", transfer, end);
+    await nextFrame();
+    dragEvent(source, "drag", transfer, end);
+    const accepted = !dragEvent(target, "dragover", transfer, end);
+    if (!accepted) {
+      dragEvent(target, "dragleave", transfer, end);
+      dragEvent(source, "dragend", transfer, end);
+      return { ok: false, code: "NOT_INTERACTABLE", message: `Dragged ${label}, but it does not accept drops (its dragover handler did not allow one); nothing was dropped.` };
+    }
+    dragEvent(target, "drop", transfer, end);
+    dragEvent(source, "dragend", transfer, end);
+    HOVERED.set(target.ownerDocument, target);
+    return { ok: true, message: `Dragged ${label} (HTML drag and drop).` };
+  }
+
+  for (let step = 1; step < DRAG_STEPS; step++) {
+    const point = {
+      clientX: from.clientX + ((end.clientX - from.clientX) * step) / DRAG_STEPS + (step === 1 ? 10 : 0),
+      clientY: from.clientY + ((end.clientY - from.clientY) * step) / DRAG_STEPS + (step === 1 ? 10 : 0),
+    };
+    pointerEvent(source, "pointermove", { ...point, buttons: 1 });
+    pointerEvent(source, "mousemove", { ...point, buttons: 1 });
+    await nextFrame();
+  }
+  movePointerTo(target, 1);
+  await nextFrame();
+  pointerEvent(target, "pointerup", { ...end, button: 0, buttons: 0 });
+  pointerEvent(target, "mouseup", { ...end, button: 0, buttons: 0 });
+  return { ok: true, message: `Dragged ${label} (pointer events).` };
+}
+
+function hover(control: OutlineControl): Effect {
+  const element = control.proxy ?? control.element;
+  try { (element as HTMLElement).scrollIntoView?.({ block: "center", inline: "nearest" }); } catch { /* detached or unsupported */ }
+  movePointerTo(element);
+  return { ok: true, message: `Hovered over ${describe(control)}.` };
 }
 
 /** Controls a submit would leave invalid under native constraint validation. */
@@ -1026,6 +1491,158 @@ function select(control: OutlineControl, values: string[]): Effect {
   return { ok: true, message: `Selected ${chosen.map((option) => JSON.stringify(optionLabel(option))).join(", ")} in ${describe(control)}.` };
 }
 
+/** Types `text` into an editable combobox to filter its options, as keystrokes would: keydown, the new value with an input event, keyup. Never a change event, which some widgets take as a commit. */
+function typeFilter(element: HTMLInputElement | HTMLTextAreaElement, text: string): void {
+  element.focus?.();
+  const last = text.at(-1) ?? "";
+  const key = { key: last, bubbles: true, cancelable: true, composed: true };
+  element.dispatchEvent(new KeyboardEvent("keydown", key));
+  element.value = text;
+  element.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: text }));
+  element.dispatchEvent(new KeyboardEvent("keyup", key));
+}
+
+/** The listboxes a combobox controls (`aria-controls`, `aria-owns`, its active descendant's), or failing that every rendered listbox in its document. */
+function listboxesFor(control: OutlineControl): Element[] {
+  const element = control.element;
+  if (control.role === "listbox") return [element];
+  const named = ["aria-controls", "aria-owns"].flatMap((attribute) => (element.getAttribute(attribute) ?? "").split(/\s+/).filter(Boolean))
+    .map((id) => rootLookup(element, id)).filter((found): found is Element => !!found);
+  const active = element.getAttribute("aria-activedescendant");
+  const activeOption = active ? rootLookup(element, active) : null;
+  const isListbox = (candidate: Element) => explicitRole(candidate) === "listbox";
+  const found = new Set<Element>();
+  for (const candidate of named) {
+    if (isListbox(candidate)) found.add(candidate);
+    else for (const inner of composedDescendants(candidate, isListbox, () => false, { nodes: 20_000 })) found.add(inner);
+    if (!found.size && composedDescendants(candidate, (inner) => explicitRole(inner) === "option", () => false, { nodes: 20_000 }).length) found.add(candidate);
+  }
+  for (let node: Element | null = activeOption; node; node = composedParent(node)) if (isListbox(node)) { found.add(node); break; }
+  const rendered = [...found].filter(isRendered);
+  if (rendered.length) return rendered;
+  const body = element.ownerDocument.body;
+  return body ? composedDescendants(body, isListbox, () => false, { nodes: MAX_VISITED_NODES }).filter(isRendered) : [];
+}
+
+interface ShownOption { element: Element; label: string }
+
+function shownOptions(control: OutlineControl): ShownOption[] {
+  return listboxesFor(control).flatMap((listbox) => composedDescendants(listbox, (candidate) => explicitRole(candidate) === "option", () => false, { nodes: 20_000 }))
+    .filter(isRendered)
+    .map((element) => ({ element, label: accessibleName(element, "option") || composedText(element, NAME_LIMIT) }));
+}
+
+/** The one option whose text is `wanted` (case-insensitive), else the one containing it. */
+function matchOption(options: ShownOption[], wanted: string): { option: ShownOption } | { matches: ShownOption[] } {
+  const lower = wanted.toLowerCase();
+  const exact = options.filter((option) => option.label.toLowerCase() === lower);
+  if (exact.length === 1) return { option: exact[0]! };
+  if (exact.length > 1) return { matches: exact };
+  const partial = options.filter((option) => option.label.toLowerCase().includes(lower));
+  return partial.length === 1 ? { option: partial[0]! } : { matches: partial };
+}
+
+/** What a combobox shows as its value: an input's value, or the text of a button-like one. */
+function shownValue(element: Element): string {
+  return isInput(element) || isTextArea(element) ? trimText(element.value ?? "") : composedText(element, VALUE_LIMIT);
+}
+
+/** How long `choose` waits for a combobox's options to appear and settle. */
+const CHOOSE_WAIT_MS = 5_000;
+const CHOOSE_MAX_WAITS = 20;
+
+/**
+ * Picks one option of a select or combobox. A native select selects it; an
+ * input with a datalist takes the option's value. An ARIA combobox (or
+ * listbox, or element with aria-haspopup=listbox) is opened with a click if
+ * collapsed, typed into when it is a text field (so filtering widgets load
+ * matching options), and then waited on until exactly one shown option
+ * matches; that option is clicked and the combobox's shown value checked.
+ * Never picks among ambiguous matches.
+ */
+async function choose(document: Document, control: OutlineControl, option: string, settle: Settle): Promise<Effect> {
+  const element = control.element;
+  const wanted = trimText(option);
+  if (isSelect(element)) return select(control, [option]);
+  const listId = isInput(element) ? element.getAttribute("list") : null;
+  if (isInput(element) && listId) {
+    const list = rootLookup(element, listId);
+    const values = list ? Array.from(list.querySelectorAll("option")).map((candidate) => ({ element: candidate as Element, label: trimText(candidate.getAttribute("label") || candidate.textContent || "") || (candidate as HTMLOptionElement).value })) : [];
+    const matched = matchOption(values, wanted);
+    if (!("option" in matched)) return { ok: false, code: "TARGET_MISSING", message: `${matched.matches.length ? `${matched.matches.length} suggestions match` : "No suggestion matches"} ${JSON.stringify(wanted)} in ${describe(control)}. Suggestions: ${values.slice(0, 30).map((value) => value.label).join(" | ") || "(none)"}` };
+    return fill(control, (matched.option.element as HTMLOptionElement).value || matched.option.label);
+  }
+  const popup = element.getAttribute("aria-haspopup");
+  if (control.role !== "combobox" && control.role !== "listbox" && popup !== "listbox") {
+    return { ok: false, code: "NOT_INTERACTABLE", message: `${describe(control)} is not a select or combobox. Click it to open its list and click the option; for a date field that accepts typed dates, use fill(text, {commit: true}).` };
+  }
+  try { (element as HTMLElement).scrollIntoView?.({ block: "center", inline: "nearest" }); } catch { /* detached or unsupported */ }
+  if (control.role !== "listbox" && (element.getAttribute("aria-expanded") !== "true" || !shownOptions(control).length)) pointerClick(element);
+  const editable = (isInput(element) && TEXT_INPUT_TYPES.has(inputType(element))) || isTextArea(element);
+  const typed = editable && !(element as HTMLInputElement).readOnly;
+  if (typed) typeFilter(element as HTMLInputElement, wanted);
+
+  const deadline = Date.now() + CHOOSE_WAIT_MS;
+  let options: ShownOption[] = [];
+  let matched: ReturnType<typeof matchOption> = { matches: [] };
+  for (let wait = 0; wait < CHOOSE_MAX_WAITS && Date.now() < deadline; wait++) {
+    await settle(document);
+    options = shownOptions(control);
+    matched = matchOption(options, wanted);
+    if ("option" in matched) break;
+  }
+  if (!("option" in matched)) {
+    const listed = options.slice(0, 20).map((shown) => JSON.stringify(shown.label)).join(", ");
+    if (matched.matches.length > 1) return { ok: false, code: "TARGET_MISSING", message: `${matched.matches.length} options match ${JSON.stringify(wanted)} in ${describe(control)}: ${matched.matches.slice(0, 20).map((shown) => JSON.stringify(shown.label)).join(", ")}. Choose with the full option text.` };
+    return {
+      ok: false, code: "TARGET_MISSING",
+      message: options.length
+        ? `No option matching ${JSON.stringify(wanted)} in ${describe(control)}. Options shown: ${listed}${options.length > 20 ? ", …" : ""}.`
+        : `No options appeared for ${describe(control)} within ${CHOOSE_WAIT_MS / 1000} s (it shows no role=listbox with role=option items). Read a snapshot and click its options; for a date field that accepts typed dates, use fill(text, {commit: true}).`,
+    };
+  }
+  const picked = matched.option;
+  if (isDisabled(picked.element)) return { ok: false, code: "NOT_INTERACTABLE", message: `Option ${JSON.stringify(picked.label)} is disabled.` };
+  movePointerTo(picked.element);
+  pointerClick(picked.element);
+  await settle(document);
+  const shown = shownValue(element);
+  const label = picked.label.toLowerCase();
+  // Text typed to filter proves nothing: an input that still shows just that, with its list open, may have ignored the click.
+  const closed = element.getAttribute("aria-expanded") === "false" || !isRendered(picked.element);
+  const confirmed = (picked.element.isConnected && picked.element.getAttribute("aria-selected") === "true") ||
+    (!!shown && (shown.toLowerCase().includes(label) || label.includes(shown.toLowerCase())) && (!typed || closed || shown !== wanted));
+  return confirmed
+    ? { ok: true, message: `Chose ${JSON.stringify(picked.label)} in ${describe(control)}${shown ? `; it shows ${JSON.stringify(clip(shown, 120))}` : ""}.` }
+    : { ok: true, message: `Clicked option ${JSON.stringify(picked.label)} in ${describe(control)}, but could not confirm it: the field shows ${JSON.stringify(clip(shown, 120))}. Check the changes below or read a snapshot.` };
+}
+
+/**
+ * Fills a field, then commits it as a typed-date picker expects: Enter
+ * (keydown/keyup only; no form submit), then blur. Reports the value the
+ * field kept, which a picker may have reformatted; an emptied field failed.
+ */
+async function fillAndCommit(document: Document, control: OutlineControl, text: string, settle: Settle): Promise<Effect> {
+  const filled = fill(control, text);
+  if (!filled.ok) return filled;
+  const element = control.element as HTMLElement;
+  const enter = { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true, composed: true };
+  element.dispatchEvent(new KeyboardEvent("keydown", enter));
+  element.dispatchEvent(new KeyboardEvent("keyup", enter));
+  if (document.activeElement === element) element.blur();
+  else {
+    element.dispatchEvent(new FocusEvent("blur", { composed: true }));
+    element.dispatchEvent(new FocusEvent("focusout", { bubbles: true, composed: true }));
+  }
+  await settle(document);
+  const kept = shownValue(control.element);
+  if (!kept) {
+    const placeholder = control.element.getAttribute("placeholder");
+    return { ok: false, code: "NOT_INTERACTABLE", message: `${describe(control)} did not keep ${JSON.stringify(text)}; it is empty after Enter and blur.${placeholder ? ` Its placeholder suggests the format ${JSON.stringify(placeholder)}.` : ""} If it needs its calendar, click it and pick the day.` };
+  }
+  return { ok: true, message: `Filled and committed ${describe(control)}; it shows ${JSON.stringify(clip(kept, 120))}${kept === trimText(text) ? "" : " (the field reformatted it)"}.`, notes: filled.notes };
+}
+
 function check(control: OutlineControl, checked: boolean): Effect {
   const element = control.element;
   const read = (): boolean | null => isInput(element) ? element.checked : element.getAttribute("aria-checked") === "true" ? true : element.getAttribute("aria-checked") === "false" ? false : null;
@@ -1043,20 +1660,51 @@ function check(control: OutlineControl, checked: boolean): Effect {
 const KEY_CODES: Record<string, { code: string; keyCode: number; key: string }> = {
   Enter: { code: "Enter", keyCode: 13, key: "Enter" }, Tab: { code: "Tab", keyCode: 9, key: "Tab" },
   Escape: { code: "Escape", keyCode: 27, key: "Escape" }, Space: { code: "Space", keyCode: 32, key: " " },
-  Backspace: { code: "Backspace", keyCode: 8, key: "Backspace" }, ArrowUp: { code: "ArrowUp", keyCode: 38, key: "ArrowUp" },
-  ArrowDown: { code: "ArrowDown", keyCode: 40, key: "ArrowDown" }, ArrowLeft: { code: "ArrowLeft", keyCode: 37, key: "ArrowLeft" },
-  ArrowRight: { code: "ArrowRight", keyCode: 39, key: "ArrowRight" },
+  Backspace: { code: "Backspace", keyCode: 8, key: "Backspace" }, Delete: { code: "Delete", keyCode: 46, key: "Delete" },
+  ArrowUp: { code: "ArrowUp", keyCode: 38, key: "ArrowUp" }, ArrowDown: { code: "ArrowDown", keyCode: 40, key: "ArrowDown" },
+  ArrowLeft: { code: "ArrowLeft", keyCode: 37, key: "ArrowLeft" }, ArrowRight: { code: "ArrowRight", keyCode: 39, key: "ArrowRight" },
+  Home: { code: "Home", keyCode: 36, key: "Home" }, End: { code: "End", keyCode: 35, key: "End" },
+  PageUp: { code: "PageUp", keyCode: 33, key: "PageUp" }, PageDown: { code: "PageDown", keyCode: 34, key: "PageDown" },
 };
 
-function press(control: OutlineControl, key: string, outline: Outline): Effect {
+const MODIFIER_KEYS: Record<KeyModifier, { code: string; keyCode: number; flag: "ctrlKey" | "altKey" | "shiftKey" | "metaKey" }> = {
+  Control: { code: "ControlLeft", keyCode: 17, flag: "ctrlKey" }, Alt: { code: "AltLeft", keyCode: 18, flag: "altKey" },
+  Shift: { code: "ShiftLeft", keyCode: 16, flag: "shiftKey" }, Meta: { code: "MetaLeft", keyCode: 91, flag: "metaKey" },
+};
+
+/** A named key's codes, or a letter's or digit's (`KeyK`, `Digit7`); Shift makes a letter's `key` uppercase. */
+function keyInfo(key: PressKey, shift: boolean): { code: string; keyCode: number; key: string } {
+  const named = KEY_CODES[key];
+  if (named) return named;
+  const upper = key.toUpperCase();
+  return /\d/.test(key)
+    ? { code: `Digit${key}`, keyCode: upper.charCodeAt(0), key }
+    : { code: `Key${upper}`, keyCode: upper.charCodeAt(0), key: shift ? upper : key };
+}
+
+/**
+ * Presses a key on the element: each modifier goes down in order, then the
+ * key (keydown, keypress for an unmodified Enter or Space, keyup) with the
+ * modifier flags set, then the modifiers come up in reverse. Only an
+ * unmodified Enter has a default here (submitting a text field's form, or
+ * activating a button or link); everything else is the page's own handlers.
+ */
+function press(control: OutlineControl, key: PressKey, modifiers: readonly KeyModifier[], outline: Outline): Effect {
   const element = control.element;
-  const info = KEY_CODES[key]!;
   (element as HTMLElement).focus?.();
-  const init = { key: info.key, code: info.code, keyCode: info.keyCode, which: info.keyCode, bubbles: true, cancelable: true, composed: true };
-  const proceed = element.dispatchEvent(new KeyboardEvent("keydown", init));
-  if (key === "Enter" || key === "Space") element.dispatchEvent(new KeyboardEvent("keypress", init));
+  const flags = { ctrlKey: false, altKey: false, shiftKey: false, metaKey: false };
+  const keyboard = (type: string, info: { code: string; keyCode: number; key: string }) =>
+    element.dispatchEvent(new KeyboardEvent(type, { key: info.key, code: info.code, keyCode: info.keyCode, which: info.keyCode, bubbles: true, cancelable: true, composed: true, ...flags }));
+  for (const modifier of modifiers) {
+    const { flag, ...info } = MODIFIER_KEYS[modifier];
+    flags[flag] = true;
+    keyboard("keydown", { ...info, key: modifier });
+  }
+  const info = keyInfo(key, flags.shiftKey);
+  const proceed = keyboard("keydown", info);
+  if ((key === "Enter" || key === "Space") && !modifiers.length) keyboard("keypress", info);
   const notes: string[] = [];
-  if (proceed && key === "Enter") {
+  if (proceed && key === "Enter" && !modifiers.length) {
     if ((isInput(element) && TEXT_INPUT_TYPES.has(inputType(element))) && element.form) {
       const invalid = invalidFormControls(element.form, outline);
       if (invalid.length) notes.push(`Native validation blocked submission: ${invalid.join("; ")}`);
@@ -1066,21 +1714,33 @@ function press(control: OutlineControl, key: string, outline: Outline): Effect {
       (element as HTMLElement).click();
     }
   }
-  element.dispatchEvent(new KeyboardEvent("keyup", init));
-  return { ok: true, message: `Pressed ${key} on ${describe(control)}.`, notes };
+  keyboard("keyup", info);
+  for (const modifier of [...modifiers].reverse()) {
+    const { flag, ...info } = MODIFIER_KEYS[modifier];
+    flags[flag] = false;
+    keyboard("keyup", { ...info, key: modifier });
+  }
+  return { ok: true, message: `Pressed ${formatKeyChord(key, modifiers)} on ${describe(control)}.`, notes };
 }
 
-function upload(control: OutlineControl, files: { name: string; mimeType: string; text: string }[]): Effect {
+function upload(control: OutlineControl, files: UploadFile[]): Effect {
   const element = control.element;
   if (!isInput(element) || inputType(element) !== "file") return { ok: false, code: "NOT_INTERACTABLE", message: `${describe(control)} is not a file input.` };
   if (files.length > 1 && !element.multiple) return { ok: false, code: "INVALID_TOOL_ARGUMENTS", message: "This file input accepts a single file." };
   const transfer = new DataTransfer();
-  for (const file of files) transfer.items.add(new File([file.text], file.name, { type: file.mimeType }));
+  for (const file of files) transfer.items.add(new File(["text" in file ? file.text : decodeBase64(file.base64)], file.name, { type: file.mimeType }));
   element.files = transfer.files;
   if ((element.files?.length ?? 0) !== files.length) return { ok: false, code: "NOT_INTERACTABLE", message: "The browser did not accept the file assignment." };
   dispatch(element, "input");
   dispatch(element, "change");
   return { ok: true, message: `Attached ${files.map((file) => JSON.stringify(file.name)).join(", ")} to ${describe(control)}.` };
+}
+
+function decodeBase64(base64: string): Uint8Array<ArrayBuffer> {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
 }
 
 function click(control: OutlineControl, outline: Outline): Effect {
@@ -1121,24 +1781,60 @@ const MAX_DIFF_ADDED = 25;
 const MAX_DIFF_REMOVED = 8;
 const MAX_DIFF_LINE = 300;
 
-/** Multiset line diff: what appeared and disappeared in the outline. */
+/**
+ * Multiset line diff: what appeared and disappeared in the outline, then,
+ * if the lines both outlines share now come in another order (a sorted table,
+ * a dragged list item), the span that moved as it reads now.
+ */
 export function describeChanges(before: readonly string[], after: readonly string[]): string {
   const remaining = new Map<string, number>();
   for (const line of before) remaining.set(line, (remaining.get(line) ?? 0) + 1);
   const added: string[] = [];
+  const kept = new Map<string, number>();
   for (const line of after) {
     const count = remaining.get(line) ?? 0;
-    if (count > 0) remaining.set(line, count - 1);
-    else added.push(line);
+    if (count > 0) {
+      remaining.set(line, count - 1);
+      kept.set(line, (kept.get(line) ?? 0) + 1);
+    } else added.push(line);
   }
   const removed = [...remaining.entries()].flatMap(([line, count]) => Array<string>(count).fill(line));
-  if (!added.length && !removed.length) return "Page outline unchanged.";
-  const lines = [`Page changes (+${added.length} −${removed.length} lines):`];
-  lines.push(...added.slice(0, MAX_DIFF_ADDED).map((line) => `+ ${clip(line, MAX_DIFF_LINE)}`));
-  if (added.length > MAX_DIFF_ADDED) lines.push(`+ …${added.length - MAX_DIFF_ADDED} more added lines; read a snapshot to see them.`);
-  lines.push(...removed.slice(0, MAX_DIFF_REMOVED).map((line) => `- ${clip(line, MAX_DIFF_LINE)}`));
-  if (removed.length > MAX_DIFF_REMOVED) lines.push(`- …${removed.length - MAX_DIFF_REMOVED} more removed lines.`);
+  const reordered = describeReorder(shared(before, kept), shared(after, kept));
+  if (!added.length && !removed.length && !reordered.length) return "Page outline unchanged.";
+  const lines: string[] = [];
+  if (added.length || removed.length) {
+    lines.push(`Page changes (+${added.length} −${removed.length} lines):`);
+    lines.push(...added.slice(0, MAX_DIFF_ADDED).map((line) => `+ ${clip(line, MAX_DIFF_LINE)}`));
+    if (added.length > MAX_DIFF_ADDED) lines.push(`+ …${added.length - MAX_DIFF_ADDED} more added lines; read a snapshot to see them.`);
+    lines.push(...removed.slice(0, MAX_DIFF_REMOVED).map((line) => `- ${clip(line, MAX_DIFF_LINE)}`));
+    if (removed.length > MAX_DIFF_REMOVED) lines.push(`- …${removed.length - MAX_DIFF_REMOVED} more removed lines.`);
+  }
+  lines.push(...reordered);
   return lines.join("\n");
+}
+
+/** The lines of `outline` that both outlines have, as many of each as they share, in order. */
+function shared(outline: readonly string[], counts: ReadonlyMap<string, number>): string[] {
+  const left = new Map(counts);
+  return outline.filter((line) => {
+    const count = left.get(line) ?? 0;
+    if (count > 0) left.set(line, count - 1);
+    return count > 0;
+  });
+}
+
+/** Where the same lines now come in another order: the span that changed, as it reads now. Empty if the order is the same. */
+function describeReorder(before: readonly string[], after: readonly string[]): string[] {
+  let start = 0;
+  while (start < after.length && before[start] === after[start]) start++;
+  if (start === after.length) return [];
+  let end = after.length - 1;
+  while (end > start && before[end] === after[end]) end--;
+  const span = after.slice(start, end + 1);
+  const lines = [`Page outline reordered (${span.length} lines moved); that part now reads:`];
+  lines.push(...span.slice(0, MAX_DIFF_ADDED).map((line) => `~ ${clip(line, MAX_DIFF_LINE)}`));
+  if (span.length > MAX_DIFF_ADDED) lines.push(`~ …${span.length - MAX_DIFF_ADDED} more lines; read a snapshot to see them.`);
+  return lines;
 }
 
 /**
@@ -1151,8 +1847,9 @@ export async function executeDomAction(
   registry: ElementRefRegistry,
   action: DomAction,
   settle: Settle = settleDom,
+  options: OutlineOptions = {},
 ): Promise<ToolResult> {
-  const before = buildOutline(document, registry);
+  const before = buildOutline(document, registry, options);
   const urlBefore = document.location?.href;
   let control: OutlineControl | null = null;
   if (action.target) {
@@ -1160,22 +1857,133 @@ export async function executeDomAction(
     if (!resolved.ok) return resolved.result;
     control = resolved.control;
   }
+  let to: OutlineControl | null = null;
+  if (action.kind === "drag") {
+    const resolved = resolveTarget(before, registry, action.to);
+    if (!resolved.ok) return { ...resolved.result, summary: `Drop target: ${resolved.result.summary}` };
+    to = resolved.control;
+  }
   let effect: Effect;
   switch (action.kind) {
     case "click": effect = click(control!, before); break;
-    case "fill": effect = fill(control!, action.text); break;
+    case "hover": effect = hover(control!); break;
+    case "drag": effect = await drag(control!, to!); break;
+    case "fill": effect = action.commit ? await fillAndCommit(document, control!, action.text, settle) : fill(control!, action.text); break;
     case "select": effect = select(control!, action.values); break;
+    case "choose": effect = await choose(document, control!, action.option, settle); break;
     case "check": effect = check(control!, action.checked); break;
-    case "press": effect = press(control!, action.key, before); break;
+    case "press": effect = press(control!, action.key, action.modifiers ?? [], before); break;
     case "upload": effect = upload(control!, action.files); break;
     case "scroll": effect = scroll(document, control, action.direction, action.amount); break;
   }
   if (!effect.ok) return { ok: false, code: effect.code ?? "NOT_INTERACTABLE", summary: effect.message };
   await settle(document);
-  const after = buildOutline(document, registry);
+  const after = buildOutline(document, registry, options);
   const location = document.location?.href;
   const parts = [effect.message, ...(effect.notes ?? [])];
-  if (action.kind !== "scroll") parts.push(describeChanges(before.lines, after.lines));
+  if (action.kind !== "scroll") {
+    const changes = describeChanges(before.lines, after.lines);
+    parts.push(changes);
+    if (action.kind === "hover" && changes === "Page outline unchanged.") {
+      parts.push("Nothing opened. A menu that opens only by CSS :hover does not respond to the agent's pointer; try click(), or focus it and press(\"ArrowDown\").");
+    }
+  }
   if (location && location !== urlBefore) parts.push(`URL changed to ${location}`);
   return { ok: true, summary: parts.join("\n") };
+}
+
+/**
+ * Measures the page for a screenshot, in document coordinates: the scrolled
+ * viewport, the page's full size, and the target element's border box
+ * (resolved like an action's target against a fresh outline, so a ref from an
+ * earlier document is stale). Same-origin frames add their offsets.
+ */
+export function measureForCapture(document: Document, registry: ElementRefRegistry, target: ElementTarget | null, options: OutlineOptions = {}):
+  { ok: true; geometry: CaptureGeometry } | { ok: false; result: ToolResult } {
+  const view = document.defaultView;
+  const root = document.documentElement;
+  const viewport: PageRect = {
+    x: view?.scrollX ?? 0,
+    y: view?.scrollY ?? 0,
+    width: root?.clientWidth || view?.innerWidth || 0,
+    height: root?.clientHeight || view?.innerHeight || 0,
+  };
+  const page = {
+    width: Math.max(viewport.width, root?.scrollWidth ?? 0, document.body?.scrollWidth ?? 0),
+    height: Math.max(viewport.height, root?.scrollHeight ?? 0, document.body?.scrollHeight ?? 0),
+  };
+  let element: PageRect | null = null;
+  if (target) {
+    const resolved = resolveTarget(buildOutline(document, registry, options), registry, target, { allowDisabled: true, accept: "any" });
+    if (!resolved.ok) return resolved;
+    const { control } = resolved;
+    element = documentRect(control.element, view);
+    if ((!element.width || !element.height) && control.proxy) element = documentRect(control.proxy, view);
+    if (!element.width || !element.height) {
+      return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `${describe(control)} has no visible box to capture.` } };
+    }
+  }
+  return {
+    ok: true,
+    geometry: { documentId: registry.documentId, url: document.location?.href ?? "", title: document.title, viewport, page, element },
+  };
+}
+
+/**
+ * Measures a cross-origin child frame for a screenshot of an element inside
+ * it: the frame element's content box (where the frame's own viewport is
+ * drawn) in document coordinates, found by Firefox's frame id among the
+ * frames in this document, its shadow roots, and its same-origin frames.
+ */
+export function measureFrameForCapture(document: Document, registry: ElementRefRegistry, frameId: number, frameIdOf: (frame: Element) => number):
+  { ok: true; geometry: CaptureGeometry } | { ok: false; result: ToolResult } {
+  const measured = measureForCapture(document, registry, null);
+  if (!measured.ok) return measured;
+  const frame = frameElements(document).find((candidate) => frameIdOf(candidate) === frameId);
+  if (!frame) return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: "The frame is no longer on the page. Read a fresh snapshot." } };
+  const border = documentRect(frame, document.defaultView);
+  const style = styleOf(frame);
+  const x = border.x + frame.clientLeft + (parseFloat(style?.paddingLeft ?? "") || 0);
+  const y = border.y + frame.clientTop + (parseFloat(style?.paddingTop ?? "") || 0);
+  const width = frame.clientWidth - (parseFloat(style?.paddingLeft ?? "") || 0) - (parseFloat(style?.paddingRight ?? "") || 0);
+  const height = frame.clientHeight - (parseFloat(style?.paddingTop ?? "") || 0) - (parseFloat(style?.paddingBottom ?? "") || 0);
+  return { ok: true, geometry: { ...measured.geometry, element: { x, y, width: Math.max(0, width), height: Math.max(0, height) } } };
+}
+
+/** Every iframe/frame element in a document, its shadow roots, and its same-origin frames. */
+function frameElements(root: Document | ShadowRoot): Element[] {
+  const found: Element[] = [];
+  for (const element of Array.from(root.querySelectorAll("*"))) {
+    const tag = tagOf(element);
+    if (tag === "iframe" || tag === "frame") {
+      found.push(element);
+      let inner: Document | null = null;
+      try { inner = (element as HTMLIFrameElement).contentDocument; } catch { inner = null; }
+      if (inner) found.push(...frameElements(inner));
+    }
+    const shadow = shadowRootOf(element);
+    if (shadow) found.push(...frameElements(shadow));
+  }
+  return found;
+}
+
+/** An element's border box relative to the top document, adding the offsets of the same-origin frames it is in. */
+function documentRect(element: Element, top: Window | null): PageRect {
+  const box = element.getBoundingClientRect();
+  let x = box.left;
+  let y = box.top;
+  let view = element.ownerDocument.defaultView;
+  while (view && view !== top && view.frameElement) {
+    const frame = view.frameElement;
+    const outer = frame.getBoundingClientRect();
+    x += outer.left + frame.clientLeft;
+    y += outer.top + frame.clientTop;
+    view = frame.ownerDocument.defaultView;
+  }
+  return { x: x + (top?.scrollX ?? 0), y: y + (top?.scrollY ?? 0), width: box.width, height: box.height };
+}
+/** Only descriptive image text from the exact context-menu target, never bytes or executable attributes. */
+export function describeMenuTarget(element: Element | undefined): string | null {
+  if (!element || element.localName !== "img") return null;
+  return (element.getAttribute("alt") || element.getAttribute("aria-label") || "").slice(0, 300) || null;
 }

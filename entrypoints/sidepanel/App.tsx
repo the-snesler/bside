@@ -8,6 +8,7 @@ import Eye from "~icons/tabler/eye";
 import ArrowDown from "~icons/tabler/arrow-down";
 import ArrowUp from "~icons/tabler/arrow-up";
 import X from "~icons/tabler/x";
+import NotePlus from "~icons/tabler/pencil-plus";
 import { Markdown } from "@/lib/ui/Markdown";
 import { Composer, parsePromptMentions } from "@/lib/ui/Composer";
 import { useBottomScroll } from "@/lib/ui/use-bottom-scroll";
@@ -20,7 +21,13 @@ import { describeTurnUsage } from "@/lib/ui/usage";
 import { HistoryDrawer } from "@/lib/ui/HistoryDrawer";
 import { Mascot } from "@/lib/ui/Mascot";
 import { AgentTabsPanel, AgentTabsToggle } from "@/lib/ui/AgentTabsTray";
+import { SiteNoteEditor } from "@/lib/ui/SiteNoteEditor";
+import { MemoryNotice } from "@/lib/ui/MemoryNotice";
+import { memoryUndoKey } from "@/lib/ui/use-background";
 import { PROMPT_MENTION_PATTERN } from "@/lib/domain/conversation";
+import { describeAsk } from "@/lib/domain/ask";
+import { QUICK_ACTIONS } from "@/lib/domain/quick-actions";
+import { AskChip } from "@/lib/ui/AskChip";
 
 function describeAttachment(page: PageArtifactSummary): string {
   let origin = page.url;
@@ -35,7 +42,7 @@ function describeAttachment(page: PageArtifactSummary): string {
 export function App() {
   const {
     conversation,
-    page,
+    page: activePage,
     activeRun,
     notice,
     lastError,
@@ -44,13 +51,14 @@ export function App() {
     settings,
     tabs,
     listTabs,
-    skills,
+    skills = [],
     listSkills,
     focusTab,
     agentTabs,
     closeAgentTabs,
     watchTab,
     unwatchTab,
+    takeOverTab,
     saveSettings,
     sendPrompt,
     steer,
@@ -61,6 +69,7 @@ export function App() {
     cancelRun,
     approveAction,
     denyAction,
+    resolveHelp,
     newChat,
     sessions,
     listSessions,
@@ -69,9 +78,24 @@ export function App() {
     pinSession,
     deleteSession,
     downloadContext,
+    siteNote,
+    rememberSite,
+    saveSiteNote,
+    closeSiteNote,
+    memoryUndo,
+    undoMemory,
+    ask,
+    dismissAsk,
+    focusVersion,
   } = useBackground();
+  const page = ask ? { tabId: ask.tabId, artifactId: `ask:${ask.id}`, kind: "page" as const, title: ask.pageTitle, url: ask.pageUrl, capturedAt: ask.at } : activePage;
   const scroll = useBottomScroll();
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [draft, setDraft] = useState<{ id: string; text: string } | null>(null);
+  useEffect(() => {
+    if (ask) setDraft({ id: ask.id, text: `Tell me about this ${ask.kind}.` });
+  }, [ask?.id]);
+  useEffect(() => { setHistoryOpen(false); }, [focusVersion]);
   const historyButton = useRef<HTMLButtonElement>(null);
   const closeHistory = () => {
     setHistoryOpen(false);
@@ -87,6 +111,7 @@ export function App() {
     provider.models[0];
   const turns = buildTurns(conversation.items, runHere);
   const pendingApproval = runHere ? activeRun.pendingApproval : null;
+  const pendingHelp = runHere ? activeRun.pendingHelp : null;
 
   // This chat's agent tabs ride on the composer. The attached page is one of
   // them while the user watches it; another chat's agent tab is never shown as attached.
@@ -96,9 +121,22 @@ export function App() {
   const pageOwner = page ? Object.keys(agentTabs.bySession).find((id) => agentTabs.bySession[id]!.some((tab) => tab.id === page.tabId)) : undefined;
   const inUseSince = runHere ? turns.at(-1)?.startedAt ?? null : null;
   const [trayOpen, setTrayOpen] = useState(false);
+  const rememberButton = page && (
+    <button
+      type="button"
+      class="context-chip__action"
+      aria-label="Remember something about this site"
+      title="Remember something about this site"
+      aria-expanded={siteNote !== null}
+      onClick={() => siteNote ? closeSiteNote() : rememberSite(page.url)}
+    >
+      <NotePlus />
+    </button>
+  );
   useEffect(() => {
     if (watchedTab) setTrayOpen(true);
   }, [watchedTab?.id]);
+  const helpTabId = pendingHelp && chatAgentTabs.some((tab) => tab.id === pendingHelp.tabId) ? pendingHelp.tabId : null;
 
   return (
     <div class="sidebar">
@@ -151,7 +189,9 @@ export function App() {
               <p>
                 {activeRun.pendingApproval
                   ? "Another chat is waiting for your confirmation."
-                  : "bside is working in another chat."}
+                  : activeRun.pendingHelp
+                    ? "Another chat needs your help in one of its tabs."
+                    : "bside is working in another chat."}
               </p>
               <button type="button" onClick={() => openSession(activeRun.conversationId)}>
                 Show
@@ -168,6 +208,14 @@ export function App() {
                     {page ? "I can read this tab and open my own in the background to get things done." : "I can open tabs of my own in the background to get things done."}
                     {" Your chats stay in this browser."}
                   </p>
+                  <div class="quick-actions" aria-label="Try a task">
+                    {QUICK_ACTIONS.map((action) => <button type="button" key={action.name} disabled={composerDisabled || !page || (pageOwner !== undefined && pageOwner !== conversation.id)}
+                      onClick={() => setDraft({ id: crypto.randomUUID(), text: action.prompt })}>{action.label}</button>)}
+                  </div>
+                  {skills.some((skill) => !skill.builtin) && <div class="skill-chips" aria-label="Saved skills">
+                    {skills.filter((skill) => !skill.builtin).slice(0, 3).map((skill) => <button type="button" key={skill.name} title={skill.description} disabled={composerDisabled}
+                      onClick={() => setDraft({ id: crypto.randomUUID(), text: `/${skill.name} ` })}>/{skill.name}</button>)}
+                  </div>}
                 </div>
               ) : (
                 <ul class="timeline">
@@ -189,6 +237,7 @@ export function App() {
                         )}
                         {turn.prompt && (
                           <li class="timeline__item timeline__item--user">
+                            {turn.prompt.scheduled && <p class="timeline__meta">Scheduled · {turn.prompt.scheduled.name} · {new Date(turn.prompt.scheduled.scheduledAt).toLocaleString()}</p>}
                             <p class="timeline__text">
                               {parsePromptMentions(turn.prompt.text).map((segment) =>
                                 segment.kind === "text" ? (
@@ -209,6 +258,7 @@ export function App() {
                                 ),
                               )}
                             </p>
+                            {turn.prompt.ask && <AskChip ask={turn.prompt.ask} />}
                           </li>
                         )}
                         {(turn.steps.length > 0 || active) && (
@@ -219,6 +269,19 @@ export function App() {
                               pendingApproval={pendingApproval}
                               onApprove={approveAction}
                               onDeny={denyAction}
+                              pendingHelp={pendingHelp}
+                              agentTabs={chatAgentTabs}
+                              onShowTab={watchTab}
+                              onResolveHelp={resolveHelp}
+                            />
+                          </li>
+                        )}
+                        {turn.memory.length > 0 && (
+                          <li class="timeline__item timeline__item--memory">
+                            <MemoryNotice
+                              changes={turn.memory}
+                              undo={memoryUndo[memoryUndoKey(turn.memory.map((change) => change.id))]}
+                              onUndo={() => undoMemory(turn.memory.map((change) => change.id))}
                             />
                           </li>
                         )}
@@ -289,6 +352,7 @@ export function App() {
                         {message.mode === "steer" ? "Steer" : "Queued"}
                       </span>
                       <span class="queue__text" title={text}>{text}</span>
+                      {message.ask && <span class="queue__label" title={describeAsk(message.ask).text}>{describeAsk(message.ask).label}</span>}
                       {message.mode === "follow-up" && activeRun === null && (
                         <button type="button" class="icon-button" aria-label="Send now" title="Send now" onClick={() => sendQueued(message.id)}>
                           <ArrowUp />
@@ -309,6 +373,7 @@ export function App() {
                 tabs={chatAgentTabs}
                 watching={watchedTab}
                 busy={inUseSince !== null && chatAgentTabs.some((tab) => tab.lastUsedAt >= inUseSince)}
+                needsYou={helpTabId !== null}
                 open={trayOpen}
                 onToggle={() => setTrayOpen(!trayOpen)}
               />
@@ -320,23 +385,30 @@ export function App() {
                   watching={watchedTab}
                   inUseSince={inUseSince}
                   canClose={activeRun === null}
+                  helpTabId={helpTabId}
+                  takenOver={agentTabs.takenOver}
                   now={Date.now()}
                   onWatch={watchTab}
                   onUnwatch={unwatchTab}
+                  onTakeOver={takeOverTab}
                   onCloseAll={() => closeAgentTabs(conversation.id)}
                 />
               )}
+              {siteNote && <SiteNoteEditor state={siteNote} onSave={saveSiteNote} onClose={closeSiteNote} />}
+              {ask && <AskChip ask={ask} onRemove={() => dismissAsk(ask.id)} />}
               {page && pageOwner === conversation.id ? (
                 <div class="context-chip context-chip--agent" title={describeAttachment(page)}>
                   <Eye />
                   <strong>{page.title || "bside's tab"}</strong>
                   <small>bside's tab</small>
+                  {rememberButton}
                 </div>
               ) : page && pageOwner === undefined && (
                 <div class="context-chip" title={describeAttachment(page)}>
                   <Globe />
                   <strong>{page.title || "Current tab"}</strong>
                   <small>{new URL(page.url).hostname}</small>
+                  {rememberButton}
                 </div>
               )}
               <Composer
@@ -345,15 +417,19 @@ export function App() {
                 working={runHere}
                 canSteer={runHere && activeRun.status !== "cancelling"}
                 configured={credential.configured}
+                draft={draft}
+                focusVersion={focusVersion}
+                askId={ask?.id}
+                placeholder={ask ? describeAsk(ask).placeholder : undefined}
                 tabs={tabs}
                 skills={skills ?? []}
                 onListSkills={listSkills}
                 onListTabs={listTabs}
                 onSend={(text) => {
                   scroll.scrollToBottom();
-                  sendPrompt(text);
+                  sendPrompt(text, ask?.id);
                 }}
-                onSteer={steer}
+                onSteer={(text) => steer(text, ask?.id)}
                 onStop={cancelRun}
               />
             </div>
@@ -409,7 +485,7 @@ export function App() {
           <HistoryDrawer
             sessions={sessions}
             openId={conversation.id}
-            run={activeRun && { conversationId: activeRun.conversationId, awaitingApproval: activeRun.pendingApproval !== null }}
+            run={activeRun && { conversationId: activeRun.conversationId, waitingFor: activeRun.pendingApproval ? "confirmation" : activeRun.pendingHelp ? "help" : null }}
             agentTabs={agentTabCounts}
             now={Date.now()}
             onOpen={(sessionId) => {

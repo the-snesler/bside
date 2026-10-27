@@ -5,9 +5,11 @@ import {
   createElementRefRegistry,
   describeChanges,
   executeDomAction,
-  extractSearchResults,
+  extractFrameOutline,
   extractSnapshot,
   findInPage,
+  measureForCapture,
+  measureFrameForCapture,
   type ElementRefRegistry,
 } from "@/lib/tools/page-executor";
 import type { DomAction, ElementTarget } from "@/lib/domain/tools";
@@ -16,6 +18,15 @@ const instant = async () => {};
 
 function setBody(html: string): void {
   document.body.innerHTML = html;
+}
+
+/** Makes `<iframe data-src>` elements cross-origin frames at that URL, without loading anything. */
+function crossOriginFrames(): HTMLIFrameElement[] {
+  return Array.from(document.querySelectorAll<HTMLIFrameElement>("iframe[data-src]"), (frame) => {
+    Object.defineProperty(frame, "contentDocument", { get: () => null });
+    Object.defineProperty(frame, "src", { get: () => frame.dataset.src });
+    return frame;
+  });
 }
 
 function outline(registry = createElementRefRegistry("doc")): string {
@@ -64,8 +75,8 @@ describe("outline extraction", () => {
     const text = outline();
     expect(text).toContain("# Agent Fixture\nOrchid launch moved to Friday.");
     expect(text).toContain("- First\n- Second");
-    expect(text).toContain("| Rank | Title\n| 1 | [e1 link \"Bad Boys\" → /m/1]");
-    expect(text).toContain('[e2 button "Submit"]');
+    expect(text).toContain("[table e1 1 row × 2 cols]\n| Rank | Title\n| 1 | [e2 link \"Bad Boys\" → /m/1]");
+    expect(text).toContain('[e3 button "Submit"]');
   });
 
   it("omits hidden content, templates, and aria-hidden subtrees", () => {
@@ -115,7 +126,7 @@ describe("outline extraction", () => {
     expect(text).not.toContain("dumbledore");
   });
 
-  it("descends into same-origin frames and lists cross-origin frames by URL", async () => {
+  it("descends into same-origin frames and lists unaddressable cross-origin frames by URL", async () => {
     setBody('<h2>Level 1</h2><iframe title="Level 2" srcdoc="<label for=n>Name</label><input id=n><button>Send</button>"></iframe>');
     await new Promise((resolve) => setTimeout(resolve, 20));
     const text = outline();
@@ -129,7 +140,43 @@ describe("outline extraction", () => {
     crossOrigin.setAttribute("src", "about:blank#remote");
     Object.defineProperty(crossOrigin, "contentDocument", { get: () => null });
     document.body.append(crossOrigin);
-    expect(outline()).toContain('[frame "Ad-free widget" cross-origin → about:blank#remote]');
+    // Without a frame id for it (no runtime.getFrameId), a cross-origin frame stays opaque.
+    expect(outline()).toContain('[frame "Ad-free widget" (about:blank#remote) not readable: its content is not available to bside]');
+  });
+
+  it("leaves a placeholder line for each cross-origin frame Firefox can address, with its frame id", () => {
+    setBody('<h2>Checkout</h2><iframe id="pay" title="Payment" data-src="https://pay.example/card"></iframe><p>Total: $5</p>' +
+      '<iframe id="pixel" data-src="https://ads.example/p" style="width:1px;height:1px"></iframe>');
+    const ids: Record<string, number> = { pay: 21474836481, pixel: 21474836482 };
+    crossOriginFrames();
+    const built = buildOutline(document, createElementRefRegistry("doc"), { frameIdOf: (frame) => ids[frame.id] ?? -1 });
+    expect(built.lines).toEqual(["## Checkout", '[frame "Payment" → https://pay.example/card]', "Total: $5"]);
+    expect(built.frames).toEqual([{ frameId: 21474836481, line: 1, title: "Payment", url: "https://pay.example/card" }]);
+  });
+
+  it("skips frames laid out off the page or at 0–1 px", () => {
+    setBody('<iframe id="parked" data-src="https://ads.example/a"></iframe><iframe id="flat" data-src="https://ads.example/b"></iframe><iframe id="ok" data-src="https://ok.example/"></iframe>');
+    const boxes: Record<string, Partial<DOMRect>> = {
+      parked: { left: -9000, top: 0, right: -8700, bottom: 250, width: 300, height: 250 },
+      flat: { left: 0, top: 0, right: 300, bottom: 1, width: 300, height: 1 },
+      ok: { left: 0, top: 10, right: 300, bottom: 260, width: 300, height: 250 },
+    };
+    for (const frame of crossOriginFrames()) frame.getBoundingClientRect = () => boxes[frame.id] as DOMRect;
+    const built = buildOutline(document, createElementRefRegistry("doc"), { frameIdOf: () => 9 });
+    expect(built.lines).toEqual(["[frame → https://ok.example/]"]);
+  });
+
+  it("labels refs with the frame's prefix and bounds a frame outline, dropping frames past the cut", () => {
+    setBody('<button>Pay</button><p>' + "x".repeat(600) + '</p><iframe data-src="https://nested.example/"></iframe>');
+    crossOriginFrames();
+    const registry = createElementRefRegistry("frame-doc");
+    const full = extractFrameOutline(document, registry, 10_000, { refPrefix: "f2:", frameIdOf: () => 33 });
+    expect(full.lines[0]).toBe('[f2:e1 button "Pay"]');
+    expect(full.frames).toEqual([{ frameId: 33, line: 2, title: "", url: "https://nested.example/" }]);
+    expect(full.documentId).toBe("frame-doc");
+    const cut = extractFrameOutline(document, registry, 500, { refPrefix: "f2:", frameIdOf: () => 33 });
+    expect(cut.lines).toEqual(['[f2:e1 button "Pay"]', "[Frame outline truncated: it exceeds the frame size limit]"]);
+    expect(cut.frames).toEqual([]);
   });
 
   it("exposes hidden radios through their visible labels and contenteditable editors as textboxes", () => {
@@ -190,21 +237,6 @@ describe("snapshot paging and find", () => {
   });
 });
 
-describe("search result extraction", () => {
-  it("unwraps redirect links into organic results with snippets and skips engine links", () => {
-    setBody(`
-      <div class="result"><h2><a href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.boxofficemojo.com%2Fyear%2Fworld%2F2020%2F&rut=x">2020 Worldwide Box Office</a></h2>
-        <a href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.boxofficemojo.com%2Fyear%2Fworld%2F2020%2F">The top grossing movies worldwide in 2020, ranked by total gross.</a></div>
-      <div class="result"><h2><a href="https://duckduckgo.com/y.js?ad_domain=ads.example">Sponsored</a></h2></div>
-      <a href="https://duckduckgo.com/settings">Settings</a>`);
-    expect(extractSearchResults(document)).toEqual([{
-      title: "2020 Worldwide Box Office",
-      url: "https://www.boxofficemojo.com/year/world/2020/",
-      snippet: expect.stringContaining("ranked by total gross"),
-    }]);
-  });
-});
-
 describe("action targeting", () => {
   beforeEach(() => setBody(""));
 
@@ -214,6 +246,26 @@ describe("action targeting", () => {
     outline(registry);
     const result = await act(registry, { kind: "click", target: { kind: "ref", ref: "e1", documentId: "previous" } });
     expect(result).toMatchObject({ ok: false, code: "STALE_SNAPSHOT" });
+  });
+
+  it("acts in a cross-origin frame's document by its local ref and reports it with the frame prefix", async () => {
+    setBody('<label for="card">Card</label><input id="card"><button>Pay</button>');
+    const registry = createElementRefRegistry("frame-doc");
+    const options = { refPrefix: "f2:" };
+    buildOutline(document, registry, options);
+    const filled = await executeDomAction(document, registry, { kind: "fill", target: { kind: "ref", ref: "e1", documentId: "frame-doc" }, text: "4242" }, instant, options);
+    expect(filled.ok).toBe(true);
+    expect(filled.summary).toContain('Filled [f2:e1 textbox "Card"].');
+    expect(filled.summary).toContain('+ Card [f2:e1 textbox "Card" value="4242"]');
+    const stale = await executeDomAction(document, registry, { kind: "click", target: { kind: "ref", ref: "e2", documentId: "old-frame-doc" } }, instant, options);
+    expect(stale).toMatchObject({ ok: false, code: "STALE_SNAPSHOT", summary: expect.stringContaining("Ref f2:e2 came from an earlier page load; frame f2 now shows a different document") });
+  });
+
+  it("points a missing locator at frame refs when the page has cross-origin frames", async () => {
+    setBody('<iframe data-src="https://pay.example/"></iframe>');
+    crossOriginFrames();
+    const result = await executeDomAction(document, createElementRefRegistry("doc"), { kind: "click", target: role("button", "Pay") }, instant, { frameIdOf: () => 5 });
+    expect(result).toMatchObject({ ok: false, code: "TARGET_MISSING", summary: expect.stringContaining('reached only by ref, like page.ref("f1:e3")') });
   });
 
   it("distinguishes removed, hidden, and disabled targets", async () => {
@@ -318,6 +370,15 @@ describe("actions and outcome feedback", () => {
     expect(changed).toBe(true);
   });
 
+  it("attaches a binary workspace file's decoded bytes", async () => {
+    setBody('<input type="file" aria-label="Photo" accept="image/png">');
+    const result = await act(createElementRefRegistry("doc"), { kind: "upload", target: role("file", "Photo"), files: [{ name: "shot.png", mimeType: "image/png", base64: "iVBORw0KGgo=" }] });
+    expect(result.ok, result.summary).toBe(true);
+    const file = (document.querySelector("input") as HTMLInputElement).files![0]!;
+    expect(file).toMatchObject({ name: "shot.png", type: "image/png", size: 8 });
+    expect([...new Uint8Array(await file.arrayBuffer())]).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  });
+
   it("submits the form on Enter from a text field", async () => {
     setBody('<form><input aria-label="Query"><button>Go</button></form>');
     let submitted = false;
@@ -339,6 +400,54 @@ describe("actions and outcome feedback", () => {
 describe("change descriptions", () => {
   it("reports added and removed lines and an unchanged outline", () => {
     expect(describeChanges(["a", "b"], ["a", "b"])).toBe("Page outline unchanged.");
+    expect(describeChanges(["h", "a", "b", "c", "f"], ["h", "c", "a", "b", "f"])).toBe("Page outline reordered (3 lines moved); that part now reads:\n~ c\n~ a\n~ b");
+    expect(describeChanges(["h", "a", "b", "c"], ["h", "c", "a", "b", "Moved"])).toBe("Page changes (+1 −0 lines):\n+ Moved\nPage outline reordered (3 lines moved); that part now reads:\n~ c\n~ a\n~ b");
+    expect(describeChanges(["a", "b", "c"], ["a", "c", "new"])).toBe("Page changes (+1 −1 lines):\n+ new\n- b");
     expect(describeChanges(["a", "b"], ["a", "c", "c"])).toBe("Page changes (+2 −1 lines):\n+ c\n+ c\n- b");
   });
 });
+
+describe("measureForCapture", () => {
+  it("reports the viewport, the page size, and a target's box in document coordinates", () => {
+    setBody('<button id="go">Go</button><button disabled>Off</button>');
+    const registry = createElementRefRegistry("doc");
+    buildOutline(document, registry);
+    const button = document.querySelector("#go")!;
+    button.getBoundingClientRect = () => ({ left: 20, top: 30, width: 60, height: 24, right: 80, bottom: 54, x: 20, y: 30, toJSON: () => ({}) });
+    window.scrollTo(0, 0);
+    const measured = measureForCapture(document, registry, role("button", "Go"));
+    expect(measured).toMatchObject({ ok: true, geometry: { documentId: "doc", element: { x: 20, y: 30, width: 60, height: 24 } } });
+    if (!measured.ok) return;
+    expect(measured.geometry.viewport.width).toBeGreaterThan(0);
+    expect(measured.geometry.page.height).toBeGreaterThanOrEqual(measured.geometry.viewport.height);
+    expect(measureForCapture(document, registry, null)).toMatchObject({ ok: true, geometry: { element: null } });
+  });
+
+  it("measures a cross-origin child frame's content box, found by frame id inside shadow roots too", () => {
+    setBody('<div id="host"></div>');
+    const root = document.getElementById("host")!.attachShadow({ mode: "open" });
+    root.innerHTML = '<iframe data-src="https://pay.example/" style="padding: 4px"></iframe>';
+    const frame = root.querySelector("iframe")!;
+    Object.defineProperty(frame, "contentDocument", { get: () => null });
+    frame.getBoundingClientRect = () => ({ left: 100, top: 200, width: 310, height: 160, right: 410, bottom: 360, x: 100, y: 200, toJSON: () => ({}) });
+    Object.defineProperties(frame, { clientLeft: { get: () => 1 }, clientTop: { get: () => 1 }, clientWidth: { get: () => 308 }, clientHeight: { get: () => 158 } });
+    window.scrollTo(0, 0);
+    const frameIdOf = (element: Element) => (element === frame ? 42 : -1);
+    expect(measureFrameForCapture(document, createElementRefRegistry("doc"), 42, frameIdOf)).toMatchObject({
+      ok: true, geometry: { documentId: "doc", element: { x: 105, y: 205, width: 300, height: 150 } },
+    });
+    expect(measureFrameForCapture(document, createElementRefRegistry("doc"), 43, frameIdOf)).toMatchObject({ ok: false, result: { code: "TARGET_MISSING" } });
+  });
+
+  it("rejects a ref from an earlier document and an element without a box; a disabled control is fine to look at", () => {
+    setBody('<button>Go</button><button disabled id="off">Off</button>');
+    const registry = createElementRefRegistry("doc");
+    buildOutline(document, registry);
+    expect(measureForCapture(document, registry, { kind: "ref", ref: "e1", documentId: "old" })).toMatchObject({ ok: false, result: { code: "STALE_SNAPSHOT" } });
+    expect(measureForCapture(document, registry, role("button", "Go"))).toMatchObject({ ok: false, result: { code: "NOT_INTERACTABLE" } });
+    const off = document.querySelector("#off")!;
+    off.getBoundingClientRect = () => ({ left: 0, top: 0, width: 10, height: 10, right: 10, bottom: 10, x: 0, y: 0, toJSON: () => ({}) });
+    expect(measureForCapture(document, registry, role("button", "Off")).ok).toBe(true);
+  });
+});
+

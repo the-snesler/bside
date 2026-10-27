@@ -21,8 +21,8 @@ export interface HistoryDrawerProps {
   /** In display order, as the background lists them. */
   sessions: readonly ConversationSummary[];
   openId: string;
-  /** The single active run, if any. */
-  run: { conversationId: string; awaitingApproval: boolean } | null;
+  /** The single active run, if any, and what it is waiting on the user for. */
+  run: { conversationId: string; waitingFor: "confirmation" | "help" | null } | null;
   /** Hidden agent tabs per session id. */
   agentTabs: Readonly<Record<string, number>>;
   now: number;
@@ -189,8 +189,9 @@ function Row({ session, openId, run, agentTabs, now, onOpen, onRename, onPin, on
           <span class="history__meta">
             <time dateTime={updated.toISOString()} title={updated.toLocaleString()}>{formatRelativeTime(session.updatedAt, now)}</time>
             {isOpen && " · Current"}
+            {session.scheduled && " · Scheduled"}
             {tabs > 0 && ` · ${tabsLabel}`}
-            {runHere && <span class="history__status">{run!.awaitingApproval ? " · Needs confirmation" : " · Working"}</span>}
+            {runHere && <span class="history__status">{run!.waitingFor === "confirmation" ? " · Needs confirmation" : run!.waitingFor === "help" ? " · Needs your help" : " · Working"}</span>}
             {/* Last, so a narrow row truncates it before the status. */}
             {usage && <span class="history__usage" title={usage.title}>{` · ${usage.text}`}</span>}
           </span>

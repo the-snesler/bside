@@ -11,7 +11,12 @@
  */
 
 import { storage } from "wxt/utils/storage";
+import { isScheduledTask, isScheduledSource, MAX_SCHEDULED_TASKS, taskDraft, type ScheduledTask, type ScheduledTasksV1, type NotificationSettingsV1 } from "@/lib/domain/automation";
 import { isSkill } from "@/lib/domain/skills";
+import { isAskContext } from "@/lib/domain/ask";
+import { isCustomInstructionsText, isSiteNote, MAX_SITE_NOTES, type CustomInstructionsV1, type SiteNote, type SiteNotesV1 } from "@/lib/domain/instructions";
+import { DEFAULT_MCP_SERVER_STATE, isMcpServerState, type McpServerStateV1 } from "@/lib/domain/mcp";
+import { DEFAULT_MEMORY_SETTINGS, isMemoryChange, isMemoryEntry, MAX_MEMORIES, MEMORY_WRITE_POLICIES, type MemoryEntry, type MemoryEntryV1, type MemorySettingsV1 } from "@/lib/domain/memory";
 import { REASONING_EFFORTS, type AppSettingsV1, type ModelListing, type ReasoningEffort } from "@/lib/domain/provider";
 import type { Conversation, ConversationIndexV1, ConversationItem, ConversationSummary, HistorySettingsV1, MessageQueueV1, QueuedMessage } from "@/lib/domain/conversation";
 import { COMPACTION_SUMMARY_MAX_CHARS, HISTORY_RETENTIONS, isTurnStart, MAX_QUEUED_MESSAGES, titleFromPrompt } from "@/lib/domain/conversation";
@@ -19,7 +24,9 @@ import { digestFromItems, isValidRunDigest } from "@/lib/domain/run-digest";
 import { addRunUsage, EMPTY_USAGE, hasTokens, isValidRunUsage, isValidUsageTotals, type RunUsageV1 } from "@/lib/domain/usage";
 import { DEFAULT_MODEL_ID, DEFAULT_REASONING_EFFORT } from "@/lib/providers/openai-models";
 import { deviceKey, type DeviceKey } from "@/lib/background/device-key";
-import { isSessionId, isWorkspacePath, validatePromptText, WORKSPACE_MAX_FILE_CHARS, WORKSPACE_MAX_FILES } from "@/lib/validation";
+import {
+  base64Bytes, binaryTypeFor, isBinaryFile, isSessionId, isWorkspacePath, validatePromptText, WORKSPACE_MAX_BINARY_TOTAL_BYTES, WORKSPACE_MAX_FILE_CHARS, WORKSPACE_MAX_FILES,
+} from "@/lib/validation";
 import type { ScratchFileEntry, ScratchStore } from "@/lib/background/browser-program";
 
 export type { AppSettingsV1 } from "@/lib/domain/provider";
@@ -64,7 +71,7 @@ export interface ChatGPTRegistrationV1 {
   redirectUri: string;
 }
 
-export type RunStatus = "running" | "awaiting-approval" | "cancelled" | "failed" | "completed";
+export type RunStatus = "running" | "awaiting-approval" | "awaiting-help" | "cancelled" | "failed" | "completed";
 
 export interface RunCheckpointV2 {
   version: 2;
@@ -79,7 +86,7 @@ export interface RunCheckpointV2 {
   updatedAt: number;
 }
 
-const RUN_STATUSES: readonly RunStatus[] = ["running", "awaiting-approval", "cancelled", "failed", "completed"];
+const RUN_STATUSES: readonly RunStatus[] = ["running", "awaiting-approval", "awaiting-help", "cancelled", "failed", "completed"];
 
 const DEFAULT_APP_SETTINGS: AppSettingsV1 = {
   version: 1,
@@ -140,11 +147,16 @@ function isValidConversationItem(value: unknown): value is ConversationItem {
   if (typeof v.id !== "string" || typeof v.at !== "number") return false;
   if (v.kind === "message") {
     if (typeof v.text !== "string") return false;
-    if (v.role === "user") return (v.context === null || typeof v.context === "object") && (v.delivery === undefined || v.delivery === "steer") && (v.skill === undefined || isSkill(v.skill));
+    if (v.role === "user") return (v.context === null || typeof v.context === "object") && (v.delivery === undefined || v.delivery === "steer") && (v.skill === undefined || isSkill(v.skill)) &&
+      (v.scheduled === undefined || isScheduledSource(v.scheduled)) &&
+      (v.sites === undefined || (Array.isArray(v.sites) && v.sites.length <= MAX_SITE_NOTES && v.sites.every(isSiteNote))) && (v.ask === undefined || isAskContext(v.ask));
     return v.role === "assistant";
   }
   if (v.kind === "tool-call") return typeof v.call === "object" && v.call !== null;
-  if (v.kind === "tool-result") return typeof v.callId === "string" && typeof v.result === "object" && v.result !== null;
+  if (v.kind === "tool-result") {
+    return typeof v.callId === "string" && typeof v.result === "object" && v.result !== null &&
+      (v.memory === undefined || (Array.isArray(v.memory) && v.memory.length <= 64 && v.memory.every(isMemoryChange)));
+  }
   if (v.kind === "run-digest") return isValidRunDigest(v.digest);
   if (v.kind === "run-usage") return isValidRunUsage(v.usage);
   if (v.kind === "compaction") {
@@ -198,6 +210,97 @@ export async function getHistorySettings(): Promise<HistorySettingsV1> {
 
 export async function saveHistorySettings(settings: HistorySettingsV1): Promise<void> {
   await historySettingsItem.setValue(settings);
+}
+
+// Automation records are only written by the background scheduler. Every read
+// removes corrupt entries and later duplicates; unrelated storage is untouched.
+const scheduledTasksItem = storage.defineItem<ScheduledTasksV1>("local:scheduledTasks", { version: 1 });
+const notificationSettingsItem = storage.defineItem<NotificationSettingsV1>("local:notificationSettings", { version: 1 });
+
+export async function getScheduledTasks(): Promise<ScheduledTask[]> {
+  const raw: unknown = await scheduledTasksItem.getValue();
+  if (raw === null) return [];
+  const record = raw as Partial<ScheduledTasksV1> | null;
+  if (record?.version !== 1 || !Array.isArray(record.tasks)) { await scheduledTasksItem.removeValue(); return []; }
+  const tasks: ScheduledTask[] = [];
+  for (const t of record.tasks) {
+    if (tasks.length >= MAX_SCHEDULED_TASKS || !isScheduledTask(t) || tasks.some((other) => other.id === t.id || (t.sessionId !== null && other.sessionId === t.sessionId))) continue;
+    tasks.push({ ...taskDraft(t), id: t.id, createdAt: t.createdAt, updatedAt: t.updatedAt, sessionId: t.sessionId, nextAt: t.nextAt, unread: t.unread,
+      lastTick: t.lastTick ? { at: t.lastTick.at, status: t.lastTick.status } : null,
+      lastRun: t.lastRun ? { runId: t.lastRun.runId, startedAt: t.lastRun.startedAt, endedAt: t.lastRun.endedAt, status: t.lastRun.status } : null });
+  }
+  if (JSON.stringify(tasks) !== JSON.stringify(record.tasks)) await saveScheduledTasks(tasks);
+  return tasks;
+}
+
+export async function saveScheduledTasks(tasks: ScheduledTask[]): Promise<void> {
+  if (tasks.length > MAX_SCHEDULED_TASKS || !tasks.every(isScheduledTask)) throw new Error("Invalid scheduled tasks.");
+  await scheduledTasksItem.setValue({ version: 1, tasks });
+}
+
+export async function getNotificationSettings(): Promise<NotificationSettingsV1> {
+  const raw: unknown = await notificationSettingsItem.getValue();
+  const v = raw as Partial<NotificationSettingsV1> | null;
+  if (v?.version === 1 && typeof v.enabled === "boolean") return { version: 1, enabled: v.enabled };
+  if (raw !== null) await notificationSettingsItem.removeValue();
+  return { version: 1, enabled: false };
+}
+
+export async function saveNotificationSettings(settings: NotificationSettingsV1): Promise<void> {
+  await notificationSettingsItem.setValue({ version: 1, enabled: settings.enabled });
+}
+
+// ---------------------------------------------------------------------------
+// Custom instructions and site notes — user-authored, written only through
+// `lib/background/instructions.ts` (options requests, and the sidebar's
+// "Remember something about this site").
+// ---------------------------------------------------------------------------
+
+const customInstructionsItem = storage.defineItem<CustomInstructionsV1>("local:customInstructions", { version: 1 });
+const siteNotesItem = storage.defineItem<SiteNotesV1>("local:siteNotes", { version: 1 });
+
+/** The custom instructions, or `""`. A malformed record is deleted. */
+export async function getCustomInstructions(): Promise<string> {
+  const raw: unknown = await customInstructionsItem.getValue();
+  const record = raw as { version?: unknown; text?: unknown } | null;
+  if (record?.version === 1 && isCustomInstructionsText(record.text) && record.text.trim()) return record.text;
+  if (raw !== null) await customInstructionsItem.removeValue();
+  return "";
+}
+
+/** Saves the text; blank text removes the record. */
+export async function saveCustomInstructions(text: string): Promise<void> {
+  if (!text.trim()) await customInstructionsItem.removeValue();
+  else await customInstructionsItem.setValue({ version: 1, text });
+}
+
+/**
+ * Site notes in stored order. Invalid entries, later duplicates of an origin,
+ * and entries past `MAX_SITE_NOTES` are dropped and the record rewritten; a
+ * malformed record is deleted.
+ */
+export async function getSiteNotes(): Promise<SiteNote[]> {
+  const raw: unknown = await siteNotesItem.getValue();
+  if (raw === null) return [];
+  const record = raw as { version?: unknown; notes?: unknown };
+  if (record.version !== 1 || !Array.isArray(record.notes)) {
+    await siteNotesItem.removeValue();
+    return [];
+  }
+  const notes: SiteNote[] = [];
+  for (const note of record.notes as unknown[]) {
+    if (notes.length < MAX_SITE_NOTES && isSiteNote(note) && !notes.some((other) => other.origin === note.origin)) {
+      notes.push({ origin: note.origin, includeSubdomains: note.includeSubdomains, text: note.text });
+    }
+  }
+  if (notes.length !== record.notes.length) await saveSiteNotes(notes);
+  return notes;
+}
+
+/** Replaces every site note; no notes removes the record. */
+export async function saveSiteNotes(notes: readonly SiteNote[]): Promise<void> {
+  if (notes.length === 0) await siteNotesItem.removeValue();
+  else await siteNotesItem.setValue({ version: 1, notes: [...notes] });
 }
 
 // ---------------------------------------------------------------------------
@@ -346,7 +449,7 @@ export async function migrateCredentials(key: DeviceKey = deviceKey): Promise<vo
 //   local:conversation:<id>            ConversationRecordV2 (item count; the commit point for appends)
 //   local:conversation:<id>:items:<n>  ConversationChunkV1 (items n*CHUNK .. n*CHUNK+CHUNK-1)
 //   local:openConversation             OpenConversationV1 (the session the sidebar shows)
-//   local:workspace:<id>:<slot>        WorkspaceFileV1 (one /workspace file of the session; see below)
+//   local:workspace:<id>:<slot>        WorkspaceFileV2 (one /workspace file of the session; see below)
 //   local:queue:<id>                   MessageQueueV1 (messages typed while a run worked, until delivered)
 //
 // An append writes only the tail chunk and the session record, in one
@@ -407,7 +510,7 @@ function withConversationLock<T>(task: () => Promise<T>): Promise<T> {
 function isValidSummary(value: unknown): value is ConversationSummary {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
-  return isSessionId(v.id) && typeof v.title === "string" && v.title.length <= 200 &&
+  return isSessionId(v.id) && (v.scheduled === undefined || isScheduledSource(v.scheduled)) && typeof v.title === "string" && v.title.length <= 200 &&
     (v.titleSource === "prompt" || v.titleSource === "user") && Number.isFinite(v.createdAt) && Number.isFinite(v.updatedAt) &&
     typeof v.pinned === "boolean" && Number.isSafeInteger(v.itemCount) && (v.itemCount as number) >= 0 &&
     (v.lastModelId === null || (typeof v.lastModelId === "string" && v.lastModelId.length <= 200)) && isValidUsageTotals(v.usage);
@@ -602,7 +705,7 @@ export function appendConversationItem(id: string, item: ConversationItem): Prom
  * prompt unless the session already has one, and an ended run's usage added
  * to the running total.
  */
-export function touchSession(id: string, turn: { prompt?: string; modelId?: string; usage?: RunUsageV1 } = {}): Promise<void> {
+export function touchSession(id: string, turn: { prompt?: string; modelId?: string; usage?: RunUsageV1; scheduled?: import("@/lib/domain/automation").ScheduledSource } = {}): Promise<void> {
   return withConversationLock(async () => {
     const sessions = await readIndex();
     const index = sessions.findIndex((session) => session.id === id);
@@ -611,6 +714,7 @@ export function touchSession(id: string, turn: { prompt?: string; modelId?: stri
     const record = await readRecord(id);
     sessions[index] = {
       ...session,
+      ...(turn.scheduled ? { scheduled: turn.scheduled } : {}),
       itemCount: record?.itemCount ?? session.itemCount,
       updatedAt: record?.updatedAt ?? session.updatedAt,
       lastModelId: turn.modelId ?? session.lastModelId,
@@ -756,38 +860,64 @@ export async function migrateConversation(): Promise<void> {
 // Workspace — each session's /workspace scratch files, one key per file slot.
 //
 // A session has WORKSPACE_MAX_FILES fixed slots, so writing, removing, or
-// renaming a file touches one key of at most WORKSPACE_MAX_FILE_CHARS, never
-// the whole workspace, and deleting a session removes a known key set without
+// renaming a file touches one key (at most WORKSPACE_MAX_FILE_CHARS of text or
+// WORKSPACE_MAX_BINARY_BYTES of binary), never the whole workspace, and deleting a session removes a known key set without
 // listing storage. The slot record carries its path; there is no separate
 // manifest that could disagree with the files.
 // ---------------------------------------------------------------------------
 
-export interface WorkspaceFileV1 {
-  version: 1;
-  path: string;
-  content: string;
-}
+/** One `/workspace` file: text, or a binary of an allowed type as base64 whose type its path's extension names. */
+export type WorkspaceFileV2 = { version: 2; path: string } & (
+  | { kind: "text"; content: string }
+  | { kind: "binary"; mimeType: string; data: string; bytes: number }
+);
 
 const workspaceKey = (id: string, slot: number) => `local:workspace:${id}:${slot}` as const;
 const workspaceKeys = (id: string) => Array.from({ length: WORKSPACE_MAX_FILES }, (_, slot) => workspaceKey(id, slot));
 
-function isValidWorkspaceFile(value: unknown): value is WorkspaceFileV1 {
-  if (typeof value !== "object" || value === null) return false;
+/** The file a slot record holds, revalidated; null when it is malformed. A pre-binary (version 1) record is a text file. */
+function readWorkspaceFile(value: unknown): WorkspaceFileV2 | null {
+  if (typeof value !== "object" || value === null) return null;
   const v = value as Record<string, unknown>;
-  return v.version === 1 && isWorkspacePath(v.path) && typeof v.content === "string" && v.content.length <= WORKSPACE_MAX_FILE_CHARS;
+  if (!isWorkspacePath(v.path)) return null;
+  const textType = binaryTypeFor(v.path) === null;
+  if (v.version === 1 && textType && typeof v.content === "string" && v.content.length <= WORKSPACE_MAX_FILE_CHARS) {
+    return { version: 2, path: v.path, kind: "text", content: v.content };
+  }
+  if (v.version !== 2) return null;
+  if (v.kind === "text") return textType && typeof v.content === "string" && v.content.length <= WORKSPACE_MAX_FILE_CHARS ? { version: 2, path: v.path, kind: "text", content: v.content } : null;
+  if (v.kind === "binary" && isBinaryFile(v.path, v.mimeType, v.data) && base64Bytes(v.data) === v.bytes) {
+    return { version: 2, path: v.path, kind: "binary", mimeType: v.mimeType as string, data: v.data as string, bytes: v.bytes as number };
+  }
+  return null;
 }
 
-/** A session's scratch files by slot. Malformed slots and later duplicates of a path are deleted. */
+/**
+ * A session's scratch files by slot. Malformed slots, later duplicates of a
+ * path, and binaries past the session's binary budget are deleted; version 1
+ * text records are rewritten as version 2.
+ */
 export async function loadWorkspaceFiles(sessionId: string): Promise<ScratchFileEntry[]> {
   const slots = await storage.getItems(workspaceKeys(sessionId));
   const files: ScratchFileEntry[] = [];
   const invalid: (typeof slots)[number]["key"][] = [];
+  const upgraded: { key: (typeof slots)[number]["key"]; value: WorkspaceFileV2 }[] = [];
+  let binaryBytes = 0;
   for (const [slot, { key, value }] of slots.entries()) {
     if (value === null || value === undefined) continue;
-    if (isValidWorkspaceFile(value) && !files.some((file) => file.path === value.path)) files.push({ slot, path: value.path, content: value.content });
-    else invalid.push(key);
+    const file = readWorkspaceFile(value);
+    if (!file || files.some((other) => other.path === file.path) ||
+        (file.kind === "binary" && binaryBytes + file.bytes > WORKSPACE_MAX_BINARY_TOTAL_BYTES)) {
+      invalid.push(key);
+      continue;
+    }
+    if (file.kind === "binary") binaryBytes += file.bytes;
+    if ((value as { version?: unknown }).version === 1) upgraded.push({ key, value: file });
+    const { version: _version, ...entry } = file;
+    files.push({ slot, ...entry });
   }
   if (invalid.length > 0) await storage.removeItems(invalid);
+  if (upgraded.length > 0) await storage.setItems(upgraded);
   return files;
 }
 
@@ -795,9 +925,130 @@ export async function loadWorkspaceFiles(sessionId: string): Promise<ScratchFile
 export function workspaceStore(sessionId: string): ScratchStore {
   return {
     load: () => loadWorkspaceFiles(sessionId),
-    write: ({ slot, path, content }) => storage.setItem(workspaceKey(sessionId, slot), { version: 1, path, content } satisfies WorkspaceFileV1),
+    write: ({ slot, ...file }) => storage.setItem(workspaceKey(sessionId, slot), { version: 2, ...file } satisfies WorkspaceFileV2),
     remove: (slot) => storage.removeItem(workspaceKey(sessionId, slot)),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Memory — the agent's global /memory, one key per entry slot like /workspace,
+// written only through `lib/background/memory.ts`. A slot record carries its
+// name; malformed records and later duplicates of a name are deleted on read.
+// ---------------------------------------------------------------------------
+
+/** One stored memory and its `local:memory:<slot>` slot (0–199). */
+export interface MemorySlot {
+  slot: number;
+  entry: MemoryEntry;
+}
+
+const memoryKey = (slot: number) => `local:memory:${slot}` as const;
+const MEMORY_KEYS = Array.from({ length: MAX_MEMORIES }, (_, slot) => memoryKey(slot));
+const memorySettingsItem = storage.defineItem<MemorySettingsV1>("local:memorySettings", { version: 1 });
+
+export async function loadMemories(): Promise<MemorySlot[]> {
+  const slots = await storage.getItems(MEMORY_KEYS);
+  const memories: MemorySlot[] = [];
+  const invalid: (typeof slots)[number]["key"][] = [];
+  for (const [slot, { key, value }] of slots.entries()) {
+    if (value === null || value === undefined) continue;
+    const record = value as { version?: unknown };
+    if (record.version === 1 && isMemoryEntry(value) && !memories.some((other) => other.entry.name === value.name)) {
+      const { name, description, body, createdAt, provenance } = value;
+      memories.push({ slot, entry: { name, description, body, createdAt, provenance } });
+    } else invalid.push(key);
+  }
+  if (invalid.length > 0) await storage.removeItems(invalid);
+  return memories;
+}
+
+export async function saveMemory({ slot, entry }: MemorySlot): Promise<void> {
+  await storage.setItem(memoryKey(slot), { version: 1, ...entry } satisfies MemoryEntryV1);
+}
+
+export async function removeMemory(slot: number): Promise<void> {
+  await storage.removeItem(memoryKey(slot));
+}
+
+export async function removeAllMemories(): Promise<void> {
+  await storage.removeItems(MEMORY_KEYS);
+}
+
+/** The memory write policy; a malformed record is deleted and reads as the default, `auto`. */
+export async function getMemorySettings(): Promise<MemorySettingsV1> {
+  const raw: unknown = await memorySettingsItem.getValue();
+  const record = raw as { version?: unknown; writes?: unknown } | null;
+  if (record?.version === 1 && Object.keys(record).length === 2 && (MEMORY_WRITE_POLICIES as readonly unknown[]).includes(record.writes)) return record as MemorySettingsV1;
+  if (raw !== null) await memorySettingsItem.removeValue();
+  return DEFAULT_MEMORY_SETTINGS;
+}
+
+export async function saveMemorySettings(settings: MemorySettingsV1): Promise<void> {
+  await memorySettingsItem.setValue({ version: 1, writes: settings.writes });
+}
+
+// ---------------------------------------------------------------------------
+// MCP connections — per directory server (lib/mcp/servers.ts): non-secret
+// state (tool catalog, the user's choices) and two device-key-sealed records,
+// the OAuth tokens and the dynamic client registration. Written only by
+// `lib/background/mcp.ts` and `lib/mcp/auth.ts`.
+// ---------------------------------------------------------------------------
+
+/** A device-key-sealed MCP record (`local:mcpCredential:<id>`, `local:mcpRegistration:<id>`). */
+export interface McpSealedRecordV1 {
+  version: 1;
+  iv: string;
+  ciphertext: string;
+}
+
+export type McpSealedKind = "credential" | "registration";
+
+const mcpServerKey = (id: string) => `local:mcpServer:${id}` as const;
+const mcpSealedKey = (kind: McpSealedKind, id: string) => `local:${kind === "credential" ? "mcpCredential" : "mcpRegistration"}:${id}` as const;
+
+/** A server's state; a malformed record is deleted and reads as the default (disconnected, writes confirmed). */
+export async function getMcpServerState(id: string): Promise<McpServerStateV1> {
+  const raw: unknown = await storage.getItem(mcpServerKey(id));
+  if (isMcpServerState(raw)) return raw;
+  if (raw !== null && raw !== undefined) await storage.removeItem(mcpServerKey(id));
+  return DEFAULT_MCP_SERVER_STATE;
+}
+
+export async function saveMcpServerState(id: string, state: McpServerStateV1): Promise<void> {
+  await storage.setItem(mcpServerKey(id), state);
+}
+
+/** Sealing context: binds a record to its kind and server, so one cannot be opened as another. */
+const mcpSealContext = (kind: McpSealedKind, id: string) => `bside:mcp-${kind}:${id}:v1`;
+
+/**
+ * Background-only: a server's sealed record, opened. A malformed record, or
+ * one the device key cannot open for this kind and server (lost key,
+ * tampering), is deleted and reads as absent; if the key store itself is
+ * unavailable the record is kept and also reads as absent.
+ */
+export async function getMcpSecret(kind: McpSealedKind, id: string, key: DeviceKey = deviceKey): Promise<string | null> {
+  const raw = await storage.getItem<McpSealedRecordV1>(mcpSealedKey(kind, id));
+  if (raw === null) return null;
+  if (!(typeof raw === "object" && raw.version === 1 && Object.keys(raw).length === 3 && typeof raw.iv === "string" && raw.iv.length === 16 &&
+    typeof raw.ciphertext === "string" && raw.ciphertext.length > 0 && raw.ciphertext.length < 200_000)) {
+    await storage.removeItem(mcpSealedKey(kind, id));
+    return null;
+  }
+  let plaintext: string | null;
+  try { plaintext = await key.open(raw, mcpSealContext(kind, id)); }
+  catch { return null; }
+  if (plaintext === null) await storage.removeItem(mcpSealedKey(kind, id));
+  return plaintext;
+}
+
+export async function saveMcpSecret(kind: McpSealedKind, id: string, plaintext: string, key: DeviceKey = deviceKey): Promise<void> {
+  const sealed = await key.seal(plaintext, mcpSealContext(kind, id));
+  await storage.setItem(mcpSealedKey(kind, id), { version: 1, iv: sealed.iv, ciphertext: sealed.ciphertext } satisfies McpSealedRecordV1);
+}
+
+export async function deleteMcpSecret(kind: McpSealedKind, id: string): Promise<void> {
+  await storage.removeItem(mcpSealedKey(kind, id));
 }
 
 // ---------------------------------------------------------------------------
@@ -810,7 +1061,8 @@ function isValidQueuedMessage(value: unknown): value is QueuedMessage {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
   return typeof v.id === "string" && v.id.length > 0 && v.id.length <= 64 && (v.mode === "follow-up" || v.mode === "steer") &&
-    typeof v.text === "string" && validatePromptText(v.text) === v.text && Number.isFinite(v.at) && (v.skill === undefined || isSkill(v.skill));
+    typeof v.text === "string" && validatePromptText(v.text) === v.text && Number.isFinite(v.at) && (v.skill === undefined || isSkill(v.skill)) &&
+    (v.ask === undefined || isAskContext(v.ask));
 }
 
 /** A session's queued messages, oldest first. A malformed record is deleted and reads as empty. */
@@ -855,7 +1107,7 @@ export async function clearRunCheckpoint(): Promise<void> {
 const INTERRUPTED_SUFFIX ="\n\n[Interrupted: the extension restarted before this response finished.]";
 
 /**
- * Startup recovery: a checkpoint left "running"/"awaiting-approval" means the
+ * Startup recovery: a checkpoint left "running"/"awaiting-approval"/"awaiting-help" means the
  * background died mid-run. Convert it into a visible interrupted assistant
  * message in the run's session rather than silently dropping it or claiming
  * stream resumption, followed by a digest of the calls it had started and
@@ -865,7 +1117,7 @@ const INTERRUPTED_SUFFIX ="\n\n[Interrupted: the extension restarted before this
 export async function recoverInterruptedRun(): Promise<string | null> {
   const checkpoint = await getRunCheckpoint();
   if (!checkpoint) return null;
-  if (checkpoint.status !== "running" && checkpoint.status !== "awaiting-approval") {
+  if (checkpoint.status !== "running" && checkpoint.status !== "awaiting-approval" && checkpoint.status !== "awaiting-help") {
     await clearRunCheckpoint();
     return null;
   }

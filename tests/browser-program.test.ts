@@ -1,8 +1,12 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { storage } from "wxt/utils/storage";
 import { BrowserProgram, parseProgram, ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
+import { listMemories, runMemory } from "@/lib/background/memory";
+import { saveMemorySettings } from "@/lib/storage";
+import type { MemoryApproval } from "@/lib/domain/memory";
 import type { ScratchFileEntry, ScratchStore } from "@/lib/background/browser-program";
 import { TabController, type TabControllerBrowserApi } from "@/lib/background/tab-controller";
-import type { DomAction, PageSnapshot, SearchResult } from "@/lib/domain/tools";
+import type { DomAction, PageSnapshot, SearchPage } from "@/lib/domain/tools";
 import type { SiteEnv } from "@/lib/sites/site-api";
 
 /** A scratch store over a slot map, standing in for the session's storage.local records. */
@@ -14,11 +18,16 @@ function memoryStore(initial: ScratchFileEntry[] = []) {
     remove: vi.fn(async (slot: number) => { slots.delete(slot); }),
   };
   /** Persisted contents by path. */
-  const files = () => Object.fromEntries([...slots.values()].map((entry) => [entry.path, entry.content]));
+  const files = () => Object.fromEntries([...slots.values()].map((entry) => [entry.path, entry.kind === "text" ? entry.content : entry.data]));
   return { store, slots, files };
 }
 
-function setup(options: { outline?: string; searchResults?: (url: string) => SearchResult[]; sites?: SiteEnv } = {}) {
+/** A Google results page for `url`, with `overrides`. */
+function googlePage(url: string, overrides: Partial<SearchPage> = {}): SearchPage {
+  return { engine: "google", engineName: "Google", url, results: [], answer: null, blocked: null, excerpt: "No results.", ...overrides };
+}
+
+function setup(options: { outline?: string; searchPage?: (url: string) => Partial<SearchPage>; sites?: SiteEnv; memory?: boolean } = {}) {
   const tabs = new Map([[1, { id: 1, url: "https://example.com", title: "Example", hidden: false }]]);
   const documents = new Map<number, string>([[1, "doc-1"]]);
   const actions: DomAction[] = [];
@@ -38,7 +47,8 @@ function setup(options: { outline?: string; searchResults?: (url: string) => Sea
       return { ok: true, type: "page.find", result: { documentId: documents.get(id) ?? `doc-${id}`, url: tabs.get(id)!.url, query: request.query, count: 1, matches: [{ offset: 0, text: '[e1 button "Continue"]' }] } };
     }
     if (request.type === "page.search-results") {
-      return { ok: true, type: "page.search-results", results: options.searchResults?.(tabs.get(id)!.url) ?? [], url: tabs.get(id)!.url, excerpt: "No results." };
+      const url = tabs.get(id)!.url;
+      return { ok: true, type: "page.search-results", page: googlePage(url, options.searchPage?.(url)) };
     }
     actions.push(request.action);
     return { ok: true, type: "page.execute", result: { ok: true, summary: "Clicked.\nPage changes (+1 −0 lines):\n+ Done" }, documentId: documents.get(id) ?? `doc-${id}` };
@@ -54,13 +64,21 @@ function setup(options: { outline?: string; searchResults?: (url: string) => Sea
     show: vi.fn(async (id) => { tabs.get(id)!.hidden = false; }),
     remove: vi.fn(async (id) => { tabs.delete(id); }),
     onUpdated: { addListener: vi.fn((listener) => setTimeout(() => listener(lastUpdated, { status: "complete" }, {}), 0)), removeListener: vi.fn() },
+  }, search: {
+    // The user's default engine is Google here.
+    query: vi.fn(async ({ text, tabId }) => {
+      lastUpdated = tabId;
+      tabs.get(tabId)!.url = `https://www.google.com/search?q=${encodeURIComponent(text)}`;
+      documents.set(tabId, `doc-${tabId}-${text}`);
+    }),
   } };
   const effect = vi.fn();
   const state = new WorkspaceState();
   const scratch = memoryStore();
   const files = new ScratchFiles(scratch.store);
   const controller = new TabController(api);
-  const program = new BrowserProgram(controller, { state, sessionId: "s1", files, sites: options.sites }, effect);
+  const memory = options.memory ? runMemory("s1", "r1") : undefined;
+  const program = new BrowserProgram(controller, { state, sessionId: "s1", files, sites: options.sites, memory }, effect);
   const run = (source: string) => program.execute(source, abort.signal);
   return { run, tabs, actions, api, effect, state, scratch, files, controller, abort, sendMessage, program, documents };
 }
@@ -256,7 +274,7 @@ describe("browser program tabs, files, and search", () => {
   });
 
   it("persists each scratch-file change to one slot before reporting it, loading the session's files on first use", async () => {
-    const scratch = memoryStore([{ slot: 3, path: "/workspace/kept.md", content: "from last week" }]);
+    const scratch = memoryStore([{ slot: 3, path: "/workspace/kept.md", kind: "text", content: "from last week" }]);
     const files = new ScratchFiles(scratch.store);
     const { controller } = setup();
     const program = new BrowserProgram(controller, { state: new WorkspaceState(), sessionId: "s1", files }, () => {});
@@ -265,7 +283,7 @@ describe("browser program tabs, files, and search", () => {
 
     expect((await run('return fs.read("/workspace/kept.md");')).summary).toBe("from last week");
     expect((await run('await fs.write("/workspace/a.md", "A"); await fs.write("/workspace/a.md", "A2"); await fs.move("/workspace/kept.md", "/workspace/old.md");')).ok).toBe(true);
-    expect([...scratch.slots.entries()].map(([slot, entry]) => [slot, entry.path, entry.content])).toEqual([
+    expect([...scratch.slots.entries()].map(([slot, entry]) => [slot, entry.path, entry.kind === "text" && entry.content])).toEqual([
       [3, "/workspace/old.md", "from last week"], [0, "/workspace/a.md", "A2"],
     ]);
     expect(scratch.store.load).toHaveBeenCalledTimes(1);
@@ -277,8 +295,8 @@ describe("browser program tabs, files, and search", () => {
     expect(failed.summary).toContain("Could not save the workspace change");
     expect((await run('return fs.read("/workspace/a.md");')).summary).toBe("A2");
 
-    await expect(files.write("/workspace/big.txt", "x".repeat(32_001))).rejects.toThrow("Workspace limit");
-    for (let n = 2; n < 64; n++) await files.write(`/workspace/f${n}.txt`, "");
+    await expect(files.write("/workspace/big.txt", { kind: "text", content: "x".repeat(32_001) })).rejects.toThrow("Workspace limits");
+    for (let n = 2; n < 64; n++) await files.write(`/workspace/f${n}.txt`, { kind: "text", content: "" });
     expect((await run('return fs.write("/workspace/one-too-many.txt", "x");')).summary).toContain("64 files");
     expect(scratch.slots.size).toBe(64);
   });
@@ -286,7 +304,7 @@ describe("browser program tabs, files, and search", () => {
   it("uploads from the run's own session workspace", async () => {
     const { controller, actions } = setup();
     const state = new WorkspaceState();
-    const mine = new BrowserProgram(controller, { state, sessionId: "a", files: new ScratchFiles(memoryStore([{ slot: 0, path: "/workspace/cv.txt", content: "Mine" }]).store) }, () => {});
+    const mine = new BrowserProgram(controller, { state, sessionId: "a", files: new ScratchFiles(memoryStore([{ slot: 0, path: "/workspace/cv.txt", kind: "text", content: "Mine" }]).store) }, () => {});
     const other = new BrowserProgram(controller, { state, sessionId: "b", files: new ScratchFiles() }, () => {});
     const upload = 'await browser.tab("/tabs/1/page.md").getByRole("file").setInputFiles("/workspace/cv.txt");';
     expect((await other.execute(upload, new AbortController().signal)).summary).toContain("does not exist");
@@ -340,26 +358,78 @@ describe("browser program tabs, files, and search", () => {
     expect(state.agentTabs.has(2)).toBe(true);
   });
 
-  it("searches the web in one reusable hidden tab and falls back to a second engine", async () => {
-    const { run, api, state } = setup({
-      searchResults: (url) => url.includes("bing.com") || url.includes("box+office") || url.includes("box%20office")
-        ? [{ title: "2020 Worldwide Box Office", url: "https://www.boxofficemojo.com/year/world/2020/", snippet: "Top grossing" }]
-        : [],
+  it("searches with the user's engine in one reusable hidden search tab per session", async () => {
+    const { run, api, state, program } = setup({
+      searchPage: (url) => url.includes("box%20office")
+        ? { results: [{ title: "2020 Worldwide Box Office", url: "https://www.boxofficemojo.com/year/world/2020/", snippet: "Top grossing" }], answer: "Bad Boys for Life was the top film of 2020." }
+        : {},
     });
     const first = await run('return web.search("box office 2020");');
     expect(first.ok, first.summary).toBe(true);
-    expect(first.summary).toContain("via DuckDuckGo");
-    expect(first.summary).toContain("1. 2020 Worldwide Box Office\n   https://www.boxofficemojo.com/year/world/2020/\n   Top grossing");
-    expect(api.tabs.create).toHaveBeenCalledTimes(1);
-    expect(state.agentTabs.get(state.searchTab("s1")!)).toMatchObject({ sessionId: "s1", role: "search" });
+    expect(program.tainted).toBe(true);
+    // The tab starts blank, hidden, and tagged; Firefox's search API loads the user's engine into it.
+    expect(api.tabs.create).toHaveBeenCalledWith({ url: "about:blank", active: false });
+    const tabId = state.searchTab("s1")!;
+    expect(api.tabs.hide).toHaveBeenCalledWith(tabId);
+    expect(state.agentTabs.get(tabId)).toMatchObject({ sessionId: "s1", role: "search" });
+    expect(api.search!.query).toHaveBeenCalledWith({ text: "box office 2020", tabId });
+    expect(first.summary).toContain(`from Google, the user's search engine (search tab /agent-tabs/${tabId}/page.md)`);
+    expect(first.summary).toContain("BEGIN_UNTRUSTED_PAGE\nAnswer box: Bad Boys for Life was the top film of 2020.\n1. 2020 Worldwide Box Office\n   https://www.boxofficemojo.com/year/world/2020/\n   Top grossing\nEND_UNTRUSTED_PAGE");
+    expect((first.data as { visited: string[] }).visited).toEqual(["https://www.google.com/search?q=box%20office%202020"]);
+
     const second = await run('return web.search("obscure query");');
     expect(api.tabs.create).toHaveBeenCalledTimes(1);
-    expect(second.summary).toContain("via Bing");
+    expect(api.search!.query).toHaveBeenLastCalledWith({ text: "obscure query", tabId });
+    expect(second.summary).toContain("No web results could be extracted");
+    // No other engine is tried, and the tab is never navigated directly.
+    expect(api.search!.query).toHaveBeenCalledTimes(2);
+    expect(api.tabs.update).not.toHaveBeenCalled();
+
     // Another session gets its own search tab rather than seeing this one.
     const other = new BrowserProgram(new TabController(api), { state, sessionId: "s2", files: new ScratchFiles() }, () => {});
     expect((await other.execute('return web.search("box office 2020");', new AbortController().signal)).ok).toBe(true);
     expect(api.tabs.create).toHaveBeenCalledTimes(2);
-    expect(state.searchTab("s2")).not.toBe(state.searchTab("s1"));
+    expect(state.searchTab("s2")).not.toBe(tabId);
+  });
+
+  it.each([
+    ["consent", "a consent page", "accept or reject its cookie consent"],
+    ["captcha", "a CAPTCHA or bot check", "prove you are not a robot"],
+  ] as const)("fails a search the engine blocks with a %s page and points the model at request_user_help on the search tab", async (blocked, shown, reason) => {
+    const { run, api, state } = setup({ searchPage: () => ({ blocked, excerpt: "Before you continue" }) });
+    const result = await run('const r = await web.search("orchids"); return r;');
+    const path = `/agent-tabs/${state.searchTab("s1")}/page.md`;
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe("UNSUPPORTED_PAGE");
+    expect(result.summary).toContain(`Google (the user's search engine) is showing ${shown} instead of results in the search tab ${path}.`);
+    expect(result.summary).toContain(`call request_user_help with tab "${path}", kind "verification"`);
+    expect(result.summary).toContain(reason);
+    expect(result.summary).toContain("Do not switch to another search engine");
+    expect(api.search!.query).toHaveBeenCalledTimes(1);
+    expect(api.tabs.update).not.toHaveBeenCalled();
+  });
+
+  it("says so when Firefox's search API is unavailable", async () => {
+    const { run, api } = setup();
+    delete api.search;
+    const result = await run('return web.search("orchids");');
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain("Firefox's search API is unavailable");
+  });
+
+  it("reports the pages a program read, acted on, navigated, or opened, but not the search tab, for site notes", async () => {
+    const { run } = setup({ searchPage: () => ({ results: [{ title: "R", url: "https://r.example/", snippet: "" }] }) });
+    const pages = async (source: string) => {
+      const result = await run(source);
+      expect(result.ok, result.summary).toBe(true);
+      return (result.data as { pages: string[] }).pages;
+    };
+    expect(await pages('return await fs.read("/tabs/1/page.md");')).toEqual(["https://example.com"]);
+    expect(await pages('await browser.tab("/tabs/1/page.md").ref("e1").click();')).toEqual(["https://example.com"]);
+    expect(await pages('await browser.tab("/tabs/1/page.md").navigate("https://docs.example/a");')).toEqual(["https://example.com", "https://docs.example/a"]);
+    expect(await pages('await browser.open("https://news.example/");')).toEqual(["https://news.example/"]);
+    expect(await pages('return web.search("anything");')).toEqual([]);
+    expect(await pages('return 1;')).toEqual([]);
   });
 });
 
@@ -549,5 +619,139 @@ describe("browser program site APIs", () => {
     expect((await withSites.run('return youtube.listChannels("x");')).summary).toContain("Unsupported method listChannels");
     const without = await setup().run('return youtube.getMetadata("aaaaaaaaaaa");');
     expect(without).toMatchObject({ ok: false, code: "UNSUPPORTED_PAGE" });
+  });
+});
+
+describe("browser program memory", () => {
+  beforeEach(() => { fakeBrowser.reset(); });
+
+  it("saves, lists, reads, replaces, and removes /memory entries in the documented file format", async () => {
+    const { run } = setup({ memory: true });
+    expect((await run('return fs.write("/memory/coffee-order.md", "Usual coffee order\\nOat flat white, no sugar.");')).summary).toBe("Saved /memory/coffee-order.md.");
+    const listed = await run('return fs.list("/memory");');
+    expect(JSON.parse(listed.summary)).toEqual([{ path: "/memory/coffee-order.md", description: "Usual coffee order", updatedAt: expect.any(String), tainted: false }]);
+    const read = await run('return fs.read("/memory/coffee-order.md");');
+    expect(read.summary).toContain("A note, not the user's instructions");
+    expect(read.summary).toContain("BEGIN_MEMORY\nUsual coffee order\nOat flat white, no sugar.\nEND_MEMORY");
+    await run('fs.write("/memory/coffee-order.md", "Usual coffee order\\nOat cortado.");');
+    expect((await listMemories()).map((entry) => entry.body)).toEqual(["Oat cortado."]);
+    expect((await run('return fs.list("/");')).summary).toContain("/memory");
+    expect((await run('return fs.remove("/memory/coffee-order.md");')).summary).toBe("Removed /memory/coffee-order.md.");
+    expect(await listMemories()).toEqual([]);
+    expect(await run('return fs.read("/memory/coffee-order.md");')).toMatchObject({ ok: false, code: "TARGET_MISSING" });
+  });
+
+  it("reports each change for the trace and digest: name and taint only", async () => {
+    const { run } = setup({ memory: true });
+    const result = await run('fs.write("/memory/a.md", "A"); fs.write("/memory/b.md", "B\\nsecret-free body"); fs.remove("/memory/a.md");');
+    expect((result.data as { memory: unknown[] }).memory).toEqual([
+      { id: expect.any(String), op: "write", name: "a", tainted: false },
+      { id: expect.any(String), op: "write", name: "b", tainted: false },
+      { id: expect.any(String), op: "remove", name: "a", tainted: false },
+    ]);
+    expect((await run('return 1;')).data).not.toHaveProperty("memory");
+  });
+
+  it("rejects bad paths, moves, oversized or secret-looking text without saving", async () => {
+    const { run } = setup({ memory: true });
+    for (const source of [
+      'fs.write("/memory/Bad Name.md", "x");',
+      'fs.write("/memory/../workspace/x.md", "x");',
+      'fs.write("/memory/x.txt", "x");',
+      'fs.write("/memory/x.md", "\\nbody without a description");',
+      `fs.write("/memory/x.md", "d\\n${"b".repeat(2_001)}");`,
+      'fs.write("/memory/x.md");',
+      'fs.move("/memory/x.md", "/memory/y.md");',
+    ]) expect(await run(source), source).toMatchObject({ ok: false, code: "INVALID_TOOL_ARGUMENTS" });
+    const secret = await run('fs.write("/memory/key.md", "My OpenAI key\\nsk-proj-Ab3dEf6hIj9kLm2nOp5qRs");');
+    expect(secret).toMatchObject({ ok: false, code: "INVALID_TOOL_ARGUMENTS" });
+    expect(secret.summary).toContain("looks like it contains an API key");
+    expect(await listMemories()).toEqual([]);
+    expect(await setup().run('return fs.list("/memory");')).toMatchObject({ ok: false, code: "UNSUPPORTED_PAGE" });
+  });
+
+  it("searches memories by name, description, and body with bounded results", async () => {
+    const { run } = setup({ memory: true });
+    await run('fs.write("/memory/flight-prefs.md", "How the user likes to fly\\nWindow seat, no red-eyes."); fs.write("/memory/coffee.md", "Coffee order\\nFlat white");');
+    const hits = JSON.parse((await run('return memory.search("window seat");')).summary);
+    expect(hits).toEqual([{ path: "/memory/flight-prefs.md", name: "flight-prefs", description: "How the user likes to fly", tainted: false, updatedAt: expect.any(String), excerpt: "Window seat, no red-eyes." }]);
+    expect(JSON.parse((await run('return memory.search("o", 1);')).summary)).toHaveLength(1);
+    for (const source of ['memory.search("");', 'memory.search("x", 21);', 'memory.list();', 'memory.search(fs);']) {
+      expect((await run(source)).ok, source).toBe(false);
+    }
+    expect(() => parseProgram('const memory = 1;')).toThrow("Reserved variable name.");
+  });
+
+  it("marks changes tainted once the run read a page, site API, or tainted memory, and keeps it for the run", async () => {
+    const clean = setup({ memory: true });
+    await clean.run('fs.write("/memory/before.md", "Before");');
+    await clean.run('const page = browser.tab("/tabs/1/page.md"); page.snapshot();');
+    await clean.run('fs.write("/memory/after.md", "After");');
+    expect(Object.fromEntries((await listMemories()).map((entry) => [entry.name, entry.provenance.by === "agent" && entry.provenance.tainted]))).toEqual({ before: false, after: true });
+
+    // A fresh run that reads the tainted memory is tainted too.
+    const reader = setup({ memory: true });
+    await reader.run('fs.read("/memory/before.md");');
+    await reader.run('fs.write("/memory/copy.md", "Copy");');
+    expect((await listMemories()).find((entry) => entry.name === "copy")?.provenance).toMatchObject({ tainted: false });
+    await reader.run('fs.read("/memory/after.md");');
+    await reader.run('fs.write("/memory/copy.md", "Copy");');
+    expect((await listMemories()).find((entry) => entry.name === "copy")?.provenance).toMatchObject({ tainted: true });
+
+    const titles = setup({ memory: true });
+    await titles.run('fs.list("/tabs");');
+    expect(titles.program.tainted).toBe(true);
+    const site = setup({ memory: true, sites: playerSites().sites });
+    await site.run('youtube.search("cats");');
+    expect(site.program.tainted).toBe(true);
+    const marked = setup({ memory: true });
+    marked.program.taint();
+    expect((await marked.run('fs.write("/memory/x.md", "X");')).data).toMatchObject({ memory: [{ name: "x", tainted: true }] });
+  });
+
+  it("refuses every change while the user's policy is off, but still reads and searches", async () => {
+    const { run } = setup({ memory: true });
+    await run('fs.write("/memory/kept.md", "Kept");');
+    await saveMemorySettings({ version: 1, writes: "off" });
+    for (const source of ['fs.write("/memory/new.md", "New");', 'fs.remove("/memory/kept.md");']) {
+      const result = await run(source);
+      expect(result).toMatchObject({ ok: false, code: "ACTION_DENIED" });
+      expect(result.summary).toContain("turned memory saving off");
+    }
+    expect((await listMemories()).map((entry) => entry.name)).toEqual(["kept"]);
+    expect((await run('return fs.read("/memory/kept.md");')).ok).toBe(true);
+    expect((await run('return memory.search("kept");')).ok).toBe(true);
+  });
+
+  it("puts each change to the user under the ask policy, and changes nothing when they decline", async () => {
+    await saveMemorySettings({ version: 1, writes: "ask" });
+    const { program, abort } = setup({ memory: true });
+    const asked: MemoryApproval[] = [];
+    const decide = (approved: boolean) => ({ confirmMemory: async (change: MemoryApproval) => { asked.push(change); return approved; } });
+    const declined = await program.execute('fs.write("/memory/seat.md", "Seat\\nWindow");', abort.signal, decide(false));
+    expect(declined).toMatchObject({ ok: false, code: "ACTION_DENIED" });
+    expect(declined.summary).toContain("The user declined saving /memory/seat.md");
+    expect(await listMemories()).toEqual([]);
+    expect((await program.execute('fs.write("/memory/seat.md", "Seat\\nWindow"); fs.write("/memory/seat.md", "Seat\\nAisle");', abort.signal, decide(true))).ok).toBe(true);
+    expect((await program.execute('fs.remove("/memory/seat.md");', abort.signal, decide(true))).ok).toBe(true);
+    expect(asked).toEqual([
+      { op: "write", name: "seat", description: "Seat", body: "Window", replaces: false, tainted: false },
+      { op: "write", name: "seat", description: "Seat", body: "Window", replaces: false, tainted: false },
+      { op: "write", name: "seat", description: "Seat", body: "Aisle", replaces: true, tainted: false },
+      { op: "remove", name: "seat", description: "Seat", body: "Aisle", replaces: false, tainted: false },
+    ]);
+    // Nothing to ask about: a missing entry, or invalid text, fails first.
+    expect(await program.execute('fs.remove("/memory/seat.md");', abort.signal, decide(true))).toMatchObject({ ok: false, code: "TARGET_MISSING" });
+    expect((await program.execute('fs.write("/memory/key.md", "Key\\nsk-proj-Ab3dEf6hIj9kLm2nOp5qRs");', abort.signal, decide(true))).code).toBe("INVALID_TOOL_ARGUMENTS");
+    expect(asked).toHaveLength(4);
+    // Without a way to ask, nothing is saved.
+    expect(await program.execute('fs.write("/memory/x.md", "X");', abort.signal)).toMatchObject({ ok: false, code: "ACTION_DENIED" });
+  });
+
+  it("gives concurrent memory writes their own slots", async () => {
+    const { run } = setup({ memory: true });
+    await run('Promise.all([fs.write("/memory/a.md", "A"), fs.write("/memory/b.md", "B"), fs.write("/memory/c.md", "C")]);');
+    expect((await listMemories()).map((entry) => entry.name).toSorted()).toEqual(["a", "b", "c"]);
+    expect((await Promise.all([0, 1, 2].map((slot) => storage.getItem(`local:memory:${slot}`)))).every(Boolean)).toBe(true);
   });
 });

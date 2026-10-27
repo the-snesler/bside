@@ -34,6 +34,16 @@ describe("trace read labels", () => {
     expect(describeActivity(activity(source, false), false)).toMatchObject({ title: "Couldn't read YouTube", status: "error" });
   });
 
+  it("labels screenshots and viewed images by their call, without any image", () => {
+    const shot = 'const page = browser.tab("/agent-tabs/3/page.md"); await page.snapshot(); await page.ref("e4").screenshot({save: "/workspace/chart.png"});';
+    expect(describeActivity(activity(shot), false)).toMatchObject({ title: "Taking a screenshot", status: "running" });
+    expect(describeActivity(activity(shot, true), false).title).toBe("Took a screenshot");
+    expect(describeActivity(activity(shot, false), false)).toMatchObject({ title: "Couldn't take a screenshot", status: "error" });
+    expect(describeActivity(activity('await fs.view("/workspace/chart.png");', true), false).title).toBe("Looked at an image");
+    // An effect in the same program still names the step.
+    expect(describeActivity(activity('await page.ref("e1").click(); await page.screenshot();', true), false).title).toBe("Clicked a page control");
+  });
+
   it("keeps page labels for page snapshots", () => {
     const source = 'const page = browser.tab("/tabs/12/page.md"); page.snapshot();';
     expect(describeActivity(activity(source), false).title).toBe("Reading page content");
@@ -48,5 +58,26 @@ describe("trace read labels", () => {
     const skipped = describeActivity({ ...activity("page.ref(\"e1\").click();"), result: { ok: false, code: "SKIPPED", summary: "Not run." } }, false);
     expect(skipped).toMatchObject({ title: "Skipped clicking a page control" });
     expect(skipped.status).toBeUndefined();
+  });
+
+  it("labels table reads", () => {
+    const source = 'const page = browser.tab("/tabs/1/page.md"); await page.snapshot(); const t = await page.table("e4", {offset: 50});';
+    expect(describeActivity(activity(source), false).title).toBe("Reading a table");
+    expect(describeActivity(activity(source, true), false).title).toBe("Read a table");
+    expect(describeActivity(activity(source, false), false)).toMatchObject({ title: "Couldn't read a table", status: "error" });
+  });
+
+  it("labels hovering, and a click after a hover as clicking", () => {
+    expect(describeActivity(activity('await page.ref("e4").hover();', true), false).title).toBe("Hovered over a page control");
+    expect(describeActivity(activity('await page.ref("e4").hover(); await page.ref("e9").click();', true), false).title).toBe("Clicked a page control");
+  });
+
+  it("labels drags", () => {
+    expect(describeActivity(activity('await page.ref("e4").dragTo(page.ref("e9"));'), false).title).toBe("Dragging a page item");
+    expect(describeActivity(activity('await page.ref("e4").dragTo("e9");', false), false)).toMatchObject({ title: "Couldn't drag a page item", status: "error" });
+  });
+
+  it("labels combobox choices like option selection", () => {
+    expect(describeActivity(activity('await page.getByRole("combobox", {name: "Country"}).choose("Canada");', true), false).title).toBe("Selected an option");
   });
 });

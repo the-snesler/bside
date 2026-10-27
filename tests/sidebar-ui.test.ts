@@ -34,7 +34,7 @@ function snapshotFor(id: string): RuntimeSnapshot {
     credential: { configured: true, maskedSuffix: null, chatgpt: { connected: false, email: null, signInAgain: false } },
     provider: OPENAI_API_KEY_PROVIDER,
     settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
-    page: null, agentTabs: { bySession: {}, watching: null }, queue: [], activeRun: null, lastSeq: 0, notice: null,
+    page: null, ask: null, agentTabs: { bySession: {}, watching: null, takenOver: false }, queue: [], activeRun: null, lastSeq: 0, notice: null,
   };
 }
 
@@ -205,7 +205,7 @@ describe("sidebar UI contracts", () => {
     const usage: RunUsageV1 = {
       version: 1, runId: "r1", billing: "api-key", modelId: "gpt-5.6-terra", responses: 1, input: 4_000, cacheRead: 8_100, cacheWrite: 200, output: 1_200, reasoning: 0, costUsd: 0.0123,
     };
-    await emit({ runId: "r1", type: "run.started", payload: { prompt: "Hello", page: null, retry: false } });
+    await emit({ runId: "r1", type: "run.started", payload: { prompt: "Hello", page: null, ask: null, retry: false } });
     await emit({ runId: "r1", type: "assistant.delta", payload: { delta: "Hi." } });
     await emit({ runId: "r1", type: "run.usage", payload: { usage } });
     expect(root.querySelector(".turn-usage")).toBeNull();
@@ -358,7 +358,7 @@ describe("sidebar UI contracts", () => {
       act(() => listeners.forEach((listener) => listener({ v: 1, conversationId, seq: 1, at: 1, ...event })));
     await emit({ runId: null, type: "state.snapshot", payload: snapshotFor("s1") });
 
-    await emit({ runId: "r1", type: "run.started", payload: { prompt: "Find it", page: null, retry: false } });
+    await emit({ runId: "r1", type: "run.started", payload: { prompt: "Find it", page: null, ask: null, retry: false } });
     await emit({ runId: "r1", type: "run.failed", payload: { code: "RATE_LIMIT", message: "Rate limited.", retryable: true, phase: "provider" } });
     expect(background!.lastError?.retryable).toBe(true);
 
@@ -366,7 +366,7 @@ describe("sidebar UI contracts", () => {
     expect(posted.at(-1)).toMatchObject({ v: 1, type: "run.retry" });
     expect(isSidebarCommand(posted.at(-1))).toBe(true);
 
-    await emit({ runId: "r2", type: "run.started", payload: { prompt: "Find it", page: null, retry: true } });
+    await emit({ runId: "r2", type: "run.started", payload: { prompt: "Find it", page: null, ask: null, retry: true } });
     expect(background!.conversation.items.filter((item) => item.kind === "message" && item.role === "user")).toHaveLength(1);
     expect(background!.activeRun?.runId).toBe("r2");
     expect(background!.lastError).toBeNull();
@@ -392,7 +392,7 @@ describe("sidebar UI contracts", () => {
       act(() => listeners.forEach((listener) => listener({ v: 1, seq: 1, at: 1, ...event })));
     await emit({ runId: null, conversationId: "open", type: "state.snapshot", payload: snapshotFor("open") });
 
-    await emit({ runId: "r1", conversationId: "other", type: "run.started", payload: { prompt: "Elsewhere", page: null, retry: false } });
+    await emit({ runId: "r1", conversationId: "other", type: "run.started", payload: { prompt: "Elsewhere", page: null, ask: null, retry: false } });
     await emit({ runId: "r1", conversationId: "other", type: "assistant.delta", payload: { delta: "Working" } });
     await emit({ runId: "r1", conversationId: "other", type: "tool.requested", payload: { call: { id: "c1", name: "browser_program", arguments: {} }, display: "" } });
     expect(background!.activeRun).toMatchObject({ runId: "r1", conversationId: "other" });
@@ -447,7 +447,7 @@ describe("sidebar UI contracts", () => {
     const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) =>
       act(() => listeners.forEach((listener) => listener({ v: 1, seq: 1, at: 1, ...event })));
     await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: snapshotFor("a") });
-    await emit({ runId: "r1", conversationId: "a", type: "run.started", payload: { prompt: "Find it", page: null, retry: false } });
+    await emit({ runId: "r1", conversationId: "a", type: "run.started", payload: { prompt: "Find it", page: null, ask: null, retry: false } });
     expect(composer.props).toMatchObject({ disabled: false, running: true, working: true, canSteer: true });
 
     await act(() => (composer.props!.onSteer as (text: string) => void)("Use tab 2"));
@@ -478,8 +478,70 @@ describe("sidebar UI contracts", () => {
     expect(posted.at(-1)).toMatchObject({ type: "queue.send", sessionId: "a", messageId: "q2" });
 
     // A run in another chat keeps this chat's composer disabled.
-    await emit({ runId: "r2", conversationId: "b", type: "run.started", payload: { prompt: "Elsewhere", page: null, retry: false } });
+    await emit({ runId: "r2", conversationId: "b", type: "run.started", payload: { prompt: "Elsewhere", page: null, ask: null, retry: false } });
     expect(composer.props).toMatchObject({ disabled: true, working: false, canSteer: false });
+    render(null, root);
+  });
+
+  it("remembers something about the attached page's site through validated background requests", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    const posted: Record<string, unknown>[] = [];
+    const listeners: Array<(message: unknown) => void> = [];
+    vi.spyOn(browser.runtime, "connect").mockReturnValue({
+      postMessage: (message: Record<string, unknown>) => posted.push(message),
+      onMessage: { addListener: (listener: (message: unknown) => void) => listeners.push(listener), removeListener: () => {} },
+      disconnect: () => {},
+    } as never);
+    const root = document.createElement("div");
+    document.body.append(root);
+    await act(() => render(h(App, {}), root));
+    const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) =>
+      act(() => listeners.forEach((listener) => listener({ v: 1, seq: 1, at: 1, ...event })));
+    const page = { artifactId: "p", kind: "page" as const, title: "Issues", url: "https://gist.github.com/the-snesler/1", capturedAt: 1, tabId: 4 };
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), page } });
+    const remember = root.querySelector<HTMLButtonElement>('[aria-label="Remember something about this site"]')!;
+    await act(() => remember.click());
+    const lookup = posted.at(-1)!;
+    expect(lookup).toMatchObject({ type: "siteNote.get", url: page.url });
+    expect(isSidebarCommand(lookup)).toBe(true);
+    expect(root.querySelector(".site-note")?.textContent).toContain("Loading");
+
+    // A reply to some other request is ignored; the matching one prefills the covering parent note.
+    const parent = { origin: "https://github.com", includeSubdomains: true, text: "Use <b>gh</b> syntax." };
+    await emit({ runId: null, conversationId: null, type: "siteNote.loaded", payload: { requestId: "stale", origin: "https://gist.github.com", note: null } });
+    expect(root.querySelector(".site-note textarea")).toBeNull();
+    await emit({ runId: null, conversationId: null, type: "siteNote.loaded", payload: { requestId: lookup.id as string, origin: "https://gist.github.com", note: parent } });
+    const textarea = root.querySelector<HTMLTextAreaElement>(".site-note textarea")!;
+    expect(textarea.value).toBe(parent.text);
+    expect(root.querySelector(".site-note b")).toBeNull();
+    expect(root.querySelector(".site-note__title")?.textContent).toBe("Remember about github.com");
+    expect(root.querySelector<HTMLInputElement>(".site-note input[type=checkbox]")!.checked).toBe(true);
+
+    await act(() => {
+      textarea.value = "a".repeat(1_001);
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const save = () => [...root.querySelectorAll<HTMLButtonElement>(".site-note button")].find((button) => button.textContent === "Save")!;
+    expect(save().disabled).toBe(true);
+    await act(() => {
+      textarea.value = "Prefer CLI-style search.";
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(() => save().click());
+    const saved = posted.at(-1)!;
+    expect(saved).toMatchObject({ type: "siteNote.save", note: { origin: "https://github.com", includeSubdomains: true, text: "Prefer CLI-style search." } });
+    expect(isSidebarCommand(saved)).toBe(true);
+
+    // A refusal keeps the draft and shows the background's safe message.
+    await emit({ runId: null, conversationId: null, type: "siteNote.saved", payload: { requestId: saved.id as string, note: null, error: "Up to 200 site notes can be saved." } });
+    expect(root.querySelector('.site-note [role="alert"]')?.textContent).toBe("Up to 200 site notes can be saved.");
+    expect(root.querySelector<HTMLTextAreaElement>(".site-note textarea")!.value).toBe("Prefer CLI-style search.");
+    await act(() => save().click());
+    const retried = posted.at(-1)!;
+    await emit({ runId: null, conversationId: null, type: "siteNote.saved", payload: { requestId: retried.id as string, note: (retried as { note: never }).note, error: null } });
+    expect(root.querySelector(".site-note")?.textContent).toContain("Saved. bside will read this when it works on https://github.com or its subdomains.");
+    await act(() => root.querySelector<HTMLButtonElement>('.site-note [aria-label="Close"]')!.click());
+    expect(root.querySelector(".site-note")).toBeNull();
     render(null, root);
   });
 
@@ -541,7 +603,7 @@ describe("history drawer", () => {
     const props: HistoryDrawerProps = {
       sessions: [summary("p", "Pinned trip", { pinned: true }), summary("a", "Alpha <b>bold</b>"), summary("b", "Beta", { updatedAt: now - 3 * 86_400_000 }), summary("e", "")],
       openId: "a",
-      run: { conversationId: "b", awaitingApproval: false },
+      run: { conversationId: "b", waitingFor: null },
       agentTabs: {},
       now,
       onOpen: vi.fn(), onRename: vi.fn(), onPin: vi.fn(), onExport: vi.fn(), onDelete: vi.fn(), onClose: vi.fn(),
@@ -758,10 +820,10 @@ describe("history drawer", () => {
     });
     const attached = (tabId: number) => ({ tabId, artifactId: `page:${tabId}`, kind: "page" as const, title: `Tab <i>${tabId}</i>`, url: `https://www.site-${tabId}.test/page`, capturedAt: 1 });
     const bySession = { a: [tab(5), tab(6, { favIconUrl: "data:image/png;base64,AAAA" })], b: [tab(9)] };
-    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), agentTabs: { bySession: { b: [tab(9)] }, watching: null } } });
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), agentTabs: { bySession: { b: [tab(9)] }, watching: null, takenOver: false } } });
     expect(root.querySelector(".agent-tabs-toggle")).toBeNull();
 
-    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession, watching: null } });
+    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession, watching: null, takenOver: false } });
     const toggle = root.querySelector<HTMLButtonElement>(".agent-tabs-toggle")!;
     expect(toggle.textContent).toBe("2 background tabs");
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
@@ -778,11 +840,11 @@ describe("history drawer", () => {
     expect(isSidebarCommand(posted.at(-1))).toBe(true);
 
     // Watching: the background reports the tab watched, and it is the attached page.
-    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession, watching: 5 } });
+    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession, watching: 5, takenOver: false } });
     await emit({ runId: null, conversationId: null, type: "page.attached", payload: attached(5) });
     expect(toggle.textContent).toBe("Watching site-5.test");
     expect(root.querySelector(".composer--watching")).not.toBeNull();
-    expect(root.querySelector(".agent-tab--watched small")?.textContent).toBe("You're watching");
+    expect(root.querySelector(".agent-tab--watched small")?.textContent).toBe("You're watching · your input is paused");
     expect(root.querySelector(".context-chip--agent")?.textContent).toBe("Tab <i>5</i>bside's tab");
     expect(root.textContent).not.toContain("Close all");
     await act(() => root.querySelector<HTMLButtonElement>(".agent-tab__action--primary")!.click());
@@ -795,9 +857,183 @@ describe("history drawer", () => {
     await emit({ runId: null, conversationId: null, type: "page.attached", payload: attached(1) });
     expect(root.querySelector(".context-chip")?.textContent).toBe("Tab <i>1</i>www.site-1.test");
 
-    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession, watching: null } });
+    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession, watching: null, takenOver: false } });
     await act(() => [...root.querySelectorAll<HTMLButtonElement>(".agent-tabs__close")][0]!.click());
     expect(posted.at(-1)).toEqual(expect.objectContaining({ type: "tabs.closeAgentTabs", sessionId: "a" }));
     expect(isSidebarCommand(posted.at(-1))).toBe(true);
+  });
+
+  /** Renders the sidebar for chat "a" with agent tabs 5 and 6, returning an event emitter and the commands it posts. */
+  async function mountApp() {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    const posted: Array<Record<string, unknown> & { type: string }> = [];
+    const listeners: Array<(message: unknown) => void> = [];
+    vi.spyOn(browser.runtime, "connect").mockReturnValue({
+      postMessage: (message: { type: string }) => posted.push(message),
+      onMessage: { addListener: (listener: (message: unknown) => void) => listeners.push(listener), removeListener: () => {} },
+      disconnect: () => {},
+    } as never);
+    root = document.createElement("div");
+    document.body.append(root);
+    await act(() => render(h(App, {}), root));
+    const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) => act(() => listeners.forEach((listener) => listener({ v: 1, seq: 0, at: 1, ...event })));
+    const tab = (id: number): AgentTabSummary => ({ id, role: id === 6 ? "search" : "agent", title: `Tab ${id}`, url: `https://site-${id}.test/`, favIconUrl: null, lastUsedAt: 0 });
+    const bySession = { a: [tab(5), tab(6)] };
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), agentTabs: { bySession, watching: null, takenOver: false } } });
+    return { posted, emit, bySession };
+  }
+  const button = (text: string) => [...root.querySelectorAll<HTMLButtonElement>("button")].find((candidate) => candidate.textContent?.trim() === text);
+
+  it("shows a help request as a card in the turn: reason as text, Show tab, Done, and Can't help with a note", async () => {
+    const { posted, emit } = await mountApp();
+    await emit({ runId: "r1", conversationId: "a", type: "run.started", payload: { prompt: "Order my groceries", page: null, ask: null, retry: false } });
+    const call = { id: "help-1", name: "request_user_help" as const, arguments: { tab: "/agent-tabs/6/page.md", kind: "login", reason: "Sign in to <b>Grocer</b> with your account." } };
+    await emit({ runId: "r1", conversationId: "a", type: "help.requested", payload: { call, tabId: 6, kind: "login", reason: "Sign in to <b>Grocer</b> with your account." } });
+
+    expect(root.textContent).toContain("Waiting for your help");
+    expect(root.textContent).toContain("Needs your help: sign in");
+    expect(root.querySelector(".help__reason")?.textContent).toBe("Sign in to <b>Grocer</b> with your account.");
+    expect(root.querySelector(".help__reason b")).toBeNull();
+    expect(root.querySelector(".help__tab")?.textContent).toBe("In bside's tab: Tab 6 · site-6.test");
+    expect(root.querySelector('.mascot[data-mood="needs"]')).not.toBeNull();
+    // The tray marks the tab bside needs the user in.
+    expect(root.querySelector(".agent-tabs-toggle")?.textContent).toContain("Needs you");
+
+    await act(() => button("Show tab")!.click());
+    expect(posted.at(-1)).toMatchObject({ type: "tabs.watch", tabId: 6 });
+    await act(() => button("Done")!.click());
+    expect(posted.at(-1)).toMatchObject({ type: "help.resolve", runId: "r1", callId: "help-1", outcome: "done", note: "" });
+    expect(isSidebarCommand(posted.at(-1))).toBe(true);
+
+    await act(() => button("Can't help")!.click());
+    const note = root.querySelector<HTMLInputElement>(".help__note")!;
+    await act(() => { note.value = "  I don't have an account there. "; note.dispatchEvent(new Event("input", { bubbles: true })); });
+    await act(() => button("Send")!.click());
+    expect(posted.at(-1)).toMatchObject({ type: "help.resolve", callId: "help-1", outcome: "unable", note: "I don't have an account there." });
+    expect(isSidebarCommand(posted.at(-1))).toBe(true);
+
+    await emit({ runId: "r1", conversationId: "a", type: "tool.result", payload: { callId: "help-1", result: { ok: true, summary: "The user reports they are done helping." } } });
+    expect(root.textContent).toContain("You helped: sign in");
+    expect(button("Done")).toBeUndefined();
+    expect(root.textContent).not.toContain("Needs you");
+  });
+
+  it("asks to approve a memory change on the program's own step under the Ask policy, showing the text as text", async () => {
+    const { posted, emit } = await mountApp();
+    await emit({ runId: "r1", conversationId: "a", type: "run.started", payload: { prompt: "Remember my seat", page: null, ask: null, retry: false } });
+    const call = { id: "p1", name: "browser_program" as const, arguments: { source: 'fs.write("/memory/seat.md", "Seat\\nWindow");' } };
+    await emit({ runId: "r1", conversationId: "a", type: "tool.requested", payload: { call, display: "Browser program" } });
+    const memory = { op: "write" as const, name: "seat", description: "Seat <b>pref</b>", body: "Window", replaces: false, tainted: true };
+    await emit({ runId: "r1", conversationId: "a", type: "action.approval-required", payload: { call, origin: "", display: "Remember memory “seat”", target: {}, memory } });
+
+    expect(root.textContent).toContain("Waiting for your approval");
+    expect(root.textContent).toContain("Waiting for approval: Remember memory “seat”");
+    expect(root.querySelector(".trace__item[data-status=\"pending\"] .tool-call")?.textContent).toBe("Seat <b>pref</b>\n\nWindow");
+    expect(root.querySelector(".tool-call b")).toBeNull();
+    expect(root.querySelector(".memory-approval__warning")?.textContent).toContain("not something a page told it to remember");
+    // The program's step is shown once, not again for its confirmation.
+    expect(root.querySelectorAll(".trace .trace .trace__item")).toHaveLength(1);
+    await act(() => button("Approve")!.click());
+    expect(posted.at(-1)).toMatchObject({ type: "action.approve", runId: "r1", callId: "p1" });
+  });
+
+  it("shows a turn's memory changes with a taint badge, View, and Undo through a validated command", async () => {
+    const { posted, emit } = await mountApp();
+    await emit({ runId: "r1", conversationId: "a", type: "run.started", payload: { prompt: "Remember my seat", page: null, ask: null, retry: false } });
+    const call = { id: "p1", name: "browser_program" as const, arguments: { source: 'fs.write("/memory/seat.md", "Seat\nWindow");' } };
+    await emit({ runId: "r1", conversationId: "a", type: "tool.requested", payload: { call, display: "Browser program" } });
+    const memory = [{ id: "m1", op: "write" as const, name: "seat", tainted: true }, { id: "m2", op: "write" as const, name: "seat", tainted: true }];
+    await emit({ runId: "r1", conversationId: "a", type: "tool.result", payload: { callId: "p1", result: { ok: true, summary: "Browser program completed." }, memory } });
+
+    const notice = root.querySelector(".memory-notice")!;
+    expect(notice.querySelector(".memory-notice__line > span")?.textContent).toBe("Saved 1 memory");
+    expect(notice.querySelector(".memory-notice__badge")?.textContent).toBe("after web content");
+    expect(notice.querySelector("a")?.getAttribute("href")).toMatch(/\/options\.html#\/memory\/seat$/);
+    await act(() => button("Undo")!.click());
+    const command = posted.at(-1)!;
+    expect(command).toMatchObject({ type: "memory.undo", changeIds: ["m1", "m2"] });
+    expect(isSidebarCommand(command)).toBe(true);
+    expect(button("Undoing…")?.disabled).toBe(true);
+    // A reply to some other request changes nothing.
+    await emit({ runId: null, conversationId: null, type: "memory.undone", payload: { requestId: "other", undone: [], error: "No." } });
+    expect(button("Undoing…")).toBeDefined();
+    await emit({ runId: null, conversationId: null, type: "memory.undone", payload: { requestId: command.id as string, undone: ["m2", "m1"], error: null } });
+    expect(root.querySelector(".memory-notice__done")?.textContent).toBe("Undone");
+    expect(button("Undo")).toBeUndefined();
+  });
+
+  it("explains an Undo the background refused and lets the user try again", async () => {
+    const { posted, emit } = await mountApp();
+    const items: ConversationItem[] = [
+      { id: "u", kind: "message", role: "user", text: "Forget my seat", context: null, at: 0 },
+      { id: "c", kind: "tool-call", call: { id: "p1", name: "browser_program", arguments: { source: "x" } }, at: 1 },
+      { id: "r", kind: "tool-result", callId: "p1", result: { ok: true, summary: "Browser program completed." }, memory: [{ id: "m1", op: "remove", name: "seat", tainted: false }], at: 2 },
+      { id: "a", kind: "message", role: "assistant", text: "Done.", at: 3 },
+    ];
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), conversation: { ...snapshotFor("a").conversation, items } } });
+    expect(root.querySelector(".memory-notice__line > span")?.textContent).toBe("Removed 1 memory");
+    expect(root.querySelector(".memory-notice__badge")).toBeNull();
+    expect(root.querySelector(".memory-notice a")?.getAttribute("href")).toMatch(/#\/memory$/);
+    await act(() => button("Undo")!.click());
+    await emit({ runId: null, conversationId: null, type: "memory.undone", payload: { requestId: posted.at(-1)!.id as string, undone: [], error: "This change can no longer be undone here." } });
+    expect(root.querySelector(".memory-notice__error")?.textContent).toBe("This change can no longer be undone here.");
+    expect(button("Undo")?.disabled).toBe(false);
+  });
+
+  it("states the watched tab's shield in the tray and offers Take over until the user takes over", async () => {
+    const { posted, emit, bySession } = await mountApp();
+    await act(() => root.querySelector<HTMLButtonElement>(".agent-tabs-toggle")!.click());
+    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession, watching: 5, takenOver: false } });
+    expect(root.querySelector(".agent-tab--watched small")?.textContent).toBe("You're watching · your input is paused");
+    expect(root.querySelector(".agent-tabs__note")?.textContent).toContain("paused");
+    await act(() => button("Take over")!.click());
+    expect(posted.at(-1)).toMatchObject({ type: "tabs.takeOver", tabId: 5 });
+    expect(isSidebarCommand(posted.at(-1))).toBe(true);
+
+    await emit({ runId: null, conversationId: null, type: "agent-tabs.changed", payload: { bySession, watching: 5, takenOver: true } });
+    expect(root.querySelector(".agent-tab--watched small")?.textContent).toBe("You took over");
+    expect(button("Take over")).toBeUndefined();
+  });
+});
+
+describe("entry-point drafts", () => {
+  it("prepares quick actions and at most three saved skills without sending, and sends a context chip by id", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    const listeners: Array<(message: unknown) => void> = [];
+    const post = vi.fn();
+    vi.spyOn(browser.runtime, "connect").mockReturnValue({
+      postMessage: post,
+      onMessage: { addListener: (listener: (message: unknown) => void) => listeners.push(listener), removeListener: () => {} },
+      disconnect: () => {},
+    } as never);
+    const root = document.createElement("div"); document.body.append(root);
+    await act(() => render(h(App, {}), root));
+    const snapshot = snapshotFor("a");
+    snapshot.page = { tabId: 1, artifactId: "page1", kind: "page", title: "Source", url: "https://example.com/", capturedAt: 1 };
+    snapshot.skills = [{ name: "youtube", description: "Packaged", builtin: true }, ...["one", "two", "three", "four"].map((name) => ({ name, description: name, builtin: false }))];
+    const emit = (type: string, payload: unknown) => act(() => listeners.forEach((listener) => listener({ v: 1, seq: 0, at: 1, runId: null, conversationId: "a", type, payload })));
+    await emit("state.snapshot", snapshot);
+    expect(root.querySelectorAll(".quick-actions button")).toHaveLength(3);
+    expect(root.querySelectorAll(".skill-chips button")).toHaveLength(3);
+    await act(() => (root.querySelector(".quick-actions button") as HTMLButtonElement).click());
+    expect(composer.props?.draft).toMatchObject({ text: "/summarize-page Summarize this page." });
+    expect(post).not.toHaveBeenCalledWith(expect.objectContaining({ type: "run.start" }));
+    await act(() => (root.querySelector(".skill-chips button") as HTMLButtonElement).click());
+    expect(composer.props?.draft).toMatchObject({ text: "/one " });
+    const ask = { version: 1, id: "ask-1", kind: "selection", tabId: 2, path: null, pageUrl: "https://source.example/", pageTitle: "Original source", text: "<img src=x onerror=alert(1)>", at: 1 };
+    await emit("ask.changed", { ask });
+    expect(root.querySelector(".ask-chip")!.textContent).toContain("Page context · untrusted");
+    expect(root.querySelector(".ask-chip img")).toBeNull();
+    expect(root.querySelector(".context-chip")!.textContent).toContain("Original source");
+    expect(composer.props?.askId).toBe("ask-1");
+    await emit("composer.focus", null);
+    expect(composer.props?.focusVersion).toBe(1);
+    await act(() => (composer.props!.onSend as (text: string) => void)("Explain"));
+    expect(post).toHaveBeenCalledWith(expect.objectContaining({ type: "run.start", prompt: "Explain", askId: "ask-1" }));
+    await act(() => root.querySelector<HTMLButtonElement>('[aria-label="Remove page context"]')!.click());
+    expect(post).toHaveBeenCalledWith(expect.objectContaining({ type: "ask.dismiss", askId: "ask-1" }));
+    await emit("ask.changed", { ask: null });
+    expect(root.querySelector(".ask-chip")).toBeNull();
+    render(null, root);
   });
 });

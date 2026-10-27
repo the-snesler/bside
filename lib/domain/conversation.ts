@@ -4,9 +4,13 @@
  * `Conversation` is the materialized view the sidebar renders.
  */
 
-import type { PageArtifactSummary, ToolCall, ToolResult } from "@/lib/domain/tools";
+import type { HelpKind, PageArtifactSummary, ToolCall, ToolResult } from "@/lib/domain/tools";
 import type { RunUsageV1, UsageTotals } from "@/lib/domain/usage";
 import type { Skill } from "@/lib/domain/skills";
+import type { SiteNote } from "@/lib/domain/instructions";
+import type { MemoryChange } from "@/lib/domain/memory";
+import type { AskContextV1 } from "@/lib/domain/ask";
+import type { ScheduledSource } from "@/lib/domain/automation";
 
 export type ConversationItem =
   | {
@@ -17,6 +21,16 @@ export type ConversationItem =
       context: PageArtifactSummary | null;
       /** The skill a leading `/name` invoked, as it was when the message was accepted. */
       skill?: Skill;
+      /**
+       * The user's site notes covering the pages attached to a turn-start
+       * message (its page outline and tab mentions), as they were when the
+       * message was accepted. Rendered on the message, so replay stays byte-identical.
+       */
+      sites?: SiteNote[];
+      /** What the user right-clicked ("Ask bside about…"), sent with this message; rendered on it on every replay. */
+      ask?: AskContextV1;
+      /** User-authored schedule metadata snapshotted at the tick, never a permission grant. */
+      scheduled?: ScheduledSource;
       /**
        * `"steer"`: guidance sent while the turn's run was working, persisted
        * where the model received it (after a tool round). It belongs to the
@@ -32,6 +46,8 @@ export type ConversationItem =
       kind: "tool-result";
       callId: string;
       result: Omit<ToolResult, "data">;
+      /** Memory changes a browser program made (names and taint only), for the trace's Undo and the run digest. */
+      memory?: MemoryChange[];
       at: number;
     }
   /** What a run did, appended when it ends; replayed to later runs as notes (see `lib/domain/run-digest.ts`). Not shown in the transcript. */
@@ -65,6 +81,8 @@ export interface QueuedMessage {
   text: string;
   /** The invoked skill, snapshotted when the message was accepted. */
   skill?: Skill;
+  /** The context-menu chip sent with the message, taken when it was accepted. */
+  ask?: AskContextV1;
   at: number;
 }
 
@@ -80,10 +98,16 @@ export const COMPACTION_SUMMARY_MAX_CHARS = 60_000;
 
 export type RunDigestStatus = "completed" | "failed" | "cancelled" | "interrupted";
 
-/** One tool call of a run. `ok`/`approved` are `null` when an interruption left no result. */
+/** One tool call of a run. `ok`/`approved`/`outcome` are `null` when an interruption left no result. */
 export type RunDigestEntry =
   | { type: "program"; source: string; ok: boolean | null; code: string | null; urls: string[]; excerpt: string }
-  | { type: "confirmation"; title: string; approved: boolean | null };
+  | { type: "confirmation"; title: string; approved: boolean | null }
+  /** A `request_user_help` pause: `outcome` is the user's answer, `"failed"` when the call was refused (not one of the chat's agent tabs). */
+  | { type: "help"; kind: HelpKind; reason: string; outcome: "done" | "unable" | "failed" | null }
+  /** A memory the preceding program saved or removed; `tainted` when the run had read untrusted content first. */
+  | { type: "memory"; op: "write" | "remove"; name: string; tainted: boolean }
+  /** A call of a connected account's tool: the server's name, its tool, and bounded excerpts of the arguments and result. Never tokens. */
+  | { type: "mcp"; server: string; tool: string; args: string; ok: boolean | null; code: string | null; excerpt: string };
 
 export interface RunDigestV1 {
   version: 1;
@@ -98,6 +122,8 @@ export interface RunDigestV1 {
 /** One session's entry in `ConversationIndexV1`. A session id is its conversation id. */
 export interface ConversationSummary {
   id: string;
+  /** Latest schedule that ran here; kept as a label after the task is deleted. */
+  scheduled?: ScheduledSource;
   /** Empty until the first prompt names the session. Untrusted text: render as text only. */
   title: string;
   /** `"prompt"` titles come from the first user prompt; `"user"` titles come from a rename and are never auto-overwritten. */

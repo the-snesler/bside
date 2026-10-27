@@ -18,6 +18,9 @@
   --primary: #15204f;
   --on-primary: #fafcda;
   --accent: #3f57be;
+  --on-accent: #ffffff;
+  --hairline: rgb(21 23 42 / 0.12);
+  --card: #ffffff;
   --user-bubble: #eceefa;
   --error: #bc4636;
   --success: oklch(0.55 0.14 145);
@@ -55,6 +58,9 @@
     --primary: #fafcda;
     --on-primary: #0b1446;
     --accent: #97a8f2;
+    --on-accent: #0b1446;
+    --hairline: rgb(241 242 227 / 0.09);
+    --card: #141622;
     --user-bubble: #1e2238;
     --error: #ee8e82;
     --success: oklch(0.75 0.14 145);

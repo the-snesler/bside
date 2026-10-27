@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Frames Fixture</title>
+  </head>
+  <body>
+    <h1>Checkout</h1>
+    <p>Order total: $42.00</p>
+
+    <!-- Serve tests/fixtures on port 4173 and open this page from 127.0.0.1:
+         the frames load from localhost, a different origin. -->
+    <iframe id="payment" title="Payment" src="http://localhost:4173/frame-payment.html" style="width: 420px; height: 220px"></iframe>
+    <iframe id="pixel" src="http://localhost:4173/frame-payment.html?pixel" style="width: 1px; height: 1px; border: 0"></iframe>
+
+    <div id="status" role="status"></div>
+
+    <script>
+      window.addEventListener("message", function (event) {
+        if (event.origin === "http://localhost:4173" && event.data === "paid") {
+          document.getElementById("status").textContent = "Payment received. Order confirmed.";
+        }
+      });
+    </script>
+  </body>
+</html>

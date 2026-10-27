@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { McpConnections } from "@/lib/background/mcp";
+import { approvingPopup, fakeMcpServers } from "@/tests/helpers/mcp-server";
 import type { Browser } from "wxt/browser";
 import { AGENT_TAB_IDLE_MS, BackgroundRuntime } from "@/lib/background/runtime";
 import { ApprovalBadge } from "@/lib/background/approval-badge";
+import { SCHEDULE_ALARM } from "@/lib/background/scheduler";
+import { RunNotifications } from "@/lib/background/notifications";
+import { taskDraft, type TaskDraft } from "@/lib/domain/automation";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController } from "@/lib/background/tab-controller";
@@ -12,15 +17,20 @@ import { ProviderStreamError } from "@/lib/providers/openai";
 import {
   saveOpenAICredential, appendConversationItem, createSession, ensureOpenSession, getConversation, getOpenAICredential, getOpenSessionId,
   listSessions, loadMessageQueue, saveHistorySettings, saveMessageQueue, saveRunCheckpoint, setOpenSessionId, updateSession,
-  getAppSettings, saveAppSettings,
+  getAppSettings, saveAppSettings, getSiteNotes, getRunCheckpoint,
+  getScheduledTasks, getNotificationSettings, saveNotificationSettings,
 } from "@/lib/storage";
 import type { ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
+import { isTurnStart } from "@/lib/domain/conversation";
 import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
 import type { PageSnapshot } from "@/lib/domain/tools";
 import type { AgentTabsState, SidebarCommand, SidebarEvent } from "@/lib/protocol";
 import { splitSystemMessage, TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
 import { buildTurns } from "@/lib/ui/turns";
 import { handleSkillsRequest } from "@/lib/background/skills";
+import { handleInstructionsRequest, handleSiteNotesRequest } from "@/lib/background/instructions";
+import { listMemories, writeMemory } from "@/lib/background/memory";
+import { buildAskContext } from "@/lib/domain/ask";
 
 type ProviderUsage = NonNullable<Extract<ScriptedProviderEvent, { type: "turn.completed" }>["usage"]>;
 
@@ -273,6 +283,136 @@ describe("BackgroundRuntime: saved skills", () => {
   });
 });
 
+describe("BackgroundRuntime: custom instructions and site notes", () => {
+  const fixture = { origin: "http://127.0.0.1:4173", includeSubdomains: false, text: "FIXTURE_NOTE" };
+  const github = { origin: "https://github.com", includeSubdomains: true, text: "GITHUB_NOTE" };
+  const unrelated = { origin: "https://unrelated.example", includeSubdomains: false, text: "UNRELATED_NOTE" };
+  const answer: ScriptedProviderEvent[] = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
+  const send = (runtime: BackgroundRuntime, command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+
+  it("snapshots instructions at run start and notes for the attached page and mentioned tabs onto the user message", async () => {
+    await saveOpenAICredential("sk-test");
+    await handleInstructionsRequest({ v: 1, id: "i", type: "instructions.save", text: "CUSTOM_INSTRUCTIONS" });
+    for (const note of [fixture, github, unrelated]) await handleSiteNotesRequest({ v: 1, id: note.origin, type: "siteNotes.save", note });
+    const provider = new FakeProvider();
+    provider.script = answer;
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: supportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    await send(runtime, { type: "run.start", prompt: "Compare with @PR (tab 7, /tabs/7/page.md, https://gist.github.com/x)" });
+    const user = (await openConversation()).items.find((item) => item.kind === "message" && item.role === "user");
+    expect(user).toMatchObject({ sites: [fixture, github] });
+    const { systemPrompt, messages } = provider.requests[0]!.context;
+    expect(systemPrompt).toContain("<user_instructions>\nCUSTOM_INSTRUCTIONS\n</user_instructions>");
+    expect(systemPrompt).not.toContain("FIXTURE_NOTE");
+    const turn = JSON.stringify(messages.at(-1));
+    expect(turn).toContain("FIXTURE_NOTE");
+    expect(turn).toContain("GITHUB_NOTE");
+    expect(turn).not.toContain("UNRELATED_NOTE");
+    // The notes the run used are in that session's export, inside the model input.
+    const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export", sessionId: (await getOpenSessionId())! });
+    expect(exported?.markdown.split("## Latest model input")[1]).toContain("FIXTURE_NOTE");
+    expect(exported?.markdown).toContain("CUSTOM_INSTRUCTIONS");
+    expect(exported?.markdown).not.toContain("UNRELATED_NOTE");
+
+    // A later run picks up edited instructions, but the earlier message keeps its snapshot.
+    await handleInstructionsRequest({ v: 1, id: "i", type: "instructions.save", text: "EDITED_INSTRUCTIONS" });
+    await handleSiteNotesRequest({ v: 1, id: "e", type: "siteNotes.save", note: { ...fixture, text: "EDITED_NOTE" } });
+    await send(runtime, { type: "run.start", prompt: "Again" });
+    const later = provider.requests[1]!.context;
+    expect(later.systemPrompt).toContain("EDITED_INSTRUCTIONS");
+    expect(JSON.stringify(later.messages[0])).toBe(JSON.stringify({ ...messages.at(-1)!, content: (messages.at(-1)!.content as { text: string }[])[0]!.text }));
+    expect(JSON.stringify(later.messages.at(-1))).toContain("EDITED_NOTE");
+  });
+
+  it("answers the sidebar's site-note lookup and save", async () => {
+    await handleSiteNotesRequest({ v: 1, id: "g", type: "siteNotes.save", note: github });
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
+    expect(await send(runtime, { type: "siteNote.get", url: "https://gist.github.com/abc" })).toEqual({ origin: "https://gist.github.com", note: github });
+    expect(await send(runtime, { type: "siteNote.get", url: "https://example.com/" })).toEqual({ origin: "https://example.com", note: null });
+    expect(await send(runtime, { type: "siteNote.get", url: "about:addons" })).toEqual({ origin: null, note: null });
+    const note = { origin: "https://example.com", includeSubdomains: false, text: "Remember me" };
+    expect(await send(runtime, { type: "siteNote.save", note })).toEqual({ note, error: null });
+    expect(await getSiteNotes()).toEqual([github, note]);
+  });
+
+  it("posts lookup and save replies only to the requesting sidebar", async () => {
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const [asking, other] = [fakePort(), fakePort()];
+    hub.handleConnect(asking);
+    hub.handleConnect(other);
+    await asking.send({ v: 1, id: "get", type: "siteNote.get", url: "https://example.com/a" });
+    await asking.send({ v: 1, id: "save", type: "siteNote.save", note: { origin: "https://example.com", includeSubdomains: true, text: "Hi" } });
+    await asking.send({ v: 1, id: "bad", type: "siteNote.save", note: { origin: "https://example.com/", includeSubdomains: true, text: "Hi" } });
+    await vi.waitFor(() => expect(asking.received.filter((event) => event.type.startsWith("siteNote."))).toHaveLength(2));
+    expect(asking.received.find((event) => event.type === "siteNote.loaded")?.payload).toEqual({ requestId: "get", origin: "https://example.com", note: null });
+    expect(asking.received.find((event) => event.type === "siteNote.saved")?.payload).toEqual({
+      requestId: "save", note: { origin: "https://example.com", includeSubdomains: true, text: "Hi" }, error: null,
+    });
+    expect(other.received.some((event) => event.type.startsWith("siteNote."))).toBe(false);
+  });
+});
+
+describe("BackgroundRuntime: memory", () => {
+  const send = (runtime: BackgroundRuntime, command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+
+  it("lists the run-start memory index on the current turn only, keeping it for the run and out of the system prompt and earlier turns", async () => {
+    await saveOpenAICredential("sk-test");
+    await writeMemory({ name: "coffee", description: "Usual coffee order", body: "Oat flat white" }, { sessionId: "old", runId: "old", tainted: false });
+    const provider = new FakeProvider();
+    let round = 0;
+    provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      if (round++ === 0) {
+        yield { type: "tool.call", call: { id: "save", name: "browser_program", arguments: { source: 'fs.write("/memory/seat.md", "Seat\\nWindow");' } } } as ScriptedProviderEvent;
+        yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+        return;
+      }
+      yield { type: "text.delta", delta: "Done." } as ScriptedProviderEvent;
+      yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+    } });
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
+    await send(runtime, { type: "run.start", prompt: "Remember my seat" });
+    expect((await listMemories()).map((entry) => entry.name)).toEqual(["seat", "coffee"]);
+    const [first, second] = provider.requests.map((request) => request.context);
+    expect(first!.systemPrompt).not.toContain("[bside memory]");
+    // The fixed policy says what memories are; the entries themselves never reach the system prompt.
+    expect(first!.systemPrompt).toContain("Memories under /memory are notes you saved in earlier chats");
+    expect(first!.systemPrompt).not.toContain("Usual coffee order");
+    const turn = JSON.stringify(first!.messages[0]);
+    expect(turn).toContain("[bside memory]");
+    expect(turn).toContain("/memory/coffee.md");
+    // The index is the run's snapshot: the second round does not list the memory the first round saved.
+    expect(JSON.stringify(second!.messages[0])).toBe(turn);
+    expect(turn).not.toContain("/memory/seat.md");
+
+    await send(runtime, { type: "run.start", prompt: "And now?" });
+    const later = provider.requests.at(-1)!.context;
+    expect(later.systemPrompt).toBe(first!.systemPrompt);
+    expect(later.messages[0]!.content).toBe("Remember my seat");
+    expect(JSON.stringify(later.messages.at(-1))).toContain("/memory/seat.md");
+    // The saved change is on the persisted program result, for the trace and Undo.
+    expect((await openConversation()).items.find((item) => item.kind === "tool-result" && item.callId === "save")).toMatchObject({ memory: [{ op: "write", name: "seat", tainted: false }] });
+  });
+
+  it("undoes a run's change from the sidebar, replying only to the requesting sidebar", async () => {
+    const change = await writeMemory({ name: "seat", description: "Seat", body: "Window" }, { sessionId: "s", runId: "r", tainted: true });
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const [asking, other] = [fakePort(), fakePort()];
+    hub.handleConnect(asking);
+    hub.handleConnect(other);
+    await asking.send({ v: 1, id: "undo", type: "memory.undo", changeIds: [change.id] });
+    await asking.send({ v: 1, id: "bad", type: "memory.undo", changeIds: [] });
+    await vi.waitFor(() => expect(asking.received.filter((event) => event.type === "memory.undone")).toHaveLength(1));
+    expect(asking.received.find((event) => event.type === "memory.undone")?.payload).toEqual({ requestId: "undo", undone: [change.id], error: null });
+    expect(other.received.some((event) => event.type === "memory.undone")).toBe(false);
+    expect(await listMemories()).toEqual([]);
+  });
+});
+
 class FakeProvider implements ProviderAdapter {
   readonly definition = { id: "openai" as const, name: "OpenAI", authMethods: [], models: [] };
   script: ScriptedProviderEvent[] | ((signal: AbortSignal) => AsyncIterable<ScriptedProviderEvent>) = [];
@@ -321,6 +461,21 @@ async function tick(times = 20): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+/**
+ * Waits until the active run has sent `count` provider requests. Before its
+ * first one a run opens the sealed credential with real WebCrypto, which
+ * finishes on the thread pool, so a fixed number of ticks can lose the race
+ * on a busy machine.
+ */
+async function untilRequested(provider: { requests: unknown[] }, count = 1): Promise<void> {
+  await vi.waitFor(() => expect(provider.requests.length).toBeGreaterThanOrEqual(count));
+}
+
+/** Waits until the active run has streamed `text` (see `untilRequested`). */
+async function untilPartial(runtime: BackgroundRuntime, text: string): Promise<void> {
+  await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun?.partialAssistantText).toBe(text));
+}
+
 beforeEach(() => {
   fakeBrowser.reset();
 });
@@ -340,9 +495,10 @@ describe("BackgroundRuntime: single active run", () => {
     hub.handleConnect(port);
 
     void port.send({ v: 1, id: "1", type: "run.start", prompt: "Hello" });
-    await tick();
+    // Wait for the first run to reach the provider, not a fixed tick count.
+    await vi.waitFor(() => expect(provider.requests).toHaveLength(1));
     await port.send({ v: 1, id: "2", type: "run.start", prompt: "Second" });
-    await tick();
+    await vi.waitFor(() => expect(port.received.some((e) => e.type === "queue.changed")).toBe(true));
 
     const snapshot = await runtime.getSnapshot();
     expect(snapshot.activeRun).not.toBeNull();
@@ -426,7 +582,7 @@ describe("BackgroundRuntime: cancellation", () => {
     hub.handleConnect(port);
 
     const runCommand = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi" });
-    await tick();
+    await untilRequested(provider);
 
     const runningSnapshot = await runtime.getSnapshot();
     const runId = runningSnapshot.activeRun?.runId;
@@ -460,7 +616,7 @@ describe("BackgroundRuntime: cancellation", () => {
     hub.handleConnect(port);
 
     const runCommand = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi" });
-    await tick();
+    await untilPartial(runtime, "The page says");
     const runId = (await runtime.getSnapshot()).activeRun?.runId as string;
 
     await runtime.handleCommand({ v: 1, id: "2", type: "run.cancel", runId });
@@ -503,7 +659,7 @@ describe("BackgroundRuntime: cancellation", () => {
     hub.handleConnect(port);
 
     const runCommand = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi" });
-    await tick();
+    await untilPartial(runtime, "partial");
     const runId = (await runtime.getSnapshot()).activeRun?.runId as string;
 
     await runtime.handleCommand({ v: 1, id: "2", type: "run.cancel", runId });
@@ -884,7 +1040,7 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
     const snapshot = port.received.at(-1);
     if (snapshot?.type !== "state.snapshot") throw new Error("expected state.snapshot");
     expect(snapshot.payload.activeRun).toBeNull();
-    expect(snapshot.payload.notice).toContain("already changed a page");
+    expect(snapshot.payload.notice).toContain("already changed a page or a connected account");
   }
 
   function setup(provider: FakeProvider) {
@@ -954,6 +1110,57 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
 
     await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
     refusedRetry(provider, port, 0);
+  });
+
+  it("offers connected accounts' tools from run start and refuses run.retry after a write to one", async () => {
+    await saveOpenAICredential("sk-test");
+    const fake = fakeMcpServers({ tools: { notion: [{ name: "notion-search", annotations: { readOnlyHint: true } }, { name: "notion-create-pages", annotations: { destructiveHint: false } }] } });
+    const mcp = new McpConnections({ popup: approvingPopup(), fetcher: fake.fetcher });
+    await mcp.connect("notion");
+    await mcp.setTrust("notion", "model");
+    const provider = new FakeProvider();
+    let round = 0;
+    provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      if (round++ > 0) throw new ProviderStreamError("Rate limited.", "RATE_LIMIT");
+      yield { type: "tool.call", call: { id: "call_1", name: "mcp__notion__notion-create-pages", arguments: { title: "Plan" } } } as ScriptedProviderEvent;
+      yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+    } });
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: supportedPageTabControllerFactory, mcp });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Add a Notion page" });
+    expect(provider.requests[0]!.context.tools!.map((tool) => tool.name)).toContain("mcp__notion__notion-create-pages");
+    expect(fake.requests.some((request) => request.body.includes('"tools/call"') && request.body.includes("notion-create-pages"))).toBe(true);
+    expect(port.received.find((event) => event.type === "run.failed")?.payload).toMatchObject({ code: "RATE_LIMIT", retryable: false });
+
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    refusedRetry(provider, port, 2);
+  });
+
+  it("refuses run.retry after an interrupted attempt that had started a write to a connected account, not a read", async () => {
+    await saveOpenAICredential("sk-test");
+    await seed({ id: "u1", kind: "message", role: "user", text: "Add a task", context: null, at: 1 });
+    await seed({ id: "c1", kind: "tool-call", call: { id: "call_1", name: "mcp__todoist__add-tasks", arguments: {}, mcp: { server: "todoist", tool: "add-tasks", readOnly: false } }, at: 2 });
+    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
+    const provider = new FakeProvider();
+    const { runtime, port } = setup(provider);
+    await runtime.initialize();
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    refusedRetry(provider, port, 0);
+  });
+
+  it("keeps an interrupted attempt retryable when it only read from a connected account", async () => {
+    await saveOpenAICredential("sk-test");
+    await seed({ id: "u1", kind: "message", role: "user", text: "Find my tasks", context: null, at: 1 });
+    await seed({ id: "c1", kind: "tool-call", call: { id: "call_1", name: "mcp__todoist__find-tasks", arguments: {}, mcp: { server: "todoist", tool: "find-tasks", readOnly: true } }, at: 2 });
+    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
+    const provider = new FakeProvider();
+    const { runtime } = setup(provider);
+    await runtime.initialize();
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    expect(provider.requests).toHaveLength(1);
   });
 
   it("keeps a turn retryable across a failed retry that committed no page effect", async () => {
@@ -1061,6 +1268,26 @@ describe("BackgroundRuntime: approval badge", () => {
     expect(texts).toEqual([""]);
   });
 
+  it("recovers a run interrupted while waiting for the user's help as interrupted and retryable, with a cleared badge", async () => {
+    await saveOpenAICredential("sk-test");
+    const sessionId = await ensureOpenSession();
+    await appendConversationItem(sessionId, { id: "u1", kind: "message", role: "user", text: "Order my groceries", context: null, at: 1 });
+    await appendConversationItem(sessionId, { id: "c1", kind: "tool-call", call: { id: "help_1", name: "request_user_help", arguments: { tab: "/agent-tabs/5/page.md", kind: "login", reason: "Sign in." } }, at: 2 });
+    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId, status: "awaiting-help", partialAssistantText: "", usage: null, lastSeq: 3, updatedAt: 1 });
+    const { badge, texts } = fakeBadge();
+    const provider = new FakeProvider();
+    provider.script = [{ type: "text.delta", delta: "Retried." }, { type: "turn.completed", replayState: null }];
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider, tabControllerFactory: unsupportedPageTabControllerFactory, approvalBadge: badge });
+    await runtime.initialize();
+    expect(texts).toEqual([""]);
+    const items = (await openConversation()).items;
+    expect(items.find((item) => item.id === "interrupted-r1")).toMatchObject({ role: "assistant" });
+    expect(items.find((item) => item.id === "digest-r1")).toMatchObject({ digest: { status: "interrupted", entries: [{ type: "help", kind: "login", reason: "Sign in.", outcome: null }] } });
+    // Asking for help is not a page effect, so the turn can be retried.
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    expect(provider.requests).toHaveLength(1);
+  });
+
   it("clears a stale badge at startup while recovering an interrupted approval", async () => {
     await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "awaiting-approval", partialAssistantText: "", usage: null, lastSeq: 3, updatedAt: 1 });
     const { badge, texts } = fakeBadge();
@@ -1138,7 +1365,7 @@ describe("BackgroundRuntime: run.retry", () => {
     const { runtime } = setup(provider);
 
     const run = runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Read it" });
-    await tick();
+    await untilPartial(runtime, "The page says");
     await runtime.handleCommand({ v: 1, id: "cancel", type: "run.cancel", runId: (await runtime.getSnapshot()).activeRun!.runId });
     await run;
 
@@ -1200,7 +1427,7 @@ describe("BackgroundRuntime: run.retry", () => {
     await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Go" });
 
     const retry = runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
-    await tick();
+    await untilPartial(runtime, "Working");
     await runtime.handleCommand({ v: 1, id: "retry-again", type: "run.retry" });
     expect(provider.requests).toHaveLength(2);
     await runtime.handleCommand({ v: 1, id: "cancel", type: "run.cancel", runId: (await runtime.getSnapshot()).activeRun!.runId });
@@ -1528,7 +1755,7 @@ describe("BackgroundRuntime: closing agent tabs", () => {
     await runtime.initialize();
 
     const run = runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Wait" });
-    await tick();
+    await untilRequested(provider);
     expect((await runtime.getSnapshot()).activeRun).not.toBeNull();
     await runtime.handleCommand({ v: 1, id: "close", type: "tabs.closeAgentTabs", sessionId: owner });
     expect(tabs.map((tab) => tab.id)).toEqual([1, 5]);
@@ -1808,7 +2035,7 @@ describe("BackgroundRuntime: watching an agent tab", () => {
    * Tabs in windows, each with one active tab, where window 1 is focused.
    * Like Firefox, switching to a hidden tab shows it, and an active tab cannot be hidden.
    */
-  async function setup(extra: WindowTab[] = [], extraTags: [number, unknown][] = [], clock?: RuntimeClock) {
+  async function setup(extra: WindowTab[] = [], extraTags: [number, unknown][] = [], clock?: RuntimeClock, approvalBadge?: ApprovalBadge) {
     const tabs: WindowTab[] = [
       { id: 1, url: "https://user.test/", title: "User", hidden: false, windowId: 1, index: 0, active: true },
       { id: 2, url: "https://other.test/", title: "Other", hidden: false, windowId: 1, index: 1, active: false },
@@ -1843,7 +2070,7 @@ describe("BackgroundRuntime: watching an agent tab", () => {
     const port = fakePort();
     hub.handleConnect(port);
     const provider = new FakeProvider();
-    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: fake.factory, clock });
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: fake.factory, clock, approvalBadge });
     hub.delegate = runtime;
     await runtime.initialize();
     const send = (command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
@@ -1975,6 +2202,138 @@ describe("BackgroundRuntime: watching an agent tab", () => {
     await send({ type: "run.start", prompt: "And now?" });
     expect(modelInput(provider)).not.toContain("Page of tab 7");
     expect(modelInput(provider)).not.toContain("/7/page.md");
+  });
+
+  /** Every page shield state sent to a content script, as [tabId, state]. */
+  const shields = (api: { sendMessage: { mock: { calls: unknown[][] } } }) => api.sendMessage.mock.calls.flatMap(([tabId, message]) =>
+    (message as { type: string }).type === "page.shield" ? [[tabId, (message as { shield: string }).shield]] : []);
+  const contentSays = async (runtime: BackgroundRuntime, tabId: number, type: "shield.sync" | "shield.takeover" = "shield.sync") =>
+    (await runtime.handleContentMessage(tabId, { v: 1, id: "content-1", type })).shield;
+
+  it("shields the watched tab from the user's input and removes the shield once watching ends", async () => {
+    const { api, send, switchTo, runtime } = await setup();
+    await send({ type: "tabs.watch", tabId: 5 });
+    expect(shields(api)).toEqual([[5, "idle"]]);
+    // A content script that loads (or reloads after a navigation) asks for its own tab's state.
+    expect(await contentSays(runtime, 5)).toBe("idle");
+    expect(await contentSays(runtime, 6)).toBe("off");
+    expect(await contentSays(runtime, 1)).toBe("off");
+
+    await switchTo(2);
+    expect(shields(api).at(-1)).toEqual([5, "off"]);
+    expect(await contentSays(runtime, 5)).toBe("off");
+  });
+
+  it("drops the shield for the rest of the watch when the user takes over, from the page or the sidebar", async () => {
+    const { api, send, runtime } = await setup();
+    await send({ type: "tabs.watch", tabId: 5 });
+    // Only the watched tab's content script can take over; the tab is always the sender's own.
+    expect(await contentSays(runtime, 6, "shield.takeover")).toBe("off");
+    expect((await runtime.getSnapshot()).agentTabs.takenOver).toBe(false);
+    expect(await contentSays(runtime, 5, "shield.takeover")).toBe("off");
+    expect(shields(api).at(-1)).toEqual([5, "off"]);
+    expect((await runtime.getSnapshot()).agentTabs).toMatchObject({ watching: 5, takenOver: true });
+    expect(await contentSays(runtime, 5)).toBe("off");
+
+    // A new watch starts shielded again.
+    await send({ type: "tabs.watch", tabId: 6 });
+    expect(shields(api).at(-1)).toEqual([6, "idle"]);
+    expect((await runtime.getSnapshot()).agentTabs).toMatchObject({ watching: 6, takenOver: false });
+    await send({ type: "tabs.takeOver", tabId: 6 });
+    expect(shields(api).at(-1)).toEqual([6, "off"]);
+    expect((await runtime.getSnapshot()).agentTabs.takenOver).toBe(true);
+  });
+
+  /** The run asks for help in `tab` first; then runs `program` if given, then answers. */
+  function helpRun(provider: FakeProvider, tab: string, program?: string) {
+    scripted(provider, [
+      [{ type: "tool.call", call: { id: "help_1", name: "request_user_help", arguments: { tab, kind: "login", reason: "Sign in to Grocer." } } }, { type: "turn.completed", replayState: null }],
+      ...(program ? [[{ type: "tool.call", call: { id: "program", name: "browser_program", arguments: { source: program } } }, { type: "turn.completed", replayState: null }] as ScriptedProviderEvent[]] : []),
+      [{ type: "text.delta", delta: "Ordered." }, { type: "turn.completed", replayState: null }],
+    ]);
+  }
+
+  function helpBadge() {
+    const texts: string[] = [];
+    return { texts, badge: new ApprovalBadge({ setBadgeText: async ({ text }) => { texts.push(text); }, setBadgeBackgroundColor: async () => {} }) };
+  }
+
+  it("pauses the run on a help request: badge, card state, the help tab unshielded while watched, and a digest entry", async () => {
+    const { badge, texts } = helpBadge();
+    const { api, send, runtime, provider, port } = await setup([], [], undefined, badge);
+    helpRun(provider, "/agent-tabs/5/page.md");
+    const run = send({ type: "run.start", prompt: "Order my groceries" });
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun?.status).toBe("awaiting-help"));
+    const snapshot = await runtime.getSnapshot();
+    expect(snapshot.activeRun?.pendingHelp).toMatchObject({ tabId: 5, kind: "login", reason: "Sign in to Grocer.", call: { id: "help_1" } });
+    expect(port.received.some((event) => event.type === "help.requested")).toBe(true);
+    expect(badge.pending).toBe(true);
+    expect(texts.at(-1)).toBe("!");
+    expect((await getRunCheckpoint())?.status).toBe("awaiting-help");
+
+    // Another watched tab of the run says bside is working; Show tab watches the help tab with no shield.
+    await send({ type: "tabs.watch", tabId: 6 });
+    expect(shields(api).at(-1)).toEqual([6, "working"]);
+    await send({ type: "tabs.watch", tabId: 5 });
+    expect(shields(api).at(-1)).toEqual([5, "off"]);
+    expect(await contentSays(runtime, 5)).toBe("off");
+
+    await send({ type: "help.resolve", runId: snapshot.activeRun!.runId, callId: "help_1", outcome: "done", note: "" });
+    await run;
+    expect(modelInput(provider)).toContain("done helping in /agent-tabs/5/page.md");
+    expect((await runtime.getSnapshot()).activeRun).toBeNull();
+    expect(badge.pending).toBe(false);
+    expect(texts.at(-1)).toBe("");
+    // Still watched once the run ends: shielded again, and idle.
+    await vi.waitFor(() => expect(shields(api).at(-1)).toEqual([5, "idle"]));
+    const digest = (await openConversation()).items.findLast((item) => item.kind === "run-digest");
+    expect(digest).toMatchObject({ digest: { entries: [{ type: "help", kind: "login", reason: "Sign in to Grocer.", outcome: "done" }] } });
+  });
+
+  it("keeps a help request open when the user switches away from its tab, and clears it on cancel", async () => {
+    const { badge } = helpBadge();
+    const { send, runtime, provider, switchTo } = await setup([], [], undefined, badge);
+    helpRun(provider, "/agent-tabs/5/page.md");
+    const run = send({ type: "run.start", prompt: "Order my groceries" });
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun?.status).toBe("awaiting-help"));
+    await send({ type: "tabs.watch", tabId: 5 });
+    await switchTo(1);
+    const snapshot = await runtime.getSnapshot();
+    expect(snapshot.agentTabs.watching).toBeNull();
+    expect(snapshot.activeRun?.pendingHelp?.tabId).toBe(5);
+
+    await send({ type: "run.cancel", runId: snapshot.activeRun!.runId });
+    await run;
+    expect((await runtime.getSnapshot()).activeRun).toBeNull();
+    expect(badge.pending).toBe(false);
+  });
+
+  it("ignores a help answer for another call or run, and passes on the user's note", async () => {
+    const { send, runtime, provider } = await setup();
+    helpRun(provider, "5");
+    const run = send({ type: "run.start", prompt: "Order my groceries" });
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun?.status).toBe("awaiting-help"));
+    const runId = (await runtime.getSnapshot()).activeRun!.runId;
+    await send({ type: "help.resolve", runId, callId: "other", outcome: "done", note: "" });
+    await send({ type: "help.resolve", runId: "other-run", callId: "help_1", outcome: "done", note: "" });
+    await tick();
+    expect((await runtime.getSnapshot()).activeRun?.status).toBe("awaiting-help");
+    await send({ type: "help.resolve", runId, callId: "help_1", outcome: "unable", note: "No account." });
+    await run;
+    expect(modelInput(provider)).toContain("could not help");
+    expect(modelInput(provider)).toContain("No account.");
+  });
+
+  it("tells the run's next program that the user took over one of its tabs", async () => {
+    const { send, runtime, provider } = await setup();
+    helpRun(provider, "/agent-tabs/5/page.md", "return 1;");
+    const run = send({ type: "run.start", prompt: "Order my groceries" });
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun?.status).toBe("awaiting-help"));
+    await send({ type: "tabs.watch", tabId: 6 });
+    expect(await contentSays(runtime, 6, "shield.takeover")).toBe("off");
+    await send({ type: "help.resolve", runId: (await runtime.getSnapshot()).activeRun!.runId, callId: "help_1", outcome: "done", note: "" });
+    await run;
+    expect(modelInput(provider)).toContain("the user took over /agent-tabs/6/page.md");
   });
 
   it("publishes each agent tab's title, site, and data-URL icon, never a remote icon", async () => {
@@ -2262,7 +2621,7 @@ describe("BackgroundRuntime: history drawer support", () => {
     const old = await createSessionWith(prompt("u1", "Old"));
     const running = (await runtime.getSnapshot()).conversation.id;
     const run = send({ type: "run.start", prompt: "Long task" });
-    await tick();
+    await untilRequested(provider);
     await send({ type: "session.create" });
     const open = (await runtime.getSnapshot()).conversation.id;
     vi.setSystemTime(Date.now() + 40 * DAY);
@@ -2300,7 +2659,7 @@ describe("BackgroundRuntime: history drawer support", () => {
     await updateSession(pinned, { pinned: true });
     const running = (await runtime.getSnapshot()).conversation.id;
     const run = send({ type: "run.start", prompt: "Long task" });
-    await tick();
+    await untilRequested(provider);
     await send({ type: "session.create" });
     const viewing = (await runtime.getSnapshot()).conversation.id;
 
@@ -2448,9 +2807,9 @@ describe("BackgroundRuntime: run digests and context continuity", () => {
 
   it("persists a digest for a cancelled run", async () => {
     await saveOpenAICredential("sk-test");
-    const { runtime } = setup([[programCall("p1"), done], "hang"]);
+    const { runtime, provider } = setup([[programCall("p1"), done], "hang"]);
     const run = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Go" });
-    await tick();
+    await untilRequested(provider, 2);
     await runtime.handleCommand({ v: 1, id: "2", type: "run.cancel", runId: (await runtime.getSnapshot()).activeRun!.runId });
     await run;
     expect(await digests()).toEqual([expect.objectContaining({ status: "cancelled", entries: [expect.objectContaining({ ok: true })] })]);
@@ -2488,9 +2847,8 @@ describe("BackgroundRuntime: run digests and context continuity", () => {
     expect(compaction).toMatchObject({ summary: "Summary of orchids.", firstKeptItemId: expect.any(String) });
     // Every item stays stored; only the model's view is summarized.
     expect(items.filter((item) => item.kind === "message")).toHaveLength(14);
-    await tick();
-    const snapshots = port.received.filter((event) => event.type === "state.snapshot");
-    expect(snapshots.some((event) => event.type === "state.snapshot" && event.payload.conversation.items.some((item) => item.kind === "compaction"))).toBe(true);
+    // The snapshot is broadcast without blocking the run, so it may land just after the run ends.
+    await vi.waitFor(() => expect(port.received.some((event) => event.type === "state.snapshot" && event.payload.conversation.items.some((item) => item.kind === "compaction"))).toBe(true));
     expect(provider.requests[1]!.context.messages[0]!.content).toContain("Summary of orchids.");
     const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export", sessionId: (await getOpenSessionId())! });
     expect(exported?.markdown).toContain("Summary of orchids.");
@@ -2542,7 +2900,7 @@ describe("BackgroundRuntime: talk while it works", () => {
     const gate = Promise.withResolvers<void>();
     scripted(provider, [{ events: program, gate: gate.promise }, { events: answer("Used tab 2.") }]);
     const run = send(runtime, { type: "run.start", prompt: "Compare prices" });
-    await tick();
+    await untilRequested(provider);
     const { activeRun, conversation } = await runtime.getSnapshot();
     await send(runtime, { type: "run.steer", runId: activeRun!.runId, text: "  Use tab 2  " });
     const [pending] = (await runtime.getSnapshot()).queue;
@@ -2568,7 +2926,7 @@ describe("BackgroundRuntime: talk while it works", () => {
     const gate = Promise.withResolvers<void>();
     scripted(provider, [{ events: answer("A done."), gate: gate.promise }, { events: answer("B done.") }]);
     const run = send(runtime, { type: "run.start", prompt: "A" });
-    await tick();
+    await untilRequested(provider);
     const first = (await runtime.getSnapshot()).conversation.id;
     await send(runtime, { type: "run.start", prompt: "B" });
     expect(await queueOf(runtime)).toEqual(["follow-up:B"]);
@@ -2595,7 +2953,7 @@ describe("BackgroundRuntime: talk while it works", () => {
     const gate = Promise.withResolvers<void>();
     scripted(provider, [{ gate: gate.promise, error: new ProviderStreamError("Rate limited.", "RATE_LIMIT") }, { events: answer("B done.") }]);
     const run = send(runtime, { type: "run.start", prompt: "A" });
-    await tick();
+    await untilRequested(provider);
     await send(runtime, { type: "run.start", prompt: "B" });
     await send(runtime, { type: "run.start", prompt: "C" });
     gate.resolve();
@@ -2615,7 +2973,7 @@ describe("BackgroundRuntime: talk while it works", () => {
     const { runtime, provider } = setup();
     scripted(provider, [{ events: answer("Never."), gate: new Promise(() => {}) }]);
     const run = send(runtime, { type: "run.start", prompt: "A" });
-    await tick();
+    await untilRequested(provider);
     const runId = (await runtime.getSnapshot()).activeRun!.runId;
     await send(runtime, { type: "run.steer", runId, text: "S" });
     await send(runtime, { type: "run.start", prompt: "F" });
@@ -2640,7 +2998,7 @@ describe("BackgroundRuntime: talk while it works", () => {
     const before = setup();
     scripted(before.provider, [{ events: answer("Never."), gate: new Promise(() => {}) }]);
     void send(before.runtime, { type: "run.start", prompt: "A" });
-    await tick();
+    await untilRequested(before.provider);
     await send(before.runtime, { type: "run.steer", runId: (await before.runtime.getSnapshot()).activeRun!.runId, text: "S" });
     await send(before.runtime, { type: "run.start", prompt: "F" });
 
@@ -2665,7 +3023,7 @@ describe("BackgroundRuntime: talk while it works", () => {
     const gate = Promise.withResolvers<void>();
     scripted(provider, [{ events: answer("A done."), gate: gate.promise }, { events: answer("B done.") }]);
     const run = send(runtime, { type: "run.start", prompt: "A" });
-    await tick();
+    await untilRequested(provider);
     await send(runtime, { type: "run.start", prompt: "B" });
     const [queued] = (await runtime.getSnapshot()).queue;
     gate.resolve();
@@ -2678,7 +3036,7 @@ describe("BackgroundRuntime: talk while it works", () => {
     const gate = Promise.withResolvers<void>();
     scripted(provider, [{ events: program, gate: gate.promise }, { error: new ProviderStreamError("Rate limited.", "RATE_LIMIT") }, { events: answer("Done.") }]);
     const run = send(runtime, { type: "run.start", prompt: "A" });
-    await tick();
+    await untilRequested(provider);
     await send(runtime, { type: "run.steer", runId: (await runtime.getSnapshot()).activeRun!.runId, text: "S" });
     gate.resolve();
     await run;
@@ -2777,7 +3135,7 @@ describe("BackgroundRuntime: usage visibility", () => {
 
   it("persists usage for failed and cancelled runs, sums a retried turn's runs, and records nothing for a run without tokens", async () => {
     await saveOpenAICredential("sk-test");
-    const { runtime, port } = setup([
+    const { runtime, port, provider } = setup([
       round([toolCall], { input: 300, output: 30, cost: cost(0.001) }),
       new ProviderStreamError("Rate limited.", "RATE_LIMIT"),
       round([text("Done.")], { input: 200, output: 20, cost: cost(0.002) }),
@@ -2793,7 +3151,7 @@ describe("BackgroundRuntime: usage visibility", () => {
     expect(turns[0]!.usage).toMatchObject({ input: 500, output: 50, costUsd: expect.closeTo(0.003, 10), pricedRuns: 2 });
 
     const run = runtime.handleCommand({ v: 1, id: "3", type: "run.start", prompt: "Go" });
-    await tick();
+    await untilRequested(provider, 5);
     await runtime.handleCommand({ v: 1, id: "4", type: "run.cancel", runId: (await runtime.getSnapshot()).activeRun!.runId });
     await run;
     expect((await usageItems()).map((item) => item.usage.input)).toEqual([300, 200, 50]);
@@ -2809,7 +3167,12 @@ describe("BackgroundRuntime: usage visibility", () => {
     await saveOpenAICredential("sk-test");
     const { runtime } = setup([round([toolCall], { input: 700, output: 70, cost: cost(0.002) }), "hang"]);
     void runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Long" });
-    await tick();
+    // Wait for the checkpoint itself, not a fixed number of ticks: on a slow
+    // machine the first round's usage lands after `tick()` returns.
+    await vi.waitFor(async () => {
+      const { runCheckpoint } = await fakeBrowser.storage.local.get("runCheckpoint") as { runCheckpoint?: { usage: unknown } };
+      expect(runCheckpoint?.usage).toMatchObject({ input: 700, responses: 1 });
+    });
     const snapshot = await runtime.getSnapshot();
     expect(snapshot.activeRun?.usage).toMatchObject({ input: 700, responses: 1 });
     const { runCheckpoint } = await fakeBrowser.storage.local.get("runCheckpoint") as { runCheckpoint: { usage: unknown } };
@@ -2821,5 +3184,327 @@ describe("BackgroundRuntime: usage visibility", () => {
     const runId = snapshot.activeRun!.runId;
     expect((await openConversation()).items.at(-1)).toMatchObject({ id: `usage-${runId}`, kind: "run-usage", usage: { input: 700, costUsd: 0.002 } });
     expect((await listSessions())[0]?.usage).toMatchObject({ input: 700, pricedRuns: 1 });
+  });
+});
+
+describe("BackgroundRuntime: context-menu drafts", () => {
+  const ask = (id = "ask-1", text = "Selected source text") => buildAskContext("selection", { selectionText: text }, { id: 1, url: "http://127.0.0.1:4173/agent-page.html", title: "Source page" }, id, 1)!;
+  const send = (runtime: BackgroundRuntime, command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+  const answer: ScriptedProviderEvent[] = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
+
+  it("keeps a removable draft without sending, ignores stale removals/labels, and preserves it on setup failure", async () => {
+    const provider = new FakeProvider();
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
+    runtime.setAsk(ask());
+    expect(provider.requests).toHaveLength(0);
+    expect((await runtime.getSnapshot()).conversation.items).toHaveLength(0);
+    await send(runtime, { type: "run.start", prompt: "Explain", askId: "ask-1" });
+    expect((await runtime.getSnapshot()).ask?.id).toBe("ask-1");
+    runtime.setAsk(ask("ask-2", "Replacement"));
+    await send(runtime, { type: "ask.dismiss", askId: "ask-1" });
+    runtime.updateAskAlt("ask-1", "Stale response");
+    expect((await runtime.getSnapshot()).ask).toMatchObject({ id: "ask-2", text: "Replacement" });
+    await send(runtime, { type: "run.start", prompt: "Explain", askId: "ask-1" });
+    expect(provider.requests).toHaveLength(0);
+    expect((await runtime.getSnapshot()).notice).toContain("replaced or removed");
+    await send(runtime, { type: "ask.dismiss", askId: "ask-2" });
+    expect((await runtime.getSnapshot()).ask).toBeNull();
+  });
+
+  it("attaches the source tab without querying the active one and pins its context through retry and replay", async () => {
+    await saveOpenAICredential("sk-test");
+    const controller = supportedPageTabControllerFactory();
+    const activeCapture = vi.spyOn(controller, "captureActivePage");
+    const sourceCapture = vi.spyOn(controller, "capturePage");
+    const provider = new FakeProvider();
+    let round = 0;
+    provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      if (round++ === 0) throw new ProviderStreamError("Try again", "NETWORK");
+      yield* answer;
+    } });
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider, tabControllerFactory: () => controller });
+    runtime.setAsk(ask());
+    await send(runtime, { type: "run.start", prompt: "Explain", askId: "ask-1" });
+    expect(activeCapture).not.toHaveBeenCalled();
+    expect(sourceCapture).toHaveBeenCalledWith(1);
+    expect((await runtime.getSnapshot()).ask).toBeNull();
+    runtime.setAsk(ask("next", "Different context"));
+    await send(runtime, { type: "run.retry" });
+    expect(sourceCapture).toHaveBeenCalledTimes(2);
+    const users = (await openConversation()).items.filter((item) => item.kind === "message" && item.role === "user");
+    expect(users).toHaveLength(1);
+    expect(users[0]).toMatchObject({ ask: { ...ask(), path: "/tabs/1/page.md" } });
+    expect(JSON.stringify(provider.requests[1]!.context.messages)).toContain("Selected source text");
+    expect(JSON.stringify(provider.requests[1]!.context.messages)).not.toContain("Different context");
+    expect(provider.requests[1]!.context.systemPrompt).toBe(provider.requests[0]!.context.systemPrompt);
+    expect(provider.requests[1]!.context.systemPrompt).not.toContain("Selected source text");
+    await send(runtime, { type: "run.start", prompt: "Follow up" });
+    expect(JSON.stringify(provider.requests[2]!.context.messages)).toContain("Selected source text");
+    expect((await runtime.getSnapshot()).ask?.id).toBe("next");
+  });
+
+  it.each(["follow-up", "steer"] as const)("snapshots a %s at acceptance and taints later memory writes", async (mode) => {
+    await saveOpenAICredential("sk-test");
+    const gate = Promise.withResolvers<void>();
+    const provider = new FakeProvider();
+    let round = 0;
+    provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      const current = round++;
+      if (current === 0) { await gate.promise; yield* answer; }
+      else if (current === 1) {
+        yield { type: "tool.call", call: { id: "save", name: "browser_program", arguments: { source: 'fs.write("/memory/selected.md", "Selected note\\nA useful detail");' } } } as ScriptedProviderEvent;
+        yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+      } else yield* answer;
+    } });
+    const controller = unsupportedPageTabControllerFactory();
+    const capture = vi.spyOn(controller, "capturePage");
+    const runtime = new BackgroundRuntime(new SidebarHub(), { provider, tabControllerFactory: () => controller });
+    const running = send(runtime, { type: "run.start", prompt: "Start" });
+    await untilRequested(provider);
+    runtime.setAsk(ask());
+    if (mode === "steer") await send(runtime, { type: "run.steer", runId: (await runtime.getSnapshot()).activeRun!.runId, text: "Explain", askId: "ask-1" });
+    else await send(runtime, { type: "run.start", prompt: "Explain", askId: "ask-1" });
+    const snapshot = await runtime.getSnapshot();
+    expect(snapshot.ask).toBeNull();
+    expect(snapshot.queue[0]?.ask).toMatchObject({ id: "ask-1", text: "Selected source text" });
+    expect((await loadMessageQueue(snapshot.conversation.id))[0]?.ask).toEqual(snapshot.queue[0]?.ask);
+    runtime.setAsk(ask("later", "Replacement"));
+    gate.resolve();
+    await running;
+    await vi.waitFor(() => expect(provider.requests).toHaveLength(3));
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun).toBeNull());
+    expect(JSON.stringify(provider.requests[1]!.context.messages)).toContain("Selected source text");
+    expect(JSON.stringify(provider.requests[1]!.context.messages)).not.toContain("Replacement");
+    expect((await listMemories())[0]?.provenance).toMatchObject({ by: "agent", tainted: true });
+    expect((await openConversation()).items.find((item) => item.kind === "message" && item.role === "user" && item.text === "Explain")).toMatchObject({ ask: { id: "ask-1" }, ...(mode === "steer" ? { delivery: "steer" } : {}) });
+    expect(capture).toHaveBeenCalledTimes(mode === "follow-up" ? 1 : 0);
+  });
+});
+
+describe("BackgroundRuntime: scheduled automation", () => {
+  const draft: TaskDraft = { name: "Morning check", prompt: "Check this page", url: "https://example.test/", enabled: true, schedule: { kind: "interval", minutes: 5 } };
+  const runtimes: BackgroundRuntime[] = [];
+  afterEach(() => { for (const runtime of runtimes.splice(0)) runtime.dispose(); });
+  async function setup(provider = new FakeProvider(), notifications?: RunNotifications, mcp?: McpConnections) {
+    await saveOpenAICredential("sk-test");
+    const openId = await ensureOpenSession();
+    const { clock, advance } = manualClock(Date.now());
+    const { api, tags, factory } = fakeTabsApi([{ id: 1, url: "https://private-user-page.test/", title: "Private page", hidden: false }]);
+    api.tabs.sendMessage.mockImplementation(async (tabId, message) => {
+      const request = message as { id: string; type: string };
+      const base = { v: 1, id: request.id, ok: true, type: request.type, url: "https://example.test/" };
+      if (request.type === "page.health") return { ...base, url: "https://example.test/" };
+      if (request.type === "page.snapshot") return { ...base, frames: 0, snapshot: { version: 2, tabId, documentId: `doc-${tabId}`, url: "https://example.test/", title: "Target page", text: "SCHEDULED_PAGE_TEXT", offset: 0, end: 19, totalChars: 19, selectionText: "" } };
+      return base;
+    });
+    const texts: string[] = [];
+    const badge = new ApprovalBadge({ setBadgeText: ({ text }) => { texts.push(text); }, setBadgeBackgroundColor: () => {} });
+    const hub = new SidebarHub();
+    const alarms = { create: vi.fn(), clear: vi.fn(async () => true) };
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory, clock, alarms, approvalBadge: badge, notifications, mcp });
+    runtimes.push(runtime); hub.delegate = runtime;
+    await runtime.initialize();
+    const saved = await runtime.handleAutomationRequest({ v: 1, id: "save", type: "automation.save", taskId: null, task: draft });
+    if (!saved.ok) throw new Error(saved.error.message);
+    const taskId = saved.tasks[0]!.id;
+    return { runtime, provider, advance, api, tags, taskId, openId, badge, texts, alarms };
+  }
+  const ended = async (taskId: string) => {
+    await vi.waitFor(async () => expect((await getScheduledTasks()).find((t) => t.id === taskId)?.lastRun?.endedAt).toBeTypeOf("number"));
+    return (await getScheduledTasks()).find((t) => t.id === taskId)!;
+  };
+
+  it("runs in a dedicated owned agent tab/session, preserves open chat, and reuses the results session", async () => {
+    const provider = new FakeProvider();
+    provider.script = [{ type: "text.delta", delta: "Checked." }, { type: "turn.completed", replayState: null }];
+    const { runtime, advance, api, tags, taskId, openId, texts } = await setup(provider);
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
+    const first = await ended(taskId);
+    expect(first.sessionId).not.toBe(openId);
+    expect(await getOpenSessionId()).toBe(openId);
+    expect((await getConversation(openId))!.items).toEqual([]);
+    const session = (await getConversation(first.sessionId!))!;
+    expect(session.scheduled).toMatchObject({ taskId, name: draft.name, url: draft.url });
+    expect(session.items.find(isTurnStart)).toMatchObject({ text: draft.prompt, scheduled: { taskId }, context: { url: draft.url } });
+    expect(api.tabs.create).toHaveBeenCalledWith({ url: draft.url, active: false });
+    expect(tags.get(100)).toMatchObject({ v: 2, sessionId: first.sessionId, role: "agent" });
+    expect(api.tabs.sendMessage.mock.calls.some(([id]) => id === 1)).toBe(false);
+    expect(JSON.stringify(provider.requests)).toContain("SCHEDULED_PAGE_TEXT");
+    expect(JSON.stringify(provider.requests)).not.toContain("private-user-page");
+    expect(texts.at(-1)).toBe("•");
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); await ended(taskId);
+    expect((await getScheduledTasks())[0]!.sessionId).toBe(first.sessionId);
+    expect((await getConversation(first.sessionId!))!.items.filter(isTurnStart)).toHaveLength(2);
+    await runtime.openAttentionSession();
+    expect(await getOpenSessionId()).toBe(first.sessionId);
+    expect((await getScheduledTasks())[0]!.unread).toBe(false);
+    expect(texts.at(-1)).toBe("");
+  });
+
+  it("skips busy ticks without interrupting a user run, including repeated alarms", async () => {
+    const { provider, release } = blockingProvider();
+    const { runtime, advance, taskId, openId } = await setup(provider);
+    const userRun = runtime.handleCommand({ v: 1, id: "user", type: "run.start", prompt: "User work" });
+    await untilRequested(provider);
+    const activeId = (await runtime.getSnapshot()).activeRun!.runId;
+    advance(300_000);
+    await Promise.all([runtime.handleAlarm(SCHEDULE_ALARM), runtime.handleAlarm(SCHEDULE_ALARM)]);
+    expect((await getScheduledTasks())[0]).toMatchObject({ lastTick: { status: "skipped-busy" }, lastRun: null, sessionId: null });
+    expect((await runtime.getSnapshot()).activeRun!.runId).toBe(activeId);
+    expect(provider.requests).toHaveLength(1);
+    release(); await userRun;
+    expect((await getScheduledTasks())[0]!.lastRun).toBeNull();
+    expect(await getOpenSessionId()).toBe(openId);
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); await ended(taskId);
+    expect(provider.requests).toHaveLength(2);
+  });
+
+  it("keeps an unsent context-menu draft separate from an automatic run", async () => {
+    const provider = new FakeProvider(); provider.script = [{ type: "turn.completed", replayState: null }];
+    const { runtime, advance, taskId } = await setup(provider);
+    const ask = buildAskContext("selection", { selectionText: "PRIVATE_UNSENT_SELECTION" }, { id: 1, url: "https://private-user-page.test/", title: "Source" }, "unsent", 1)!;
+    runtime.setAsk(ask);
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); await ended(taskId);
+    expect((await runtime.getSnapshot()).ask).toEqual(ask);
+    expect(JSON.stringify(provider.requests)).not.toContain("PRIVATE_UNSENT_SELECTION");
+  });
+
+  it("keeps scheduled help pending until a user response", async () => {
+    const provider = new FakeProvider();
+    scripted(provider, [[{ type: "tool.call", call: { id: "help", name: "request_user_help", arguments: { tab: "/agent-tabs/100/page.md", kind: "verification", reason: "Clear verification in the tab." } } }, { type: "turn.completed", replayState: null }], [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }]]);
+    const { runtime, advance, taskId, texts } = await setup(provider);
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun?.status).toBe("awaiting-help"));
+    const active = (await runtime.getSnapshot()).activeRun!;
+    expect((await getScheduledTasks())[0]!.lastRun?.status).toBe("awaiting-help");
+    expect(provider.requests).toHaveLength(1); expect(texts.at(-1)).toBe("!");
+    await runtime.handleCommand({ v: 1, id: "done", type: "help.resolve", runId: active.runId, callId: "help", outcome: "done", note: "" });
+    expect((await ended(taskId)).lastRun?.status).toBe("completed");
+  });
+
+  it("preserves confirm-writes MCP gates on unattended runs", async () => {
+    const fake = fakeMcpServers({ tools: { notion: [{ name: "create-page", annotations: { readOnlyHint: false } }] } });
+    const mcp = new McpConnections({ popup: approvingPopup(), fetcher: fake.fetcher });
+    await mcp.connect("notion");
+    const provider = new FakeProvider();
+    scripted(provider, [[{ type: "tool.call", call: { id: "write", name: "mcp__notion__create-page", arguments: { title: "Draft" } } }, { type: "turn.completed", replayState: null }], [{ type: "text.delta", delta: "Denied." }, { type: "turn.completed", replayState: null }]]);
+    const { runtime, advance, taskId } = await setup(provider, undefined, mcp);
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun?.pendingApproval?.mcp?.tool).toBe("create-page"));
+    const active = (await runtime.getSnapshot()).activeRun!;
+    expect(fake.requests.some((request) => request.body.includes('"tools/call"'))).toBe(false);
+    await runtime.handleCommand({ v: 1, id: "deny", type: "action.deny", runId: active.runId, callId: "write" });
+    await ended(taskId);
+    expect(fake.requests.some((request) => request.body.includes('"tools/call"'))).toBe(false);
+  });
+
+  it("never runs two due tasks simultaneously", async () => {
+    const { provider, release } = blockingProvider();
+    const { runtime, advance, taskId } = await setup(provider);
+    await runtime.handleAutomationRequest({ v: 1, id: "second", type: "automation.save", taskId: null, task: { ...draft, name: "Second task" } });
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); await untilRequested(provider);
+    const tasks = await getScheduledTasks();
+    expect(tasks.filter((t) => t.lastRun)).toHaveLength(1);
+    expect(tasks[1]!.lastTick?.status).toBe("skipped-busy");
+    expect(provider.requests).toHaveLength(1);
+    release(); await ended(taskId);
+  });
+
+  it("pauses scheduled confirmation until the user responds and preserves ! priority", async () => {
+    const provider = new FakeProvider();
+    scripted(provider, [[
+      { type: "tool.call", call: { id: "confirm", name: "request_action_confirmation", arguments: { title: "Send", message: "Send the draft?", artifact: "Draft" } } },
+      { type: "tool.call", call: { id: "after", name: "browser_program", arguments: { source: 'return fs.write("/workspace/approved.txt", "approved");' } } },
+      { type: "turn.completed", replayState: null },
+    ], [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }]]);
+    const { runtime, advance, taskId, openId, badge, texts } = await setup(provider);
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun?.status).toBe("awaiting-approval"));
+    const active = (await runtime.getSnapshot()).activeRun!;
+    expect((await getScheduledTasks())[0]!.lastRun?.status).toBe("awaiting-approval");
+    expect(await getOpenSessionId()).toBe(openId);
+    expect(provider.requests).toHaveLength(1);
+    badge.setResults(true); await tick(); expect(texts.at(-1)).toBe("!");
+    await runtime.openAttentionSession(); expect(await getOpenSessionId()).toBe(active.conversationId);
+    await runtime.handleCommand({ v: 1, id: "approve", type: "action.approve", runId: active.runId, callId: "confirm" });
+    const task = await ended(taskId);
+    expect((await getConversation(task.sessionId!))!.items.some((item) => item.kind === "tool-result" && item.callId === "after" && item.result.ok)).toBe(true);
+    expect(provider.requests).toHaveLength(2);
+    expect(texts.at(-1)).toBe("•");
+  });
+
+  it("keeps Ask-memory policy as a pause in scheduled runs, and cancellation remains terminal", async () => {
+    await browser.storage.local.set({ memorySettings: { version: 1, writes: "ask" } });
+    const provider = new FakeProvider();
+    scripted(provider, programRound('return fs.write("/memory/scheduled-note.md", "A note\\nBody");'));
+    const { runtime, advance, taskId } = await setup(provider);
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun?.status).toBe("awaiting-approval"));
+    const active = (await runtime.getSnapshot()).activeRun!;
+    expect(active.pendingApproval?.memory?.name).toBe("scheduled-note");
+    expect(await listMemories()).toEqual([]);
+    await runtime.handleCommand({ v: 1, id: "cancel", type: "run.cancel", runId: active.runId });
+    expect((await ended(taskId)).lastRun?.status).toBe("cancelled");
+    expect(await listMemories()).toEqual([]);
+  });
+
+  it("snapshots current skills/site notes/memory without changing the cache prefix", async () => {
+    const provider = new FakeProvider();
+    provider.script = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
+    const { runtime, advance, taskId } = await setup(provider);
+    const skill = { name: "scheduled", description: "Scheduled summary", body: "FIRST_SKILL" };
+    await handleSkillsRequest({ v: 1, id: "skill", type: "skills.save", skill });
+    await handleSiteNotesRequest({ v: 1, id: "note", type: "siteNotes.save", note: { origin: "https://example.test", includeSubdomains: false, text: "SITE_NOTE" } });
+    await writeMemory({ name: "morning", description: "MEMORY_INDEX", body: "Memory body" }, { sessionId: "seed", runId: "seed", tainted: false });
+    const original = (await getScheduledTasks())[0]!;
+    await runtime.handleAutomationRequest({ v: 1, id: "edit", type: "automation.save", taskId, task: { ...taskDraft(original), prompt: "/scheduled check this page" } });
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); const first = await ended(taskId);
+    const user = (await getConversation(first.sessionId!))!.items.find(isTurnStart)!;
+    expect(user.skill).toEqual(skill); expect(user.sites?.[0]?.text).toBe("SITE_NOTE");
+    const input = provider.requests[0]!;
+    expect(JSON.stringify(input.context.messages)).toContain("MEMORY_INDEX");
+    expect(JSON.stringify(input.context.messages)).toContain("Scheduling source");
+    expect(input.context.systemPrompt).not.toContain("SITE_NOTE");
+    expect(input.context.systemPrompt).not.toContain("MEMORY_INDEX");
+    await handleSkillsRequest({ v: 1, id: "edit-skill", type: "skills.save", skill: { ...skill, body: "SECOND_SKILL" } });
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); await ended(taskId);
+    const prompts = (await getConversation(first.sessionId!))!.items.filter(isTurnStart);
+    expect(prompts[0]!.skill?.body).toBe("FIRST_SKILL"); expect(prompts[1]!.skill?.body).toBe("SECOND_SKILL");
+    expect(provider.requests[1]!.context.systemPrompt).toEqual(input.context.systemPrompt);
+  });
+
+  it("session deletion, delete-all and retention disable schedules and remove result links", async () => {
+    for (const mode of ["delete", "all", "retention"]) {
+      const provider = new FakeProvider(); provider.script = [{ type: "turn.completed", replayState: null }];
+      const { runtime, advance, taskId } = await setup(provider);
+      advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); const task = await ended(taskId);
+      if (mode === "delete") await runtime.handleCommand({ v: 1, id: "delete", type: "session.delete", sessionId: task.sessionId!, closeAgentTabs: true });
+      if (mode === "all") await runtime.handleHistoryRequest({ v: 1, id: "all", type: "history.deleteAll" });
+      if (mode === "retention") { advance(8 * 24 * 60 * 60_000); await runtime.handleHistoryRequest({ v: 1, id: "retention", type: "history.retention.save", retention: "7d" }); }
+      const response = await runtime.handleAutomationRequest({ v: 1, id: "list", type: "automation.get" });
+      expect(response.ok && response.tasks.find((t) => t.id === taskId)).toMatchObject({ enabled: false, sessionId: null, lastRun: null, nextAt: null });
+      advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); expect(provider.requests).toHaveLength(1);
+      runtime.dispose(); fakeBrowser.reset();
+    }
+  });
+
+  it("notifications remain opt-in through the background, use generic text, and clicks select results", async () => {
+    const create = vi.fn(async (id: string) => id);
+    const openSidebar = vi.fn(); let clicked: ((id: string) => void) | undefined;
+    let runtime!: BackgroundRuntime;
+    const notifications = new RunNotifications({ api: { create, clear: async () => true, onClicked: { addListener: (cb) => { clicked = cb; }, removeListener: vi.fn() } }, openSidebar, selectSession: (id) => runtime.openResultsSession(id) });
+    const provider = new FakeProvider(); provider.script = [{ type: "text.delta", delta: "PRIVATE_MODEL_TEXT" }, { type: "turn.completed", replayState: null }];
+    const setupResult = await setup(provider, notifications); runtime = setupResult.runtime;
+    expect(await getNotificationSettings()).toEqual({ version: 1, enabled: false });
+    setupResult.advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); await ended(setupResult.taskId);
+    expect(create).not.toHaveBeenCalled();
+    await runtime.handleAutomationRequest({ v: 1, id: "enable", type: "automation.notifications.save", enabled: true });
+    setupResult.advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); const task = await ended(setupResult.taskId);
+    await vi.waitFor(() => expect(create).toHaveBeenCalledOnce());
+    const wire = JSON.stringify(create.mock.calls); expect(wire).not.toContain("PRIVATE"); expect(wire).not.toContain("example.test"); expect(wire).not.toContain(draft.prompt);
+    clicked!(create.mock.calls[0]![0]); expect(openSidebar).toHaveBeenCalledOnce();
+    await vi.waitFor(async () => expect(await getOpenSessionId()).toBe(task.sessionId));
+    await runtime.handleAutomationRequest({ v: 1, id: "disable", type: "automation.notifications.save", enabled: false });
+    expect(await getNotificationSettings()).toEqual({ version: 1, enabled: false });
   });
 });

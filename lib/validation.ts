@@ -5,7 +5,7 @@
  * on, by the agent loop after the provider returns complete arguments.
  */
 
-import type { DomAction, ElementTarget, JsonValue, PressKey, UploadFile } from "@/lib/domain/tools";
+import type { CharacterKey, DomAction, ElementTarget, JsonValue, KeyModifier, NamedKey, PressKey, UploadFile } from "@/lib/domain/tools";
 
 const MAX_REF_LEN = 32;
 const MAX_DOCUMENT_ID_LEN = 64;
@@ -17,7 +17,69 @@ const MAX_SELECT_VALUES = 20;
 const MAX_SELECT_VALUE_LEN = 256;
 export const MAX_UPLOAD_FILES = 5;
 export const MAX_UPLOAD_FILE_CHARS = 32_000;
-export const PRESS_KEYS: readonly PressKey[] = ["Enter", "Tab", "Escape", "Space", "Backspace", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"];
+export const PRESS_KEYS: readonly NamedKey[] = [
+  "Enter", "Tab", "Escape", "Space", "Backspace", "Delete", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown",
+];
+export const CHARACTER_KEYS = [..."abcdefghijklmnopqrstuvwxyz0123456789"] as readonly CharacterKey[];
+/** In the order a chord is written and its keys go down. */
+export const KEY_MODIFIERS: readonly KeyModifier[] = ["Control", "Alt", "Shift", "Meta"];
+const MODIFIER_ALIASES: Readonly<Record<string, KeyModifier>> = {
+  control: "Control", ctrl: "Control", alt: "Alt", option: "Alt", shift: "Shift", meta: "Meta", cmd: "Meta", command: "Meta",
+};
+
+export interface KeyChord { key: PressKey; modifiers: KeyModifier[] }
+
+/**
+ * Why a key and modifiers are not a pressable chord, or null if they are:
+ * an allowlisted key, distinct modifiers, a letter or digit only with
+ * Control, Alt, or Meta, and never copy, cut, or paste (Control/Meta + C, X,
+ * V, or Shift+Delete).
+ */
+export function keyChordProblem(key: unknown, modifiers: readonly unknown[]): string | null {
+  if (!(PRESS_KEYS as readonly unknown[]).includes(key) && !(CHARACTER_KEYS as readonly unknown[]).includes(key)) {
+    return `press() supports ${PRESS_KEYS.join(", ")}, and letters or digits with a modifier.`;
+  }
+  if (modifiers.length > KEY_MODIFIERS.length || new Set(modifiers).size !== modifiers.length || !modifiers.every((modifier) => (KEY_MODIFIERS as readonly unknown[]).includes(modifier))) {
+    return `Modifiers are ${KEY_MODIFIERS.join(", ")}, each at most once.`;
+  }
+  const held = new Set(modifiers);
+  if ((CHARACTER_KEYS as readonly unknown[]).includes(key) && !held.has("Control") && !held.has("Alt") && !held.has("Meta")) {
+    return "A letter or digit is pressed only with Control, Alt, or Meta; type text with fill().";
+  }
+  if (((key === "c" || key === "x" || key === "v") && (held.has("Control") || held.has("Meta"))) || (key === "Delete" && held.has("Shift"))) {
+    return "Copy, cut, and paste shortcuts are not available: bside never uses the clipboard.";
+  }
+  return null;
+}
+
+/** The chord as written: "Control+Shift+k", or just the key. */
+export function formatKeyChord(key: PressKey, modifiers: readonly KeyModifier[] = []): string {
+  return [...modifiers, key].join("+");
+}
+
+/**
+ * Parses a chord as a program writes it ("Control+Enter", "shift+tab",
+ * "Cmd+K", " " for Space): modifiers then one key, joined by "+". Modifier
+ * and key names are case-insensitive; letters are pressed lowercase.
+ */
+export function parseKeyChord(text: string): KeyChord | { error: string } {
+  const parts = text === " " ? ["Space"] : text.split("+").map((part) => part.trim());
+  if (parts.some((part) => !part) || parts.length > KEY_MODIFIERS.length + 1) {
+    return { error: `Write a key chord like "Enter", "Control+Enter", or "Shift+Tab".` };
+  }
+  const modifiers: KeyModifier[] = [];
+  for (const part of parts.slice(0, -1)) {
+    const modifier = MODIFIER_ALIASES[part.toLowerCase()];
+    if (!modifier) return { error: `Unknown modifier ${JSON.stringify(part)}; use ${KEY_MODIFIERS.join(", ")}.` };
+    modifiers.push(modifier);
+  }
+  const last = parts.at(-1)!;
+  const key = PRESS_KEYS.find((name) => name.toLowerCase() === last.toLowerCase()) ??
+    (/^[A-Za-z0-9]$/.test(last) ? (last.toLowerCase() as CharacterKey) : null);
+  const ordered = KEY_MODIFIERS.filter((modifier) => modifiers.includes(modifier));
+  const problem = keyChordProblem(key, modifiers);
+  return problem || !key ? { error: problem ?? "Unknown key." } : { key, modifiers: ordered };
+}
 
 export function isRecord(value: JsonValue): value is { [key: string]: JsonValue } {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -54,8 +116,13 @@ export function validateElementTarget(raw: unknown): ElementTarget | null {
 }
 
 function validateUploadFile(raw: unknown): UploadFile | null {
-  if (!isObject(raw) || !hasExactKeys(raw, ["name", "mimeType", "text"])) return null;
+  if (!isObject(raw)) return null;
   if (!isBoundedString(raw.name, 255) || /[\\/\x00-\x1f]/.test(raw.name)) return null;
+  if (hasExactKeys(raw, ["name", "mimeType", "base64"])) {
+    if (!isBinaryFile(raw.name, raw.mimeType, raw.base64)) return null;
+    return { name: raw.name, mimeType: raw.mimeType as string, base64: raw.base64 as string };
+  }
+  if (!hasExactKeys(raw, ["name", "mimeType", "text"])) return null;
   if (typeof raw.mimeType !== "string" || !/^[a-z]+\/[a-z0-9.+-]+$/i.test(raw.mimeType)) return null;
   if (typeof raw.text !== "string" || raw.text.length > MAX_UPLOAD_FILE_CHARS) return null;
   return { name: raw.name, mimeType: raw.mimeType, text: raw.text };
@@ -70,11 +137,21 @@ export function validateDomAction(raw: unknown): DomAction | null {
       const t = target();
       return t && hasExactKeys(raw, ["kind", "target"]) ? { kind: "click", target: t } : null;
     }
+    case "hover": {
+      const t = target();
+      return t && hasExactKeys(raw, ["kind", "target"]) ? { kind: "hover", target: t } : null;
+    }
+    case "drag": {
+      const t = target();
+      const to = validateElementTarget(raw.to);
+      return t && to && hasExactKeys(raw, ["kind", "target", "to"]) ? { kind: "drag", target: t, to } : null;
+    }
     case "fill": {
       const t = target();
-      if (!t || !hasExactKeys(raw, ["kind", "target", "text"])) return null;
-      if (typeof raw.text !== "string" || raw.text.length > MAX_FILL_TEXT_LEN) return null;
-      return { kind: "fill", target: t, text: raw.text };
+      if (!t || typeof raw.text !== "string" || raw.text.length > MAX_FILL_TEXT_LEN) return null;
+      if (hasExactKeys(raw, ["kind", "target", "text"])) return { kind: "fill", target: t, text: raw.text };
+      if (!hasExactKeys(raw, ["kind", "target", "text", "commit"]) || typeof raw.commit !== "boolean") return null;
+      return { kind: "fill", target: t, text: raw.text, commit: raw.commit };
     }
     case "select": {
       const t = target();
@@ -83,6 +160,12 @@ export function validateDomAction(raw: unknown): DomAction | null {
       if (!raw.values.every((value) => typeof value === "string" && value.length <= MAX_SELECT_VALUE_LEN)) return null;
       return { kind: "select", target: t, values: raw.values as string[] };
     }
+    case "choose": {
+      const t = target();
+      if (!t || !hasExactKeys(raw, ["kind", "target", "option"])) return null;
+      if (!isBoundedString(raw.option, MAX_SELECT_VALUE_LEN) || !raw.option.trim()) return null;
+      return { kind: "choose", target: t, option: raw.option };
+    }
     case "check": {
       const t = target();
       if (!t || !hasExactKeys(raw, ["kind", "target", "checked"]) || typeof raw.checked !== "boolean") return null;
@@ -90,9 +173,13 @@ export function validateDomAction(raw: unknown): DomAction | null {
     }
     case "press": {
       const t = target();
-      if (!t || !hasExactKeys(raw, ["kind", "target", "key"])) return null;
-      if (!(PRESS_KEYS as readonly unknown[]).includes(raw.key)) return null;
-      return { kind: "press", target: t, key: raw.key as PressKey };
+      if (!t) return null;
+      if (hasExactKeys(raw, ["kind", "target", "key"])) {
+        return keyChordProblem(raw.key, []) ? null : { kind: "press", target: t, key: raw.key as PressKey };
+      }
+      if (!hasExactKeys(raw, ["kind", "target", "key", "modifiers"]) || !Array.isArray(raw.modifiers) || !raw.modifiers.length) return null;
+      if (keyChordProblem(raw.key, raw.modifiers)) return null;
+      return { kind: "press", target: t, key: raw.key as PressKey, modifiers: [...raw.modifiers] as KeyModifier[] };
     }
     case "upload": {
       const t = target();
@@ -160,6 +247,34 @@ export function validateSessionTitle(raw: string): string | null {
 /** `/workspace` scratch-file limits, per session. */
 export const WORKSPACE_MAX_FILES = 64;
 export const WORKSPACE_MAX_FILE_CHARS = 32_000;
+/** Most bytes (decoded) one binary `/workspace` file may hold. */
+export const WORKSPACE_MAX_BINARY_BYTES = 1_500_000;
+/** Most bytes (decoded) all of one session's binary files may hold together. */
+export const WORKSPACE_MAX_BINARY_TOTAL_BYTES = 6_000_000;
+/** The binary file types `/workspace` holds, by extension; the extension decides the type. */
+export const WORKSPACE_BINARY_TYPES: Readonly<Record<string, string>> = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", pdf: "application/pdf",
+};
+/** Binary types the model can look at with `fs.view`. */
+export const VIEWABLE_IMAGE_TYPES: readonly string[] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/** The binary type a file name's extension stands for, or null for a text file. */
+export function binaryTypeFor(name: string): string | null {
+  const dot = name.lastIndexOf(".");
+  return dot < 0 ? null : WORKSPACE_BINARY_TYPES[name.slice(dot + 1).toLowerCase()] ?? null;
+}
+
+/** Decoded size of canonical base64 text, or null if it is not base64. */
+export function base64Bytes(data: unknown): number | null {
+  if (typeof data !== "string" || data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(data)) return null;
+  return (data.length / 4) * 3 - (data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0);
+}
+
+/** A binary file: an allowed type its name's extension stands for, and 1 to `WORKSPACE_MAX_BINARY_BYTES` base64 bytes. */
+export function isBinaryFile(name: string, mimeType: unknown, base64: unknown): boolean {
+  const bytes = base64Bytes(base64);
+  return binaryTypeFor(name) === mimeType && bytes !== null && bytes > 0 && bytes <= WORKSPACE_MAX_BINARY_BYTES;
+}
 
 /** A `/workspace/…` file path: segments of letters, digits, '.', '_' and '-', no traversal, at most 256 characters. */
 export function isWorkspacePath(value: unknown): value is string {

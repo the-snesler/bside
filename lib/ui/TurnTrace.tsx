@@ -1,45 +1,73 @@
 import { useEffect, useState } from "preact/hooks";
 import ArrowsMove from "~icons/tabler/arrows-move";
+import DragDrop from "~icons/tabler/drag-drop";
 import ArrowsVertical from "~icons/tabler/arrows-vertical";
+import Brain from "~icons/tabler/brain";
 import BrandYoutube from "~icons/tabler/brand-youtube";
+import Camera from "~icons/tabler/camera";
 import Checkbox from "~icons/tabler/checkbox";
 import Clock from "~icons/tabler/clock";
 import ExternalLink from "~icons/tabler/external-link";
 import FilePencil from "~icons/tabler/file-pencil";
 import FileText from "~icons/tabler/file-text";
 import Forms from "~icons/tabler/forms";
+import HandClick from "~icons/tabler/hand-click";
+import HandFinger from "~icons/tabler/hand-finger";
+import Keyboard from "~icons/tabler/keyboard";
 import List from "~icons/tabler/list";
+import LockAccess from "~icons/tabler/lock-access";
+import Login from "~icons/tabler/login";
 import Paperclip from "~icons/tabler/paperclip";
+import Photo from "~icons/tabler/photo";
 import Pointer from "~icons/tabler/pointer";
 import Search from "~icons/tabler/search";
 import Selector from "~icons/tabler/selector";
 import Shield from "~icons/tabler/shield-check";
+import Table from "~icons/tabler/table";
+import ShieldQuestion from "~icons/tabler/shield-question";
 import Terminal from "~icons/tabler/terminal-2";
 import Trash from "~icons/tabler/trash";
 import WorldSearch from "~icons/tabler/world-search";
 import { PROMPT_MENTION_PATTERN } from "@/lib/domain/conversation";
-import type { ApprovalRequest } from "@/lib/protocol";
+import type { HelpKind } from "@/lib/domain/tools";
+import { MAX_HELP_NOTE_CHARS } from "@/lib/domain/tools";
+import { findMcpServer } from "@/lib/mcp/servers";
+import { mcpServerIcon } from "@/lib/ui/mcp-icons";
+import type { AgentTabSummary, ApprovalRequest, HelpOutcome, HelpRequest } from "@/lib/protocol";
 import { Markdown } from "@/lib/ui/Markdown";
+import { AskChip } from "@/lib/ui/AskChip";
 import { Mascot, type MascotMood } from "@/lib/ui/Mascot";
 import { Trace, TraceLine, type TraceStatus } from "@/lib/ui/Trace";
 import { formatDuration, type Activity, type Turn, type TurnStep } from "@/lib/ui/turns";
 
 type Icon = typeof Pointer;
 
+/** A connected account's tool call: the server's icon and "Notion: notion-search". */
+function mcpLabel(activity: Activity): { Icon: Icon; label: string } | null {
+  const mcp = activity.call.mcp;
+  if (!mcp) return null;
+  return { Icon: mcpServerIcon(mcp.server), label: `${findMcpServer(mcp.server)?.name ?? mcp.server}: ${mcp.tool}` };
+}
+
 /** First matching effect wins: [source pattern, icon, running, done, failed]. */
 const PROGRAM_ACTIONS: [RegExp, Icon, string, string, string][] = [
   [/\.setInputFiles\(/, Paperclip, "Attaching a file", "Attached a file", "Couldn't attach a file"],
+  [/\.dragTo\s*\(/, DragDrop, "Dragging a page item", "Dragged a page item", "Couldn't drag a page item"],
   [/\.click\(|\.press\(/, Pointer, "Clicking a page control", "Clicked a page control", "Couldn't click a page control"],
   [/\.fill\(/, Forms, "Filling page fields", "Filled page fields", "Couldn't fill page fields"],
-  [/\.selectOption\(/, Selector, "Selecting an option", "Selected an option", "Couldn't select an option"],
+  [/\.selectOption\(|\.choose\s*\(/, Selector, "Selecting an option", "Selected an option", "Couldn't select an option"],
   [/\.setChecked\(|\.check\(|\.uncheck\(/, Checkbox, "Updating a checkbox", "Updated a checkbox", "Couldn't update a checkbox"],
+  [/\.hover\s*\(/, HandFinger, "Hovering over a page control", "Hovered over a page control", "Couldn't hover over a page control"],
   [/web\.search\(/, WorldSearch, "Searching the web", "Searched the web", "Web search failed"],
   [/youtube\s*\.\s*\w+\s*\(/, BrandYoutube, "Reading YouTube", "Read YouTube", "Couldn't read YouTube"],
   [/\.navigate\(|\.goBack\(|browser\.open\(/, ExternalLink, "Opening a page", "Opened a page", "Couldn't open a page"],
+  [/\.screenshot\s*\(/, Camera, "Taking a screenshot", "Took a screenshot", "Couldn't take a screenshot"],
+  [/fs\s*\.\s*view\s*\(/, Photo, "Looking at an image", "Looked at an image", "Couldn't show an image"],
   [/fs\.remove\(/, Trash, "Removing a file or tab", "Removed a file or tab", "Couldn't remove a file or tab"],
   [/fs\.move\(/, ArrowsMove, "Moving a file or tab", "Moved a file or tab", "Couldn't move a file or tab"],
   [/fs\.write\(/, FilePencil, "Writing a scratch file", "Wrote a scratch file", "Couldn't write a scratch file"],
   [/\.scroll\(/, ArrowsVertical, "Scrolling the page", "Scrolled the page", "Couldn't scroll the page"],
+  [/\.table\s*\(/, Table, "Reading a table", "Read a table", "Couldn't read a table"],
   [/\.find\(|\.waitFor\(/, Search, "Searching page content", "Searched page content", "Page search failed"],
   [/fs\s*\.\s*read\s*\(/, FileText, "Reading file content", "Read file content", "Couldn't read file content"],
   [/\.snapshot\(/, FileText, "Reading page content", "Read page content", "Couldn't read page content"],
@@ -52,20 +80,57 @@ function stringArg(activity: Activity, key: string): string {
   return typeof value === "string" ? value : "";
 }
 
-/** A denied confirmation is the user's decision, and a skipped call never ran: neither is a failed step. */
-function failed(activity: Activity): boolean {
-  if (!activity.result || activity.result.ok || activity.result.code === "SKIPPED") return false;
-  return !(activity.call.name === "request_action_confirmation" && activity.result.code === "ACTION_DENIED");
+/** What each kind of help request asks of the user, and its icon. */
+export const HELP_KIND_LABELS: Record<HelpKind, { Icon: Icon; label: string }> = {
+  login: { Icon: Login, label: "sign in" },
+  verification: { Icon: ShieldQuestion, label: "verification" },
+  information: { Icon: Keyboard, label: "enter information" },
+  permission: { Icon: LockAccess, label: "permission prompt" },
+  other: { Icon: HandClick, label: "a step only you can do" },
+};
+
+function helpKind(activity: Activity): { Icon: Icon; label: string } {
+  return HELP_KIND_LABELS[stringArg(activity, "kind") as HelpKind] ?? HELP_KIND_LABELS.other;
 }
 
-/** Icon, status, and a title that states that status in words. */
-export function describeActivity(activity: Activity, pending: boolean): { Icon: Icon; title: string; status?: TraceStatus } {
+/**
+ * A denied confirmation (a gated MCP call's included) or help the user could not give is the user's
+ * decision, and a skipped call never ran: none is a failed step. A help
+ * request fails only when it was refused (not one of the chat's agent tabs).
+ */
+function failed(activity: Activity): boolean {
+  if (!activity.result || activity.result.ok || activity.result.code === "SKIPPED") return false;
+  if (activity.call.name === "request_user_help") return activity.result.code === "INVALID_TOOL_ARGUMENTS";
+  return !((activity.call.name === "request_action_confirmation" || activity.call.mcp) && activity.result.code === "ACTION_DENIED");
+}
+
+/** Icon, status, and a title that states that status in words. `approval` is the request pending on this step, if any. */
+export function describeActivity(activity: Activity, pending: boolean, approval?: ApprovalRequest | null): { Icon: Icon; title: string; status?: TraceStatus } {
+  if (pending && approval?.memory) return { Icon: Brain, title: `Waiting for approval: ${approval.display}`, status: "pending" };
+  const mcp = mcpLabel(activity);
+  if (mcp) {
+    const { Icon, label } = mcp;
+    if (pending) return { Icon, title: `Waiting for approval: ${label}`, status: "pending" };
+    if (!activity.result) return { Icon, title: `Using ${label}`, status: "running" };
+    if (activity.result.code === "SKIPPED") return { Icon, title: `Skipped using ${label}` };
+    if (activity.result.code === "ACTION_DENIED") return { Icon, title: `Denied: ${label}` };
+    return activity.result.ok ? { Icon, title: `Used ${label}` } : { Icon, title: `Couldn't use ${label}`, status: "error" };
+  }
   if (activity.call.name === "request_action_confirmation") {
     const title = stringArg(activity, "title") || "an action";
     if (pending) return { Icon: Shield, title: `Waiting for approval: ${title}`, status: "pending" };
     if (!activity.result) return { Icon: Shield, title: `Asking to confirm: ${title}`, status: "running" };
     if (activity.result.code === "SKIPPED") return { Icon: Shield, title: `Skipped asking to confirm: ${title}` };
     return { Icon: Shield, title: `${activity.result.ok ? "Approved" : "Denied"}: ${title}` };
+  }
+  if (activity.call.name === "request_user_help") {
+    const { Icon, label } = helpKind(activity);
+    if (pending) return { Icon, title: `Needs your help: ${label}`, status: "pending" };
+    if (!activity.result) return { Icon, title: `Asked for your help: ${label}`, status: "running" };
+    if (activity.result.code === "SKIPPED") return { Icon, title: `Skipped asking for your help: ${label}` };
+    if (failed(activity)) return { Icon, title: `Couldn't ask for your help: ${label}`, status: "error" };
+    if (activity.result.ok) return { Icon, title: `You helped: ${label}` };
+    return { Icon, title: activity.result.code === "ACTION_DENIED" ? `You couldn't help: ${label}` : `Stopped waiting for your help: ${label}` };
   }
   const source = stringArg(activity, "source");
   const [, Icon, running, done, error] =
@@ -77,17 +142,105 @@ export function describeActivity(activity: Activity, pending: boolean): { Icon: 
   return failed(activity) ? { Icon, title: error, status: "error" } : { Icon, title: done };
 }
 
+function hostname(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * The pending help request's answers: show the tab (watching it without the
+ * page shield, since bside asked for the user's hands), say it is done, or
+ * say they can't, optionally with a short note.
+ */
+function HelpActions(props: { tab: AgentTabSummary | null; onShowTab: () => void; onResolve: (outcome: HelpOutcome, note: string) => void }) {
+  const [declining, setDeclining] = useState(false);
+  const [note, setNote] = useState("");
+  if (declining) {
+    const send = () => props.onResolve("unable", note.trim());
+    return (
+      <form class="help__decline" onSubmit={(event) => { event.preventDefault(); send(); }}>
+        <input
+          type="text"
+          class="help__note"
+          aria-label="Why not? (optional)"
+          placeholder="Why not? (optional)"
+          maxLength={MAX_HELP_NOTE_CHARS}
+          value={note}
+          onInput={(event) => setNote(event.currentTarget.value)}
+          onKeyDown={(event) => { if (event.key === "Escape") setDeclining(false); }}
+          autoFocus
+        />
+        <div class="trace__actions">
+          <button type="submit" class="trace__approve">Send</button>
+          <button type="button" onClick={() => setDeclining(false)}>Back</button>
+        </div>
+      </form>
+    );
+  }
+  return (
+    <div class="trace__actions">
+      <button type="button" disabled={!props.tab} title={props.tab ? "Show bside's tab so you can do this there" : "This tab is closed"} onClick={props.onShowTab}>
+        Show tab
+      </button>
+      <button type="button" class="trace__approve" onClick={() => props.onResolve("done", "")}>Done</button>
+      <button type="button" onClick={() => setDeclining(true)}>Can't help</button>
+    </div>
+  );
+}
+
+/** A memory change the user's Ask policy holds for approval: the entry as it would be saved, or as it is before removal. */
+function MemoryApprovalCard(props: { change: NonNullable<ApprovalRequest["memory"]> }) {
+  const { change } = props;
+  return (
+    <>
+      <p>{change.op === "remove" ? "bside wants to forget this memory:" : change.replaces ? "bside wants to update this memory:" : "bside wants to remember this:"}</p>
+      <pre class="tool-call">{change.body ? `${change.description}\n\n${change.body}` : change.description}</pre>
+      {change.tainted && change.op === "write" && (
+        <p class="memory-approval__warning">bside read web content earlier in this task. Make sure this is something you want kept, not something a page told it to remember.</p>
+      )}
+    </>
+  );
+}
+
+/** A connected account's call the server's "Always confirm writes" trust level holds for approval. */
+function McpApprovalCard(props: { request: NonNullable<ApprovalRequest["mcp"]> }) {
+  const { request } = props;
+  return (
+    <>
+      <p>
+        {request.destructive
+          ? `bside wants to use ${request.serverName}'s ${request.tool} tool, which may change or delete data in your account:`
+          : `bside wants to use ${request.serverName}'s ${request.tool} tool, which may change data in your account:`}
+      </p>
+      <pre class="tool-call">{request.arguments}</pre>
+      <p class="mcp-approval__note">You asked to confirm writes on {request.serverName}. You can change this in Settings › Connections.</p>
+    </>
+  );
+}
+
 function ActivityLine(props: {
   activity: Activity;
   pending: boolean;
+  /** The confirmation pending on this step, when it is a memory change under the Ask policy. */
+  approval?: ApprovalRequest | null;
   onApprove: () => void;
   onDeny: () => void;
+  helpTab?: AgentTabSummary | null;
+  onShowTab?: () => void;
+  onResolveHelp?: (outcome: HelpOutcome, note: string) => void;
 }) {
   const { activity, pending } = props;
-  const { Icon, title, status } = describeActivity(activity, pending);
+  const { Icon, title, status } = describeActivity(activity, pending, props.approval);
+  const memoryApproval = pending ? props.approval?.memory : undefined;
+  const mcpApproval = pending ? props.approval?.mcp : undefined;
   const elapsed = activity.endedAt === null ? 0 : activity.endedAt - activity.startedAt;
   const isConfirmation = activity.call.name === "request_action_confirmation";
+  const isHelp = activity.call.name === "request_user_help";
   const artifact = stringArg(activity, "artifact");
+  const helpTab = props.helpTab ?? null;
   return (
     <TraceLine
       icon={<Icon />}
@@ -96,10 +249,25 @@ function ActivityLine(props: {
       status={status}
       open={pending}
     >
-      {isConfirmation ? (
+      {memoryApproval ? (
+        <MemoryApprovalCard change={memoryApproval} />
+      ) : mcpApproval ? (
+        <McpApprovalCard request={mcpApproval} />
+      ) : activity.call.mcp ? (
+        <pre class="tool-call">{typeof activity.call.arguments === "string" ? activity.call.arguments : JSON.stringify(activity.call.arguments, null, 2)}</pre>
+      ) : isConfirmation ? (
         <>
           <p>{stringArg(activity, "message")}</p>
           {artifact && <pre class="tool-call">{artifact}</pre>}
+        </>
+      ) : isHelp ? (
+        <>
+          <p class="help__reason">{stringArg(activity, "reason")}</p>
+          {pending && (
+            <p class="help__tab">
+              {helpTab ? `In bside's tab: ${helpTab.title || hostname(helpTab.url)} · ${hostname(helpTab.url)}` : "bside's tab for this is closed."}
+            </p>
+          )}
         </>
       ) : activity.call.name === "browser_program" ? (
         <pre class="tool-call">
@@ -107,7 +275,10 @@ function ActivityLine(props: {
         </pre>
       ) : null}
       {activity.result && <p class="trace__result">{activity.result.summary}</p>}
-      {pending && (
+      {pending && isHelp && props.onShowTab && props.onResolveHelp && (
+        <HelpActions tab={helpTab} onShowTab={props.onShowTab} onResolve={props.onResolveHelp} />
+      )}
+      {pending && !isHelp && (
         <div class="trace__actions">
           <button type="button" class="trace__approve" onClick={props.onApprove}>
             Approve
@@ -154,8 +325,15 @@ export function TurnTrace(props: {
   pendingApproval: ApprovalRequest | null;
   onApprove: (callId: string) => void;
   onDeny: (callId: string) => void;
+  /** The run's open help request, answered from its card. */
+  pendingHelp?: HelpRequest | null;
+  /** The chat's agent tabs, to name the tab a help request is about. */
+  agentTabs?: readonly AgentTabSummary[];
+  onShowTab?: (tabId: number) => void;
+  onResolveHelp?: (callId: string, outcome: HelpOutcome, note: string) => void;
 }) {
   const { turn, active, pendingApproval } = props;
+  const pendingHelp = props.pendingHelp ?? null;
   const now = useNow(active);
   if (!active && turn.steps.length === 0) return null;
 
@@ -166,7 +344,9 @@ export function TurnTrace(props: {
   const header: { title: string; status?: TraceStatus; mood: MascotMood } = active
     ? pendingApproval
       ? { title: "Waiting for your approval", status: "pending", mood: "needs" }
-      : { title: `Working for ${elapsed}`, status: "running", mood: "working" }
+      : pendingHelp
+        ? { title: "Waiting for your help", status: "pending", mood: "needs" }
+        : { title: `Working for ${elapsed}`, status: "running", mood: "working" }
     : { title: `${ENDED[ended]} ${elapsed}`, mood: ended === "completed" ? "idle" : "failed" };
   const description = activities.length ? (
     <>
@@ -200,17 +380,22 @@ export function TurnTrace(props: {
                   <ActivityLine
                     key={activity.id}
                     activity={activity}
-                    pending={pendingApproval?.call.id === activity.call.id}
+                    pending={pendingApproval?.call.id === activity.call.id || pendingHelp?.call.id === activity.call.id}
+                    approval={pendingApproval?.call.id === activity.call.id ? pendingApproval : null}
                     onApprove={() => props.onApprove(activity.call.id)}
                     onDeny={() => props.onDeny(activity.call.id)}
+                    helpTab={pendingHelp?.call.id === activity.call.id ? props.agentTabs?.find((tab) => tab.id === pendingHelp.tabId) ?? null : null}
+                    onShowTab={pendingHelp && props.onShowTab ? () => props.onShowTab!(pendingHelp.tabId) : undefined}
+                    onResolveHelp={props.onResolveHelp ? (outcome, note) => props.onResolveHelp!(activity.call.id, outcome, note) : undefined}
                   />
                 ))}
               </Trace>
             ) : group.kind === "steer" ? (
-              <p key={group.id} class="trace__steer">
+              <div key={group.id} class="trace__steer">
                 <span class="trace__steer-label">You</span>
                 {group.text.replace(PROMPT_MENTION_PATTERN, "@$1")}
-              </p>
+                {group.ask && <AskChip ask={group.ask} />}
+              </div>
             ) : (
               <div key={group.id} class="trace__message">
                 <Markdown text={group.text} />

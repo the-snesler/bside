@@ -11,16 +11,26 @@
  * persistence) and everything outside an active run (credentials, settings).
  */
 
-import { AgentLoop } from "@/lib/background/agent-loop";
-import { getSkills } from "@/lib/background/skills";
+import { AGENT_TOOL_NAMES, AgentLoop } from "@/lib/background/agent-loop";
+import { getSkills, sidebarSkillCatalog } from "@/lib/background/skills";
 import { captureInvokedSkill } from "@/lib/background/skill-context";
+import { isAskContext, type AskContextV1 } from "@/lib/domain/ask";
 import { skillCatalog, type Skill, type SkillSummary } from "@/lib/domain/skills";
+import { readInstructions, saveSiteNoteFromSidebar } from "@/lib/background/instructions";
+import { readMemoryIndex, runMemory, undoMemoryChanges } from "@/lib/background/memory";
+import { matchSiteNotes, pageOrigin, siteNoteForPage, type SiteNote } from "@/lib/domain/instructions";
 import type { ApprovalBadge } from "@/lib/background/approval-badge";
+import { TaskScheduler, type RecordTaskStart, type SchedulerAlarms, type TaskDispatch } from "@/lib/background/scheduler";
+import type { ScheduledSource, ScheduledTask } from "@/lib/domain/automation";
+import type { RunNotifications } from "@/lib/background/notifications";
+import type { McpConnections } from "@/lib/background/mcp";
+import type { McpToolDefinition } from "@/lib/mcp/tools";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
 import type { AgentTab } from "@/lib/background/browser-program";
 import type { SidebarHub } from "@/lib/background/sidebar-hub";
-import { TabController } from "@/lib/background/tab-controller";
+import { FrameAliases, TabController } from "@/lib/background/tab-controller";
+import { PdfReader, workerPdfExtractor } from "@/lib/background/pdf";
 import { browserSiteEnv } from "@/lib/sites";
 import type { SiteEnv } from "@/lib/sites/site-api";
 import type { AgentTabTagV1, AgentTabTagV2, TabControllerBrowserApi, TabSnapshot } from "@/lib/background/tab-controller";
@@ -36,6 +46,8 @@ import {
   getAppSettings,
   getConversation,
   getHistorySettings,
+  getNotificationSettings,
+  saveNotificationSettings,
   isSessionUntouched,
   loadMessageQueue,
   loadWorkspaceFiles,
@@ -62,19 +74,26 @@ import type { RunStatus } from "@/lib/storage";
 import { validatePromptText, validateSessionTitle } from "@/lib/validation";
 import type { ContextArtifact } from "@/lib/domain/tools";
 import type { Conversation, ConversationItem, ConversationSummary, QueuedMessage, UserMessageItem } from "@/lib/domain/conversation";
-import { isTurnStart, MAX_QUEUED_MESSAGES, retentionCutoff } from "@/lib/domain/conversation";
+import { isTurnStart, MAX_QUEUED_MESSAGES, PROMPT_MENTION_PATTERN, retentionCutoff } from "@/lib/domain/conversation";
 import { buildRunDigest } from "@/lib/domain/run-digest";
 import { hasTokens, newRunUsage, type RunUsageV1 } from "@/lib/domain/usage";
 import type { AppSettingsV1, ModelDefinition, ProviderAdapter, ProviderAuth, ProviderDefinition } from "@/lib/domain/provider";
 import type {
   AgentTabsState,
+  AutomationRequest,
+  AutomationResponse,
   AgentTabSummary,
   ApprovalRequest,
+  ContentMessage,
+  ContentMessageResponse,
   CredentialRequest,
   CredentialResponse,
+  HelpOutcome,
+  HelpRequest,
   HistoryRequest,
   HistoryResponse,
   NormalizedError,
+  PageShieldState,
   RuntimeSnapshot,
   SettingsRequest,
   SettingsResponse,
@@ -98,11 +117,20 @@ const RETENTION_SWEEP_MS = 60 * 60_000;
 export interface RuntimeClock {
   now(): number;
   setInterval(callback: () => void, ms: number): unknown;
+  clearInterval?(timer: unknown): void;
 }
 
-const SYSTEM_CLOCK: RuntimeClock = { now: () => Date.now(), setInterval: (callback, ms) => setInterval(callback, ms) };
+const SYSTEM_CLOCK: RuntimeClock = { now: () => Date.now(), setInterval: (callback, ms) => setInterval(callback, ms), clearInterval: (timer) => clearInterval(timer as ReturnType<typeof setInterval>) };
 
-type RunLifecycleStatus = "running" | "awaiting-approval" | "cancelling";
+type RunLifecycleStatus = "running" | "awaiting-approval" | "awaiting-help" | "cancelling";
+
+/** The user's instructions and site notes, the memory index, and connected accounts' tools, snapshotted when a run starts. */
+interface Personalization {
+  instructions: string;
+  siteNotes: SiteNote[];
+  memoryIndex: string | null;
+  mcpTools: McpToolDefinition[];
+}
 
 /** Run-level diagnostics for context export; held in memory only. */
 interface RunRecord {
@@ -122,11 +150,15 @@ interface ActiveRun {
   runId: string;
   /** The session the run started in; every item it produces is appended there. */
   sessionId: string;
+  scheduled?: ScheduledSource;
   controller: AbortController;
   agentLoop: AgentLoop;
   status: RunLifecycleStatus;
   partialAssistantText: string;
   pendingApproval: ApprovalRequest | null;
+  pendingHelp: HelpRequest | null;
+  /** The run's agent tabs the user took over since the run's last browser program; its next result says so. */
+  takeovers: Set<number>;
   /** Published and checkpointed once a provider response reports tokens. */
   usage: RunUsageV1 | null;
   lastCheckpointAt: number;
@@ -140,6 +172,13 @@ export class BackgroundRuntime {
   #tabControllerFactory: () => TabController;
   #sites: SiteEnv;
   #approvalBadge: ApprovalBadge | null;
+  /** Connected accounts' tools; none when absent. */
+  #mcp: McpConnections | null;
+  #scheduler: TaskScheduler;
+  #scheduledStarting = false;
+  #notifications: RunNotifications | null;
+  #sweepTimer: unknown;
+  #disposed = false;
   #activeRun: ActiveRun | null = null;
   #notice: string | null = null;
   #clock: RuntimeClock;
@@ -170,20 +209,57 @@ export class BackgroundRuntime {
   /** Serialized tag last read from or written to each owned tab, so unchanged tags are not rewritten. */
   #agentTabTags = new Map<number, string>();
   /** Agent tabs as last published to sidebars. */
-  #agentTabsState: AgentTabsState = { bySession: {}, watching: null };
+  #agentTabsState: AgentTabsState = { bySession: {}, watching: null, takenOver: false };
   #publishedAgentTabs = JSON.stringify(this.#agentTabsState);
   /**
    * The agent tab the user is watching, shown and active, and the tab they
-   * watched from. In memory only: after a restart a visible tagged tab is
-   * released to the user like any other.
+   * watched from. `takenOver`: the user pressed "Take over", which removes the
+   * page shield until watching ends. In memory only: after a restart a visible
+   * tagged tab is released to the user like any other.
    */
-  #watching: { tabId: number; returnTabId: number | null } | null = null;
+  #watching: { tabId: number; returnTabId: number | null; takenOver: boolean } | null = null;
+  /** The page shield state last sent to a tab's content script. */
+  #shieldSent: { tabId: number; shield: PageShieldState } | null = null;
   /** Each session's message queue once loaded; this cache is authoritative and written through to storage. */
   #queues = new Map<string, QueuedMessage[]>();
+  /** The last menu gesture, held only in the background until sent or removed. */
+  #ask: AskContextV1 | null = null;
+
+  setAsk(ask: AskContextV1): void {
+    if (!isAskContext(ask) || ask.path !== null) return;
+    this.#ask = structuredClone(ask);
+    this.#sidebarHub.publishAsk(this.#ask);
+    this.#sidebarHub.focusComposer();
+  }
+
+  updateAskAlt(id: string, alt: string | null): void {
+    if (this.#ask?.id !== id || this.#ask.kind !== "image" || !alt) return;
+    const next = { ...this.#ask, alt };
+    if (!isAskContext(next)) return;
+    this.#ask = next;
+    this.#sidebarHub.publishAsk(next);
+  }
+
+  #consumeAsk(id: string | undefined, sessionId: string): AskContextV1 | undefined {
+    if (!id || this.#ask?.id !== id) return undefined;
+    const ask = this.#ask;
+    const owner = this.#workspace.agentTabs.get(ask.tabId)?.sessionId;
+    const path = owner && owner !== sessionId ? null : `/${owner ? "agent-tabs" : "tabs"}/${ask.tabId}/page.md`;
+    this.#ask = null;
+    this.#sidebarHub.publishAsk(null);
+    return { ...ask, path };
+  }
+
+  #askIsCurrent(id: string | undefined): boolean {
+    if (!id || this.#ask?.id === id) return true;
+    this.#notice = "That page context was replaced or removed. Review the current chip before sending again.";
+    void this.#sidebarHub.broadcastSnapshot();
+    return false;
+  }
 
   constructor(
     sidebarHub: SidebarHub,
-    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController; sites?: SiteEnv; approvalBadge?: ApprovalBadge; clock?: RuntimeClock } = {},
+    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController; sites?: SiteEnv; approvalBadge?: ApprovalBadge; clock?: RuntimeClock; mcp?: McpConnections; alarms?: SchedulerAlarms; notifications?: RunNotifications } = {},
   ) {
     this.#sidebarHub = sidebarHub;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
@@ -193,9 +269,17 @@ export class BackgroundRuntime {
       async (auth, signal) => auth.method === "chatgpt" ? this.#chatgpt.getAuth(signal) : auth,
       (id) => this.#modelCatalog.find((model) => model.id === id),
     );
-    this.#tabControllerFactory = options.tabControllerFactory ?? (() => new TabController(browser as unknown as TabControllerBrowserApi));
+    // One set of frame names for the background's lifetime, so `f3:e12` names the same frame in every run,
+    // and one PDF reader, so a PDF is parsed once (in the bundled pdf-text worker, never in this page).
+    const frameAliases = new FrameAliases();
+    const pdfs = new PdfReader(workerPdfExtractor(() => new Worker(browser.runtime.getURL("/pdf-text.js"))));
+    this.#tabControllerFactory = options.tabControllerFactory ?? (() => new TabController(browser as unknown as TabControllerBrowserApi, undefined, frameAliases, pdfs));
     this.#sites = options.sites ?? browserSiteEnv();
     this.#approvalBadge = options.approvalBadge ?? null;
+    this.#mcp = options.mcp ?? null;
+    this.#notifications = options.notifications ?? null;
+    this.#scheduler = new TaskScheduler({ alarms: options.alarms, now: () => this.#clock.now(),
+      dispatch: (task, at, recordStart) => this.#launchScheduled(task, at, recordStart), liveSessions: async () => (await listSessions()).map((s) => s.id) });
     this.#workspace.onOwnershipChange = () => void this.#queueAgentTabSync();
   }
 
@@ -217,18 +301,34 @@ export class BackgroundRuntime {
         .then(() => recoverInterruptedRun())
         .then(async (sessionId) => {
           if (!sessionId) return;
-          this.#retryable = { sessionId, hadPageEffect: lastTurnRanProgram((await getConversation(sessionId))?.items ?? []) };
+          this.#retryable = { sessionId, hadPageEffect: lastTurnMayHaveCommitted((await getConversation(sessionId))?.items ?? []) };
         })
         .finally(() => this.#openSession())
         .finally(() => restored.catch(() => {}))
         .then(() => this.#applyRetention()),
       restored,
-    ]).then(() => {});
+    ]).then(async () => {
+      await this.#scheduler.initialize();
+      await this.#syncScheduleBadge();
+      await this.#notifications?.initialize();
+      await this.#notifications?.setEnabled((await getNotificationSettings()).enabled);
+    }).catch(() => {
+      console.warn("[bside] Could not restore scheduled tasks; no missed runs will be started.");
+    });
     await this.#ready;
-    this.#clock.setInterval(() => {
+    if (this.#disposed) return;
+    this.#sweepTimer = this.#clock.setInterval(() => {
       void this.#closeIdleAgentTabs();
       if (this.#clock.now() - this.#lastRetentionAt >= RETENTION_SWEEP_MS) void this.#applyRetention().catch(() => {});
     }, AGENT_TAB_SWEEP_MS);
+  }
+
+  dispose(): void {
+    this.#disposed = true;
+    this.#activeRun?.controller.abort();
+    this.#scheduler.dispose();
+    void this.#notifications?.dispose();
+    this.#clock.clearInterval?.(this.#sweepTimer);
   }
 
   /**
@@ -247,7 +347,8 @@ export class BackgroundRuntime {
   }
 
   /** Republishes an agent tab whose title, URL, or icon changed, so the sidebar's list stays current. */
-  handleTabUpdated(tabId: number, changeInfo: { title?: string; url?: string; favIconUrl?: string }): void {
+  handleTabUpdated(tabId: number, changeInfo: { title?: string; url?: string; favIconUrl?: string; status?: string }): void {
+    if (changeInfo.status === "loading" || changeInfo.url !== undefined) this.#tabControllerFactory().forgetPdf(tabId);
     if (!this.#workspace.agentTabs.has(tabId)) return;
     if (changeInfo.title === undefined && changeInfo.url === undefined && changeInfo.favIconUrl === undefined) return;
     void this.#queueAgentTabSync();
@@ -285,7 +386,7 @@ export class BackgroundRuntime {
       return;
     }
     // Set first, so switching to the tab is not taken for the user leaving it.
-    const watching = { tabId, returnTabId: previous?.returnTabId ?? null };
+    const watching = { tabId, returnTabId: previous?.returnTabId ?? null, takenOver: false };
     this.#watching = watching;
     try {
       const before = await tabController.revealTab(tabId);
@@ -318,6 +419,70 @@ export class BackgroundRuntime {
     if (back) await tabController.activateTab(back.id!).catch(() => {});
     if (watched) await this.#rehide(tabController, watching.tabId);
     await this.#queueAgentTabSync();
+  }
+
+  /**
+   * "Take over" (from the shield in the page, or the sidebar): removes the
+   * page shield from the watched tab until watching ends. If the tab belongs
+   * to the active run's session, the run's next browser program result says
+   * the user may have changed the page (not while the run waits on a help
+   * request for that tab: answering it says as much).
+   */
+  async #takeOver(tabId: number): Promise<void> {
+    const watching = this.#watching;
+    if (!watching || watching.tabId !== tabId || watching.takenOver) return;
+    watching.takenOver = true;
+    const run = this.#activeRun;
+    if (run && run.sessionId === this.#workspace.agentTabs.get(tabId)?.sessionId && run.pendingHelp?.tabId !== tabId) run.takeovers.add(tabId);
+    await this.#queueAgentTabSync();
+  }
+
+  /**
+   * The page shield a tab should show: only the watched agent tab has one,
+   * unless the user took over or a help request is open for it. It says
+   * bside is working while the tab's session has the active run.
+   */
+  #shieldFor(tabId: number): PageShieldState {
+    const watching = this.#watching;
+    const tab = this.#workspace.agentTabs.get(tabId);
+    if (!tab || watching?.tabId !== tabId || watching.takenOver) return "off";
+    const run = this.#activeRun;
+    if (run?.pendingHelp?.tabId === tabId) return "off";
+    return run?.sessionId === tab.sessionId ? "working" : "idle";
+  }
+
+  /**
+   * Sends the watched tab its shield state when it changed, and removes the
+   * shield from a tab no longer watched. A content script that is not loaded
+   * yet (the tab is navigating) asks for its state when it starts.
+   */
+  async #syncShield(tabController: TabController): Promise<void> {
+    const tabId = this.#watching?.tabId ?? null;
+    const sent = this.#shieldSent;
+    if (sent && sent.tabId !== tabId) {
+      this.#shieldSent = null;
+      if (sent.shield !== "off") await tabController.setShield(sent.tabId, "off");
+    }
+    if (tabId === null) return;
+    const shield = this.#shieldFor(tabId);
+    if (this.#shieldSent?.shield === shield) return;
+    this.#shieldSent = { tabId, shield };
+    await tabController.setShield(tabId, shield);
+  }
+
+  /** Resyncs the shield after a run or help request changed what it shows; a no-op unless a tab is (or was just) watched. */
+  #refreshShield(): void {
+    if (this.#watching || this.#shieldSent) void this.#queueAgentTabSync();
+  }
+
+  /**
+   * A message from the content script in `tabId` (the sender's own tab, never
+   * an id the page could choose): its shield state, after a takeover if asked.
+   */
+  async handleContentMessage(tabId: number, message: ContentMessage): Promise<ContentMessageResponse> {
+    await this.#ready;
+    if (message.type === "shield.takeover") await this.#takeOver(tabId);
+    return { v: 1, id: message.id, ok: true, shield: this.#shieldFor(tabId) };
   }
 
   /** Hides a tab the user was watching. One Firefox cannot hide (pinned, or the only tab in its window) becomes the user's. */
@@ -438,11 +603,12 @@ export class BackgroundRuntime {
     // A failed write leaves its cached tag stale, so the next sync retries it.
     await Promise.allSettled(writes);
     if (this.#watching && !this.#workspace.agentTabs.has(this.#watching.tabId)) this.#watching = null;
+    await this.#syncShield(tabController);
     const bySession: Record<string, AgentTabSummary[]> = {};
     for (const [id, tab] of this.#workspace.agentTabs) {
       if (open.has(id)) (bySession[tab.sessionId] ??= []).push(toAgentTabSummary(id, tab, open.get(id)!));
     }
-    const state: AgentTabsState = { bySession, watching: this.#watching?.tabId ?? null };
+    const state: AgentTabsState = { bySession, watching: this.#watching?.tabId ?? null, takenOver: this.#watching?.takenOver ?? false };
     const serialized = JSON.stringify(state);
     if (serialized !== this.#publishedAgentTabs) {
       this.#publishedAgentTabs = serialized;
@@ -480,10 +646,11 @@ export class BackgroundRuntime {
       credential: { ...credential, configured: credential.chatgpt.connected || credential.configured },
       provider,
       settings,
-      skills: skillCatalog(await getSkills()),
+      skills: sidebarSkillCatalog(await getSkills()),
       page: this.#sidebarHub.currentAttachment(),
       agentTabs: this.#agentTabsState,
       queue: [...await this.#queue(conversation.id)],
+      ask: this.#ask,
       activeRun: this.#activeRun
         ? {
             runId: this.#activeRun.runId,
@@ -491,6 +658,7 @@ export class BackgroundRuntime {
             status: this.#activeRun.status,
             partialAssistantText: this.#activeRun.partialAssistantText,
             pendingApproval: this.#activeRun.pendingApproval,
+            pendingHelp: this.#activeRun.pendingHelp,
             usage: this.#activeRun.usage,
           }
         : null,
@@ -504,7 +672,7 @@ export class BackgroundRuntime {
   handleCommand(command: SidebarCommand): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]>;
   async handleCommand(command: SidebarCommand): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]> {
     await this.#ready;
-    if (command.type === "skills.list") return { skills: skillCatalog(await getSkills()) };
+    if (command.type === "skills.list") return { skills: sidebarSkillCatalog(await getSkills()) };
     if (command.type === "tabs.list") {
       // As the open session's runs see them: other sessions' agent tabs are left out.
       const openId = await this.#openSession();
@@ -525,6 +693,10 @@ export class BackgroundRuntime {
       await this.#stopWatching();
       return;
     }
+    if (command.type === "tabs.takeOver") {
+      await this.#takeOver(command.tabId);
+      return;
+    }
     if (command.type === "tabs.closeAgentTabs") {
       // Refused rather than deferred while a run is active: the run may be using
       // these tabs, and a deferred close would fire after the user moved on.
@@ -537,6 +709,12 @@ export class BackgroundRuntime {
       await this.handleSettingsRequest(command);
       return;
     }
+    if (command.type === "siteNote.get") {
+      const origin = pageOrigin(command.url);
+      return { origin, note: origin ? siteNoteForPage((await readInstructions()).siteNotes, command.url) : null };
+    }
+    if (command.type === "siteNote.save") return saveSiteNoteFromSidebar(command.note);
+    if (command.type === "memory.undo") return undoMemoryChanges(command.changeIds);
     if (command.type === "session.list") return { sessions: await listSessions() };
     if (command.type === "session.create" || command.type === "session.open" || command.type === "session.delete" ||
       command.type === "session.rename" || command.type === "session.pin") {
@@ -544,12 +722,24 @@ export class BackgroundRuntime {
       return;
     }
     if (command.type === "context.export") return this.#exportSession(command.sessionId);
+    if (command.type === "ask.dismiss") {
+      if (this.#ask?.id === command.askId) {
+        this.#ask = null;
+        this.#sidebarHub.publishAsk(null);
+      }
+      return;
+    }
+    if ((command.type === "run.start" || command.type === "run.steer") && command.askId && this.#ask?.id !== command.askId) {
+      this.#notice = "That page context was replaced or removed. Review the current chip before sending again.";
+      await this.#sidebarHub.broadcastSnapshot();
+      return;
+    }
     if (command.type === "run.start") {
-      await this.#submitPrompt(command.prompt);
+      await this.#submitPrompt(command.prompt, command.askId);
       return;
     }
     if (command.type === "run.steer") {
-      await this.#steer(command.runId, command.text);
+      await this.#steer(command.runId, command.text, command.askId);
       return;
     }
     if (command.type === "queue.remove") {
@@ -578,6 +768,10 @@ export class BackgroundRuntime {
     }
     if (command.type === "action.deny") {
       this.#resolveApproval(command.runId, command.callId, false);
+      return;
+    }
+    if (command.type === "help.resolve") {
+      this.#resolveHelp(command.runId, command.callId, command.outcome, command.note);
     }
   }
 
@@ -610,8 +804,8 @@ export class BackgroundRuntime {
       latestRun && this.#debugOutputs.length ? fence(`[\n${this.#debugOutputs.join(",\n")}\n]`) : "No tool output captured for this chat in this background session.",
       "## Conversation log", fence(JSON.stringify(conversation, null, 2)),
       "## Partial response", fence(this.#activeRun?.sessionId === sessionId ? this.#activeRun.partialAssistantText : ""),
-      "## Scratch files", "This chat's /workspace files, kept until the chat is deleted.",
-      files ? fence(JSON.stringify(Object.fromEntries(files.map((file) => [file.path, file.content])), null, 2)) : "The scratch files could not be read.",
+      "## Scratch files", "This chat's /workspace files, kept until the chat is deleted. Binary files (saved screenshots) are listed by type and size, not exported.",
+      files ? fence(JSON.stringify(Object.fromEntries(files.map((file) => [file.path, file.kind === "text" ? file.content : `[binary ${file.mimeType}, ${file.bytes} bytes]`])), null, 2)) : "The scratch files could not be read.",
     ].join("\n\n") };
   }
 
@@ -631,6 +825,10 @@ export class BackgroundRuntime {
   async #runSessionCommand(command: SessionCommand): Promise<void> {
     try { await this.#queueSessionOp(() => this.#applySessionCommand(command)); }
     catch { this.#notice = "Could not update chats. Try again."; }
+    if (command.type === "session.open") {
+      await this.#scheduler.markRead(await this.#openSession()).catch(() => {});
+      await this.#syncScheduleBadge();
+    }
     await this.#sidebarHub.broadcastSnapshot();
     await this.#publishSessions();
   }
@@ -697,6 +895,10 @@ export class BackgroundRuntime {
    * deletion and pruning both spare the active run's.
    */
   async #forgetSessions(ids: readonly string[], closeTabs: boolean): Promise<void> {
+    // Do not await while holding the session-operation lock: an alarm may
+    // already hold the scheduler lock and be waiting to reserve a session.
+    // The queued detach runs before a subsequent settings read or alarm.
+    void this.#scheduler.forgetSessions(ids).then(() => this.#syncScheduleBadge()).catch(() => {});
     if (this.#retryable && ids.includes(this.#retryable.sessionId)) this.#retryable = null;
     for (const id of ids) this.#queues.delete(id);
     if (this.#debugSessionId !== null && ids.includes(this.#debugSessionId)) this.#clearDebugBuffers();
@@ -825,6 +1027,94 @@ export class BackgroundRuntime {
     }
   }
 
+  /** Only the options-page adapter calls this; no automation command exists on the sidebar Port. */
+  async handleAutomationRequest(request: AutomationRequest): Promise<AutomationResponse> {
+    await this.#ready;
+    try {
+      if (request.type === "automation.save") await this.#scheduler.save(request.taskId, request.task);
+      else if (request.type === "automation.delete") await this.#scheduler.remove(request.taskId);
+      else if (request.type === "automation.notifications.save") {
+        await saveNotificationSettings({ version: 1, enabled: request.enabled });
+        await this.#notifications?.setEnabled(request.enabled);
+      }
+      else if (request.type === "automation.results") {
+        const task = (await this.#scheduler.list()).find((t) => t.id === request.taskId);
+        if (!task?.sessionId) throw new Error("This task has no saved results yet.");
+        await this.openResultsSession(task.sessionId);
+      }
+      await this.#syncScheduleBadge();
+      return { v: 1, id: request.id, ok: true, tasks: await this.#scheduler.list(), notifications: await getNotificationSettings(), available: this.#scheduler.available };
+    } catch {
+      return { v: 1, id: request.id, ok: false, error: { code: "INVALID_REQUEST", message: "Could not update automation. Check the task fields and try again.", retryable: false, phase: "persistence" } };
+    }
+  }
+
+  async handleAlarm(name: string): Promise<void> {
+    await this.#ready;
+    await this.#scheduler.handleAlarm(name).catch(() => {});
+  }
+
+  /** A deliberate UI/notification click, never called by automatic dispatch. */
+  async openResultsSession(sessionId: string): Promise<void> {
+    await this.#ready;
+    await this.#runSessionCommand({ v: 1, id: crypto.randomUUID(), type: "session.open", sessionId });
+  }
+
+  async openAttentionSession(): Promise<void> {
+    await this.#ready;
+    const waiting = this.#activeRun;
+    const sessionId = waiting?.pendingApproval || waiting?.pendingHelp ? waiting.sessionId :
+      (await this.#scheduler.list()).filter((t) => t.unread).toSorted((a, b) => (b.lastRun?.startedAt ?? 0) - (a.lastRun?.startedAt ?? 0))[0]?.sessionId;
+    if (sessionId) await this.openResultsSession(sessionId);
+  }
+
+  async #syncScheduleBadge(): Promise<void> {
+    this.#approvalBadge?.setResults((await this.#scheduler.list()).some((t) => t.unread));
+  }
+
+  async #launchScheduled(task: ScheduledTask, scheduledAt: number, recordStart: RecordTaskStart): Promise<TaskDispatch> {
+    if (this.#disposed) return { status: "unavailable" };
+    if (this.#activeRun || this.#scheduledStarting || this.#sessionOpsPending > 0) return { status: "skipped-busy" };
+    this.#scheduledStarting = true;
+    try {
+      return await this.#queueSessionOp(async (): Promise<TaskDispatch> => {
+        if (this.#activeRun) return { status: "skipped-busy" };
+        // Never recreate a deleted results session from a stale alarm. Its
+        // queued detach disables the task; only explicit re-enabling recreates it.
+        if (task.sessionId && !await getConversation(task.sessionId)) return { status: "unavailable" };
+        const sessionId = task.sessionId ?? (await createSession()).id;
+        if (!task.sessionId) await updateSession(sessionId, { title: task.name });
+        const runId = crypto.randomUUID();
+        const scheduled: ScheduledSource = { taskId: task.id, name: task.name, url: task.url, scheduledAt };
+        await recordStart(sessionId, runId);
+        if (this.#disposed) return { status: "unavailable" };
+        // #startRun claims the global slot synchronously. Do not hold the
+        // scheduler/session lock for the provider request or a user pause.
+        void this.#startRun(sessionId, task.prompt, undefined, { scheduled, runId }).catch(async () => {
+          if (this.#activeRun?.runId !== runId) return;
+          this.#activeRun.status = "cancelling";
+          this.#activeRun.controller.abort();
+          this.#approvalBadge?.set(false);
+          void this.#notifications?.clearRun(runId);
+          await clearRunCheckpoint().catch(() => {});
+          const error: NormalizedError = { code: "PROTOCOL_ERROR", message: "The scheduled run stopped unexpectedly. Its earlier actions may have taken effect.", retryable: false, phase: "persistence" };
+          await appendConversationItem(sessionId, { id: crypto.randomUUID(), kind: "run-digest", digest: { version: 1, status: "failed", error: error.message, entries: [], omittedEntries: 0 }, at: this.#clock.now() }).catch(() => {});
+          await touchSession(sessionId, { scheduled }).catch(() => {});
+          this.#sidebarHub.startRun(sessionId);
+          this.#sidebarHub.publishRunEvent(runId, "run.failed", error);
+          await this.#scheduler.updateRun(task.id, runId, "failed").catch(() => {});
+          await this.#syncScheduleBadge();
+          await this.#publishSessions();
+          this.#activeRun = null;
+          this.#refreshShield();
+          void this.#notifications?.finished(runId, sessionId, { scheduled: true, durationMs: 0, status: "failed" });
+          await this.#sidebarHub.broadcastSnapshot();
+        });
+        return { status: "started", runId, sessionId };
+      });
+    } finally { this.#scheduledStarting = false; }
+  }
+
   async #getCredentialStatus() {
     const [apiKey, chatgpt] = await Promise.all([getCredentialStatus(), this.#chatgpt.status()]);
     return { ...apiKey, chatgpt };
@@ -920,18 +1210,20 @@ export class BackgroundRuntime {
   }
 
   /** `run.start`: while the open session's run is active, the prompt waits as a follow-up; otherwise a run starts with it. */
-  async #submitPrompt(rawPrompt: string): Promise<void> {
+  async #submitPrompt(rawPrompt: string, askId?: string): Promise<void> {
     const sessionId = await this.#openSession();
     const queue = await this.#queue(sessionId);
     const prompt = validatePromptText(rawPrompt);
-    if (!prompt || this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, rawPrompt);
+    if (!prompt || this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, rawPrompt, undefined, undefined, askId);
     if (await this.#queueFull(queue)) return;
     const skill = await this.#captureSkill(prompt);
     if (skill === null) return;
-    if (this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, prompt, undefined, { skill });
+    if (this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, prompt, undefined, { skill }, askId);
     const current = await this.#queue(sessionId);
     if (await this.#queueFull(current)) return;
-    await this.#setQueue(sessionId, [...current, { id: crypto.randomUUID(), mode: "follow-up", text: prompt, ...(skill ? { skill } : {}), at: Date.now() }]);
+    if (!this.#askIsCurrent(askId)) return;
+    const ask = this.#consumeAsk(askId, sessionId);
+    await this.#setQueue(sessionId, [...current, { id: crypto.randomUUID(), mode: "follow-up", text: prompt, ...(skill ? { skill } : {}), ...(ask ? { ask } : {}), at: Date.now() }]);
   }
 
   async #captureSkill(text: string): Promise<Skill | undefined | null> {
@@ -944,20 +1236,22 @@ export class BackgroundRuntime {
   }
 
   /** `run.steer`: hands guidance to the active run's agent loop and shows it as pending until delivered. */
-  async #steer(runId: string, rawText: string): Promise<void> {
+  async #steer(runId: string, rawText: string, askId?: string): Promise<void> {
     const run = this.#activeRun;
-    if (!run || run.runId !== runId) return this.#submitPrompt(rawText);
+    if (!run || run.runId !== runId) return this.#submitPrompt(rawText, askId);
     const queue = await this.#queue(run.sessionId);
     const text = validatePromptText(rawText);
     // Re-checked after loading: once a run ends or is cancelling, a steer could never be delivered.
-    if (!text || this.#activeRun !== run || run.status === "cancelling") return this.#submitPrompt(rawText);
+    if (!text || this.#activeRun !== run || run.status === "cancelling") return this.#submitPrompt(rawText, askId);
     if (await this.#queueFull(queue)) return;
     const skill = await this.#captureSkill(text);
     if (skill === null) return;
-    if (this.#activeRun !== run || run.controller.signal.aborted) return this.#submitPrompt(rawText);
+    if (this.#activeRun !== run || run.controller.signal.aborted) return this.#submitPrompt(rawText, askId);
     const current = await this.#queue(run.sessionId);
     if (await this.#queueFull(current)) return;
-    const message: QueuedMessage = { id: crypto.randomUUID(), mode: "steer", text, ...(skill ? { skill } : {}), at: Date.now() };
+    if (!this.#askIsCurrent(askId)) return;
+    const ask = this.#consumeAsk(askId, run.sessionId);
+    const message: QueuedMessage = { id: crypto.randomUUID(), mode: "steer", text, ...(skill ? { skill } : {}), ...(ask ? { ask } : {}), at: Date.now() };
     run.agentLoop.steer(message);
     await this.#setQueue(run.sessionId, [...current, message]);
   }
@@ -977,7 +1271,7 @@ export class BackgroundRuntime {
       await this.#sidebarHub.broadcastSnapshot();
       return;
     }
-    await this.#startRun(sessionId, message.text, message.id, { skill: message.skill });
+    await this.#startRun(sessionId, message.text, message.id, { skill: message.skill, ask: message.ask });
   }
 
   /**
@@ -988,7 +1282,7 @@ export class BackgroundRuntime {
   async #dispatchFollowUp(sessionId: string): Promise<void> {
     if (this.#activeRun || this.#sessionOpsPending > 0) return;
     const next = (await this.#queue(sessionId)).find((message) => message.mode === "follow-up");
-    if (next) await this.#startRun(sessionId, next.text, next.id, { skill: next.skill });
+    if (next) await this.#startRun(sessionId, next.text, next.id, { skill: next.skill, ask: next.ask });
   }
 
   /**
@@ -998,14 +1292,15 @@ export class BackgroundRuntime {
    * names the queued follow-up the prompt came from; its user message keeps
    * that id, and it leaves the queue once that message is written.
    */
-  async #startRun(sessionId: string, rawPrompt: string | null, queuedId?: string, accepted?: { skill?: Skill }): Promise<void> {
+  async #startRun(sessionId: string, rawPrompt: string | null, queuedId?: string, accepted?: { skill?: Skill; ask?: AskContextV1; scheduled?: ScheduledSource; runId?: string }, askId?: string): Promise<void> {
+    if (this.#disposed) return;
     const retry = rawPrompt === null;
-    if (this.#activeRun || this.#sessionOpsPending > 0 || (retry && this.#retryable?.sessionId !== sessionId)) {
+    if (this.#activeRun || (!accepted?.scheduled && (this.#sessionOpsPending > 0 || this.#scheduledStarting)) || (retry && this.#retryable?.sessionId !== sessionId)) {
       await this.#sidebarHub.broadcastSnapshot();
       return;
     }
     if (retry && this.#retryable?.hadPageEffect) {
-      this.#notice = "The last attempt already changed a page, so retrying it could repeat that change. Send a new message to continue.";
+      this.#notice = "The last attempt already changed a page or a connected account, so retrying it could repeat that change. Send a new message to continue.";
       await this.#sidebarHub.broadcastSnapshot();
       return;
     }
@@ -1020,20 +1315,24 @@ export class BackgroundRuntime {
     // Claim the run slot synchronously, before any `await`, so a second
     // `run.start` arriving before credential lookup resolves still sees an
     // active run and is dropped rather than racing into a second run.
-    const runId = crypto.randomUUID();
+    const runId = accepted?.runId ?? crypto.randomUUID();
     const controller = new AbortController();
     const tabController = this.#tabControllerFactory();
-    // The session's scratch files load on the first program that uses them.
-    const scope = { state: this.#workspace, sessionId, files: new ScratchFiles(workspaceStore(sessionId)), skills: new Map<string, Skill>(), sites: this.#sites };
+    // The session's scratch files load on the first program that uses them; memory is global and read at each use.
+    const scope = { state: this.#workspace, sessionId, files: new ScratchFiles(workspaceStore(sessionId)), skills: new Map<string, Skill>(), sites: this.#sites,
+      memory: runMemory(sessionId, runId) };
     const agentLoop = new AgentLoop(this.#provider, tabController, this.#sidebarHub, scope);
     const run: ActiveRun = this.#activeRun = {
       runId,
       sessionId,
+      ...(accepted?.scheduled ? { scheduled: accepted.scheduled } : {}),
       controller,
       agentLoop,
       status: "running",
       partialAssistantText: "",
       pendingApproval: null,
+      pendingHelp: null,
+      takeovers: new Set(),
       usage: null,
       lastCheckpointAt: 0,
     };
@@ -1042,11 +1341,18 @@ export class BackgroundRuntime {
     let conversation: Conversation | null;
     let skill: Skill | undefined;
     let catalog: SkillSummary[];
+    // Like skills, the run uses the custom instructions, site notes, and memory index as they are now.
+    let personal: Personalization;
+    let ask: AskContextV1 | undefined;
     try {
+      // Memory the run cannot read is left out of its prompt rather than stopping it.
+      // Likewise for connected accounts' tools: one that cannot be read is not offered.
+      personal = { ...await readInstructions(), memoryIndex: await readMemoryIndex().catch(() => null),
+        mcpTools: await this.#mcp?.toolDefinitions(AGENT_TOOL_NAMES).catch(() => []) ?? [] };
       const available = await getSkills();
       catalog = skillCatalog(available);
       for (const skill of available) scope.skills.set(skill.name, skill);
-      if (!retry) skill = accepted ? accepted.skill : await captureInvokedSkill(prompt!, available);
+      if (!retry) skill = accepted && !accepted.scheduled ? accepted.skill : await captureInvokedSkill(prompt!, available);
       const chatgpt = await this.#chatgpt.status();
       const credential = chatgpt.connected ? null : await getOpenAICredential();
       if (!chatgpt.connected && !credential) throw new ProviderStreamError("Sign in with ChatGPT or add an OpenAI API key in settings before starting a conversation.", "AUTHENTICATION");
@@ -1054,15 +1360,31 @@ export class BackgroundRuntime {
       conversation = await getConversation(sessionId);
       if (!conversation) throw new ProviderStreamError("This chat no longer exists.", "INVALID_REQUEST");
       if (retry && !conversation.items.some(isTurnStart)) throw new ProviderStreamError("There is no turn to retry.", "INVALID_REQUEST");
+      if (!this.#askIsCurrent(askId)) throw new ProviderStreamError(this.#notice!, "INVALID_REQUEST");
+      ask = retry ? conversation.items.findLast(isTurnStart)?.ask : accepted?.ask ?? this.#consumeAsk(askId, sessionId);
+      if (retry) run.scheduled = conversation.items.findLast(isTurnStart)?.scheduled;
+      controller.signal.throwIfAborted();
     } catch (error) {
       this.#activeRun = null;
       await this.#settleSteers(sessionId);
       this.#notice = toNormalizedError(error, "setup").message;
+      if (run.scheduled) {
+        const safe = error instanceof ProviderStreamError ? error.message : "Scheduled run could not start. Check your connection and task settings.";
+        if (!retry) await appendConversationItem(sessionId, { id: crypto.randomUUID(), kind: "message", role: "user", text: prompt!, context: null, scheduled: run.scheduled, at: this.#clock.now() }).catch(() => {});
+        await appendConversationItem(sessionId, { id: crypto.randomUUID(), kind: "run-digest", digest: { version: 1, status: "failed", error: safe, entries: [], omittedEntries: 0 }, at: this.#clock.now() }).catch(() => {});
+        await touchSession(sessionId, { scheduled: run.scheduled }).catch(() => {});
+        void this.#scheduler.updateRun(run.scheduled.taskId, runId, controller.signal.aborted ? "cancelled" : "failed").catch(() => {});
+        void this.#notifications?.finished(runId, sessionId, { scheduled: true, durationMs: 0, status: controller.signal.aborted ? "cancelled" : "failed" });
+        void this.#syncScheduleBadge();
+        await this.#publishSessions();
+      }
       await this.#sidebarHub.broadcastSnapshot();
       return;
     }
 
     this.#sidebarHub.startRun(sessionId);
+    // A watched tab of this session now says bside is working in it.
+    this.#refreshShield();
 
     this.#latestContext = null;
     this.#debugOutputs = [];
@@ -1071,8 +1393,11 @@ export class BackgroundRuntime {
 
     // The active tab is an agent tab while the user watches one. The run's
     // own is attached under /agent-tabs; another session's stays invisible to it.
-    const captureOutcome = await tabController.captureActivePage();
-    const captured = captureOutcome.ok ? captureOutcome.value : null;
+    const askOwner = ask ? this.#workspace.agentTabs.get(ask.tabId)?.sessionId : undefined;
+    const captureOutcome = run.scheduled ? await this.#captureScheduledPage(tabController, run) : ask
+      ? askOwner && askOwner !== sessionId ? null : await tabController.capturePage(ask.tabId)
+      : await tabController.captureActivePage();
+    const captured = captureOutcome?.ok ? captureOutcome.value : null;
     const capturedOwner = captured ? this.#workspace.agentTabs.get(captured.snapshot.tabId)?.sessionId : undefined;
     const artifact: ContextArtifact | null = captured && (capturedOwner === undefined || capturedOwner === sessionId)
       ? { ...captured.artifact, target: { kind: "tab", tabId: captured.snapshot.tabId, mount: capturedOwner ? "agent-tabs" : "tabs" }, snapshot: captured.snapshot }
@@ -1080,12 +1405,17 @@ export class BackgroundRuntime {
 
     let items = conversation.items;
     if (!retry) {
+      // Notes for the attached page and mentioned tabs ride on the message as a snapshot, so replay never changes.
+      const sites = matchSiteNotes(personal.siteNotes, [...(artifact ? [artifact.url] : []), ...(ask ? [ask.pageUrl] : []), ...[...prompt!.matchAll(PROMPT_MENTION_PATTERN)].map((match) => match[4]!)]);
       const item: UserMessageItem = {
         id: queuedId ?? crypto.randomUUID(),
         kind: "message",
         role: "user",
         text: prompt!,
         skill,
+        ...(ask ? { ask } : {}),
+        ...(run.scheduled ? { scheduled: run.scheduled } : {}),
+        ...(sites.length ? { sites } : {}),
         context: artifact ? { artifactId: artifact.artifactId, kind: "page", title: artifact.title, url: artifact.url, capturedAt: artifact.capturedAt } : null,
         at: Date.now(),
       };
@@ -1097,7 +1427,7 @@ export class BackgroundRuntime {
     const userItem = items[userIndex] as UserMessageItem;
     this.#retryable = null;
 
-    this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt: userItem.text, page: userItem.context, retry });
+    this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt: userItem.text, page: userItem.context, ask: userItem.ask ?? null, retry, ...(userItem.scheduled ? { scheduled: userItem.scheduled } : {}) });
     await this.#writeCheckpoint(run, "running", "");
 
     // Pi owns assistant/tool replay during this run. Persisted tool items are
@@ -1114,17 +1444,41 @@ export class BackgroundRuntime {
     for (const item of transcript.slice(userIndex)) {
       if (item.kind === "message" && item.role === "user" && item.skill) scope.skills.set(item.skill.name, item.skill);
     }
-    await this.#runAgentLoop(runId, transcript, catalog, artifact, auth);
+    await this.#runAgentLoop(runId, transcript, catalog, personal, artifact, auth);
   }
 
-  async #runAgentLoop(runId: string, transcript: ConversationItem[], catalog: SkillSummary[], artifact: ContextArtifact | null, auth: ProviderAuth): Promise<void> {
+  async #captureScheduledPage(tabs: TabController, run: ActiveRun): Promise<Awaited<ReturnType<TabController["captureActivePage"]>>> {
+    let tabId: number | null = null;
+    try {
+      run.controller.signal.throwIfAborted();
+      tabId = await tabs.createTab(run.scheduled!.url);
+      this.#workspace.agentTabs.set(tabId, { role: "agent", sessionId: run.sessionId, lastUsedAt: this.#clock.now() });
+      await tabs.tagAgentTab(tabId, { v: 2, role: "agent", sessionId: run.sessionId, lastUsedAt: this.#clock.now() });
+      await tabs.hideTab(tabId);
+      await tabs.waitUntilReady(tabId, run.controller.signal);
+      const bound = await tabs.forTab(tabId);
+      const outcome = await bound.snapshot();
+      if (!outcome.ok) return outcome;
+      const artifact = bound.currentAttachment()!;
+      return { ok: true, value: { artifact, snapshot: outcome.value } };
+    } catch {
+      if (tabId !== null) {
+        await tabs.closeTab(tabId).catch(() => {});
+        this.#workspace.agentTabs.delete(tabId);
+      }
+      return { ok: false, error: { code: "UNSUPPORTED_PAGE", message: "The scheduled target could not be attached. Open its HTTP(S) URL in an agent tab to try again.", retryable: false, phase: "page" } };
+    } finally { void this.#queueAgentTabSync(); }
+  }
+
+  async #runAgentLoop(runId: string, transcript: ConversationItem[], catalog: SkillSummary[], personal: Personalization,
+    artifact: ContextArtifact | null, auth: ProviderAuth): Promise<void> {
     const run = this.#activeRun;
     if (!run || run.runId !== runId) return;
 
     const settings = await this.#getValidatedSettings();
     // Titles a new session from its first prompt and records the model for the history list.
     // The index only lags on failure, so a failed write never stops the run.
-    await touchSession(run.sessionId, { prompt: transcript.findLast(isTurnStart)?.text, modelId: settings.modelId }).catch(() => {});
+    await touchSession(run.sessionId, { prompt: transcript.findLast(isTurnStart)?.text, modelId: settings.modelId, scheduled: run.scheduled }).catch(() => {});
     await this.#publishSessions();
     const record: RunRecord = {
       runId, modelId: settings.modelId, reasoningEffort: settings.reasoningEffort, startedAt: Date.now(), endedAt: null, status: "running", error: null,
@@ -1155,6 +1509,10 @@ export class BackgroundRuntime {
       reasoningEffort: settings.reasoningEffort,
       transcript,
       skills: catalog,
+      instructions: personal.instructions,
+      siteNotes: personal.siteNotes,
+      memoryIndex: personal.memoryIndex,
+      ...(personal.mcpTools.length && this.#mcp ? { mcp: { tools: personal.mcpTools, call: this.#mcp.call.bind(this.#mcp) } } : {}),
       contextArtifact: artifact,
       auth,
       onContext: (context) => { this.#latestContext = context; },
@@ -1219,7 +1577,30 @@ export class BackgroundRuntime {
         run.pendingApproval = request;
         run.status = request ? "awaiting-approval" : "running";
         this.#approvalBadge?.set(request !== null);
+        if (request) void this.#notifications?.pending(runId, run.sessionId, "approval");
+        else void this.#notifications?.clearPending(runId);
+        if (run.scheduled) void this.#scheduler.updateRun(run.scheduled.taskId, runId, request ? "awaiting-approval" : "running").catch(() => {});
         void this.#sidebarHub.broadcastSnapshot();
+      },
+      onHelpPending: (request) => {
+        if (this.#activeRun?.runId !== runId) return;
+        flushDelta();
+        run.pendingHelp = request;
+        if (run.status !== "cancelling") run.status = request ? "awaiting-help" : "running";
+        this.#approvalBadge?.set(request !== null);
+        if (request) void this.#notifications?.pending(runId, run.sessionId, "help");
+        else void this.#notifications?.clearPending(runId);
+        if (run.scheduled) void this.#scheduler.updateRun(run.scheduled.taskId, runId, request ? "awaiting-help" : "running").catch(() => {});
+        // The help tab's shield comes off while the request is open.
+        this.#refreshShield();
+        // Recorded when the pause opens; the run's next item records it running again.
+        if (request) void this.#writeCheckpoint(run, run.status, run.partialAssistantText);
+        void this.#sidebarHub.broadcastSnapshot();
+      },
+      userNotes: () => {
+        const notes = [...run.takeovers].map((id) => `Note: the user took over /agent-tabs/${id}/page.md while watching it, so they may have changed that page. Read a fresh snapshot of it before relying on earlier observations.`);
+        run.takeovers.clear();
+        return notes;
       },
     });
 
@@ -1244,7 +1625,11 @@ export class BackgroundRuntime {
     const finish = async () => {
       await clearRunCheckpoint();
       await touchSession(run.sessionId, { usage: run.usage ?? undefined }).catch(() => {});
+      if (run.scheduled) await this.#scheduler.updateRun(run.scheduled.taskId, runId, result.status).catch(() => {});
+      if (run.scheduled) await this.#syncScheduleBadge();
+      void this.#notifications?.finished(runId, run.sessionId, { scheduled: !!run.scheduled, durationMs: this.#clock.now() - runStartedAt, status: result.status });
       this.#activeRun = null;
+      this.#refreshShield();
       // After the run slot is released, so no steer can be accepted for this run any more.
       await this.#settleSteers(run.sessionId);
       await this.#publishSessions();
@@ -1326,7 +1711,15 @@ export class BackgroundRuntime {
   #cancelRun(runId: string): void {
     if (!this.#activeRun || this.#activeRun.runId !== runId || this.#activeRun.status === "cancelling") return;
     this.#activeRun.status = "cancelling";
+    this.#approvalBadge?.set(false);
+    void this.#notifications?.clearPending(runId);
     this.#activeRun.controller.abort();
+  }
+
+  #resolveHelp(runId: string, callId: string, outcome: HelpOutcome, note: string): void {
+    if (!this.#activeRun || this.#activeRun.runId !== runId) return;
+    if (this.#activeRun.pendingHelp?.call.id !== callId) return;
+    this.#activeRun.agentLoop.resolveHelp(callId, outcome, note);
   }
 
   #resolveApproval(runId: string, callId: string, approved: boolean): void {
@@ -1343,8 +1736,10 @@ type SessionCommand = Extract<SidebarCommand, { type: "session.create" | "sessio
  * Whether the last turn started a browser program. Run checkpoints record no
  * effects, so after an interruption any started program may have committed one.
  */
-function lastTurnRanProgram(items: readonly ConversationItem[]): boolean {
-  return items.slice(items.findLastIndex(isTurnStart) + 1).some((item) => item.kind === "tool-call" && item.call.name === "browser_program");
+/** After an interruption: the last turn ran a browser program, or started a call of a connected account's tool not marked read-only. */
+function lastTurnMayHaveCommitted(items: readonly ConversationItem[]): boolean {
+  return items.slice(items.findLastIndex(isTurnStart) + 1).some((item) => item.kind === "tool-call" &&
+    (item.call.name === "browser_program" || (item.call.mcp !== undefined && !item.call.mcp.readOnly)));
 }
 
 function toAgentTabSummary(id: number, tab: AgentTab, snapshot: TabSnapshot): AgentTabSummary {

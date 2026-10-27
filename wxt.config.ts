@@ -3,7 +3,7 @@ import preact from "@preact/preset-vite";
 import Icons from "unplugin-icons/vite";
 
 const CSP =
-  "default-src 'self'; script-src 'self'; object-src 'none'; connect-src 'self' https://api.openai.com https://auth.openai.com https://www.youtube.com; img-src 'self' data:; style-src 'self' 'unsafe-inline'";
+  "default-src 'self'; script-src 'self'; object-src 'none'; connect-src 'self' https://api.openai.com https://auth.openai.com https://www.youtube.com https://mcp.notion.com https://ai.todoist.net https://todoist.com; img-src 'self' data:; style-src 'self' 'unsafe-inline'";
 
 export default defineConfig({
   browser: "firefox",
@@ -16,16 +16,33 @@ export default defineConfig({
     icons: { "32": "icon.svg" },
     permissions: [
       "storage",
+      // User-authored local scheduled tasks (docs/automation.md): one-shot
+      // wakeups, no catch-up runs after a browser restart.
+      "alarms",
+      // Private generic hints only, behind an explicit opt-in (default off).
+      "notifications",
       "cookies",
       "identity",
       "webRequest",
       "webRequestBlocking",
       "tabHide",
       "sessions",
+      // web.search runs the user's default engine in the hidden search tab
+      // (search.query); no search service or API of bside's own.
+      "search",
+      // "Ask bside about this selection / link / image / page" in the page's
+      // context menu (lib/background/context-menu.ts).
+      "menus",
       "https://api.openai.com/*",
       "https://auth.openai.com/*",
-      "http://*/*",
-      "https://*/*",
+      // MCP directory servers (lib/mcp/servers.ts): Notion's MCP and OAuth
+      // server, Todoist's MCP server, and Todoist's OAuth server.
+      "https://mcp.notion.com/*",
+      "https://ai.todoist.net/*",
+      "https://todoist.com/*",
+      // Page content scripts, tab URLs, the sign-in callback filter, site API
+      // requests, and tabs.captureTab (screenshots), which requires <all_urls>.
+      "<all_urls>",
     ],
     content_security_policy: {
       extension_pages: CSP,
@@ -33,6 +50,16 @@ export default defineConfig({
     browser_action: {
       default_icon: "icon.svg",
       default_title: "Toggle sidebar",
+    },
+    // Ctrl+Shift+Y is Firefox's Downloads on Linux and Cmd+Shift+B its
+    // bookmarks toolbar on macOS; Alt+Shift+B and Control+Shift+B are free.
+    // Users change or clear these in about:addons → Manage Extension Shortcuts.
+    commands: {
+      _execute_sidebar_action: {
+        suggested_key: { default: "Alt+Shift+B", mac: "MacCtrl+Shift+B" },
+        description: "Open or close the bside sidebar",
+      },
+      "new-chat": { description: "Start a new bside chat" },
     },
   },
   hooks: {

@@ -15,6 +15,7 @@ const BADGE_COLOR = "#d97706";
 export class ApprovalBadge {
   #api: ApprovalBadgeBrowserApi;
   #pending = false;
+  #results = false;
 
   constructor(api: ApprovalBadgeBrowserApi) {
     this.#api = api;
@@ -23,11 +24,18 @@ export class ApprovalBadge {
   get pending(): boolean {
     return this.#pending;
   }
+  get attention(): boolean { return this.#pending || this.#results; }
+
+  setResults(results: boolean): void {
+    if (results === this.#results) return;
+    this.#results = results;
+    this.set(this.#pending);
+  }
 
   /** Always writes through, so startup and terminal clears are unconditional. Badge failures never affect a run. */
   set(pending: boolean): void {
     this.#pending = pending;
     if (pending) void Promise.resolve().then(() => this.#api.setBadgeBackgroundColor({ color: BADGE_COLOR })).catch(() => {});
-    void Promise.resolve().then(() => this.#api.setBadgeText({ text: pending ? "!" : "" })).catch(() => {});
+    void Promise.resolve().then(() => this.#api.setBadgeText({ text: this.#pending ? "!" : this.#results ? "•" : "" })).catch(() => {});
   }
 }

@@ -3,12 +3,18 @@
   "gecko_id": "bside@tsuni.dev",
   "background_persistent": true,
   "permissions": [
+    "<all_urls>",
+    "alarms",
     "cookies",
-    "http://*/*",
-    "https://*/*",
+    "https://ai.todoist.net/*",
     "https://api.openai.com/*",
     "https://auth.openai.com/*",
+    "https://mcp.notion.com/*",
+    "https://todoist.com/*",
     "identity",
+    "menus",
+    "notifications",
+    "search",
     "sessions",
     "storage",
     "tabHide",
@@ -20,7 +26,7 @@
     "default-src 'self'",
     "script-src 'self'",
     "object-src 'none'",
-    "connect-src 'self' https://api.openai.com https://auth.openai.com https://www.youtube.com",
+    "connect-src 'self' https://api.openai.com https://auth.openai.com https://www.youtube.com https://mcp.notion.com https://ai.todoist.net https://todoist.com",
     "img-src 'self' data:",
     "style-src 'self' 'unsafe-inline'"
   ],
@@ -29,6 +35,12 @@
       "http://*/*",
       "https://*/*"
     ]
+  ],
+  "content_scripts_frames": [
+    {
+      "all_frames": true,
+      "match_about_blank": false
+    }
   ],
   "web_accessible_resources": []
 }
