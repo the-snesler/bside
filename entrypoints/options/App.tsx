@@ -19,10 +19,22 @@ export function App() {
   const [query, setQuery] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
   const search = useRef<HTMLInputElement>(null);
+  const menuButton = useRef<HTMLButtonElement>(null);
+  const pageTitle = useRef<HTMLHeadingElement>(null);
+  const focusPage = useRef(false);
+  const [narrow, setNarrow] = useState(() => window.matchMedia("(max-width: 719px)").matches);
   const page = findPage(route);
 
   useEffect(() => {
+    const media = window.matchMedia("(max-width: 719px)");
+    const changed = () => setNarrow(media.matches);
+    media.addEventListener("change", changed);
+    return () => media.removeEventListener("change", changed);
+  }, []);
+
+  useEffect(() => {
     const onHashChange = () => {
+      focusPage.current = true;
       setRoute(routeFromHash(location.hash));
       setMenuOpen(false);
       window.scrollTo?.(0, 0);
@@ -30,6 +42,10 @@ export function App() {
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
+
+  useEffect(() => {
+    if (focusPage.current && page) { focusPage.current = false; pageTitle.current?.focus(); }
+  }, [route, page]);
 
   // Resolve the default page once, after the first status reply, and record
   // it in the URL so connecting an account does not move the page.
@@ -47,10 +63,19 @@ export function App() {
   useEffect(() => {
     if (!menuOpen) return;
     search.current?.focus();
-    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") setMenuOpen(false); };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { setMenuOpen(false); menuButton.current?.focus(); }
+      if (event.key !== "Tab" || !narrow) return;
+      // The narrow menu covers the pane. Keep keyboard focus in its visible
+      // controls, including the button that closes it.
+      const controls = [menuButton.current, ...document.querySelectorAll<HTMLElement>("#settings-sidebar input, #settings-sidebar a")].filter((element): element is HTMLElement => element !== null);
+      const first = controls[0], last = controls.at(-1);
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [menuOpen]);
+  }, [menuOpen, narrow]);
 
   const results = searchPages(SETTINGS_PAGES, query);
 
@@ -73,6 +98,7 @@ export function App() {
         <button
           type="button"
           class="settings-topbar__menu"
+          ref={menuButton}
           aria-label="Settings menu"
           aria-expanded={menuOpen}
           aria-controls="settings-sidebar"
@@ -120,7 +146,11 @@ export function App() {
                           class="settings-nav__item"
                           href={hrefFor(item)}
                           aria-current={item === page ? "page" : undefined}
-                          onClick={() => setMenuOpen(false)}
+                          onClick={() => {
+                            setMenuOpen(false);
+                            // Selecting the current route causes no hashchange.
+                            if (item === page && narrow) requestAnimationFrame(() => pageTitle.current?.focus());
+                          }}
                         >
                           <ItemIcon class="settings-nav__icon" aria-hidden="true" />
                           <span class="settings-nav__text">
@@ -139,10 +169,10 @@ export function App() {
         </nav>
       </aside>
 
-      <main class="settings-pane">
+      <main class="settings-pane" inert={menuOpen && narrow}>
         {page && PageComponent && (
           <div class="settings-page" key={page.id}>
-            <h1 class="settings-page__title">{page.label}</h1>
+            <h1 class="settings-page__title" ref={pageTitle} tabIndex={-1}>{page.label}</h1>
             {page.description && <p class="settings-page__description">{page.description}</p>}
             <PageComponent app={app} />
           </div>

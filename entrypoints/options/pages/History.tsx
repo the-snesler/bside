@@ -4,6 +4,7 @@ import type { HistoryRequest } from "@/lib/protocol";
 import { Card, Feedback, Row, Select, SettingsSection } from "@/lib/ui/settings/primitives";
 import { BACKGROUND_FAILURE, sendHistoryRequest, type RequestBody } from "@/lib/ui/settings/requests";
 import { useRefreshOnFocus } from "../state";
+import { ProblemReport } from "@/lib/ui/settings/ProblemReport";
 
 const RETENTION_LABELS: Record<HistoryRetention, string> = { forever: "Forever", "30d": "30 days", "7d": "7 days" };
 
@@ -89,7 +90,9 @@ export function HistoryPage() {
             description="Chats are saved only in this Firefox profile and are never synced. They contain your prompts, bside's answers, and text from pages bside read for you, such as page titles, addresses, and excerpts."
           />
         </Card>
+        <p class="settings-note"><a href="/privacy.html">Read the privacy policy</a> · <a href="/onboarding.html">Getting started</a></p>
       </SettingsSection>
+      <ProblemReport />
     </>
   );
 }

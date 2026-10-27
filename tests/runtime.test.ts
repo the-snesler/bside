@@ -146,6 +146,12 @@ describe("context controls", () => {
     expect(latestRun).toContain('"status": "completed"');
     expect(latestRun).toContain('"providerResponses": 2');
     expect(latestRun).toContain('"name": "browser_program"');
+    const report = await runtime.handleProblemReportRequest({ v: 1, id: "report", type: "problemReport.export", sessionId: (await getOpenSessionId())! });
+    expect(report.ok && report.type === "problemReport.export").toBe(true);
+    if (report.ok && report.type === "problemReport.export") {
+      expect(JSON.parse(report.json).latestRun).toMatchObject({ providerResponses: 2, toolCalls: [{ ok: true }] });
+      for (const value of ["Orchid", "Read the fixture", "agent-page.html", "doc-1", "browser_program", "sk-test"]) expect(report.json).not.toContain(value);
+    }
     const persisted = (await openConversation()).items;
     expect(JSON.stringify(persisted.filter((item) => item.kind !== "run-digest"))).not.toContain("Orchid launch moved to Friday.");
     const digest = persisted.find((item) => item.kind === "run-digest");
@@ -2405,12 +2411,19 @@ describe("BackgroundRuntime: sessions", () => {
   });
 
   it("New chat leaves the previous chat's run diagnostics in its export and starts without them", async () => {
-    const { send } = await setup(["Noted."]);
+    const { runtime, send } = await setup(["Noted."]);
     await send({ type: "run.start", prompt: "Remember this" });
     const previous = (await getOpenSessionId())!;
     await send({ type: "session.create" });
     expect((await send({ type: "context.export", sessionId: (await getOpenSessionId())! }) as { markdown: string }).markdown).toContain("No run recorded");
     expect((await send({ type: "context.export", sessionId: previous }) as { markdown: string }).markdown).toContain('"providerResponses"');
+    const reportOf = async (sessionId: string) => {
+      const response = await runtime.handleProblemReportRequest({ v: 1, id: "report", type: "problemReport.export", sessionId });
+      return response.ok && response.type === "problemReport.export" ? JSON.parse(response.json) : null;
+    };
+    expect((await reportOf(previous)).latestRun.providerResponses).toBe(1);
+    expect((await reportOf((await getOpenSessionId())!)).latestRun).toBeNull();
+    expect(await reportOf("missing")).toBeNull();
   });
 
   it("opens another session, deleting the empty one it leaves, and reopens the last session after a restart", async () => {
@@ -3307,7 +3320,7 @@ describe("BackgroundRuntime: scheduled automation", () => {
     const saved = await runtime.handleAutomationRequest({ v: 1, id: "save", type: "automation.save", taskId: null, task: draft });
     if (!saved.ok) throw new Error(saved.error.message);
     const taskId = saved.tasks[0]!.id;
-    return { runtime, provider, advance, api, tags, taskId, openId, badge, texts, alarms };
+    return { runtime, provider, advance, api, tags, taskId, openId, badge, texts, alarms, hub };
   }
   const ended = async (taskId: string) => {
     await vi.waitFor(async () => expect((await getScheduledTasks()).find((t) => t.id === taskId)?.lastRun?.endedAt).toBeTypeOf("number"));
@@ -3367,6 +3380,96 @@ describe("BackgroundRuntime: scheduled automation", () => {
     advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); await ended(taskId);
     expect((await runtime.getSnapshot()).ask).toEqual(ask);
     expect(JSON.stringify(provider.requests)).not.toContain("PRIVATE_UNSENT_SELECTION");
+  });
+
+  it("leaves prepared MCP attachments private to their manual chat while automatic runs use ordinary context", async () => {
+    const fake = fakeMcpServers({ capabilities: { tools: {}, resources: {} }, content: (_server, method) => method === "resources/list"
+      ? { resources: [{ name: "PRIVATE_PENDING_NAME", uri: "internal://private-pending-uri" }] }
+      : { contents: [{ uri: "internal://private-pending-uri", text: "PRIVATE_PENDING_MCP_TEXT" }] } });
+    const mcp = new McpConnections({ fetcher: fake.fetcher, popup: approvingPopup() });
+    await mcp.connect("notion");
+    const provider = new FakeProvider(); provider.script = [{ type: "turn.completed", replayState: null }];
+    const { runtime, advance, taskId, openId } = await setup(provider, undefined, mcp);
+    const owner = {};
+    const catalog = await runtime.handleCommand({ v: 1, id: "catalog", type: "mcp.content.list", sessionId: openId, kind: "resource" }, owner);
+    if (!catalog || !("contentReply" in catalog) || !catalog.contentReply.ok || !("choices" in catalog.contentReply)) throw new Error("Missing resource catalog");
+    const prepared = await runtime.handleCommand({ v: 1, id: "prepare", type: "mcp.content.prepare", sessionId: openId, choiceId: catalog.contentReply.choices[0]!.id, arguments: {} }, owner);
+    if (!prepared || !("contentReply" in prepared) || !prepared.contentReply.ok || !("snapshot" in prepared.contentReply)) throw new Error("Missing resource preview");
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
+    const task = await ended(taskId);
+    expect(JSON.stringify(provider.requests)).not.toMatch(/PRIVATE_PENDING|private-pending-uri/);
+    const scheduled = (await getConversation(task.sessionId!))!.items.find(isTurnStart)!;
+    expect(scheduled.scheduled?.taskId).toBe(taskId);
+    expect(scheduled.content).toBeUndefined();
+    await runtime.handleCommand({ v: 1, id: "manual", type: "run.start", prompt: "Read my selected attachment", sessionId: openId, contentIds: [prepared.contentReply.snapshot.id] }, owner);
+    expect(JSON.stringify(provider.requests.at(-1))).toContain("PRIVATE_PENDING_MCP_TEXT");
+    const report = await runtime.handleProblemReportRequest({ v: 1, id: "report", type: "problemReport.export", sessionId: openId });
+    expect(report.ok).toBe(true);
+    expect(JSON.stringify(report)).not.toMatch(/PRIVATE_PENDING|private-pending-uri/);
+  });
+
+  it("keeps accepted steers as usable follow-ups when a scheduled initial save fails", async () => {
+    const fake = fakeMcpServers({ capabilities: { tools: {}, resources: {} }, content: (_server, method) => method === "resources/list"
+      ? { resources: [{ name: "Roadmap", uri: "internal://roadmap" }] }
+      : { contents: [{ uri: "internal://roadmap", text: "Original scheduled steer attachment" }] } });
+    const mcp = new McpConnections({ fetcher: fake.fetcher, popup: approvingPopup() });
+    await mcp.connect("notion");
+    const provider = new FakeProvider();
+    provider.script = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
+    const { runtime, advance, api, taskId, hub } = await setup(provider, undefined, mcp);
+    const capturing = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    const sendMessage = api.tabs.sendMessage.getMockImplementation()!;
+    api.tabs.sendMessage.mockImplementation(async (tabId, message) => {
+      if ((message as { type: string }).type === "page.snapshot") {
+        capturing.resolve(); await resume.promise;
+      }
+      return sendMessage(tabId, message);
+    });
+    let failed = false;
+    const originalSet = browser.storage.local.set.bind(browser.storage.local);
+    const fail = vi.spyOn(browser.storage.local, "set").mockImplementation(async items => {
+      const chunks = Object.entries(items).filter(([key]) => key.startsWith("conversation:") && key.endsWith(":items:0"));
+      if (!failed && chunks.some(([, value]) => (value as { items: ConversationItem[] }).items.some(item => isTurnStart(item) && item.text === draft.prompt))) {
+        failed = true;
+        throw new Error("private storage error");
+      }
+      await originalSet(items);
+    });
+    try {
+      advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
+      await capturing.promise;
+      const sessionId = (await getScheduledTasks()).find(task => task.id === taskId)!.sessionId!;
+      await runtime.openResultsSession(sessionId);
+      const port = fakePort(); hub.handleConnect(port);
+      await port.send({ v: 1, id: "subscribe", type: "state.subscribe", lastSeq: 0 });
+      const runId = (await runtime.getSnapshot()).activeRun!.runId;
+      const catalog = await runtime.handleCommand({ v: 1, id: "catalog", type: "mcp.content.list", sessionId, kind: "resource" }, port);
+      if (!catalog || !("contentReply" in catalog) || !catalog.contentReply.ok || !("choices" in catalog.contentReply)) throw new Error("Missing resource catalog");
+      const result = await runtime.handleCommand({ v: 1, id: "prepare", type: "mcp.content.prepare", sessionId, choiceId: catalog.contentReply.choices[0]!.id, arguments: {} }, port);
+      if (!result || !("contentReply" in result) || !result.contentReply.ok || !("snapshot" in result.contentReply)) throw new Error("Missing resource preview");
+      const prepared = result.contentReply.snapshot;
+      await port.send({ v: 1, id: "steer", type: "run.steer", runId, text: "Explain the attachment", sessionId, contentIds: [prepared.id] });
+      await port.send({ v: 1, id: "remove-later", type: "run.steer", runId, text: "Remove this guidance later" });
+      const pending = await loadMessageQueue(sessionId);
+      expect(pending).toMatchObject([{ mode: "steer", content: [prepared] }, { mode: "steer" }]);
+      resume.resolve();
+      expect((await ended(taskId)).lastRun?.status).toBe("failed");
+      await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun).toBeNull());
+      const queue = pending.map(message => ({ ...message, mode: "follow-up" }));
+      expect((await runtime.getSnapshot()).queue).toEqual(queue);
+      expect(await loadMessageQueue(sessionId)).toEqual(queue);
+      expect(provider.requests).toHaveLength(0);
+      expect(port.received.findLast(event => event.type === "state.snapshot")?.payload).toMatchObject({ activeRun: null, queue });
+      await port.send({ v: 1, id: "remove", type: "queue.remove", sessionId, messageId: pending[1]!.id });
+      expect(await loadMessageQueue(sessionId)).toEqual([queue[0]]);
+      await port.send({ v: 1, id: "send", type: "queue.send", sessionId, messageId: pending[0]!.id });
+      expect((await getConversation(sessionId))!.items.filter(isTurnStart)).toMatchObject([{ id: pending[0]!.id, text: "Explain the attachment", content: [prepared] }]);
+      expect(provider.requests).toHaveLength(1);
+      expect(JSON.stringify(provider.requests)).toContain(prepared.text);
+      expect(await loadMessageQueue(sessionId)).toEqual([]);
+      expect(port.received.filter(event => event.type === "mcp.content.accepted")).toHaveLength(1);
+    } finally { resume.resolve(); fail.mockRestore(); }
   });
 
   it("keeps scheduled help pending until a user response", async () => {
@@ -3506,5 +3609,364 @@ describe("BackgroundRuntime: scheduled automation", () => {
     await vi.waitFor(async () => expect(await getOpenSessionId()).toBe(task.sessionId));
     await runtime.handleAutomationRequest({ v: 1, id: "disable", type: "automation.notifications.save", enabled: false });
     expect(await getNotificationSettings()).toEqual({ version: 1, enabled: false });
+  });
+});
+
+describe("BackgroundRuntime: selected MCP content", () => {
+  const answer: ScriptedProviderEvent[] = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
+  const ask = (id = "ask-1", text = "Selected source text") => buildAskContext("selection", { selectionText: text }, { id: 1, url: "http://127.0.0.1:4173/agent-page.html", title: "Source page" }, id, 1)!;
+  /** Hold the real queue/message write, not the runtime's admission helpers. */
+  function holdAdmission(sessionId: string, text: string, reject: boolean) {
+    const writing = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    const originalSet = browser.storage.local.set.bind(browser.storage.local);
+    let held = false;
+    const spy = vi.spyOn(browser.storage.local, "set").mockImplementation(async items => {
+      const records = items as Record<string, unknown>;
+      const queue = records[`queue:${sessionId}`] as { messages?: Array<{ text: string }> } | undefined;
+      const chunk = records[`conversation:${sessionId}:items:0`] as { items?: ConversationItem[] } | undefined;
+      if (!held && (queue?.messages?.some(item => item.text === text) || chunk?.items?.some(item => item.kind === "message" && item.role === "user" && item.text === text))) {
+        held = true; writing.resolve(); await resume.promise;
+        if (reject) throw new Error("private storage error");
+      }
+      await originalSet(items);
+    });
+    return { writing: writing.promise, resume: () => resume.resolve(), restore: () => spy.mockRestore() };
+  }
+  async function fixture(provider = new FakeProvider(), tabControllerFactory = unsupportedPageTabControllerFactory) {
+    const remote = { text: "Original remote snapshot" };
+    const fake = fakeMcpServers({ capabilities: { tools: {}, prompts: {}, resources: {} }, content: (_server, method) => {
+      if (method === "prompts/list") return { prompts: [{ name: "summarize", arguments: [{ name: "topic", required: true }] }] };
+      if (method === "resources/list") return { resources: [{ name: "Roadmap", uri: "internal://roadmap" }] };
+      if (method === "resources/read") return { contents: [{ uri: "internal://roadmap", text: remote.text }] };
+      return { messages: [{ role: "system", content: { type: "text", text: remote.text } }] };
+    } });
+    const mcp = new McpConnections({ fetcher: fake.fetcher, popup: approvingPopup() });
+    await mcp.connect("notion");
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider, mcp, tabControllerFactory });
+    const owner = {};
+    const sessionId = (await runtime.getSnapshot()).conversation.id;
+    const send = (command: Record<string, unknown>, sender = owner) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand, sender);
+    const prepare = async (kind: "prompt" | "resource" = "prompt", sender = owner) => {
+      const list = await send({ type: "mcp.content.list", kind, sessionId }, sender);
+      if (!list || !("contentReply" in list) || !list.contentReply.ok || !("choices" in list.contentReply)) throw new Error("Missing catalog");
+      const result = await send({ type: "mcp.content.prepare", sessionId, choiceId: list.contentReply.choices[0]!.id, arguments: { topic: "planning" } }, sender);
+      if (!result || !("contentReply" in result) || !result.contentReply.ok || !("snapshot" in result.contentReply)) throw new Error("Missing snapshot");
+      return result.contentReply.snapshot;
+    };
+    return { runtime, mcp, hub, provider, remote, sessionId, send, prepare, owner };
+  }
+
+  it("settles an accepted second-sidebar steer when the initial message cannot be saved after capture", async () => {
+    await saveOpenAICredential("sk-test");
+    const controller = supportedPageTabControllerFactory();
+    const capture = controller.captureActivePage.bind(controller);
+    const capturing = Promise.withResolvers<void>();
+    const resumeCapture = Promise.withResolvers<void>();
+    const heldCapture = vi.spyOn(controller, "captureActivePage").mockImplementationOnce(async () => {
+      capturing.resolve(); await resumeCapture.promise;
+      return capture();
+    });
+    const f = await fixture(undefined, () => controller);
+    f.hub.delegate = f.runtime;
+    f.provider.script = answer;
+    const first = fakePort(); f.hub.handleConnect(first);
+    const originalSet = browser.storage.local.set.bind(browser.storage.local);
+    const fail = vi.spyOn(browser.storage.local, "set").mockImplementation(async items => {
+      const chunk = (items as Record<string, unknown>)[`conversation:${f.sessionId}:items:0`] as { items?: ConversationItem[] } | undefined;
+      if (chunk?.items?.some(item => item.kind === "message" && item.role === "user" && item.text === "Start")) throw new Error("private storage error");
+      await originalSet(items);
+    });
+    const starting = first.send({ v: 1, id: "start", type: "run.start", prompt: "Start" });
+    try {
+      await capturing.promise;
+      const second = fakePort(); f.hub.handleConnect(second);
+      await second.send({ v: 1, id: "subscribe", type: "state.subscribe", lastSeq: 0 });
+      const runId = (await f.runtime.getSnapshot()).activeRun!.runId;
+      const prepared = await f.prepare("resource", second);
+      await second.send({ v: 1, id: "steer", type: "run.steer", runId, text: "Explain", sessionId: f.sessionId, contentIds: [prepared.id] });
+      const [pending] = await loadMessageQueue(f.sessionId);
+      expect(pending).toMatchObject({ mode: "steer", content: [prepared] });
+      resumeCapture.resolve(); await starting;
+      const snapshot = await f.runtime.getSnapshot();
+      expect(snapshot.activeRun).toBeNull();
+      expect(snapshot.queue).toEqual([{ ...pending, mode: "follow-up" }]);
+      expect(await loadMessageQueue(f.sessionId)).toEqual(snapshot.queue);
+      expect(f.provider.requests).toHaveLength(0);
+      const idle = second.received.findLast(event => event.type === "state.snapshot");
+      expect(idle?.payload).toMatchObject({ activeRun: null, queue: snapshot.queue });
+      fail.mockRestore();
+      await second.send({ v: 1, id: "send", type: "queue.send", sessionId: f.sessionId, messageId: pending!.id });
+      expect((await getConversation(f.sessionId))!.items.filter(isTurnStart)).toMatchObject([{ id: pending!.id, text: "Explain", content: [prepared] }]);
+      expect(await loadMessageQueue(f.sessionId)).toEqual([]);
+      expect(second.received.filter(event => event.type === "mcp.content.accepted")).toHaveLength(1);
+    } finally {
+      resumeCapture.resolve(); fail.mockRestore(); heldCapture.mockRestore();
+      await starting;
+    }
+  });
+
+  it("keeps failed-send chips available, refuses other sidebars/session and duplicate sends, and replays exact bytes after disconnect", async () => {
+    const f = await fixture();
+    await f.send({ type: "run.start", prompt: "/mcp:notion:summarize" });
+    expect((await f.runtime.getSnapshot()).notice).toContain("prepare its preview");
+    const prepared = await f.prepare();
+    const command = { type: "run.start", prompt: "/mcp:notion:summarize", sessionId: f.sessionId, contentIds: [prepared.id] };
+    await f.send(command, {});
+    expect((await f.runtime.getSnapshot()).notice).toContain("no longer available");
+    await f.send(command);
+    expect(f.provider.requests).toHaveLength(0); // No provider credential; preparation survives.
+    await saveOpenAICredential("sk-test");
+    f.provider.script = () => ({ [Symbol.asyncIterator]: async function* () { throw new ProviderStreamError("Try again", "NETWORK"); } });
+    await f.send(command);
+    const originalInput = JSON.stringify(f.provider.requests[0]!.context.messages);
+    expect(originalInput).toContain("Original remote snapshot");
+    expect(f.provider.requests[0]!.context.systemPrompt).not.toContain("Original remote snapshot");
+    await f.mcp.disconnect("notion");
+    f.remote.text = "Remote replacement";
+    f.provider.script = answer;
+    await f.send({ type: "run.retry" });
+    expect(JSON.stringify(f.provider.requests[1]!.context.messages)).toBe(originalInput);
+    await f.send(command);
+    expect(f.provider.requests).toHaveLength(2);
+    expect((await getConversation(f.sessionId))!.items.filter(i => i.kind === "message" && i.role === "user")).toHaveLength(1);
+    const exported = await f.runtime.handleCommand({ v: 1, id: "export", type: "context.export", sessionId: f.sessionId });
+    expect(exported!.markdown).toContain("Original remote snapshot");
+    expect(exported!.markdown).not.toContain("Remote replacement");
+    const report = await f.runtime.handleProblemReportRequest({ v: 1, id: "metadata", type: "problemReport.export", sessionId: f.sessionId });
+    expect(report.ok).toBe(true);
+    expect(JSON.stringify(report)).not.toMatch(/Original remote snapshot|Remote replacement|summarize|mcp:notion/);
+  });
+
+  it("taints first-turn memory reads and accepts no MCP write/effect merely for selecting content", async () => {
+    await saveOpenAICredential("sk-test");
+    const f = await fixture();
+    const prepared = await f.prepare("resource");
+    let round = 0;
+    f.provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      if (round++ === 0) {
+        yield { type: "tool.call", call: { id: "save", name: "browser_program", arguments: { source: 'fs.write("/memory/content.md", "Selected content\\nDurable useful detail");' } } } as ScriptedProviderEvent;
+        yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+      } else throw new ProviderStreamError("Try again", "NETWORK");
+    } });
+    await f.send({ type: "run.start", prompt: "Explain this", sessionId: f.sessionId, contentIds: [prepared.id] });
+    expect((await listMemories())[0]?.provenance).toMatchObject({ tainted: true });
+    f.provider.script = answer;
+    await f.send({ type: "run.retry" });
+    expect(f.provider.requests.length).toBeGreaterThanOrEqual(3);
+    expect((await getConversation(f.sessionId))!.items.filter(i => i.kind === "tool-call").every(i => !i.call.mcp)).toBe(true);
+  });
+
+  it.each(["follow-up", "steer"] as const)("preserves accepted %s snapshots through refresh, persistence and delivery", async mode => {
+    await saveOpenAICredential("sk-test");
+    const f = await fixture();
+    const gate = Promise.withResolvers<void>();
+    let round = 0;
+    f.provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      const current = round++;
+      if (current === 0) { await gate.promise; yield* answer; }
+      else if (current === 1) {
+        yield { type: "tool.call", call: { id: "save", name: "browser_program", arguments: { source: 'fs.write("/memory/content.md", "Selected content\\nDurable useful detail");' } } } as ScriptedProviderEvent;
+        yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+      } else yield* answer;
+    } });
+    const running = f.send({ type: "run.start", prompt: "Start" });
+    await untilRequested(f.provider);
+    const prepared = await f.prepare();
+    const runId = (await f.runtime.getSnapshot()).activeRun!.runId;
+    const command = { type: mode === "steer" ? "run.steer" : "run.start", runId, prompt: "Explain", text: "Explain", sessionId: f.sessionId, contentIds: [prepared.id] };
+    await Promise.all([f.send(command), f.send(command)]);
+    expect((await loadMessageQueue(f.sessionId))).toHaveLength(1);
+    expect((await loadMessageQueue(f.sessionId))[0]!.content).toEqual([prepared]);
+    f.remote.text = "Remote replacement";
+    await f.mcp.refresh("notion");
+    gate.resolve();
+    await running;
+    await vi.waitFor(async () => expect((await f.runtime.getSnapshot()).activeRun).toBeNull());
+    expect(f.provider.requests).toHaveLength(3);
+    expect(JSON.stringify(f.provider.requests[1]!.context.messages)).toContain("Original remote snapshot");
+    expect(JSON.stringify(f.provider.requests[1]!.context.messages)).not.toContain("Remote replacement");
+    expect((await listMemories())[0]?.provenance).toMatchObject({ tainted: true });
+    expect((await getConversation(f.sessionId))!.items.find(i => i.kind === "message" && i.role === "user" && i.text === "Explain")).toMatchObject({ content: [prepared], ...(mode === "steer" ? { delivery: "steer" } : {}) });
+  });
+
+  it.each(["removal", "delivery", "settlement"] as const)("serializes %s while attachment acceptance is persisting without resurrecting queued messages", async mode => {
+    await saveOpenAICredential("sk-test");
+    const f = await fixture();
+    const observer = fakePort(); f.hub.handleConnect(observer);
+    const firstRound = Promise.withResolvers<void>();
+    const secondRound = Promise.withResolvers<void>();
+    let round = 0;
+    f.provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      const current = round++;
+      if (current === 0) await firstRound.promise;
+      if (current === 1 && mode === "delivery") await secondRound.promise;
+      yield* answer;
+    } });
+    const running = f.send({ type: "run.start", prompt: "Start" });
+    await untilRequested(f.provider);
+    const runId = (await f.runtime.getSnapshot()).activeRun!.runId;
+    await f.send(mode === "removal" ? { type: "run.start", prompt: "A" } : { type: "run.steer", runId, text: "A" });
+    const a = (await loadMessageQueue(f.sessionId))[0]!;
+    const prepared = await f.prepare("resource");
+    const writing = Promise.withResolvers<void>();
+    const resumeWrite = Promise.withResolvers<void>();
+    const originalSet = browser.storage.local.set.bind(browser.storage.local);
+    let held = false;
+    const spy = vi.spyOn(browser.storage.local, "set").mockImplementation(async items => {
+      const queue = (items as Record<string, unknown>)[`queue:${f.sessionId}`] as { messages?: Array<{ content?: Array<{ id: string }> }> } | undefined;
+      if (!held && queue?.messages?.some(message => message.content?.some(item => item.id === prepared.id))) {
+        held = true; writing.resolve(); await resumeWrite.promise;
+      }
+      await originalSet(items);
+    });
+    const accepting = f.send({ type: "run.start", prompt: "B", sessionId: f.sessionId, contentIds: [prepared.id] });
+    try {
+      await writing.promise;
+      let removing: Promise<unknown> | undefined;
+      if (mode === "removal") removing = f.send({ type: "queue.remove", sessionId: f.sessionId, messageId: a.id }, {});
+      else if (mode === "delivery") {
+        firstRound.resolve();
+        await vi.waitFor(async () => expect((await getConversation(f.sessionId))!.items.some(item => item.id === a.id && item.kind === "message" && item.role === "user" && item.delivery === "steer")).toBe(true));
+      } else {
+        await f.send({ type: "run.cancel", runId });
+        firstRound.resolve();
+        await vi.waitFor(async () => expect((await f.runtime.getSnapshot()).activeRun).toBeNull());
+      }
+      // Let the competing command/delivery reach the held acceptance boundary.
+      await tick();
+      resumeWrite.resolve();
+      await accepting;
+      await removing;
+      if (mode === "settlement") await running;
+      const expected = mode === "settlement" ? ["A", "B"] : ["B"];
+      await vi.waitFor(async () => expect((await f.runtime.getSnapshot()).queue.map(message => message.text)).toEqual(expected));
+      await vi.waitFor(async () => expect((await loadMessageQueue(f.sessionId)).map(message => message.text)).toEqual(expected));
+      if (mode === "delivery") {
+        await vi.waitFor(() => expect(observer.received.some(event => event.type === "steer.delivered" && event.payload.item.id === a.id)).toBe(true));
+        const delivery = observer.received.findIndex(event => event.type === "steer.delivered" && event.payload.item.id === a.id);
+        const updates = observer.received.slice(delivery + 1).filter(event => event.type === "queue.changed");
+        expect(updates.every(event => !event.payload.messages.some(message => message.id === a.id))).toBe(true);
+      }
+      expect((await loadMessageQueue(f.sessionId)).every(message => message.mode === "follow-up")).toBe(true);
+      firstRound.resolve(); secondRound.resolve();
+      await running;
+      if (mode === "settlement") await f.send({ type: "queue.send", sessionId: f.sessionId, messageId: a.id });
+      await vi.waitFor(async () => expect((await f.runtime.getSnapshot()).activeRun).toBeNull());
+      const users = (await getConversation(f.sessionId))!.items.filter(item => item.kind === "message" && item.role === "user");
+      expect(users.filter(item => item.text === "A")).toHaveLength(mode === "removal" ? 0 : 1);
+      expect(users.filter(item => item.text === "B")).toHaveLength(1);
+      expect(await loadMessageQueue(f.sessionId)).toEqual([]);
+    } finally {
+      resumeWrite.resolve(); firstRound.resolve(); secondRound.resolve(); spy.mockRestore();
+      await accepting; await running;
+    }
+  });
+
+  it.each([
+    { mode: "initial", withContent: true },
+    { mode: "follow-up", withContent: true },
+    { mode: "steer", withContent: true },
+    { mode: "follow-up", withContent: false },
+  ] as const)("retains $mode drafts when persistence fails, then accepts them exactly once (MCP: $withContent)", async ({ mode, withContent }) => {
+    await saveOpenAICredential("sk-test");
+    const f = await fixture();
+    const first = fakePort(); const second = fakePort();
+    f.hub.handleConnect(first); f.hub.handleConnect(second);
+    const gate = Promise.withResolvers<void>();
+    let round = 0;
+    f.provider.script = () => ({ [Symbol.asyncIterator]: async function* () { if (mode !== "initial" && round++ === 0) await gate.promise; yield* answer; } });
+    const running = mode === "initial" ? Promise.resolve() : f.send({ type: "run.start", prompt: "Start" });
+    if (mode !== "initial") await untilRequested(f.provider);
+    const prepared = withContent ? await f.prepare("prompt", first) : undefined;
+    const competing = withContent ? await f.prepare("resource", second) : undefined;
+    const source = ask(); f.runtime.setAsk(source);
+    const runId = (await f.runtime.getSnapshot()).activeRun?.runId;
+    const command = { type: mode === "steer" ? "run.steer" : "run.start", runId, prompt: "Explain", text: "Explain", askId: source.id, sessionId: f.sessionId, contentIds: prepared ? [prepared.id] : undefined };
+    const competingCommand = { ...command, contentIds: competing ? [competing.id] : undefined };
+    const expected = { ask: { ...source, path: "/tabs/1/page.md" }, ...(prepared ? { content: [prepared] } : {}) };
+    const held = holdAdmission(f.sessionId, "Explain", true);
+    const sending = f.send(command, first);
+    try {
+      await held.writing;
+      const visibleWhileSaving = first.received.filter(event => event.type === "ask.changed").at(-1)?.payload;
+      // A distinct capability in a second sidebar cannot admit the same Ask twice.
+      const competingSend = f.send(competingCommand, second);
+      await tick();
+      held.resume(); await Promise.all([sending, competingSend]);
+      expect(visibleWhileSaving).toEqual({ ask: source });
+      expect((await f.runtime.getSnapshot()).ask).toEqual(source);
+      expect((await f.runtime.getSnapshot()).queue).toEqual([]);
+      expect(await loadMessageQueue(f.sessionId)).toEqual([]);
+      expect(first.received.some(event => event.type === "mcp.content.accepted")).toBe(false);
+      expect(f.provider.requests).toHaveLength(mode === "initial" ? 0 : 1);
+      held.restore();
+      await Promise.all([f.send(command, first), f.send(command, first)]);
+      await f.send(competingCommand, second);
+      expect((await f.runtime.getSnapshot()).ask).toBeNull();
+      if (mode !== "initial") expect((await loadMessageQueue(f.sessionId))).toMatchObject([expected]);
+      gate.resolve(); await running;
+      await vi.waitFor(async () => {
+        const snapshot = await f.runtime.getSnapshot();
+        expect(snapshot.activeRun).toBeNull(); expect(snapshot.queue).toEqual([]);
+      });
+      const users = (await getConversation(f.sessionId))!.items.filter(item => item.kind === "message" && item.role === "user" && item.text === "Explain");
+      expect(users).toMatchObject([expected]);
+      expect(first.received.filter(event => event.type === "mcp.content.accepted")).toHaveLength(withContent ? 1 : 0);
+      expect(first.received.filter(event => event.type === "ask.changed" && event.payload.ask === null)).toHaveLength(1);
+      expect(second.received.some(event => event.type === "mcp.content.accepted")).toBe(false);
+    } finally {
+      held.resume(); held.restore(); gate.resolve();
+      await sending; await running;
+    }
+  });
+
+  it.each([
+    { mode: "initial", change: "replace", reject: false },
+    { mode: "follow-up", change: "replace", reject: true },
+    { mode: "steer", change: "dismiss", reject: true },
+  ] as const)("preserves a concurrent Ask $change during $mode admission (rejected: $reject)", async ({ mode, change, reject }) => {
+    await saveOpenAICredential("sk-test");
+    const f = await fixture();
+    const gate = Promise.withResolvers<void>();
+    let round = 0;
+    f.provider.script = () => ({ [Symbol.asyncIterator]: async function* () { if (mode !== "initial" && round++ === 0) await gate.promise; yield* answer; } });
+    const running = mode === "initial" ? Promise.resolve() : f.send({ type: "run.start", prompt: "Start" });
+    if (mode !== "initial") await untilRequested(f.provider);
+    const prepared = await f.prepare();
+    f.runtime.setAsk(ask());
+    const runId = (await f.runtime.getSnapshot()).activeRun?.runId;
+    const held = holdAdmission(f.sessionId, "Explain", reject);
+    const sending = f.send({ type: mode === "steer" ? "run.steer" : "run.start", runId, prompt: "Explain", text: "Explain", askId: "ask-1", sessionId: f.sessionId, contentIds: [prepared.id] });
+    try {
+      await held.writing;
+      if (change === "replace") f.runtime.setAsk(ask("newer", "New menu gesture"));
+      else await f.send({ type: "ask.dismiss", askId: "ask-1" });
+      held.resume(); await sending;
+      expect((await f.runtime.getSnapshot()).ask).toEqual(change === "replace" ? ask("newer", "New menu gesture") : null);
+      const users = (await getConversation(f.sessionId))!.items.filter(item => item.kind === "message" && item.role === "user" && item.text === "Explain");
+      expect(users).toMatchObject(reject ? [] : [{ ask: { ...ask(), path: "/tabs/1/page.md" }, content: [prepared] }]);
+    } finally {
+      held.resume(); held.restore(); gate.resolve();
+      await sending; await running;
+    }
+  });
+
+  it("refuses stale preparation after session switch or connection refresh and accepts only native sidebar senders", async () => {
+    const f = await fixture();
+    const prepared = await f.prepare();
+    await f.mcp.refresh("notion");
+    await f.send({ type: "run.start", prompt: "Explain", sessionId: f.sessionId, contentIds: [prepared.id] });
+    expect((await f.runtime.getSnapshot()).notice).toContain("disconnected");
+    await f.send({ type: "session.open", sessionId: (await createSession()).id });
+    await f.send({ type: "run.start", prompt: "Explain", sessionId: f.sessionId, contentIds: [prepared.id] });
+    expect((await f.runtime.getSnapshot()).notice).toContain("chat changed");
+    const port = fakePort();
+    Object.assign(port, { sender: { id: browser.runtime.id, url: "https://example.com/" } });
+    f.hub.handleConnect(port);
+    await port.send({ v: 1, id: "read", type: "mcp.content.list", kind: "resource", sessionId: f.sessionId });
+    expect(port.received).toHaveLength(0);
+    expect(f.provider.requests).toHaveLength(0);
   });
 });

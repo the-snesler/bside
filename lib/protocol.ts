@@ -9,6 +9,7 @@
  * already defined here.
  */
 
+import { isMcpArguments, MCP_CONTENT_LIMITS, type McpContentChoice, type McpContentSnapshot } from "@/lib/domain/mcp-content";
 import type {
   CaptureGeometry,
   DomAction,
@@ -568,7 +569,7 @@ export type SidebarCommand =
    * session, queues the prompt as a follow-up instead: it starts the next
    * turn once that run completes (not after a failure or cancellation).
    */
-  | { v: 1; id: string; type: "run.start"; prompt: string; askId?: string }
+  | { v: 1; id: string; type: "run.start"; prompt: string; askId?: string; contentIds?: string[]; sessionId?: string }
   /**
    * Guidance for the active run, delivered as a user message at its next tool
    * boundary, within the same turn and budgets. If `runId` is no longer
@@ -576,7 +577,10 @@ export type SidebarCommand =
    * `askId` (on either) sends the pending context-menu chip with the message;
    * a chip that is no longer pending refuses the send with a notice.
    */
-  | { v: 1; id: string; type: "run.steer"; runId: string; text: string; askId?: string }
+  | { v: 1; id: string; type: "run.steer"; runId: string; text: string; askId?: string; contentIds?: string[]; sessionId?: string }
+  | { v: 1; id: string; type: "mcp.content.list"; sessionId: string; kind: "prompt" | "resource" }
+  | { v: 1; id: string; type: "mcp.content.prepare"; sessionId: string; choiceId: string; arguments: Record<string, string> }
+  | { v: 1; id: string; type: "mcp.content.dismiss"; sessionId: string; contentIds: string[] }
   /** Removes the pending "Ask bside about…" chip, if it is still the one named. */
   | { v: 1; id: string; type: "ask.dismiss"; askId: string }
   /** Discards a queued follow-up, or a steer not yet delivered, from a session's queue. */
@@ -591,9 +595,15 @@ export type SidebarCommand =
   /** Answers the active run's pending `request_user_help`: `done` (the user finished in the tab) or `unable`, with an optional short note. */
   | { v: 1; id: string; type: "help.resolve"; runId: string; callId: string; outcome: HelpOutcome; note: string };
 
+export type McpContentReply =
+  | { ok: true; choices: McpContentChoice[]; errors: NormalizedError[] }
+  | { ok: true; snapshot: McpContentSnapshot }
+  | { ok: false; error: NormalizedError };
+
 export type HelpOutcome = "done" | "unable";
 
 const isAskId = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 64;
+const isContentIds = (value: unknown): value is string[] => Array.isArray(value) && value.length <= MCP_CONTENT_LIMITS.attachments && value.every(isAskId) && new Set(value).size === value.length;
 const isOptionalAskId = (value: unknown) => value === undefined || isAskId(value);
 
 export interface ApprovalRequest {
@@ -683,7 +693,9 @@ export type SidebarEvent =
   /** The pending context-menu chip changed: a new click, alt text the page reported, sent, or removed. Not run-sequenced. */
   | EventBase<"ask.changed", { ask: AskContextV1 | null }>
   | EventBase<"composer.focus", null>
-  | EventBase<"run.started", { prompt: string; page: PageArtifactSummary | null; ask: AskContextV1 | null; retry: boolean; scheduled?: ScheduledSource }>
+  | EventBase<"mcp.content.reply", { requestId: string; result: McpContentReply }>
+  | EventBase<"mcp.content.accepted", { ids: string[] }>
+  | EventBase<"run.started", { content?: McpContentSnapshot[]; prompt: string; page: PageArtifactSummary | null; ask: AskContextV1 | null; retry: boolean; scheduled?: ScheduledSource }>
   | EventBase<"assistant.delta", { delta: string }>
   | EventBase<"tool.requested", { call: ToolCall; display: string }>
   | EventBase<"action.approval-required", ApprovalRequest>
@@ -701,6 +713,9 @@ export type SidebarEvent =
 export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (!isEnvelope(value)) return false;
   const candidate = value as Record<string, unknown>;
+  if (candidate.type === "mcp.content.list") return isSessionId(candidate.sessionId) && (candidate.kind === "prompt" || candidate.kind === "resource");
+  if (candidate.type === "mcp.content.prepare") return isSessionId(candidate.sessionId) && isAskId(candidate.choiceId) && isMcpArguments(candidate.arguments);
+  if (candidate.type === "mcp.content.dismiss") return isSessionId(candidate.sessionId) && isContentIds(candidate.contentIds);
   if (candidate.type === "skills.list") return true;
   if (candidate.type === "tabs.list") return true;
   if (candidate.type === "tabs.focus") return Number.isSafeInteger(candidate.tabId);
@@ -726,8 +741,8 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (candidate.type === "state.subscribe") {
     return candidate.lastSeq === null || typeof candidate.lastSeq === "number";
   }
-  if (candidate.type === "run.start") return typeof candidate.prompt === "string" && isOptionalAskId(candidate.askId);
-  if (candidate.type === "run.steer") return typeof candidate.runId === "string" && typeof candidate.text === "string" && isOptionalAskId(candidate.askId);
+  if (candidate.type === "run.start") return typeof candidate.prompt === "string" && isOptionalAskId(candidate.askId) && (candidate.contentIds === undefined || (isContentIds(candidate.contentIds) && isSessionId(candidate.sessionId)));
+  if (candidate.type === "run.steer") return typeof candidate.runId === "string" && typeof candidate.text === "string" && isOptionalAskId(candidate.askId) && (candidate.contentIds === undefined || (isContentIds(candidate.contentIds) && isSessionId(candidate.sessionId)));
   if (candidate.type === "ask.dismiss") return isAskId(candidate.askId);
   if (candidate.type === "queue.remove" || candidate.type === "queue.send") {
     return isSessionId(candidate.sessionId) && typeof candidate.messageId === "string";
@@ -910,6 +925,30 @@ export type HistoryRequest =
 export type HistoryResponse =
   | { v: 1; id: string; ok: true; settings: HistorySettingsV1; sessionCount: number; notice: string | null }
   | { v: 1; id: string; ok: false; error: NormalizedError };
+
+/** Options-only, local, metadata-only diagnostics. Deliberately no include-content switch. */
+export type ProblemReportRequest =
+  | { v: 1; id: string; type: "problemReport.list" }
+  | { v: 1; id: string; type: "problemReport.export"; sessionId: string };
+
+export type ProblemReportResponse =
+  | { v: 1; id: string; ok: true; type: "problemReport.list"; sessions: { id: string; title: string }[] }
+  | { v: 1; id: string; ok: true; type: "problemReport.export"; json: string; filename: string }
+  | { v: 1; id: string; ok: false; error: NormalizedError };
+
+export function isProblemReportRequest(value: unknown): value is ProblemReportRequest {
+  if (!isEnvelope(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  const keys = candidate.type === "problemReport.list" ? ["v", "id", "type"] : ["v", "id", "type", "sessionId"];
+  if (Object.keys(candidate).some((key) => !keys.includes(key))) return false;
+  return candidate.type === "problemReport.list" ||
+    (candidate.type === "problemReport.export" && isSessionId(candidate.sessionId));
+}
+
+/** Options routes may contain a hash, but never a query or a different page. */
+export function isOptionsSender(sender: { id?: string; url?: string }, extensionId: string, optionsUrl: string): boolean {
+  return sender.id === extensionId && sender.url?.replace(/#.*$/s, "") === optionsUrl;
+}
 
 export function isHistoryRequest(value: unknown): value is HistoryRequest {
   if (!isEnvelope(value)) return false;

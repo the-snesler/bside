@@ -125,6 +125,17 @@ describe("settings primitives", () => {
 });
 
 describe("settings navigation", () => {
+  it("returns focus to the menu button on Escape and to the page title after navigation", async () => {
+    await mount({ hash: "#/general", configured: true });
+    const toggle = root.querySelector<HTMLButtonElement>('[aria-label="Settings menu"]')!;
+    await act(async () => toggle.click());
+    expect(document.activeElement).toBe(search());
+    await act(async () => { window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); });
+    expect(document.activeElement).toBe(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    await go("#/history");
+    expect(document.activeElement).toBe(root.querySelector("h1"));
+  });
   it("opens Account by default until an account is connected, and records it in the URL", async () => {
     await mount();
     await vi.waitFor(() => expect(title()).toBe("Account"));

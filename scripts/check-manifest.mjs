@@ -27,6 +27,9 @@ function normalize(manifest) {
   return {
     manifest_version: manifest.manifest_version,
     gecko_id: manifest.browser_specific_settings?.gecko?.id ?? null,
+    gecko_min_version: manifest.browser_specific_settings?.gecko?.strict_min_version ?? null,
+    gecko_android_min_version: manifest.browser_specific_settings?.gecko_android?.strict_min_version ?? null,
+    data_collection_permissions: manifest.browser_specific_settings?.gecko?.data_collection_permissions ?? null,
     background_persistent: manifest.background?.persistent ?? null,
     permissions: sorted(manifest.permissions),
     optional_permissions: sorted(manifest.optional_permissions),

@@ -10,6 +10,10 @@ export function Markdown({ text }: { text: string }) {
         skipHtml
         urlTransform={(url) => (/^(https?:\/\/|mailto:)/i.test(url) ? url : "")}
         components={{
+          // Long tables/code scroll within the narrow sidebar. A keyboard
+          // user needs a focus target to reach and scroll that content.
+          table: ({ children }) => <table tabIndex={0} aria-label="Scrollable table">{children}</table>,
+          pre: ({ children }) => <pre tabIndex={0} aria-label="Code block">{children}</pre>,
           a: ({ href, children }) =>
             href ? (
               <a href={href} target="_blank" rel="noopener noreferrer">

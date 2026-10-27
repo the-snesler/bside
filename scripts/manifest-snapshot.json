@@ -1,6 +1,22 @@
 {
   "manifest_version": 2,
   "gecko_id": "bside@tsuni.dev",
+  "gecko_min_version": "140.0",
+  "gecko_android_min_version": "142.0",
+  "data_collection_permissions": {
+    "required": [
+      "authenticationInfo",
+      "browsingActivity",
+      "financialAndPaymentInfo",
+      "healthInfo",
+      "locationInfo",
+      "personalCommunications",
+      "personallyIdentifyingInfo",
+      "searchTerms",
+      "websiteActivity",
+      "websiteContent"
+    ]
+  },
   "background_persistent": true,
   "permissions": [
     "<all_urls>",

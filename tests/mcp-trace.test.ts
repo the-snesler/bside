@@ -42,4 +42,23 @@ describe("MCP calls in the sidebar trace", () => {
     expect([...root.querySelectorAll(".trace__actions button")].map((button) => button.textContent)).toEqual(["Approve", "Deny"]);
     render(null, root);
   });
+  it("retains visible source-labeled MCP snapshots in delivered-steer trace steps", () => {
+    const content: import("@/lib/domain/mcp-content").McpContentSnapshot[] = [{ version: 1, id: "selected", sessionId: "s1", kind: "resource", serverId: "notion", server: "Notion", name: "Roadmap", uri: "internal://roadmap", text: '<img src="https://bad.invalid/track">Original steering context' }];
+    const items: ConversationItem[] = [
+      { id: "u", kind: "message", role: "user", text: "Start", context: null, at: 0 },
+      { id: "steer", kind: "message", role: "user", text: "Use this source", context: null, delivery: "steer", content, at: 1 },
+      { id: "answer", kind: "message", role: "assistant", text: "Done", at: 2 },
+    ];
+    const turn = buildTurns(items, false)[0]!;
+    expect(turn.steps[0]).toMatchObject({ kind: "steer", content });
+    const root = document.createElement("div"); document.body.append(root);
+    render(h(TurnTrace, { turn, active: false, pendingApproval: null, onApprove: () => {}, onDeny: () => {} }), root);
+    expect(root.querySelector(".trace__steer")?.textContent).toContain("Use this source");
+    expect(root.querySelector(".trace__steer summary")?.textContent).toBe("Notion · Resource · Roadmap");
+    expect(root.querySelector(".trace__steer pre")?.textContent).toBe(content[0]!.text);
+    expect(root.querySelector(".trace__steer")?.textContent).toContain("internal://roadmap");
+    expect(root.querySelectorAll("img,a,script")).toHaveLength(0);
+    render(null, root); root.remove();
+  });
+
 });

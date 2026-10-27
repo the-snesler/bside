@@ -9,6 +9,8 @@
  * `conversationId` is the open session's.
  */
 
+import type { McpContentChoice, McpContentSnapshot } from "@/lib/domain/mcp-content";
+import type { McpContentReply } from "@/lib/protocol";
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import type { Browser } from "wxt/browser";
 import { RUN_CANCELLED_SUFFIX, SIDEBAR_PORT_NAME } from "@/lib/protocol";
@@ -42,6 +44,7 @@ export const memoryUndoKey = (changeIds: readonly string[]) => changeIds.join(" 
 
 export interface BackgroundState extends RuntimeSnapshot {
   focusVersion: number;
+  mcpAttachments: McpContentSnapshot[];
   tabs: TabMention[];
   /** The session index, pinned first, then most recent. Requested on connect and pushed by the background whenever it changes. */
   sessions: ConversationSummary[];
@@ -52,6 +55,9 @@ export interface BackgroundState extends RuntimeSnapshot {
 }
 
 export interface BackgroundActions {
+  listMcpContent(kind: "prompt" | "resource"): Promise<{ choices: McpContentChoice[]; errors: import("@/lib/protocol").NormalizedError[] }>;
+  prepareMcpContent(choiceId: string, args: Record<string, string>): Promise<void>;
+  dismissMcpContent(id: string): void;
   listTabs(): void;
   listSkills(): void;
   focusTab(tabId: number): void;
@@ -65,9 +71,9 @@ export interface BackgroundActions {
   takeOverTab(tabId: number): void;
   saveSettings(settings: AppSettingsV1): void;
   /** Starts a run, or queues a follow-up while this chat's run is working. */
-  sendPrompt(prompt: string, askId?: string): void;
+  sendPrompt(prompt: string, askId?: string, contentIds?: string[]): void;
   /** Guidance for the running turn, delivered at its next tool boundary. */
-  steer(text: string, askId?: string): void;
+  steer(text: string, askId?: string, contentIds?: string[]): void;
   dismissAsk(askId: string): void;
   removeQueued(messageId: string): void;
   sendQueued(messageId: string): void;
@@ -102,6 +108,7 @@ const EMPTY_CONVERSATION: Conversation = {
 const INITIAL_STATE: BackgroundState = {
   ask: null,
   focusVersion: 0,
+  mcpAttachments: [],
   skills: [],
   tabs: [],
   sessions: [],
@@ -131,6 +138,7 @@ export function useBackground(): BackgroundState & BackgroundActions {
   const siteNoteRequestRef = useRef<string | null>(null);
   /** Undo requests awaiting their reply, by request id. */
   const undoRequestsRef = useRef(new Map<string, string>());
+  const contentRequests = useRef(new Map<string, (reply: McpContentReply) => void>());
   const conversationIdRef = useRef("");
   conversationIdRef.current = state.conversation.id;
 
@@ -140,6 +148,15 @@ export function useBackground(): BackgroundState & BackgroundActions {
 
     const onMessage = (message: unknown) => {
       const event = message as SidebarEvent;
+      if (event.type === "mcp.content.reply") {
+        contentRequests.current.get(event.payload.requestId)?.(event.payload.result);
+        contentRequests.current.delete(event.payload.requestId);
+        return;
+      }
+      if (event.type === "mcp.content.accepted") {
+        setState(prev => ({ ...prev, mcpAttachments: prev.mcpAttachments.filter(item => !event.payload.ids.includes(item.id)) }));
+        return;
+      }
       if (event.type === "context.exported") {
         if (event.payload.requestId !== exportRequestRef.current) return;
         exportRequestRef.current = null;
@@ -182,20 +199,45 @@ export function useBackground(): BackgroundState & BackgroundActions {
       port.onMessage.removeListener(onMessage);
       port.disconnect();
       portRef.current = null;
+      for (const resolve of contentRequests.current.values()) resolve({ ok: false, error: { code: "PROTOCOL_ERROR", phase: "setup", retryable: false, message: "The sidebar disconnected. Choose the content again." } });
+      contentRequests.current.clear();
     };
   }, []);
 
-  const sendPrompt = useCallback((prompt: string, askId?: string) => {
-    const command: SidebarCommand = { v: 1, id: crypto.randomUUID(), type: "run.start", prompt, ...(askId ? { askId } : {}) };
+  const requestContent = (request: Extract<SidebarCommand, { type: "mcp.content.list" | "mcp.content.prepare" }>): Promise<McpContentReply> => new Promise((resolve, reject) => {
+    if (!portRef.current) { reject(new Error("The sidebar is disconnected.")); return; }
+    const timer = setTimeout(() => { contentRequests.current.delete(request.id); reject(new Error("Preparing MCP content timed out. Open the picker again.")); }, 65_000);
+    contentRequests.current.set(request.id, result => { clearTimeout(timer); resolve(result); });
+    portRef.current.postMessage(request);
+  });
+  const listMcpContent: BackgroundActions["listMcpContent"] = async kind => {
+    const result = await requestContent({ v: 1, id: crypto.randomUUID(), type: "mcp.content.list", kind, sessionId: conversationIdRef.current });
+    if (!result.ok) throw new Error(result.error.message);
+    if (!("choices" in result)) throw new Error("Unexpected MCP catalog response.");
+    return result;
+  };
+  const prepareMcpContent: BackgroundActions["prepareMcpContent"] = async (choiceId, args) => {
+    const result = await requestContent({ v: 1, id: crypto.randomUUID(), type: "mcp.content.prepare", choiceId, arguments: args, sessionId: conversationIdRef.current });
+    if (!result.ok) throw new Error(result.error.message);
+    if (!("snapshot" in result)) throw new Error("Unexpected MCP preparation response.");
+    setState(prev => ({ ...prev, mcpAttachments: [...prev.mcpAttachments, result.snapshot] }));
+  };
+  const dismissMcpContent: BackgroundActions["dismissMcpContent"] = id => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "mcp.content.dismiss", sessionId: conversationIdRef.current, contentIds: [id] } satisfies SidebarCommand);
+    setState(prev => ({ ...prev, mcpAttachments: prev.mcpAttachments.filter(item => item.id !== id) }));
+  };
+
+  const sendPrompt = useCallback((prompt: string, askId?: string, contentIds?: string[]) => {
+    const command: SidebarCommand = { v: 1, id: crypto.randomUUID(), type: "run.start", prompt, ...(askId ? { askId } : {}), ...(contentIds?.length ? { contentIds, sessionId: conversationIdRef.current } : {}) };
     portRef.current?.postMessage(command);
   }, []);
 
-  const steer = useCallback((text: string, askId?: string) => {
+  const steer = useCallback((text: string, askId?: string, contentIds?: string[]) => {
     const runId = activeRunIdRef.current;
     // With no run to steer, the background treats the text as a normal prompt.
     portRef.current?.postMessage(runId
-      ? { v: 1, id: crypto.randomUUID(), type: "run.steer", runId, text, ...(askId ? { askId } : {}) } satisfies SidebarCommand
-      : { v: 1, id: crypto.randomUUID(), type: "run.start", prompt: text, ...(askId ? { askId } : {}) } satisfies SidebarCommand);
+      ? { v: 1, id: crypto.randomUUID(), type: "run.steer", runId, text, ...(askId ? { askId } : {}), ...(contentIds?.length ? { contentIds, sessionId: conversationIdRef.current } : {}) } satisfies SidebarCommand
+      : { v: 1, id: crypto.randomUUID(), type: "run.start", prompt: text, ...(askId ? { askId } : {}), ...(contentIds?.length ? { contentIds, sessionId: conversationIdRef.current } : {}) } satisfies SidebarCommand);
   }, []);
   const removeQueued = useCallback((messageId: string) => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "queue.remove", sessionId: conversationIdRef.current, messageId } satisfies SidebarCommand);
@@ -309,6 +351,7 @@ export function useBackground(): BackgroundState & BackgroundActions {
 
   return {
     ...state, sendPrompt, steer, removeQueued, sendQueued, retryRun, cancelRun, approveAction, denyAction, resolveHelp, newChat, listSessions, openSession, renameSession, pinSession,
+    listMcpContent, prepareMcpContent, dismissMcpContent,
     dismissAsk: (askId: string) => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "ask.dismiss", askId } satisfies SidebarCommand),
     deleteSession, downloadContext, rememberSite, saveSiteNote, closeSiteNote, undoMemory, listTabs, listSkills: () => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "skills.list" } satisfies SidebarCommand), focusTab, closeAgentTabs, watchTab, unwatchTab, takeOverTab, saveSettings,
   };
@@ -417,6 +460,7 @@ function applyEvent(
         context: event.payload.page,
         ...(event.payload.ask ? { ask: event.payload.ask } : {}),
         ...(event.payload.scheduled ? { scheduled: event.payload.scheduled } : {}),
+        ...(event.payload.content?.length ? { content: event.payload.content } : {}),
         at: event.at,
       };
       const conversationId = event.conversationId!;

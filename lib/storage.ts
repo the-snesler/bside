@@ -10,6 +10,7 @@
  * arbitrary corruption.
  */
 
+import { isMcpContentSnapshots } from "@/lib/domain/mcp-content";
 import { storage } from "wxt/utils/storage";
 import { isScheduledTask, isScheduledSource, MAX_SCHEDULED_TASKS, taskDraft, type ScheduledTask, type ScheduledTasksV1, type NotificationSettingsV1 } from "@/lib/domain/automation";
 import { isSkill } from "@/lib/domain/skills";
@@ -149,7 +150,7 @@ function isValidConversationItem(value: unknown): value is ConversationItem {
     if (typeof v.text !== "string") return false;
     if (v.role === "user") return (v.context === null || typeof v.context === "object") && (v.delivery === undefined || v.delivery === "steer") && (v.skill === undefined || isSkill(v.skill)) &&
       (v.scheduled === undefined || isScheduledSource(v.scheduled)) &&
-      (v.sites === undefined || (Array.isArray(v.sites) && v.sites.length <= MAX_SITE_NOTES && v.sites.every(isSiteNote))) && (v.ask === undefined || isAskContext(v.ask));
+      (v.sites === undefined || (Array.isArray(v.sites) && v.sites.length <= MAX_SITE_NOTES && v.sites.every(isSiteNote))) && (v.ask === undefined || isAskContext(v.ask)) && (v.content === undefined || isMcpContentSnapshots(v.content));
     return v.role === "assistant";
   }
   if (v.kind === "tool-call") return typeof v.call === "object" && v.call !== null;
@@ -531,10 +532,10 @@ function isValidRecord(value: unknown, id: string): value is ConversationRecordV
     Number.isSafeInteger(v.itemCount) && (v.itemCount as number) >= 0;
 }
 
-function isValidChunk(value: unknown): value is ConversationChunkV1 {
+function isValidChunk(value: unknown, sessionId?: string): value is ConversationChunkV1 {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
-  return v.version === 1 && Array.isArray(v.items) && v.items.length <= CONVERSATION_CHUNK_SIZE && v.items.every(isValidConversationItem);
+  return v.version === 1 && Array.isArray(v.items) && v.items.length <= CONVERSATION_CHUNK_SIZE && v.items.every(item => isValidConversationItem(item) && (item.kind !== "message" || item.role !== "user" || item.content === undefined || isMcpContentSnapshots(item.content, sessionId)));
 }
 
 function isValidLegacyConversation(value: unknown): value is LegacyConversationRecordV1 {
@@ -613,7 +614,7 @@ async function readItems(record: ConversationRecordV2): Promise<ConversationItem
   const items: ConversationItem[] = [];
   for (const [n, { value }] of chunks.entries()) {
     const expected = Math.min(CONVERSATION_CHUNK_SIZE, record.itemCount - n * CONVERSATION_CHUNK_SIZE);
-    if (!isValidChunk(value) || value.items.length < expected) {
+    if (!isValidChunk(value, record.id) || value.items.length < expected) {
       await storage.setItem(recordKey(record.id), { ...record, itemCount: items.length });
       await storage.removeItems(keys.slice(n));
       break;
@@ -677,6 +678,7 @@ export function isSessionUntouched(id: string): Promise<boolean> {
  */
 export function appendConversationItem(id: string, item: ConversationItem): Promise<void> {
   return withConversationLock(async () => {
+    if (item.kind === "message" && item.role === "user" && item.content !== undefined && !isMcpContentSnapshots(item.content, id)) throw new Error("Invalid MCP attachment snapshot.");
     let record = await readRecord(id);
     if (!record) {
       const summary = (await readIndex()).find((session) => session.id === id);
@@ -689,7 +691,7 @@ export function appendConversationItem(id: string, item: ConversationItem): Prom
     let itemCount = record.itemCount;
     if (offset > 0) {
       const raw = await storage.getItem<unknown>(chunkKey(id, n));
-      if (isValidChunk(raw) && raw.items.length >= offset) tail = raw.items.slice(0, offset);
+      if (isValidChunk(raw, id) && raw.items.length >= offset) tail = raw.items.slice(0, offset);
       else itemCount -= offset;
     }
     await storage.setItems([
@@ -1062,14 +1064,14 @@ function isValidQueuedMessage(value: unknown): value is QueuedMessage {
   const v = value as Record<string, unknown>;
   return typeof v.id === "string" && v.id.length > 0 && v.id.length <= 64 && (v.mode === "follow-up" || v.mode === "steer") &&
     typeof v.text === "string" && validatePromptText(v.text) === v.text && Number.isFinite(v.at) && (v.skill === undefined || isSkill(v.skill)) &&
-    (v.ask === undefined || isAskContext(v.ask));
+    (v.ask === undefined || isAskContext(v.ask)) && (v.content === undefined || isMcpContentSnapshots(v.content));
 }
 
 /** A session's queued messages, oldest first. A malformed record is deleted and reads as empty. */
 export async function loadMessageQueue(sessionId: string): Promise<QueuedMessage[]> {
   const raw = await storage.getItem<unknown>(queueKey(sessionId));
   const queue = raw as { version?: unknown; messages?: unknown } | null;
-  if (queue?.version === 1 && Array.isArray(queue.messages) && queue.messages.length <= MAX_QUEUED_MESSAGES && queue.messages.every(isValidQueuedMessage)) {
+  if (queue?.version === 1 && Array.isArray(queue.messages) && queue.messages.length <= MAX_QUEUED_MESSAGES && queue.messages.every(message => isValidQueuedMessage(message) && (message.content === undefined || isMcpContentSnapshots(message.content, sessionId)))) {
     return queue.messages;
   }
   if (raw !== null) await storage.removeItem(queueKey(sessionId));
@@ -1078,6 +1080,7 @@ export async function loadMessageQueue(sessionId: string): Promise<QueuedMessage
 
 /** Replaces a session's queue; an empty queue removes the record. */
 export async function saveMessageQueue(sessionId: string, messages: readonly QueuedMessage[]): Promise<void> {
+  if (messages.some(message => message.content !== undefined && !isMcpContentSnapshots(message.content, sessionId))) throw new Error("Invalid queued MCP attachment snapshot.");
   if (messages.length === 0) await storage.removeItem(queueKey(sessionId));
   else await storage.setItem(queueKey(sessionId), { version: 1, messages: [...messages] } satisfies MessageQueueV1);
 }

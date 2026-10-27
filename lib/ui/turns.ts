@@ -2,6 +2,7 @@ import { isTurnStart, type ConversationItem, type RunDigestStatus, type UserMess
 import type { ToolCall, ToolResult } from "@/lib/domain/tools";
 import { addRunUsage, EMPTY_USAGE, type UsageTotals } from "@/lib/domain/usage";
 import type { MemoryChange } from "@/lib/domain/memory";
+import type { McpContentSnapshot } from "@/lib/domain/mcp-content";
 import type { AskContextV1 } from "@/lib/domain/ask";
 
 export type Activity = {
@@ -14,7 +15,7 @@ export type Activity = {
 };
 
 /** `steer`: guidance the user sent while the turn was working, where the model received it. */
-export type TurnStep = { kind: "text" | "steer"; id: string; text: string; ask?: AskContextV1 } | Activity;
+export type TurnStep = { kind: "text" | "steer"; id: string; text: string; ask?: AskContextV1; content?: McpContentSnapshot[] } | Activity;
 
 /** One user prompt, the work done for it, and its final answer. */
 export type Turn = {
@@ -75,7 +76,7 @@ export function buildTurns(items: ConversationItem[], running: boolean): Turn[] 
     }
     turn.endedAt = Math.max(turn.endedAt, item.at);
     if (item.kind === "message") {
-      turn.steps.push({ kind: item.role === "user" ? "steer" : "text", id: item.id, text: item.text, ...(item.role === "user" && item.ask ? { ask: item.ask } : {}) });
+      turn.steps.push({ kind: item.role === "user" ? "steer" : "text", id: item.id, text: item.text, ...(item.role === "user" && item.ask ? { ask: item.ask } : {}), ...(item.role === "user" && item.content?.length ? { content: item.content } : {}) });
     } else if (item.kind === "tool-call") {
       const activity: Activity = { kind: "activity", id: item.id, call: item.call, result: null, startedAt: item.at, endedAt: null };
       activities.set(item.call.id, activity);

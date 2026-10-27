@@ -22,6 +22,8 @@ const json = (body: unknown, status = 200, headers: Record<string, string> = {})
  */
 export function fakeMcpServers(options: {
   tools?: Record<string, FakeTool[]>;
+  capabilities?: Record<string, unknown>;
+  content?: (server: string, method: string, params: Record<string, unknown>) => unknown;
   call?: (server: string, name: string, args: unknown) => unknown;
   override?: (request: FakeRequest) => Response | Promise<Response> | undefined;
 } = {}) {
@@ -47,9 +49,13 @@ export function fakeMcpServers(options: {
       if (path === `${issuer}/revoke`) return new Response(null, { status: 200 });
       if (path === server.endpoint) {
         const body = JSON.parse(request.body) as { id?: number; method: string; params?: { name?: string; arguments?: unknown } };
-        if (body.method === "initialize") return json({ jsonrpc: "2.0", id: body.id, result: { protocolVersion: "2025-06-18", capabilities: { tools: {} } } }, 200, { "Mcp-Session-Id": `s-${server.id}` });
+        if (body.method === "initialize") return json({ jsonrpc: "2.0", id: body.id, result: { protocolVersion: "2025-06-18", capabilities: options.capabilities ?? { tools: {} } } }, 200, { "Mcp-Session-Id": `s-${server.id}` });
         if (body.method.startsWith("notifications/")) return new Response(null, { status: 202 });
         if (body.method === "tools/list") return json({ jsonrpc: "2.0", id: body.id, result: { tools: (tools[server.id] ?? []).map((tool) => ({ inputSchema: { type: "object" }, ...tool })) } });
+        if (/^(prompts|resources)\//.test(body.method)) {
+          const result = options.content?.(server.id, body.method, (body.params ?? {}) as Record<string, unknown>) ?? {};
+          return json({ jsonrpc: "2.0", id: body.id, ...(isRpcError(result) ? { error: result.error } : { result }) });
+        }
         if (body.method === "tools/call") {
           const result = options.call?.(server.id, body.params!.name!, body.params!.arguments) ?? { content: [{ type: "text", text: "done" }] };
           return json({ jsonrpc: "2.0", id: body.id, ...(isRpcError(result) ? { error: result.error } : { result }) });

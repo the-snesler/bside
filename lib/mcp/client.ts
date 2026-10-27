@@ -6,6 +6,7 @@
  * capabilities, so server-to-client requests in a stream are ignored.
  */
 
+import { MCP_CONTENT_LIMITS, readMcpPrompt, readMcpResource, validPromptArguments, contentRecord, type McpPrompt, type McpResource } from "@/lib/domain/mcp-content";
 import type { JsonValue } from "@/lib/domain/tools";
 import { McpError } from "@/lib/mcp/errors";
 import type { Fetcher } from "@/lib/mcp/egress";
@@ -45,6 +46,7 @@ export interface McpTokenSource {
 interface Session {
   id: string | null;
   version: string;
+  capabilities: Record<string, unknown>;
 }
 
 type RpcMessage = { jsonrpc: "2.0"; id?: number | string | null; method?: string; params?: unknown; result?: unknown; error?: { code?: unknown; message?: unknown } };
@@ -59,6 +61,9 @@ export class McpClient {
   #session: Session | null = null;
   #opening: Promise<Session> | null = null;
   #nextId = 1;
+  #prompts: McpPrompt[] = [];
+  #resources: McpResource[] = [];
+  #generation = 0;
 
   constructor(server: McpServer, fetcher: Fetcher, tokens: McpTokenSource, clientVersion = "0") {
     this.#server = server;
@@ -67,13 +72,17 @@ export class McpClient {
     this.#clientVersion = clientVersion;
   }
 
-  /** Forgets the session; the next request initializes again. */
+  /** Explicit connection/catalog reset (refresh, connect, disconnect). HTTP session recovery keeps authorization. */
   reset(): void {
+    this.#generation++;
     this.#session = null;
     this.#opening = null;
+    this.#prompts = [];
+    this.#resources = [];
   }
 
   async listTools(signal: AbortSignal): Promise<McpToolDescriptor[]> {
+    if (!contentRecord((await this.#open(signal)).capabilities.tools)) return [];
     const tools: McpToolDescriptor[] = [];
     let cursor: string | undefined;
     for (let page = 0; page < MAX_LIST_PAGES; page++) {
@@ -88,6 +97,68 @@ export class McpClient {
       cursor = result.nextCursor;
     }
     return tools;
+  }
+
+  async listPrompts(signal: AbortSignal): Promise<McpPrompt[]> {
+    const generation = this.#generation;
+    const prompts = await this.#listContent("prompts", readMcpPrompt, signal);
+    if (generation !== this.#generation) throw this.#protocol("changed its catalog while loading; choose it again");
+    return this.#prompts = prompts;
+  }
+
+  async listResources(signal: AbortSignal): Promise<McpResource[]> {
+    const generation = this.#generation;
+    const resources = await this.#listContent("resources", readMcpResource, signal);
+    if (generation !== this.#generation) throw this.#protocol("changed its catalog while loading; choose it again");
+    return this.#resources = resources;
+  }
+
+  async #listContent<T extends McpPrompt | McpResource>(kind: "prompts" | "resources", read: (v: unknown) => T | null, signal: AbortSignal): Promise<T[]> {
+    if (!contentRecord((await this.#open(signal)).capabilities[kind])) return [];
+    const items: T[] = [];
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    for (let page = 0; page < MCP_CONTENT_LIMITS.pages; page++) {
+      const result = await this.#request(`${kind}/list`, cursor === undefined ? {} : { cursor }, signal, MCP_REQUEST_TIMEOUT_MS);
+      if (!isRecord(result) || !Array.isArray(result[kind])) throw this.#protocol("returned an invalid content catalog");
+      for (const raw of result[kind]) {
+        const item = read(raw);
+        if (!item) continue;
+        const key = item.kind === "prompt" ? item.name : item.uri;
+        if (!seen.has(key)) { seen.add(key); items.push(item); }
+        if (items.length >= MCP_CONTENT_LIMITS.entries) return items;
+      }
+      if (result.nextCursor === undefined) return items;
+      if (typeof result.nextCursor !== "string" || result.nextCursor.length > 2_048) throw this.#protocol("returned an invalid catalog cursor");
+      if (!result.nextCursor || result.nextCursor === cursor) return items;
+      cursor = result.nextCursor;
+    }
+    return items;
+  }
+
+  async getPrompt(name: string, args: Record<string, string>, signal: AbortSignal): Promise<string> {
+    const prompt = this.#prompts.find(p => p.name === name);
+    if (!prompt || !validPromptArguments(prompt, args)) throw this.#protocol("cannot prepare that prompt with these arguments; choose it again");
+    const result = await this.#request("prompts/get", { name, arguments: args }, signal, MCP_REQUEST_TIMEOUT_MS);
+    if (!isRecord(result) || !Array.isArray(result.messages) || result.messages.length > 100) throw this.#protocol("returned an invalid prompt");
+    const parts: string[] = [];
+    for (const message of result.messages) {
+      if (!isRecord(message) || !isRecord(message.content)) throw this.#protocol("returned an invalid prompt message");
+      // Roles are deliberately discarded: this is one user-selected data snapshot.
+      parts.push(renderSelectedContent(message.content));
+    }
+    return boundedSelectedText(parts.join("\n"));
+  }
+
+  async readResource(uri: string, signal: AbortSignal): Promise<string> {
+    if (!this.#resources.some(r => r.uri === uri)) throw this.#protocol("cannot read a resource outside the selected catalog");
+    // A resource URI is an MCP identifier, never a fetch destination.
+    const result = await this.#request("resources/read", { uri }, signal, MCP_REQUEST_TIMEOUT_MS);
+    if (!isRecord(result) || !Array.isArray(result.contents) || result.contents.length > 100) throw this.#protocol("returned an invalid resource");
+    return boundedSelectedText(result.contents.map(item => {
+      if (!isRecord(item) || typeof item.uri !== "string") throw this.#protocol("returned invalid resource contents");
+      return typeof item.text === "string" ? item.text : "[Binary resource; not shown]";
+    }).join("\n"));
   }
 
   /**
@@ -108,28 +179,40 @@ export class McpClient {
       } catch (error) {
         // The server dropped the session: start a new one, once.
         if (!(error instanceof SessionExpired) || attempt > 0) throw error instanceof SessionExpired ? this.#protocol("ended the session") : error;
-        if (this.#session === session) this.reset();
+        if (this.#session === session) {
+          // Protocol sessions expire independently of the directory catalog.
+          // Keep the authorized selections; explicit reset (refresh/disconnect) revokes them.
+          this.#session = null;
+          this.#opening = null;
+        }
       }
     }
   }
 
   #open(signal: AbortSignal): Promise<Session> {
     if (this.#session) return Promise.resolve(this.#session);
-    this.#opening ??= this.#initialize(signal).then((session) => {
+    if (this.#opening) return this.#opening;
+    const generation = this.#generation;
+    const pending: Promise<Session> = this.#initialize(signal).then((session) => {
+      if (generation !== this.#generation) throw this.#protocol("changed its connection while opening; try again");
       this.#session = session;
       return session;
-    }).finally(() => { this.#opening = null; });
-    return this.#opening;
+    }).finally(() => {
+      // An obsolete initialization must not clear a newer single-flight request.
+      if (this.#opening === pending) this.#opening = null;
+    });
+    this.#opening = pending;
+    return pending;
   }
 
   async #initialize(signal: AbortSignal): Promise<Session> {
-    const pending: Session = { id: null, version: MCP_PROTOCOL_VERSIONS[0] };
+    const pending: Session = { id: null, version: MCP_PROTOCOL_VERSIONS[0], capabilities: {} };
     const result = await this.#rpc(null, "initialize", {
       protocolVersion: MCP_PROTOCOL_VERSIONS[0], capabilities: {}, clientInfo: { name: "bside", version: this.#clientVersion },
     }, signal, MCP_REQUEST_TIMEOUT_MS, pending);
     if (!isRecord(result) || typeof result.protocolVersion !== "string") throw this.#protocol("answered initialize in an unexpected format");
-    if (!(MCP_PROTOCOL_VERSIONS as readonly string[]).includes(result.protocolVersion)) throw this.#protocol(`uses MCP version ${JSON.stringify(result.protocolVersion.slice(0, 32))}, which bside does not support`);
-    const session: Session = { id: pending.id, version: result.protocolVersion };
+    if (!(MCP_PROTOCOL_VERSIONS as readonly string[]).includes(result.protocolVersion)) throw this.#protocol("uses an MCP version which bside does not support");
+    const session: Session = { id: pending.id, version: result.protocolVersion, capabilities: isRecord(result.capabilities) ? result.capabilities : {} };
     await this.#notify(session, "notifications/initialized", undefined, signal);
     return session;
   }
@@ -336,4 +419,14 @@ export function renderToolContent(result: Record<string, unknown>): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function renderSelectedContent(item: Record<string, unknown>): string {
+  if (item.type === "text" && typeof item.text === "string") return item.text;
+  if (item.type === "resource" && isRecord(item.resource) && typeof item.resource.text === "string") return item.resource.text;
+  return "[Non-text MCP content; not shown]";
+}
+function boundedSelectedText(text: string): string {
+  if (text.length > MCP_CONTENT_LIMITS.text) throw new McpError("TOO_LARGE", "The selected MCP content exceeds 8,000 characters. Choose a smaller item.");
+  return text || "[No text content]";
 }

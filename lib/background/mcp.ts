@@ -6,6 +6,8 @@
  * nothing here returns them. See docs/mcp.md.
  */
 
+import { findSecret } from "@/lib/domain/memory";
+import { mcpPromptCommand, type McpContentChoice, type McpContentSnapshot, type McpContentDescriptor } from "@/lib/domain/mcp-content";
 import { FirefoxOAuthPopup, type OAuthPopup } from "@/lib/background/oauth-popup";
 import { clipMcpError, MAX_MCP_SERVER_TOOLS, MAX_MCP_TOOLS, type McpConnectionStatus, type McpServerStateV1, type McpServerStatus, type McpTrust } from "@/lib/domain/mcp";
 import type { JsonValue } from "@/lib/domain/tools";
@@ -34,6 +36,68 @@ export interface McpConnectionsOptions {
 
 export class McpConnections {
   #connections: Connection[];
+  #content = new Map<string, Promise<McpContentChoice[]>>();
+  #preparedGeneration = new Map<string, number>();
+  #generation = new Map<string, number>();
+  #choices = new Map<string, { choice: McpContentChoice; serverId: string }>();
+
+  #invalidateContent(id: string): void {
+    this.#generation.set(id, (this.#generation.get(id) ?? 0) + 1);
+    this.#content.delete(`${id}:prompt`);
+    this.#content.delete(`${id}:resource`);
+    for (const [key, item] of this.#choices) if (item.serverId === id) this.#choices.delete(key);
+  }
+
+  /** Lazy, background-only discovery after an explicit composer interaction. */
+  async contentCatalog(kind: "prompt" | "resource"): Promise<{ choices: McpContentChoice[]; errors: NormalizedError[] }> {
+    const choices: McpContentChoice[] = [];
+    const errors: NormalizedError[] = [];
+    await Promise.all(this.#connections.map(async connection => {
+      const { server, auth, client } = connection;
+      if (this.#busy.has(server.id) || !await auth.connected()) return;
+      const key = `${server.id}:${kind}`;
+      let pending = this.#content.get(key);
+      if (!pending) {
+        const generation = this.#generation.get(server.id) ?? 0;
+        pending = (async () => {
+          const descriptors: McpContentDescriptor[] = await (kind === "prompt" ? client.listPrompts(AbortSignal.timeout(60_000)) : client.listResources(AbortSignal.timeout(60_000)));
+          if (generation !== (this.#generation.get(server.id) ?? 0) || this.#busy.has(server.id) || !await auth.connected()) throw new McpError("NOT_CONNECTED", "That connection changed. Open the picker again.");
+          return descriptors.map(descriptor => {
+            const choice: McpContentChoice = { ...descriptor, id: crypto.randomUUID(), server: server.name, command: mcpPromptCommand(server.id, descriptor.name) };
+            this.#choices.set(choice.id, { choice, serverId: server.id });
+            return choice;
+          });
+        })();
+        this.#content.set(key, pending);
+        void pending.catch(() => { if (this.#content.get(key) === pending) this.#content.delete(key); });
+      }
+      try { choices.push(...await pending); }
+      catch (error) { errors.push(toNormalizedMcpError(error)); }
+    }));
+    return { choices, errors };
+  }
+
+  async prepareContent(id: string, args: Record<string, string>, sessionId: string): Promise<McpContentSnapshot> {
+    if (Object.values(args).some(value => findSecret(value))) throw new McpError("PROTOCOL", "Prompt arguments cannot contain secrets. Remove passwords, tokens, or payment details.");
+    const entry = this.#choices.get(id);
+    if (!entry) throw new McpError("PROTOCOL", "That MCP item is no longer available. Open the picker again.");
+    const connection = this.#connection(entry.serverId);
+    if (this.#busy.has(entry.serverId) || !await connection.auth.connected()) throw new McpError("NOT_CONNECTED", "That account is no longer available. Reconnect it in settings.");
+    const { choice } = entry;
+    const text = choice.kind === "prompt" ? await connection.client.getPrompt(choice.name, args, AbortSignal.timeout(60_000))
+      : await connection.client.readResource(choice.uri, AbortSignal.timeout(60_000));
+    if (this.#choices.get(id) !== entry || !await connection.auth.connected()) throw new McpError("NOT_CONNECTED", "That connection changed while preparing content. Choose it again.");
+    const preparedId = crypto.randomUUID();
+    this.#preparedGeneration.set(preparedId, this.#generation.get(entry.serverId) ?? 0);
+    if (this.#preparedGeneration.size > 256) this.#preparedGeneration.delete(this.#preparedGeneration.keys().next().value!);
+    return { version: 1, id: preparedId, sessionId, serverId: entry.serverId, server: choice.server, kind: choice.kind, name: choice.name,
+      ...(choice.kind === "resource" ? { uri: choice.uri } : {}), text };
+  }
+
+  async contentAvailable(snapshot: McpContentSnapshot): Promise<boolean> {
+    return this.#preparedGeneration.get(snapshot.id) === (this.#generation.get(snapshot.serverId) ?? 0) && !this.#busy.has(snapshot.serverId) && await this.#connection(snapshot.serverId).auth.connected();
+  }
+
   /** Servers with a sign-in or disconnect in progress. */
   #busy = new Set<string>();
   #mutations: Promise<unknown> = Promise.resolve();
@@ -74,6 +138,7 @@ export class McpConnections {
   async connect(id: string): Promise<void> {
     const connection = this.#connection(id);
     await this.#exclusive(id, async () => {
+      this.#invalidateContent(id);
       await connection.auth.connect();
       connection.client.reset();
       await this.#update(id, (state) => ({ ...state, needsReauth: false, error: null }));
@@ -85,6 +150,7 @@ export class McpConnections {
   async disconnect(id: string): Promise<McpRevocation> {
     const connection = this.#connection(id);
     return this.#exclusive(id, async () => {
+      this.#invalidateContent(id);
       const outcome = await connection.auth.disconnect();
       connection.client.reset();
       await this.#update(id, (state) => ({ ...state, tools: [], toolsAt: null, needsReauth: false, error: null }));
@@ -95,6 +161,8 @@ export class McpConnections {
   async refresh(id: string): Promise<void> {
     const connection = this.#connection(id);
     if (!await connection.auth.connected()) throw new McpError("NOT_CONNECTED", `${connection.server.name} is not connected.`);
+    this.#invalidateContent(id);
+    connection.client.reset();
     await this.#listTools(connection);
   }
 

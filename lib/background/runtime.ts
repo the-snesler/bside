@@ -11,6 +11,9 @@
  * persistence) and everything outside an active run (credentials, settings).
  */
 
+import { PreparedMcpContent, type ContentAcceptance } from "@/lib/background/mcp-content";
+import { hasPreparedMcpPrompt, type McpContentSnapshot } from "@/lib/domain/mcp-content";
+import { McpError, toNormalizedMcpError } from "@/lib/mcp/errors";
 import { AGENT_TOOL_NAMES, AgentLoop } from "@/lib/background/agent-loop";
 import { getSkills, sidebarSkillCatalog } from "@/lib/background/skills";
 import { captureInvokedSkill } from "@/lib/background/skill-context";
@@ -76,6 +79,7 @@ import type { ContextArtifact } from "@/lib/domain/tools";
 import type { Conversation, ConversationItem, ConversationSummary, QueuedMessage, UserMessageItem } from "@/lib/domain/conversation";
 import { isTurnStart, MAX_QUEUED_MESSAGES, PROMPT_MENTION_PATTERN, retentionCutoff } from "@/lib/domain/conversation";
 import { buildRunDigest } from "@/lib/domain/run-digest";
+import { buildProblemReport } from "@/lib/domain/problem-report";
 import { hasTokens, newRunUsage, type RunUsageV1 } from "@/lib/domain/usage";
 import type { AppSettingsV1, ModelDefinition, ProviderAdapter, ProviderAuth, ProviderDefinition } from "@/lib/domain/provider";
 import type {
@@ -92,6 +96,8 @@ import type {
   HelpRequest,
   HistoryRequest,
   HistoryResponse,
+  ProblemReportRequest,
+  ProblemReportResponse,
   NormalizedError,
   PageShieldState,
   RuntimeSnapshot,
@@ -164,6 +170,12 @@ interface ActiveRun {
   lastCheckpointAt: number;
 }
 
+interface AskAcceptance {
+  ask: AskContextV1;
+  commit(): void;
+  release(): void;
+}
+
 export class BackgroundRuntime {
   #sidebarHub: SidebarHub;
   #provider: ProviderAdapter;
@@ -179,6 +191,12 @@ export class BackgroundRuntime {
   #notifications: RunNotifications | null;
   #sweepTimer: unknown;
   #disposed = false;
+  #queueOps: Promise<unknown> = Promise.resolve();
+  #queueClaims = new Set<string>();
+  #preparedContent = new PreparedMcpContent();
+
+  releaseContentOwner(owner: object): void { this.#preparedContent.releaseOwner(owner); }
+
   #activeRun: ActiveRun | null = null;
   #notice: string | null = null;
   #clock: RuntimeClock;
@@ -224,6 +242,8 @@ export class BackgroundRuntime {
   #queues = new Map<string, QueuedMessage[]>();
   /** The last menu gesture, held only in the background until sent or removed. */
   #ask: AskContextV1 | null = null;
+  /** An in-flight send reserves its snapshot without removing the visible chip. */
+  #askClaims = new Set<string>();
 
   setAsk(ask: AskContextV1): void {
     if (!isAskContext(ask) || ask.path !== null) return;
@@ -240,13 +260,28 @@ export class BackgroundRuntime {
     this.#sidebarHub.publishAsk(next);
   }
 
-  #consumeAsk(id: string | undefined, sessionId: string): AskContextV1 | undefined {
-    if (!id || this.#ask?.id !== id) return undefined;
-    const ask = this.#ask;
+  #claimAsk(id: string): AskAcceptance {
+    if (this.#ask?.id !== id || this.#askClaims.has(id)) throw new McpError("PROTOCOL", "That page context is no longer available or is already being sent. Review the current chip before sending again.");
+    const ask = { ...this.#ask };
+    this.#askClaims.add(id);
+    return {
+      ask,
+      commit: () => {
+        this.#askClaims.delete(id);
+        // A newer menu gesture or an explicit dismissal wins over this send.
+        if (this.#ask?.id !== id) return;
+        this.#ask = null;
+        this.#sidebarHub.publishAsk(null);
+      },
+      release: () => { this.#askClaims.delete(id); },
+    };
+  }
+
+  #snapshotAsk(selection: AskAcceptance | undefined, sessionId: string): AskContextV1 | undefined {
+    if (!selection) return undefined;
+    const ask = selection.ask;
     const owner = this.#workspace.agentTabs.get(ask.tabId)?.sessionId;
     const path = owner && owner !== sessionId ? null : `/${owner ? "agent-tabs" : "tabs"}/${ask.tabId}/page.md`;
-    this.#ask = null;
-    this.#sidebarHub.publishAsk(null);
     return { ...ask, path };
   }
 
@@ -669,9 +704,21 @@ export class BackgroundRuntime {
 
   handleCommand(command: Extract<SidebarCommand, { type: "context.export" }>): Promise<{ markdown: string; filename: string } | undefined>;
   handleCommand(command: { v: 1; id: string; type: "session.list" }): Promise<{ sessions: ConversationSummary[] }>;
-  handleCommand(command: SidebarCommand): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]>;
-  async handleCommand(command: SidebarCommand): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]> {
+  handleCommand(command: SidebarCommand, owner?: object): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]>;
+  async handleCommand(command: SidebarCommand, owner: object = this): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]> {
     await this.#ready;
+    if (command.type === "mcp.content.list" || command.type === "mcp.content.prepare" || command.type === "mcp.content.dismiss") {
+      try {
+        if (command.sessionId !== await this.#openSession()) throw new McpError("PROTOCOL", "This chat changed. Open the picker again.");
+        if (command.type === "mcp.content.dismiss") { this.#preparedContent.dismiss(command.contentIds, owner); return; }
+        if (!this.#mcp) throw new McpError("NOT_CONNECTED", "Connect an account in settings first.");
+        if (command.type === "mcp.content.list") return { contentReply: { ok: true, ...await this.#mcp.contentCatalog(command.kind) } };
+        const snapshot = await this.#mcp.prepareContent(command.choiceId, command.arguments, command.sessionId);
+        if (command.sessionId !== await this.#openSession()) throw new McpError("PROTOCOL", "This chat changed while preparing content. Choose it again.");
+        this.#preparedContent.add(snapshot, owner);
+        return { contentReply: { ok: true, snapshot } };
+      } catch (error) { return { contentReply: { ok: false, error: toNormalizedMcpError(error) } }; }
+    }
     if (command.type === "skills.list") return { skills: sidebarSkillCatalog(await getSkills()) };
     if (command.type === "tabs.list") {
       // As the open session's runs see them: other sessions' agent tabs are left out.
@@ -734,20 +781,30 @@ export class BackgroundRuntime {
       await this.#sidebarHub.broadcastSnapshot();
       return;
     }
-    if (command.type === "run.start") {
-      await this.#submitPrompt(command.prompt, command.askId);
-      return;
-    }
-    if (command.type === "run.steer") {
-      await this.#steer(command.runId, command.text, command.askId);
+    if (command.type === "run.start" || command.type === "run.steer") {
+      let claim: ReturnType<PreparedMcpContent["claim"]> | undefined;
+      let askSelection: AskAcceptance | undefined;
+      try {
+        if (command.askId) askSelection = this.#claimAsk(command.askId);
+        if (command.contentIds?.length) {
+          if (command.sessionId !== await this.#openSession()) throw new McpError("PROTOCOL", "The chat changed. Review the selected attachments before sending.");
+          claim = this.#preparedContent.claim(command.contentIds, command.sessionId, owner, () => this.#sidebarHub.contentAccepted(owner, command.contentIds!));
+          if (!this.#mcp || !(await Promise.all(claim.accepted.content.map(item => this.#mcp!.contentAvailable(item)))).every(Boolean)) throw new McpError("NOT_CONNECTED", "A selected account changed or disconnected. Choose its attachment again.");
+        }
+        if (command.type === "run.start") await this.#submitPrompt(command.prompt, askSelection, claim?.accepted);
+        else await this.#steer(command.runId, command.text, askSelection, claim?.accepted);
+      } catch (error) {
+        this.#notice = toNormalizedMcpError(error).message;
+        await this.#sidebarHub.broadcastSnapshot();
+      } finally { claim?.release(); askSelection?.release(); }
       return;
     }
     if (command.type === "queue.remove") {
-      const queue = await this.#queue(command.sessionId);
-      // A pending steer is already on its way to the model, so only follow-ups can be withdrawn.
-      if (queue.some((message) => message.id === command.messageId && message.mode === "follow-up")) {
-        await this.#setQueue(command.sessionId, queue.filter((message) => message.id !== command.messageId));
-      }
+      await this.#changeQueue(command.sessionId, queue => {
+        // A steer or claimed follow-up is already being delivered.
+        return !this.#queueClaims.has(command.messageId) && queue.some(message => message.id === command.messageId && message.mode === "follow-up")
+          ? queue.filter(message => message.id !== command.messageId) : queue;
+      });
       return;
     }
     if (command.type === "queue.send") {
@@ -900,7 +957,14 @@ export class BackgroundRuntime {
     // The queued detach runs before a subsequent settings read or alarm.
     void this.#scheduler.forgetSessions(ids).then(() => this.#syncScheduleBadge()).catch(() => {});
     if (this.#retryable && ids.includes(this.#retryable.sessionId)) this.#retryable = null;
-    for (const id of ids) this.#queues.delete(id);
+    await this.#withQueueLock(async () => {
+      for (const id of ids) {
+        for (const message of this.#queues.get(id) ?? []) this.#queueClaims.delete(message.id);
+        this.#queues.delete(id);
+        // An admission already in flight may have written after session deletion.
+        await saveMessageQueue(id, []).catch(() => {});
+      }
+    });
     if (this.#debugSessionId !== null && ids.includes(this.#debugSessionId)) this.#clearDebugBuffers();
     const owned = (tab: AgentTab) => ids.includes(tab.sessionId);
     if (![...this.#workspace.agentTabs.values()].some(owned)) return;
@@ -1009,6 +1073,25 @@ export class BackgroundRuntime {
     }
   }
 
+  /** Options-only local report. The latest diagnostics belong to exactly one chat. */
+  async handleProblemReportRequest(request: ProblemReportRequest): Promise<ProblemReportResponse> {
+    await this.#ready;
+    try {
+      if (request.type === "problemReport.list") {
+        return { v: 1, id: request.id, ok: true, type: request.type,
+          sessions: (await listSessions()).map(({ id, title }) => ({ id, title })) };
+      }
+      const conversation = await getConversation(request.sessionId);
+      if (!conversation) throw new Error("missing session");
+      return { v: 1, id: request.id, ok: true, type: request.type,
+        filename: "bside-problem-report.json",
+        json: buildProblemReport(conversation, this.#debugSessionId === request.sessionId ? this.#runRecord : null, extensionVersion()) };
+    } catch {
+      return { v: 1, id: request.id, ok: false, error: { code: "INVALID_REQUEST", phase: "persistence", retryable: false,
+        message: "Could not build this report. The chat may have been deleted; refresh and try again." } };
+    }
+  }
+
   /** Options page: history retention and "Delete all history". */
   async handleHistoryRequest(request: HistoryRequest): Promise<HistoryResponse> {
     await this.#ready;
@@ -1105,6 +1188,7 @@ export class BackgroundRuntime {
           await this.#scheduler.updateRun(task.id, runId, "failed").catch(() => {});
           await this.#syncScheduleBadge();
           await this.#publishSessions();
+          await this.#settleSteers(sessionId);
           this.#activeRun = null;
           this.#refreshShield();
           void this.#notifications?.finished(runId, sessionId, { scheduled: true, durationMs: 0, status: "failed" });
@@ -1180,7 +1264,19 @@ export class BackgroundRuntime {
    * id as its item id, so one the restart caught between writing its item and
    * leaving the queue is dropped here rather than sent twice.
    */
-  async #queue(sessionId: string): Promise<QueuedMessage[]> {
+  #withQueueLock<T>(task: () => Promise<T>): Promise<T> {
+    const operation = this.#queueOps.then(task);
+    this.#queueOps = operation.then(() => undefined, () => undefined);
+    return operation;
+  }
+
+  #queue(sessionId: string): Promise<QueuedMessage[]> {
+    const cached = this.#queues.get(sessionId);
+    return cached ? Promise.resolve(cached) : this.#withQueueLock(() => this.#readQueue(sessionId));
+  }
+
+  /** Queue cache initialization; called only while holding the queue lock. */
+  async #readQueue(sessionId: string): Promise<QueuedMessage[]> {
     const cached = this.#queues.get(sessionId);
     if (cached) return cached;
     let stored = await loadMessageQueue(sessionId).catch(() => []);
@@ -1188,17 +1284,41 @@ export class BackgroundRuntime {
       const delivered = new Set((await getConversation(sessionId).catch(() => null))?.items.map((item) => item.id));
       stored = stored.filter((message) => !delivered.has(message.id));
     }
-    // A concurrent caller may have loaded and changed it meanwhile.
-    const queue = this.#queues.get(sessionId) ?? stored.map((message) => ({ ...message, mode: "follow-up" as const }));
+    const queue = stored.map((message) => ({ ...message, mode: "follow-up" as const }));
     this.#queues.set(sessionId, queue);
     return queue;
   }
 
-  /** Replaces a session's queue (synchronously in memory), pushes it to every sidebar, and persists it. */
-  async #setQueue(sessionId: string, messages: QueuedMessage[]): Promise<void> {
+  /** Caller holds the queue lock through persistence and publication. Never call a locking helper here. */
+  async #writeQueue(sessionId: string, messages: QueuedMessage[], requirePersistence = false): Promise<void> {
+    if (requirePersistence) await saveMessageQueue(sessionId, messages);
     this.#queues.set(sessionId, messages);
     this.#sidebarHub.publishQueue(sessionId, messages);
-    await saveMessageQueue(sessionId, messages).catch(() => console.warn("[bside] Could not save queued messages."));
+    if (!requirePersistence) await saveMessageQueue(sessionId, messages).catch(() => console.warn("[bside] Could not save queued messages."));
+  }
+
+  #changeQueue(sessionId: string, change: (queue: QueuedMessage[]) => QueuedMessage[], after?: () => void): Promise<void> {
+    return this.#withQueueLock(async () => {
+      const queue = await this.#readQueue(sessionId);
+      const next = change(queue);
+      if (next !== queue) await this.#writeQueue(sessionId, next);
+      after?.();
+    });
+  }
+
+  /** All admissions, removals, delivery, and settlement share the same lock. */
+  async #appendQueued(sessionId: string, message: QueuedMessage, selection?: ContentAcceptance, askSelection?: AskAcceptance): Promise<boolean> {
+    const accepted = await this.#withQueueLock(async () => {
+      const current = await this.#readQueue(sessionId);
+      if (current.length >= MAX_QUEUED_MESSAGES) return false;
+      await this.#writeQueue(sessionId, [...current, message], !!selection || !!askSelection);
+      selection?.commit();
+      askSelection?.commit();
+      return true;
+    });
+    // Snapshot construction may load another chat's queue, so publish outside the lock.
+    if (!accepted) { this.#notice = `Up to ${MAX_QUEUED_MESSAGES} messages can wait at once.`; await this.#sidebarHub.broadcastSnapshot(); }
+    return accepted;
   }
 
   /** Refuses a queue at capacity with a notice. */
@@ -1210,20 +1330,22 @@ export class BackgroundRuntime {
   }
 
   /** `run.start`: while the open session's run is active, the prompt waits as a follow-up; otherwise a run starts with it. */
-  async #submitPrompt(rawPrompt: string, askId?: string): Promise<void> {
+  async #submitPrompt(rawPrompt: string, askSelection?: AskAcceptance, selection?: ContentAcceptance): Promise<void> {
     const sessionId = await this.#openSession();
+    if (selection?.content.some(item => item.sessionId !== sessionId)) throw new McpError("PROTOCOL", "The chat changed. Choose the attachments again.");
     const queue = await this.#queue(sessionId);
     const prompt = validatePromptText(rawPrompt);
-    if (!prompt || this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, rawPrompt, undefined, undefined, askId);
+    if (prompt && !hasPreparedMcpPrompt(prompt, selection?.content)) throw new McpError("PROTOCOL", "Choose the MCP prompt from / and prepare its preview before sending.");
+    if (!prompt || this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, rawPrompt, undefined, undefined, askSelection, selection);
     if (await this.#queueFull(queue)) return;
     const skill = await this.#captureSkill(prompt);
     if (skill === null) return;
-    if (this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, prompt, undefined, { skill }, askId);
+    if (this.#activeRun?.sessionId !== sessionId) return this.#startRun(sessionId, prompt, undefined, { skill }, askSelection, selection);
     const current = await this.#queue(sessionId);
     if (await this.#queueFull(current)) return;
-    if (!this.#askIsCurrent(askId)) return;
-    const ask = this.#consumeAsk(askId, sessionId);
-    await this.#setQueue(sessionId, [...current, { id: crypto.randomUUID(), mode: "follow-up", text: prompt, ...(skill ? { skill } : {}), ...(ask ? { ask } : {}), at: Date.now() }]);
+    if (!this.#askIsCurrent(askSelection?.ask.id)) return;
+    const ask = this.#snapshotAsk(askSelection, sessionId);
+    await this.#appendQueued(sessionId, { id: crypto.randomUUID(), mode: "follow-up", text: prompt, ...(skill ? { skill } : {}), ...(ask ? { ask } : {}), ...(selection?.content.length ? { content: selection.content } : {}), at: Date.now() }, selection, askSelection);
   }
 
   async #captureSkill(text: string): Promise<Skill | undefined | null> {
@@ -1236,53 +1358,57 @@ export class BackgroundRuntime {
   }
 
   /** `run.steer`: hands guidance to the active run's agent loop and shows it as pending until delivered. */
-  async #steer(runId: string, rawText: string, askId?: string): Promise<void> {
+  async #steer(runId: string, rawText: string, askSelection?: AskAcceptance, selection?: ContentAcceptance): Promise<void> {
     const run = this.#activeRun;
-    if (!run || run.runId !== runId) return this.#submitPrompt(rawText, askId);
+    if (!run || run.runId !== runId) return this.#submitPrompt(rawText, askSelection, selection);
+    if (selection?.content.some(item => item.sessionId !== run.sessionId)) throw new McpError("PROTOCOL", "Those attachments belong to another chat.");
     const queue = await this.#queue(run.sessionId);
     const text = validatePromptText(rawText);
+    if (text && !hasPreparedMcpPrompt(text, selection?.content)) throw new McpError("PROTOCOL", "Choose the MCP prompt from / and prepare its preview before sending.");
     // Re-checked after loading: once a run ends or is cancelling, a steer could never be delivered.
-    if (!text || this.#activeRun !== run || run.status === "cancelling") return this.#submitPrompt(rawText, askId);
+    if (!text || this.#activeRun !== run || run.status === "cancelling") return this.#submitPrompt(rawText, askSelection, selection);
     if (await this.#queueFull(queue)) return;
     const skill = await this.#captureSkill(text);
     if (skill === null) return;
-    if (this.#activeRun !== run || run.controller.signal.aborted) return this.#submitPrompt(rawText, askId);
+    if (this.#activeRun !== run || run.controller.signal.aborted) return this.#submitPrompt(rawText, askSelection, selection);
     const current = await this.#queue(run.sessionId);
     if (await this.#queueFull(current)) return;
-    if (!this.#askIsCurrent(askId)) return;
-    const ask = this.#consumeAsk(askId, run.sessionId);
-    const message: QueuedMessage = { id: crypto.randomUUID(), mode: "steer", text, ...(skill ? { skill } : {}), ...(ask ? { ask } : {}), at: Date.now() };
-    run.agentLoop.steer(message);
-    await this.#setQueue(run.sessionId, [...current, message]);
+    if (!this.#askIsCurrent(askSelection?.ask.id)) return;
+    const ask = this.#snapshotAsk(askSelection, run.sessionId);
+    const message: QueuedMessage = { id: crypto.randomUUID(), mode: "steer", text, ...(skill ? { skill } : {}), ...(ask ? { ask } : {}), ...(selection?.content.length ? { content: selection.content } : {}), at: Date.now() };
+    if (!await this.#appendQueued(run.sessionId, message, selection, askSelection)) return;
+    if (this.#activeRun === run && !run.controller.signal.aborted) run.agentLoop.steer(message);
+    else await this.#settleSteers(run.sessionId);
   }
 
   /** Steers the run never delivered become follow-ups: kept visible, and sent next only if the run completed. */
   async #settleSteers(sessionId: string): Promise<void> {
-    const queue = await this.#queue(sessionId);
-    if (queue.some((message) => message.mode === "steer")) {
-      await this.#setQueue(sessionId, queue.map((message) => ({ ...message, mode: "follow-up" })));
-    }
+    await this.#changeQueue(sessionId, queue => queue.some(message => message.mode === "steer")
+      ? queue.map(message => ({ ...message, mode: "follow-up" })) : queue);
   }
 
-  /** `queue.send`: starts a run with a queued follow-up of the open session now. */
+  /** Claim under the queue lock, then start outside it: a run itself delivers/removes queue entries. */
+  async #runQueued(sessionId: string, messageId?: string): Promise<boolean> {
+    const message = await this.#withQueueLock(async () => {
+      if (this.#activeRun || this.#queueClaims.size || this.#sessionOpsPending > 0 || this.#scheduledStarting) return undefined;
+      const candidate = (await this.#readQueue(sessionId)).find(item => item.mode === "follow-up" && (messageId === undefined || item.id === messageId));
+      if (candidate) this.#queueClaims.add(candidate.id);
+      return candidate;
+    });
+    if (!message) return false;
+    try { await this.#startRun(sessionId, message.text, message.id, { skill: message.skill, ask: message.ask, content: message.content }); }
+    finally { await this.#withQueueLock(async () => { this.#queueClaims.delete(message.id); }); }
+    return true;
+  }
+
+  /** `queue.send`: only an unclaimed follow-up of the open session can start. */
   async #sendQueued(sessionId: string, messageId: string): Promise<void> {
-    const message = (await this.#queue(sessionId)).find((candidate) => candidate.id === messageId && candidate.mode === "follow-up");
-    if (!message || sessionId !== await this.#openSession()) {
-      await this.#sidebarHub.broadcastSnapshot();
-      return;
-    }
-    await this.#startRun(sessionId, message.text, message.id, { skill: message.skill, ask: message.ask });
+    if (sessionId !== await this.#openSession() || !await this.#runQueued(sessionId, messageId)) await this.#sidebarHub.broadcastSnapshot();
   }
 
-  /**
-   * After a completed run, starts the next turn with the oldest queued
-   * follow-up of its session, open or not. Follow-ups wait after a failed,
-   * cancelled, or interrupted run until the user sends them.
-   */
+  /** Completed runs dispatch oldest first; failed/cancelled runs leave follow-ups pending. */
   async #dispatchFollowUp(sessionId: string): Promise<void> {
-    if (this.#activeRun || this.#sessionOpsPending > 0) return;
-    const next = (await this.#queue(sessionId)).find((message) => message.mode === "follow-up");
-    if (next) await this.#startRun(sessionId, next.text, next.id, { skill: next.skill, ask: next.ask });
+    await this.#runQueued(sessionId);
   }
 
   /**
@@ -1292,7 +1418,7 @@ export class BackgroundRuntime {
    * names the queued follow-up the prompt came from; its user message keeps
    * that id, and it leaves the queue once that message is written.
    */
-  async #startRun(sessionId: string, rawPrompt: string | null, queuedId?: string, accepted?: { skill?: Skill; ask?: AskContextV1; scheduled?: ScheduledSource; runId?: string }, askId?: string): Promise<void> {
+  async #startRun(sessionId: string, rawPrompt: string | null, queuedId?: string, accepted?: { skill?: Skill; ask?: AskContextV1; scheduled?: ScheduledSource; runId?: string; content?: McpContentSnapshot[] }, askSelection?: AskAcceptance, selection?: ContentAcceptance): Promise<void> {
     if (this.#disposed) return;
     const retry = rawPrompt === null;
     if (this.#activeRun || (!accepted?.scheduled && (this.#sessionOpsPending > 0 || this.#scheduledStarting)) || (retry && this.#retryable?.sessionId !== sessionId)) {
@@ -1345,6 +1471,7 @@ export class BackgroundRuntime {
     let personal: Personalization;
     let ask: AskContextV1 | undefined;
     try {
+      if (!retry && !hasPreparedMcpPrompt(prompt!, selection?.content ?? accepted?.content)) throw new ProviderStreamError("MCP prompts require a prepared preview in a sidebar message. Use ordinary text for a scheduled task.", "INVALID_REQUEST");
       // Memory the run cannot read is left out of its prompt rather than stopping it.
       // Likewise for connected accounts' tools: one that cannot be read is not offered.
       personal = { ...await readInstructions(), memoryIndex: await readMemoryIndex().catch(() => null),
@@ -1360,8 +1487,8 @@ export class BackgroundRuntime {
       conversation = await getConversation(sessionId);
       if (!conversation) throw new ProviderStreamError("This chat no longer exists.", "INVALID_REQUEST");
       if (retry && !conversation.items.some(isTurnStart)) throw new ProviderStreamError("There is no turn to retry.", "INVALID_REQUEST");
-      if (!this.#askIsCurrent(askId)) throw new ProviderStreamError(this.#notice!, "INVALID_REQUEST");
-      ask = retry ? conversation.items.findLast(isTurnStart)?.ask : accepted?.ask ?? this.#consumeAsk(askId, sessionId);
+      if (!this.#askIsCurrent(askSelection?.ask.id)) throw new ProviderStreamError(this.#notice!, "INVALID_REQUEST");
+      ask = retry ? conversation.items.findLast(isTurnStart)?.ask : accepted?.ask ?? this.#snapshotAsk(askSelection, sessionId);
       if (retry) run.scheduled = conversation.items.findLast(isTurnStart)?.scheduled;
       controller.signal.throwIfAborted();
     } catch (error) {
@@ -1415,19 +1542,34 @@ export class BackgroundRuntime {
         skill,
         ...(ask ? { ask } : {}),
         ...(run.scheduled ? { scheduled: run.scheduled } : {}),
+        ...((selection?.content ?? accepted?.content)?.length ? { content: selection?.content ?? accepted?.content } : {}),
         ...(sites.length ? { sites } : {}),
         context: artifact ? { artifactId: artifact.artifactId, kind: "page", title: artifact.title, url: artifact.url, capturedAt: artifact.capturedAt } : null,
         at: Date.now(),
       };
-      await appendConversationItem(sessionId, item);
+      try { await appendConversationItem(sessionId, item); }
+      catch (error) {
+        if (run.scheduled) throw error;
+        this.#activeRun = null;
+        await this.#settleSteers(sessionId);
+        this.#refreshShield();
+        this.#notice = "Could not save this message. Its prepared attachments are still available; try sending again.";
+        await this.#sidebarHub.broadcastSnapshot();
+        return;
+      }
+      selection?.commit();
+      askSelection?.commit();
       items = [...items, item];
-      if (queuedId) await this.#setQueue(sessionId, (await this.#queue(sessionId)).filter((message) => message.id !== queuedId));
+      if (queuedId) await this.#changeQueue(sessionId, queue => {
+        this.#queueClaims.delete(queuedId);
+        return queue.filter(message => message.id !== queuedId);
+      });
     }
     const userIndex = items.findLastIndex(isTurnStart);
     const userItem = items[userIndex] as UserMessageItem;
     this.#retryable = null;
 
-    this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt: userItem.text, page: userItem.context, ask: userItem.ask ?? null, retry, ...(userItem.scheduled ? { scheduled: userItem.scheduled } : {}) });
+    this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt: userItem.text, page: userItem.context, ask: userItem.ask ?? null, content: userItem.content, retry, ...(userItem.scheduled ? { scheduled: userItem.scheduled } : {}) });
     await this.#writeCheckpoint(run, "running", "");
 
     // Pi owns assistant/tool replay during this run. Persisted tool items are
@@ -1563,9 +1705,10 @@ export class BackgroundRuntime {
         if (item.kind === "message" && item.role === "assistant") run.partialAssistantText = "";
         if (item.kind === "message" && item.role === "user") {
           // A delivered steer: shown inline in the turn and no longer pending.
-          flushDelta();
-          this.#sidebarHub.publishRunEvent(runId, "steer.delivered", { item });
-          await this.#setQueue(run.sessionId, (await this.#queue(run.sessionId)).filter((message) => message.id !== item.id));
+          await this.#changeQueue(run.sessionId, queue => queue.filter(message => message.id !== item.id), () => {
+            flushDelta();
+            this.#sidebarHub.publishRunEvent(runId, "steer.delivered", { item });
+          });
         }
         await this.#writeCheckpoint(run, run.status, run.partialAssistantText);
         // No run event carries a compaction; a snapshot shows its marker at once.
