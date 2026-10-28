@@ -132,7 +132,7 @@ it("keeps previews after a refused send and sends only prepared ids until backgr
   await act(async () => render(h(Harness, {}), root));
   const state: RuntimeSnapshot = { conversation: { id: "s1", title: "", titleSource: "prompt", createdAt: 0, updatedAt: 0, pinned: false, itemCount: 0, lastModelId: null, usage: EMPTY_USAGE, items: [] },
     credential: { configured: true, maskedSuffix: null, chatgpt: { connected: false, email: null, signInAgain: false } }, provider: OPENAI_PROVIDER,
-    settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" }, page: null, ask: null, agentTabs: { bySession: {}, watching: null, takenOver: false }, queue: [], activeRun: null, lastSeq: 0, notice: null };
+    settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" }, permissionMode: "ask", page: null, ask: null, agentTabs: { bySession: {}, watching: null, takenOver: false }, queue: [], activeRun: null, lastSeq: 0, notice: null };
   const emit = (type: string, payload: unknown) => act(async () => receive({ v: 1, runId: null, conversationId: "s1", seq: 0, at: 1, type, payload } as SidebarEvent));
   await emit("state.snapshot", state);
   let listing: ReturnType<typeof background.listMcpContent>;

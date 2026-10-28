@@ -1028,6 +1028,45 @@ describe("BackgroundRuntime: reconnect during approval (regression)", () => {
   });
 });
 
+describe("BackgroundRuntime: permission mode", () => {
+  it("saves the mode mid-run, broadcasts it, keeps it across restarts, and applies it at the run's next confirmation", async () => {
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    let round = 0;
+    provider.script = () => ({
+      [Symbol.asyncIterator]: async function* () {
+        round += 1;
+        if (round <= 2) yield { type: "tool.call", call: { id: `call_${round}`, name: "request_action_confirmation", arguments: { title: "Submit", message: "Submit the draft?", artifact: "Draft" } } } as ScriptedProviderEvent;
+        yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+      },
+    });
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: supportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+    expect((await runtime.getSnapshot()).permissionMode).toBe("ask");
+
+    const running = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Submit it" });
+    await tick(200);
+    const runId = (await runtime.getSnapshot()).activeRun!.runId;
+    expect((await runtime.getSnapshot()).activeRun?.pendingApproval?.call.id).toBe("call_1");
+
+    await runtime.handleCommand({ v: 1, id: "2", type: "permissions.save", mode: "auto" });
+    expect(port.received.find((event) => event.type === "permissions.changed")?.payload).toEqual({ mode: "auto" });
+    await runtime.handleCommand({ v: 1, id: "3", type: "action.approve", runId, callId: "call_1" });
+    await running;
+    await tick(200);
+
+    const approvals = port.received.filter((event) => event.type === "action.approval-required");
+    expect(approvals.map((event) => event.type === "action.approval-required" && event.payload.call.id)).toEqual(["call_1"]);
+    expect(port.received.some((event) => event.type === "run.completed")).toBe(true);
+    const restarted = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
+    await restarted.initialize();
+    expect((await restarted.getSnapshot()).permissionMode).toBe("auto");
+  });
+});
+
 describe("BackgroundRuntime: retry gating on committed page effects (regression)", () => {
   it("marks a rate-limit failure non-retryable once a consequential action already succeeded this run", async () => {
     await saveOpenAICredential("sk-test");
@@ -2467,6 +2506,7 @@ describe("BackgroundRuntime: sessions", () => {
 
     const restarted = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
     await restarted.initialize();
+    await restarted.initialize();
     expect((await restarted.getSnapshot()).conversation.id).toBe(a);
   });
 
@@ -3151,6 +3191,7 @@ describe("BackgroundRuntime: usage visibility", () => {
     // Totals keep accumulating, and a restarted background lists them from storage.
     const restarted = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
     await restarted.initialize();
+    await restarted.initialize();
     const { sessions } = await restarted.handleCommand({ v: 1, id: "list", type: "session.list" });
     expect(sessions[0]?.usage).toMatchObject({ responses: 3, input: 2006, output: 155, costUsd: expect.closeTo(0.0041, 10), pricedRuns: 2 });
   });
@@ -3221,6 +3262,7 @@ describe("BackgroundRuntime: usage visibility", () => {
 
     // The background dies; the next one recovers the run from its checkpoint.
     const restarted = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
+    await restarted.initialize();
     await restarted.initialize();
     const runId = snapshot.activeRun!.runId;
     expect((await openConversation()).items.at(-1)).toMatchObject({ id: `usage-${runId}`, kind: "run-usage", usage: { input: 700, costUsd: 0.002 } });

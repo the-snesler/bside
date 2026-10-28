@@ -24,6 +24,7 @@ import { renderSkillCatalog, type Skill, type SkillSummary } from "@/lib/domain/
 import { matchSiteNotes, renderCustomInstructions, renderToolSiteNotes, type SiteNote } from "@/lib/domain/instructions";
 import { isMemoryChange, memoryApprovalTitle, type MemoryApproval, type MemoryChange } from "@/lib/domain/memory";
 import { MAX_MCP_APPROVAL_ARGS } from "@/lib/domain/mcp";
+import { AUTO_APPROVED_SUMMARY, READ_ONLY_DENIED_SUMMARY, readOnlyRefusal, type PermissionMode } from "@/lib/domain/permissions";
 import type { McpCallOutcome } from "@/lib/mcp/client";
 import { McpError } from "@/lib/mcp/errors";
 import { wrapMcpResult, type McpToolDefinition } from "@/lib/mcp/tools";
@@ -71,6 +72,8 @@ export interface AgentLoopParams {
   onItem: (item: ConversationItem) => Promise<void>;
   /** Called whenever the pending-approval gate opens or closes for this run. */
   onApprovalPending: (request: ApprovalRequest | null) => void;
+  /** The user's permission mode, read at each gated call so a change applies mid-run; `ask` when absent. */
+  permissionMode?: () => PermissionMode;
   /** Called whenever a `request_user_help` pause opens or closes for this run. */
   onHelpPending?: (request: HelpRequest | null) => void;
   /** Notes about the user's own changes to the run's tabs since the last call (a takeover), appended to the next browser program result. */
@@ -89,6 +92,10 @@ export interface McpTools {
 
 /** Persisted MCP call arguments are cut to this many characters (as JSON text). */
 export const MAX_PERSISTED_MCP_ARGS = 8_000;
+
+function permissionMode(params: AgentLoopParams): PermissionMode {
+  return params.permissionMode?.() ?? "ask";
+}
 
 /** McpError codes for calls the server never ran: they commit nothing. */
 const MCP_NOT_RUN = new Set(["RPC", "NOT_CONNECTED", "REAUTH", "AUTH", "EGRESS"]);
@@ -464,16 +471,24 @@ export class AgentLoop {
     let result: ToolResult;
     if (call.name === "request_action_confirmation" && typeof args.title === "string" && args.title.trim().length > 0 && args.title.length <= 160 &&
         typeof args.message === "string" && args.message.trim().length > 0 && args.message.length <= 4000 && typeof args.artifact === "string" && args.artifact.length <= 32000 && Object.keys(args).length === 3) {
-      const approved = await this.#awaitApproval(params, { call, origin: "", display: args.title, target: {} }, signal);
-      result = approved
-        ? { ok: true, summary: "approved:true. The user confirmed the described action only." }
-        : { ok: false, code: "ACTION_DENIED", summary: "approved:false. Do not perform this action. The user denied it or the run was cancelled." };
+      // Read-only refuses and auto approves without a card. The prompt is the same in every mode, so the mode can change mid-run.
+      const mode = permissionMode(params);
+      if (mode !== "ask") {
+        this.#sidebarHub.publishRunEvent(params.runId, "tool.requested", { call, display: args.title });
+        result = mode === "auto" ? { ok: true, summary: AUTO_APPROVED_SUMMARY } : { ok: false, code: "ACTION_DENIED", summary: READ_ONLY_DENIED_SUMMARY };
+      } else {
+        const approved = await this.#awaitApproval(params, { call, origin: "", display: args.title, target: {} }, signal);
+        result = approved
+          ? { ok: true, summary: "approved:true. The user confirmed the described action only." }
+          : { ok: false, code: "ACTION_DENIED", summary: "approved:false. Do not perform this action. The user denied it or the run was cancelled." };
+      }
     } else if (call.name === "request_user_help" && isHelpArguments(args)) {
       result = await this.#requestHelp(params, call, args, signal);
     } else if (call.name === "browser_program" && typeof args.source === "string" && Object.keys(args).length === 1) {
       this.#sidebarHub.publishRunEvent(params.runId, "tool.requested", { call, display: "Browser program" });
       // Under the user's Ask memory policy, each memory change the program makes waits for their decision.
       result = await this.#program.execute(args.source, signal, {
+        readOnly: () => permissionMode(params) === "read-only",
         confirmMemory: (change: MemoryApproval) => this.#awaitApproval(params, { call, origin: "", display: memoryApprovalTitle(change), target: {}, memory: change }, signal),
       });
       const images = this.#program.takeImages();
@@ -508,7 +523,9 @@ export class AgentLoop {
   async #callMcp(params: AgentLoopParams, call: ToolCall, definition: McpToolDefinition, args: Record<string, JsonValue>, signal: AbortSignal): Promise<ToolResult> {
     const label = `${definition.serverName}: ${definition.tool}`;
     this.#sidebarHub.publishRunEvent(params.runId, "tool.requested", { call, display: label });
-    if (definition.gated) {
+    const mode = permissionMode(params);
+    if (mode === "read-only" && !definition.readOnly) return { ok: false, code: "ACTION_DENIED", summary: readOnlyRefusal(`this ${definition.serverName} call (${definition.tool}), which is not marked read-only,`) };
+    if (definition.gated && mode !== "auto") {
       const approved = await this.#awaitApproval(params, {
         call, origin: "", display: label, target: {},
         mcp: { server: definition.serverId, serverName: definition.serverName, tool: definition.tool, destructive: definition.destructive, arguments: boundedText(JSON.stringify(args, null, 2) ?? "{}", MAX_MCP_APPROVAL_ARGS) },

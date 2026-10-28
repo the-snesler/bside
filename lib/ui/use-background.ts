@@ -17,6 +17,7 @@ import { RUN_CANCELLED_SUFFIX, SIDEBAR_PORT_NAME } from "@/lib/protocol";
 import type { HelpOutcome, NormalizedError, RuntimeSnapshot, SidebarCommand, SidebarEvent } from "@/lib/protocol";
 import type { Conversation, ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
 import type { AppSettingsV1 } from "@/lib/domain/provider";
+import type { PermissionMode } from "@/lib/domain/permissions";
 import type { TabMention } from "@/lib/protocol";
 import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
 import { EMPTY_USAGE } from "@/lib/domain/usage";
@@ -70,6 +71,8 @@ export interface BackgroundActions {
   /** Removes the page shield from the watched agent tab until watching ends. */
   takeOverTab(tabId: number): void;
   saveSettings(settings: AppSettingsV1): void;
+  /** Sets the permission mode; allowed mid-run, where it applies at the run's next gated call. */
+  savePermissionMode(mode: PermissionMode): void;
   /** Starts a run, or queues a follow-up while this chat's run is working. */
   sendPrompt(prompt: string, askId?: string, contentIds?: string[]): void;
   /** Guidance for the running turn, delivered at its next tool boundary. */
@@ -124,6 +127,7 @@ const INITIAL_STATE: BackgroundState = {
   credential: { configured: false, maskedSuffix: null, chatgpt: { connected: false, email: null, signInAgain: false } },
   provider: OPENAI_PROVIDER,
   settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
+  permissionMode: "ask",
   page: null,
   agentTabs: { bySession: {}, watching: null, takenOver: false },
   queue: [],
@@ -384,12 +388,16 @@ export function useBackground(): BackgroundState & BackgroundActions {
   const saveSettings = useCallback((settings: AppSettingsV1) => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "settings.save", settings } satisfies SidebarCommand);
   }, []);
+  const savePermissionMode = useCallback((mode: PermissionMode) => {
+    setState((prev) => ({ ...prev, permissionMode: mode }));
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "permissions.save", mode } satisfies SidebarCommand);
+  }, []);
 
   return {
     ...state, sendPrompt, steer, removeQueued, sendQueued, retryRun, cancelRun, approveAction, denyAction, resolveHelp, newChat, listSessions, openSession, renameSession, pinSession,
     listMcpContent, prepareMcpContent, dismissMcpContent,
     dismissAsk: (askId: string) => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "ask.dismiss", askId } satisfies SidebarCommand),
-    deleteSession, downloadContext, rememberSite, saveSiteNote, closeSiteNote, undoMemory, loadWorkspaceImage, listTabs, listSkills: () => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "skills.list" } satisfies SidebarCommand), focusTab, closeAgentTabs, watchTab, unwatchTab, takeOverTab, saveSettings,
+    deleteSession, downloadContext, rememberSite, saveSiteNote, closeSiteNote, undoMemory, loadWorkspaceImage, listTabs, listSkills: () => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "skills.list" } satisfies SidebarCommand), focusTab, closeAgentTabs, watchTab, unwatchTab, takeOverTab, saveSettings, savePermissionMode,
   };
 }
 
@@ -462,6 +470,10 @@ function applyEvent(
   }
   if (event.type === "agent-tabs.changed") {
     setState((prev) => ({ ...prev, agentTabs: event.payload }));
+    return;
+  }
+  if (event.type === "permissions.changed") {
+    setState((prev) => ({ ...prev, permissionMode: event.payload.mode }));
     return;
   }
   if (event.type === "queue.changed") {

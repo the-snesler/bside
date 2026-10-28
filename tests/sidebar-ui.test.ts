@@ -34,6 +34,7 @@ function snapshotFor(id: string): RuntimeSnapshot {
     credential: { configured: true, maskedSuffix: null, chatgpt: { connected: false, email: null, signInAgain: false } },
     provider: OPENAI_API_KEY_PROVIDER,
     settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
+    permissionMode: "ask",
     page: null, ask: null, agentTabs: { bySession: {}, watching: null, takenOver: false }, queue: [], activeRun: null, lastSeq: 0, notice: null,
   };
 }
@@ -227,6 +228,35 @@ describe("sidebar UI contracts", () => {
     expect(line.title).toContain("Estimated cost: $0.012");
     const text = root.querySelector(".timeline")!.textContent!;
     expect(text.indexOf("Hi.")).toBeLessThan(text.indexOf("12.3k in"));
+    render(null, root);
+  });
+
+  it("offers the permission mode beside the composer, usable mid-run, and follows other sidebars' changes", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    const listeners: Array<(message: unknown) => void> = [];
+    const posted: unknown[] = [];
+    vi.spyOn(browser.runtime, "connect").mockReturnValue({
+      postMessage: (message: unknown) => posted.push(message),
+      onMessage: { addListener: (listener: (message: unknown) => void) => listeners.push(listener), removeListener: () => {} },
+      disconnect: () => {},
+    } as never);
+    const root = document.createElement("div");
+    document.body.append(root);
+    await act(() => render(h(App, {}), root));
+    const emit = (event: Partial<SidebarEvent>) => act(() => listeners.forEach((listener) => listener({ v: 1, runId: null, conversationId: "s1", seq: 0, at: 1, ...event })));
+    await emit({ type: "state.snapshot", payload: { ...snapshotFor("s1"), activeRun: { runId: "r1", conversationId: "s1", status: "running", partialAssistantText: "", pendingApproval: null, pendingHelp: null, usage: null } } });
+    const select = root.querySelector<HTMLSelectElement>('select[aria-label="Permissions"]')!;
+    expect([...select.options].map((option) => option.textContent)).toEqual(["Ask first", "Read-only", "Don't ask"]);
+    expect(select.value).toBe("ask");
+    expect(select.disabled).toBe(false);
+    await act(() => { select.value = "read-only"; select.dispatchEvent(new Event("change")); });
+    const command = posted.find((message) => (message as { type?: string }).type === "permissions.save");
+    expect(command).toMatchObject({ type: "permissions.save", mode: "read-only" });
+    expect(isSidebarCommand(command)).toBe(true);
+    expect(isSidebarCommand({ ...command as object, mode: "yolo" })).toBe(false);
+    expect(root.querySelector(".composer__mode--read-only")).not.toBeNull();
+    await emit({ type: "permissions.changed", payload: { mode: "auto" } });
+    expect(root.querySelector<HTMLSelectElement>('select[aria-label="Permissions"]')!.value).toBe("auto");
     render(null, root);
   });
 

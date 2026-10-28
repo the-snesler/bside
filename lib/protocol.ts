@@ -28,6 +28,7 @@ import type {
 import type { Conversation, ConversationItem, ConversationSummary, HistoryRetention, HistorySettingsV1, QueuedMessage } from "@/lib/domain/conversation";
 import { HISTORY_RETENTIONS } from "@/lib/domain/conversation";
 import { MAX_HELP_NOTE_CHARS, TABLE_LIMITS } from "@/lib/domain/tools";
+import { isPermissionMode, type PermissionMode } from "@/lib/domain/permissions";
 import { REASONING_EFFORTS, type AppSettingsV1, type ChatGPTStatus, type ProviderDefinition } from "@/lib/domain/provider";
 import type { RunUsageV1 } from "@/lib/domain/usage";
 import type { PdfFetchResult } from "@/lib/domain/pdf";
@@ -532,6 +533,8 @@ export type SidebarCommand =
   /** Removes the page shield from the watched agent tab until watching ends, like the shield's own "Take over" button. */
   | { v: 1; id: string; type: "tabs.takeOver"; tabId: number }
   | { v: 1; id: string; type: "settings.save"; settings: AppSettingsV1 }
+  /** Sets the permission mode beside the composer. Accepted mid-run: the active run reads it at each gated call. */
+  | { v: 1; id: string; type: "permissions.save"; mode: PermissionMode }
   /** Looks up the site note to edit for a page URL. Answered with `siteNote.loaded` to the requesting sidebar only. */
   | { v: 1; id: string; type: "siteNote.get"; url: string }
   /**
@@ -650,6 +653,8 @@ export interface RuntimeSnapshot {
   credential: { configured: boolean; maskedSuffix: string | null; chatgpt: ChatGPTStatus };
   provider: ProviderDefinition;
   settings: AppSettingsV1;
+  /** The permission mode beside the composer; it applies to the active run at its next gated call. */
+  permissionMode: PermissionMode;
   page: AttachedPage | null;
   agentTabs: AgentTabsState;
   /** The open session's queued follow-ups and undelivered steers, oldest first. */
@@ -700,6 +705,8 @@ export type SidebarEvent =
   | EventBase<"session.listed", { sessions: ConversationSummary[] }>
   | EventBase<"page.attached", AttachedPage | null>
   | EventBase<"agent-tabs.changed", AgentTabsState>
+  /** The permission mode changed (from any sidebar). Not run-sequenced. */
+  | EventBase<"permissions.changed", { mode: PermissionMode }>
   /** A session's queue after it changed; `conversationId` is that session. Not run-sequenced. */
   | EventBase<"queue.changed", { messages: QueuedMessage[] }>
   /** The pending context-menu chip changed: a new click, alt text the page reported, sent, or removed. Not run-sequenced. */
@@ -736,6 +743,7 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (candidate.type === "tabs.unwatch") return true;
   if (candidate.type === "tabs.takeOver") return Number.isSafeInteger(candidate.tabId);
   if (candidate.type === "settings.save") return isAppSettings(candidate.settings);
+  if (candidate.type === "permissions.save") return isPermissionMode(candidate.mode);
   if (candidate.type === "siteNote.get") return typeof candidate.url === "string" && candidate.url.length <= 8_192;
   if (candidate.type === "siteNote.save") return isSiteNote(candidate.note);
   if (candidate.type === "memory.undo") {

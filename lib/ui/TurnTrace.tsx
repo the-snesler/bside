@@ -40,6 +40,7 @@ import { AskChip } from "@/lib/ui/AskChip";
 import { Mascot, type MascotMood } from "@/lib/ui/Mascot";
 import { Trace, TraceLine, type TraceStatus } from "@/lib/ui/Trace";
 import { formatDuration, type Activity, type Turn, type TurnStep } from "@/lib/ui/turns";
+import { AUTO_APPROVED_SUMMARY, isReadOnlyRefusal } from "@/lib/domain/permissions";
 
 type Icon = typeof Pointer;
 
@@ -101,6 +102,8 @@ function helpKind(activity: Activity): { Icon: Icon; label: string } {
  */
 function failed(activity: Activity): boolean {
   if (!activity.result || activity.result.ok || activity.result.code === "SKIPPED") return false;
+  // The user's read-only mode refused it before any effect: their setting, not a failure.
+  if (activity.result.code === "ACTION_DENIED" && isReadOnlyRefusal(activity.result.summary)) return false;
   if (activity.call.name === "request_user_help") return activity.result.code === "INVALID_TOOL_ARGUMENTS";
   return !((activity.call.name === "request_action_confirmation" || activity.call.mcp) && activity.result.code === "ACTION_DENIED");
 }
@@ -114,6 +117,7 @@ export function describeActivity(activity: Activity, pending: boolean, approval?
     if (pending) return { Icon, title: `Waiting for approval: ${label}`, status: "pending" };
     if (!activity.result) return { Icon, title: `Using ${label}`, status: "running" };
     if (activity.result.code === "SKIPPED") return { Icon, title: `Skipped using ${label}` };
+    if (readOnlyRefused(activity)) return { Icon, title: `Not allowed in read-only mode: ${label}` };
     if (activity.result.code === "ACTION_DENIED") return { Icon, title: `Denied: ${label}` };
     return activity.result.ok ? { Icon, title: `Used ${label}` } : { Icon, title: `Couldn't use ${label}`, status: "error" };
   }
@@ -122,6 +126,8 @@ export function describeActivity(activity: Activity, pending: boolean, approval?
     if (pending) return { Icon: Shield, title: `Waiting for approval: ${title}`, status: "pending" };
     if (!activity.result) return { Icon: Shield, title: `Asking to confirm: ${title}`, status: "running" };
     if (activity.result.code === "SKIPPED") return { Icon: Shield, title: `Skipped asking to confirm: ${title}` };
+    if (activity.result.summary === AUTO_APPROVED_SUMMARY) return { Icon: Shield, title: `Approved without asking: ${title}` };
+    if (readOnlyRefused(activity)) return { Icon: Shield, title: `Not allowed in read-only mode: ${title}` };
     return { Icon: Shield, title: `${activity.result.ok ? "Approved" : "Denied"}: ${title}` };
   }
   if (activity.call.name === "request_user_help") {
@@ -140,7 +146,12 @@ export function describeActivity(activity: Activity, pending: boolean, approval?
     [null, Terminal, "Running a browser program", "Ran a browser program", "Browser program failed"];
   if (!activity.result) return { Icon, title: running, status: "running" };
   if (activity.result.code === "SKIPPED") return { Icon, title: `Skipped ${running.charAt(0).toLowerCase()}${running.slice(1)}` };
+  if (readOnlyRefused(activity)) return { Icon, title: "Not allowed in read-only mode" };
   return failed(activity) ? { Icon, title: error, status: "error" } : { Icon, title: done };
+}
+
+function readOnlyRefused(activity: Activity): boolean {
+  return activity.result?.code === "ACTION_DENIED" && isReadOnlyRefusal(activity.result.summary);
 }
 
 function hostname(url: string): string {

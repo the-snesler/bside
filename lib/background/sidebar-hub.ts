@@ -18,6 +18,7 @@ import type { ConversationSummary, QueuedMessage } from "@/lib/domain/conversati
 import type { SkillSummary } from "@/lib/domain/skills";
 import type { SiteNote } from "@/lib/domain/instructions";
 import type { AskContextV1 } from "@/lib/domain/ask";
+import type { PermissionMode } from "@/lib/domain/permissions";
 
 const MAX_REPLAY_EVENTS = 512;
 const UNSUPPORTED_HOSTNAME_SUFFIXES = [".mozilla.org", ".mozilla.com"];
@@ -29,7 +30,7 @@ export interface SidebarHubDelegate {
     { origin: string | null; note: SiteNote | null } | { note: SiteNote | null; error: string | null } | { undone: string[]; error: string | null } | { contentReply: import("@/lib/protocol").McpContentReply } | { workspaceImage: import("@/lib/protocol").WorkspaceImageReply } | void>;
 }
 
-type RunEvent = Exclude<SidebarEvent, { type: "mcp.content.reply" | "mcp.content.accepted" | "state.snapshot" | "page.attached" | "agent-tabs.changed" | "queue.changed" | "ask.changed" | "composer.focus" | "context.exported" | "tabs.listed" | "skills.listed" | "session.listed" | "siteNote.loaded" | "siteNote.saved" | "memory.undone" | "workspace.image.loaded" }>;
+type RunEvent = Exclude<SidebarEvent, { type: "mcp.content.reply" | "mcp.content.accepted" | "state.snapshot" | "page.attached" | "agent-tabs.changed" | "permissions.changed" | "queue.changed" | "ask.changed" | "composer.focus" | "context.exported" | "tabs.listed" | "skills.listed" | "session.listed" | "siteNote.loaded" | "siteNote.saved" | "memory.undone" | "workspace.image.loaded" }>;
 
 export class SidebarHub {
   delegate: SidebarHubDelegate | null = null;
@@ -100,6 +101,20 @@ export class SidebarHub {
       type: "agent-tabs.changed",
       at: Date.now(),
       payload: state,
+    };
+    for (const port of this.#ports) port.postMessage(event);
+  }
+
+  /** Broadcasts the permission mode after a sidebar changes it. Not run-sequenced, like `agent-tabs.changed`. */
+  publishPermissionMode(mode: PermissionMode): void {
+    const event: SidebarEvent = {
+      v: 1,
+      runId: null,
+      conversationId: null,
+      seq: this.#lastSeq,
+      type: "permissions.changed",
+      at: Date.now(),
+      payload: { mode },
     };
     for (const port of this.#ports) port.postMessage(event);
   }

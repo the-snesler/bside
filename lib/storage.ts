@@ -17,6 +17,7 @@ import { isSkill } from "@/lib/domain/skills";
 import { isAskContext } from "@/lib/domain/ask";
 import { isCustomInstructionsText, isSiteNote, MAX_SITE_NOTES, type CustomInstructionsV1, type SiteNote, type SiteNotesV1 } from "@/lib/domain/instructions";
 import { DEFAULT_MCP_SERVER_STATE, isMcpServerState, type McpServerStateV1 } from "@/lib/domain/mcp";
+import { DEFAULT_PERMISSION_SETTINGS, isPermissionMode, type PermissionSettingsV1 } from "@/lib/domain/permissions";
 import { DEFAULT_MEMORY_SETTINGS, isMemoryChange, isMemoryEntry, MAX_MEMORIES, MEMORY_WRITE_POLICIES, type MemoryEntry, type MemoryEntryV1, type MemorySettingsV1 } from "@/lib/domain/memory";
 import { REASONING_EFFORTS, type AppSettingsV1, type ModelListing, type ReasoningEffort } from "@/lib/domain/provider";
 import type { Conversation, ConversationIndexV1, ConversationItem, ConversationSummary, HistorySettingsV1, MessageQueueV1, QueuedMessage } from "@/lib/domain/conversation";
@@ -987,6 +988,21 @@ export async function getMemorySettings(): Promise<MemorySettingsV1> {
 
 export async function saveMemorySettings(settings: MemorySettingsV1): Promise<void> {
   await memorySettingsItem.setValue({ version: 1, writes: settings.writes });
+}
+
+const permissionSettingsItem = storage.defineItem<PermissionSettingsV1>("local:permissionSettings", { version: 1 });
+
+/** The permission mode chosen beside the composer; a malformed record is deleted and reads as the default, `ask`. */
+export async function getPermissionSettings(): Promise<PermissionSettingsV1> {
+  const raw: unknown = await permissionSettingsItem.getValue();
+  const record = raw as { version?: unknown; mode?: unknown } | null;
+  if (record?.version === 1 && Object.keys(record).length === 2 && isPermissionMode(record.mode)) return { version: 1, mode: record.mode };
+  if (raw !== null) await permissionSettingsItem.removeValue();
+  return DEFAULT_PERMISSION_SETTINGS;
+}
+
+export async function savePermissionSettings(settings: PermissionSettingsV1): Promise<void> {
+  await permissionSettingsItem.setValue({ version: 1, mode: settings.mode });
 }
 
 // ---------------------------------------------------------------------------

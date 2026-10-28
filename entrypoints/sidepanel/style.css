@@ -937,6 +937,29 @@ summary.trace__line:focus-visible .trace__chevron,
   padding: 4px 2px;
   cursor: pointer;
 }
+.composer__mode {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-right: auto;
+  min-width: 0;
+  color: var(--muted);
+}
+.composer__mode svg {
+  flex: none;
+  width: 13px;
+  height: 13px;
+}
+.composer__mode--read-only {
+  color: var(--accent);
+}
+.composer__mode--auto {
+  color: var(--error);
+}
+.composer__settings .composer__mode select {
+  max-width: none;
+  color: inherit;
+}
 .composer__settings option {
   background: var(--bg);
   color: var(--ink);

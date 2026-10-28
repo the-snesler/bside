@@ -6,6 +6,7 @@ import { buildTurns, type Activity } from "@/lib/ui/turns";
 import type { ConversationItem } from "@/lib/domain/conversation";
 import type { ToolCall, ToolResult } from "@/lib/domain/tools";
 import type { ApprovalRequest } from "@/lib/protocol";
+import { AUTO_APPROVED_SUMMARY, READ_ONLY_DENIED_SUMMARY, readOnlyRefusal } from "@/lib/domain/permissions";
 
 const call: ToolCall = { id: "c1", name: "mcp__notion__notion-delete", arguments: { page: "<b>Plan</b>" }, mcp: { server: "notion", tool: "notion-delete", readOnly: false } };
 
@@ -22,6 +23,18 @@ describe("MCP calls in the sidebar trace", () => {
     expect(describeActivity(activity({ ok: false, code: "ACTION_DENIED", summary: "Denied." }), false)).toEqual(expect.objectContaining({ title: "Denied: Notion: notion-delete" }));
     expect(describeActivity(activity({ ok: false, code: "ACTION_DENIED", summary: "Denied." }), false).status).toBeUndefined();
     expect(describeActivity(activity(null), true)).toMatchObject({ title: "Waiting for approval: Notion: notion-delete", status: "pending" });
+  });
+
+  it("labels steps the permission mode decided, never as failures", () => {
+    expect(describeActivity(activity({ ok: false, code: "ACTION_DENIED", summary: readOnlyRefusal("this Notion call") }), false)).toEqual({ Icon: expect.anything(), title: "Not allowed in read-only mode: Notion: notion-delete" });
+    const confirmation = (result: ToolResult): Activity => ({ kind: "activity", id: "c2", startedAt: 0, endedAt: 1, call: { id: "c2", name: "request_action_confirmation", arguments: { title: "Send email", message: "Send it?", artifact: "" } }, result });
+    expect(describeActivity(confirmation({ ok: true, summary: AUTO_APPROVED_SUMMARY }), false).title).toBe("Approved without asking: Send email");
+    expect(describeActivity(confirmation({ ok: false, code: "ACTION_DENIED", summary: READ_ONLY_DENIED_SUMMARY }), false).title).toBe("Not allowed in read-only mode: Send email");
+    expect(describeActivity(confirmation({ ok: true, summary: "approved:true. The user confirmed the described action only." }), false).title).toBe("Approved: Send email");
+    const program: Activity = { kind: "activity", id: "c3", startedAt: 0, endedAt: 1, call: { id: "c3", name: "browser_program", arguments: { source: "await x.click();" } },
+      result: { ok: false, code: "ACTION_DENIED", summary: `0 statements completed. Stopped in statement 1; earlier effects may have committed. ${readOnlyRefusal("click()")}` } };
+    expect(describeActivity(program, false)).toMatchObject({ title: "Not allowed in read-only mode" });
+    expect(describeActivity(program, false).status).toBeUndefined();
   });
 
   it("shows a gated call's server, tool, and arguments on the confirmation card as text", () => {

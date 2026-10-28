@@ -25,6 +25,7 @@ import { matchSiteNotes, pageOrigin, siteNoteForPage, type SiteNote } from "@/li
 import type { ApprovalBadge } from "@/lib/background/approval-badge";
 import { TaskScheduler, type RecordTaskStart, type SchedulerAlarms, type TaskDispatch } from "@/lib/background/scheduler";
 import type { ScheduledSource, ScheduledTask } from "@/lib/domain/automation";
+import { DEFAULT_PERMISSION_SETTINGS, type PermissionMode } from "@/lib/domain/permissions";
 import type { RunNotifications } from "@/lib/background/notifications";
 import type { McpConnections } from "@/lib/background/mcp";
 import type { McpToolDefinition } from "@/lib/mcp/tools";
@@ -49,6 +50,8 @@ import {
   getAppSettings,
   getConversation,
   getHistorySettings,
+  getPermissionSettings,
+  savePermissionSettings,
   getNotificationSettings,
   saveNotificationSettings,
   isSessionUntouched,
@@ -222,6 +225,8 @@ export class BackgroundRuntime {
   #runRecord: RunRecord | null = null;
   /** Settles once startup recovery/restoration finishes; every sidebar command waits on it. */
   #ready: Promise<void> = Promise.resolve();
+  /** The permission mode beside the composer, cached so a run reads it synchronously at each gated call. */
+  #permissionMode: PermissionMode = DEFAULT_PERMISSION_SETTINGS.mode;
   #agentTabSync: Promise<void> = Promise.resolve();
   #agentTabSyncQueued = false;
   /** Serialized tag last read from or written to each owned tab, so unchanged tags are not rewritten. */
@@ -331,6 +336,7 @@ export class BackgroundRuntime {
     const restored = this.#restoreAgentTabs();
     this.#ready = Promise.allSettled([
       migrateCredentials(),
+      getPermissionSettings().then((settings) => { this.#permissionMode = settings.mode; }),
       migrateConversation()
         .catch(() => console.warn("[bside] Could not migrate the saved conversation; will retry at next startup."))
         .then(() => recoverInterruptedRun())
@@ -681,6 +687,7 @@ export class BackgroundRuntime {
       credential: { ...credential, configured: credential.chatgpt.connected || credential.configured },
       provider,
       settings,
+      permissionMode: this.#permissionMode,
       skills: sidebarSkillCatalog(await getSkills()),
       page: this.#sidebarHub.currentAttachment(),
       agentTabs: this.#agentTabsState,
@@ -754,6 +761,13 @@ export class BackgroundRuntime {
     if (command.type === "settings.save") {
       if (this.#activeRun) return;
       await this.handleSettingsRequest(command);
+      return;
+    }
+    if (command.type === "permissions.save") {
+      // Accepted mid-run: the active run reads the mode at its next gated call.
+      await savePermissionSettings({ version: 1, mode: command.mode });
+      this.#permissionMode = command.mode;
+      this.#sidebarHub.publishPermissionMode(command.mode);
       return;
     }
     if (command.type === "siteNote.get") {
@@ -1722,6 +1736,8 @@ export class BackgroundRuntime {
         // No run event carries a compaction; a snapshot shows its marker at once.
         if (item.kind === "compaction") void this.#sidebarHub.broadcastSnapshot();
       },
+      // Scheduled runs are unattended: they always ask, whatever the sidebar's mode.
+      permissionMode: () => run.scheduled ? "ask" : this.#permissionMode,
       onApprovalPending: (request) => {
         if (this.#activeRun?.runId !== runId) return;
         flushDelta();

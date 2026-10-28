@@ -18,6 +18,7 @@ import type { ApprovalRequest, HelpRequest, SidebarEvent } from "@/lib/protocol"
 import { ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
 import { listMemories, runMemory } from "@/lib/background/memory";
 import { saveMemorySettings } from "@/lib/storage";
+import { AUTO_APPROVED_SUMMARY, READ_ONLY_DENIED_SUMMARY, type PermissionMode } from "@/lib/domain/permissions";
 import { splitSystemMessage, TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
 
 function buildSnapshot(overrides: Partial<PageSnapshot> = {}): PageSnapshot {
@@ -311,6 +312,80 @@ describe("AgentLoop: denial as a tool result", () => {
     const round2Request = provider.requests[1];
     const toolResultInput = round2Request?.context.messages.find((item) => item.role === "toolResult");
     expect(toolResultInput?.role === "toolResult" ? toolResultInput.content[0] : undefined).toMatchObject({ text: expect.stringContaining("ACTION_DENIED") });
+  });
+});
+
+describe("AgentLoop: permission mode", () => {
+  async function runWithMode(mode: () => PermissionMode, rounds: ConstructorParameters<typeof ScriptedProvider>[0]) {
+    const provider = new ScriptedProvider(rounds);
+    const actions: unknown[] = [];
+    const { tabController, sendMessageMock } = await createTabController({ onExecute: (action) => { actions.push(action); return { result: { ok: true, summary: "Clicked." }, documentId: "doc-1" }; } });
+    const hub = new SidebarHub();
+    const port = fakePort();
+    hub.handleConnect(port);
+    const loop = new AgentLoop(provider, tabController, hub);
+    const items: ConversationItem[] = [];
+    const result = await loop.run({
+      runId: "run1", conversationId: "default", modelId: "gpt-5.6-terra", reasoningEffort: "medium", transcript: baseTranscript, contextArtifact: artifact,
+      auth: AUTH, signal: new AbortController().signal, onDelta: () => {}, onItem: async (item) => { items.push(item); }, onApprovalPending: () => {},
+      permissionMode: mode,
+    });
+    const toolResults = (round: number) => provider.requests[round]!.context.messages.filter((m) => m.role === "toolResult").map((m) => JSON.stringify(m.content));
+    return { result, actions, items, port, provider, sendMessageMock, toolResults };
+  }
+  const confirm = (id: string) => toolCallEvent(id, "request_action_confirmation", { title: "Submit", message: "Submit it?", artifact: "" });
+  const click = 'await browser.tab("/tabs/1/page.md").ref("e1").click();';
+  const done = () => [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }] as ScriptedProviderEvent[];
+
+  it("approves a confirmation without a card in Don't-ask mode, and runs the action batched after it", async () => {
+    const { result, actions, port, toolResults } = await runWithMode(() => "auto", [
+      () => [confirm("call_1"), toolCallEvent("call_2", "browser_program", { source: click }), { type: "turn.completed", replayState: null }],
+      done,
+    ]);
+    expect(result.status).toBe("completed");
+    expect(port.received.some((event) => event.type === "action.approval-required")).toBe(false);
+    expect(toolResults(1)[0]).toContain(AUTO_APPROVED_SUMMARY);
+    expect(actions).toHaveLength(1);
+  });
+
+  it("refuses a confirmation and every page interaction in read-only mode before any effect, but still reads", async () => {
+    const { result, actions, port, items, toolResults } = await runWithMode(() => "read-only", [
+      () => [confirm("call_1"), { type: "turn.completed", replayState: null }],
+      () => [toolCallEvent("call_2", "browser_program", { source: 'return await fs.read("/tabs/1/page.md");' }), { type: "turn.completed", replayState: null }],
+      () => [toolCallEvent("call_3", "browser_program", { source: click }), { type: "turn.completed", replayState: null }],
+      () => [toolCallEvent("call_4", "browser_program", { source: 'await browser.tab("/tabs/1/page.md").navigate("https://example.com/");' }), { type: "turn.completed", replayState: null }],
+      () => { throw new ProviderStreamError("Rate limited.", "RATE_LIMIT"); },
+    ]);
+    expect(port.received.some((event) => event.type === "action.approval-required")).toBe(false);
+    expect(toolResults(1)[0]).toContain(READ_ONLY_DENIED_SUMMARY.slice(0, 60));
+    expect(toolResults(2)[1]).toContain("Orchid launch moved to Friday.");
+    expect(toolResults(3)[2]).toContain("ACTION_DENIED");
+    expect(toolResults(3)[2]).toContain("read-only mode");
+    expect(toolResults(4)[3]).toContain("read-only mode");
+    expect(actions).toHaveLength(0);
+    expect(items.filter((item) => item.kind === "tool-result").map((item) => item.kind === "tool-result" && item.result.code)).toEqual(["ACTION_DENIED", undefined, "ACTION_DENIED", "ACTION_DENIED"]);
+    // Nothing was done, so the failed run stays retryable.
+    expect(result).toMatchObject({ status: "failed", hadPageEffect: false });
+  });
+
+  it("reads the mode at each call, so a change mid-run applies to the next one", async () => {
+    let mode: PermissionMode = "read-only";
+    const { actions, toolResults } = await runWithMode(() => mode, [
+      () => [toolCallEvent("call_1", "browser_program", { source: click }), { type: "turn.completed", replayState: null }],
+      () => { mode = "ask"; return [toolCallEvent("call_2", "browser_program", { source: click }), { type: "turn.completed", replayState: null }]; },
+      done,
+    ]);
+    expect(toolResults(1)[0]).toContain("read-only mode");
+    expect(toolResults(2)[1]).not.toContain("ACTION_DENIED");
+    expect(actions).toHaveLength(1);
+  });
+
+  it("sends the same system prompt and tools in every mode", async () => {
+    const prompts = await Promise.all((["ask", "read-only", "auto"] as const).map(async (mode) => {
+      const { provider } = await runWithMode(() => mode, [done]);
+      return JSON.stringify([provider.requests[0]!.context.systemPrompt, provider.requests[0]!.context.tools]);
+    }));
+    expect(new Set(prompts).size).toBe(1);
   });
 });
 
@@ -1468,6 +1543,7 @@ describe("AgentLoop: connected accounts (MCP)", () => {
     call?: McpTools["call"];
     onApprovalPending?: (request: ApprovalRequest | null, loop: AgentLoop) => void;
     withoutMcp?: boolean;
+    permissionMode?: PermissionMode;
   }) {
     const provider = new ScriptedProvider(options.rounds);
     const { tabController } = await createTabController();
@@ -1482,6 +1558,7 @@ describe("AgentLoop: connected accounts (MCP)", () => {
       ...(options.withoutMcp ? {} : { mcp: { tools: definitions(options.trust), call } }),
       auth: AUTH, signal: new AbortController().signal, onDelta: () => {}, onItem: async (item) => { items.push(item); },
       onApprovalPending: (request) => options.onApprovalPending?.(request, loop),
+      ...(options.permissionMode ? { permissionMode: () => options.permissionMode! } : {}),
     });
     const toolResults = () => provider.requests.at(-1)!.context.messages.filter((message) => message.role === "toolResult").map((message) => JSON.stringify(message.content));
     return { result, loop, port, provider, items, call, toolResults };
@@ -1548,6 +1625,27 @@ describe("AgentLoop: connected accounts (MCP)", () => {
     expect(toolResults()[0]).toContain("ACTION_DENIED");
     expect(toolResults()[1]).toContain("SKIPPED");
     expect(result).toMatchObject({ status: "failed", hadPageEffect: false });
+  });
+
+  it("runs a write without the card in Don't-ask mode, despite Always confirm writes", async () => {
+    const { port, call, result } = await runMcp({ permissionMode: "auto", rounds: [() => [toolCallEvent("c1", "mcp__notion__notion-delete", { q: "x" }), { type: "turn.completed", replayState: null }], fail] });
+    expect(port.received.some((event) => event.type === "action.approval-required")).toBe(false);
+    expect(call).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ hadPageEffect: true });
+  });
+
+  it("refuses a write in read-only mode without calling the server, but still runs read-only tools", async () => {
+    const { port, call, toolResults, result } = await runMcp({ permissionMode: "read-only", trust: "model", rounds: [
+      () => [toolCallEvent("c1", "mcp__notion__notion-search", { q: "x" }), { type: "turn.completed", replayState: null }],
+      () => [toolCallEvent("c2", "mcp__notion__notion-delete", { q: "x" }), { type: "turn.completed", replayState: null }],
+      fail,
+    ] });
+    expect(port.received.some((event) => event.type === "action.approval-required")).toBe(false);
+    expect(call).toHaveBeenCalledTimes(1);
+    expect(call).toHaveBeenCalledWith(expect.objectContaining({ tool: "notion-search" }), { q: "x" }, expect.any(AbortSignal));
+    expect(toolResults().at(-1)).toContain("ACTION_DENIED");
+    expect(toolResults().at(-1)).toContain("read-only mode");
+    expect(result).toMatchObject({ hadPageEffect: false });
   });
 
   it("leaves writes to the model's policy when the user lets bside decide", async () => {

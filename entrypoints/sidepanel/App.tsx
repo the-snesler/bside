@@ -10,10 +10,13 @@ import ArrowDown from "~icons/tabler/arrow-down";
 import ArrowUp from "~icons/tabler/arrow-up";
 import X from "~icons/tabler/x";
 import NotePlus from "~icons/tabler/pencil-plus";
+import ShieldCheck from "~icons/tabler/shield-check";
+import Bolt from "~icons/tabler/bolt";
 import { Markdown } from "@/lib/ui/Markdown";
 import { Composer, parsePromptMentions } from "@/lib/ui/Composer";
 import { useBottomScroll } from "@/lib/ui/use-bottom-scroll";
 import type { ReasoningEffort } from "@/lib/domain/provider";
+import type { PermissionMode } from "@/lib/domain/permissions";
 import { useBackground } from "@/lib/ui/use-background";
 import type { PageArtifactSummary } from "@/lib/domain/tools";
 import { TurnTrace } from "@/lib/ui/TurnTrace";
@@ -29,6 +32,33 @@ import { PROMPT_MENTION_PATTERN } from "@/lib/domain/conversation";
 import { describeAsk } from "@/lib/domain/ask";
 import { QUICK_ACTIONS } from "@/lib/domain/quick-actions";
 import { AskChip } from "@/lib/ui/AskChip";
+
+const PERMISSION_MODE_OPTIONS: { mode: PermissionMode; label: string; title: string; Icon: typeof ShieldCheck }[] = [
+  { mode: "ask", label: "Ask first", title: "Asks before sending, submitting, buying, or deleting", Icon: ShieldCheck },
+  { mode: "read-only", label: "Read-only", title: "Reads and answers only: clicks, typing, and account changes are refused", Icon: Eye },
+  { mode: "auto", label: "Don't ask", title: "Acts without asking for confirmation, including sending, buying, and deleting", Icon: Bolt },
+];
+
+/** The permission mode beside the composer; changing it mid-run applies at the run's next gated call. */
+function PermissionModeSelect(props: { mode: PermissionMode; onChange: (mode: PermissionMode) => void }) {
+  const current = PERMISSION_MODE_OPTIONS.find((option) => option.mode === props.mode) ?? PERMISSION_MODE_OPTIONS[0]!;
+  return (
+    <label class={`composer__mode composer__mode--${current.mode}`} title={current.title}>
+      <current.Icon aria-hidden="true" />
+      <select
+        aria-label="Permissions"
+        value={current.mode}
+        onChange={(event) => props.onChange(event.currentTarget.value as PermissionMode)}
+      >
+        {PERMISSION_MODE_OPTIONS.map((option) => (
+          <option key={option.mode} value={option.mode} title={option.title}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
 
 function describeAttachment(page: PageArtifactSummary): string {
   let origin = page.url;
@@ -61,6 +91,8 @@ export function App() {
     unwatchTab,
     takeOverTab,
     saveSettings,
+    permissionMode,
+    savePermissionMode,
     sendPrompt,
     listMcpContent, prepareMcpContent, dismissMcpContent, mcpAttachments,
     steer,
@@ -446,6 +478,7 @@ export function App() {
               />
             </div>
             <div class="composer__settings">
+              <PermissionModeSelect mode={permissionMode} onChange={savePermissionMode} />
               <select
                 aria-label="Model"
                 title="Model"

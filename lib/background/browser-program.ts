@@ -14,6 +14,7 @@ import { SITE_APIS } from "@/lib/sites";
 import { SiteError, type SiteEnv } from "@/lib/sites/site-api";
 import { AGENT_TAB_ROLES, DEFAULT_SNAPSHOT_CHARS, TabController } from "./tab-controller";
 import { renderPdfText } from "@/lib/domain/pdf";
+import { readOnlyRefusal } from "@/lib/domain/permissions";
 import { sliceOutline } from "@/lib/domain/outline";
 
 export const PROGRAM_HELP = `Run a small browser/filesystem program. It is interpreted, not JavaScript: only const/let (including array destructuring), await, return, strings, numbers, booleans, arrays, objects, variables, + (strings and numbers), read-only property access on returned values (x.key, x[0], x.length), Promise.all, and the globals below. No loops, functions, selectors, or other globals. End statements with semicolons. Variables persist across programs in this run. The program stops at the first failure; earlier effects stay committed, so never replay completed steps.
@@ -531,6 +532,8 @@ export class BrowserProgram {
   #memoryChanges: MemoryChange[] = [];
   /** Asks the user to approve a memory change under the Ask policy; set per program by the agent loop. */
   #confirmMemory: ((change: MemoryApproval) => Promise<boolean>) | null = null;
+  /** Whether the user's permission mode is read-only now; set per program by the agent loop and read before each effect. */
+  #readOnly: () => boolean = () => false;
   private readonly state: WorkspaceState;
   /** The run's session: its agent tabs are this program's `/agent-tabs`, and `files` is its `/workspace`. */
   private readonly sessionId: string;
@@ -575,8 +578,12 @@ export class BrowserProgram {
     return this.#tainted;
   }
 
-  /** `confirmMemory` gates memory changes under the Ask policy; without it they are refused there. */
-  async execute(source: string, signal: AbortSignal, hooks: { confirmMemory?: (change: MemoryApproval) => Promise<boolean> } = {}): Promise<ToolResult> {
+  /**
+   * `confirmMemory` gates memory changes under the Ask policy; without it they
+   * are refused there. `readOnly`, read before each effect, refuses page
+   * interactions (hover aside) and changes to the user's own tabs.
+   */
+  async execute(source: string, signal: AbortSignal, hooks: { confirmMemory?: (change: MemoryApproval) => Promise<boolean>; readOnly?: () => boolean } = {}): Promise<ToolResult> {
     const output = new Output();
     let completed = 0;
     let parsed = false;
@@ -585,6 +592,7 @@ export class BrowserProgram {
     this.#images = [];
     this.#memoryChanges = [];
     this.#confirmMemory = hooks.confirmMemory ?? null;
+    this.#readOnly = hooks.readOnly ?? (() => false);
     try {
       const statements = parseProgram(source);
       parsed = true;
@@ -1033,6 +1041,7 @@ export class BrowserProgram {
         "Locators support click, hover, dragTo, fill, choose, selectOption, setChecked, check, uncheck, press, setInputFiles, screenshot, table.",
       );
     signal.throwIfAborted();
+    if (action.kind !== "hover") this.#refuseIfReadOnly(`${method}()`);
     // A lost response can follow a committed effect; disable automatic retry before dispatch.
     this.onEffect();
     const outcome = await controller.act(action, frame);
@@ -1192,6 +1201,7 @@ export class BrowserProgram {
     if (method === "navigate" || method === "goBack") {
       if (method === "navigate") count(1);
       else count(0);
+      if (!this.#ownsTab(tabId)) this.#refuseIfReadOnly(`${method}() in the user's own tab ${this.#path(tabId)}`);
       if (method === "navigate") this.#visited.push(text(0, "an absolute URL"));
       this.onEffect();
       const result =
@@ -1653,6 +1663,11 @@ export class BrowserProgram {
     return `/${this.#ownsTab(tabId) ? "agent-tabs" : "tabs"}/${tabId}/page.md`;
   }
 
+  /** Stops the program before an effect the user's read-only mode does not allow. */
+  #refuseIfReadOnly(action: string): void {
+    if (this.#readOnly()) throw new ProgramError(readOnlyRefusal(action), "ACTION_DENIED");
+  }
+
   #ownsTab(tabId: number): boolean {
     return this.state.agentTabs.get(tabId)?.sessionId === this.sessionId;
   }
@@ -1939,6 +1954,7 @@ export class BrowserProgram {
     if (method === "remove") {
       if (args.length !== 1)
         throw new Error("fs.remove(path) takes one argument.");
+      if (!this.#ownsTab(id)) this.#refuseIfReadOnly(`closing the user's tab ${path}`);
       this.onEffect();
       await this.tabs.closeTab(id);
       this.state.releaseTab(id);
@@ -1951,6 +1967,7 @@ export class BrowserProgram {
         throw new Error(
           "Tab moves must preserve the ID and switch /tabs and /agent-tabs.",
         );
+      if (toAgent) this.#refuseIfReadOnly(`moving the user's tab ${path} into /agent-tabs`);
       this.onEffect();
       if (toAgent) {
         await this.tabs.hideTab(id);
