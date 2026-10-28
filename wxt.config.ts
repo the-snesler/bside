@@ -1,6 +1,42 @@
-import { defineConfig } from "wxt";
+import { defineConfig, type WxtViteConfig } from "wxt";
 import preact from "@preact/preset-vite";
 import Icons from "unplugin-icons/vite";
+
+type VitePlugin = Extract<NonNullable<WxtViteConfig["plugins"]>[number], { name: string }>;
+
+const PI_OAUTH_LOADER = "/@earendil-works/pi-ai/dist/auth/oauth/load.js";
+const PI_OAUTH_IMPORT = "import(__rewriteRelativeImportExtension(runtimeSpecifier))";
+
+/**
+ * Rewrites dependency code that `web-ext lint` flags but bside never needs:
+ * - `Function('return this')()` (lodash via Slate, core-js in pdf.js's legacy
+ *   build) is a global-object fallback; `globalThis` is the same object.
+ * - Pi's OAuth loader imports Node-only sign-in flows by a variable path; bside
+ *   signs in with ChatGPT itself, so the import is refused instead.
+ * - decode-named-character-reference's browser build decodes through
+ *   `innerHTML`; its default build uses a lookup table.
+ */
+function lintCleanDependencies(): VitePlugin {
+  return {
+    name: "bside:lint-clean-dependencies",
+    enforce: "pre",
+    async resolveId(source, importer, options) {
+      if (source !== "decode-named-character-reference") return null;
+      const resolved = await this.resolve(source, importer, { ...options, skipSelf: true });
+      return resolved && { ...resolved, id: resolved.id.replace(/index\.dom\.js$/, "index.js") };
+    },
+    transform(code, id) {
+      const [path = id] = id.split("?");
+      if (!path.includes("/node_modules/")) return null;
+      let next = code.replaceAll("Function('return this')()", "globalThis");
+      if (path.endsWith(PI_OAUTH_LOADER)) {
+        if (!next.includes(PI_OAUTH_IMPORT)) this.warn("Pi's OAuth loader changed; its dynamic import is no longer stubbed.");
+        next = next.replace(PI_OAUTH_IMPORT, `Promise.reject(new Error("Pi's OAuth sign-in flows are not bundled."))`);
+      }
+      return next === code ? null : { code: next, map: null };
+    },
+  };
+}
 
 const CSP =
   "default-src 'self'; script-src 'self'; object-src 'none'; connect-src 'self' https://api.openai.com https://auth.openai.com https://www.youtube.com https://mcp.notion.com https://ai.todoist.net https://todoist.com; img-src 'self' data:; style-src 'self' 'unsafe-inline'";
@@ -12,7 +48,7 @@ export default defineConfig({
   // must come only from scripts/source-submission.mjs's committed allowlist.
   zip: { zipSources: false },
   vite: () => ({
-    plugins: [preact(), Icons({ compiler: "jsx", jsx: "preact" })],
+    plugins: [preact(), Icons({ compiler: "jsx", jsx: "preact" }), lintCleanDependencies()],
   }),
   manifest: {
     browser_specific_settings: { gecko: {
