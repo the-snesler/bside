@@ -243,7 +243,9 @@ export function Composer(props: {
           const skillMatch = /^\/([^\s]*)$/.exec(before);
           const atStart = Editor.isStart(editor, start, []);
           const isSkill = !!skillMatch && atStart;
-          const match = isSkill ? skillMatch : /(?:^|\s)@([^@\n]*)$/.exec(before);
+          const match = isSkill
+            ? skillMatch
+            : /(?:^|\s)@([^@\n]*)$/.exec(before);
           if (match) {
             const anchor = {
               ...selection.anchor,
@@ -264,22 +266,78 @@ export function Composer(props: {
         setTarget(null);
       }}
     >
-      {(props.attachments ?? []).map(item => <McpContentChip key={item.id} item={item} onRemove={() => props.onDismissMcpContent?.(item.id)} />)}
-      {selectedPrompt && <form class="mcp-prompt-form" aria-label={`Prepare ${selectedPrompt.server} prompt`} onSubmit={event => { event.preventDefault(); void prepare(selectedPrompt, args); }}>
-        <strong>{selectedPrompt.server} · /{selectedPrompt.command}</strong>
-        <p>{selectedPrompt.description}</p>
-        <small>Arguments are sent to this connected account. Do not enter passwords, tokens, or verification codes.</small>
-        {selectedPrompt.arguments.map((arg, i) => <label key={arg.name}>
-          {arg.name} ({arg.required ? "required" : "optional"})
-          <small id={`mcp-arg-help-${i}`}>{arg.description}</small>
-          <input autoFocus={i === 0} name={arg.name} required={arg.required} maxLength={MCP_CONTENT_LIMITS.argumentChars} aria-describedby={`mcp-arg-help-${i}`} value={args[arg.name] ?? ""}
-            onInput={event => setArgs({ ...args, [arg.name]: event.currentTarget.value })} disabled={preparing} />
-        </label>)}
-        <button type="submit" autoFocus={selectedPrompt.arguments.length === 0} disabled={preparing || (props.attachments?.length ?? 0) >= MCP_CONTENT_LIMITS.attachments}>{preparing ? "Preparing…" : "Prepare preview"}</button>
-        <button type="button" disabled={preparing} onClick={() => { setSelectedPrompt(null); ReactEditor.focus(editor); }}>Cancel</button>
-      </form>}
-      {remoteError && <p role="alert" class="sidebar__error">{remoteError}</p>}
-      {preparing && !selectedPrompt && <p role="status">Preparing resource preview…</p>}
+      {(props.attachments ?? []).map((item) => (
+        <McpContentChip
+          key={item.id}
+          item={item}
+          onRemove={() => props.onDismissMcpContent?.(item.id)}
+        />
+      ))}
+      {selectedPrompt && (
+        <form
+          class="mcp-prompt-form"
+          aria-label={`Prepare ${selectedPrompt.server} prompt`}
+          onSubmit={(event) => {
+            event.preventDefault();
+            void prepare(selectedPrompt, args);
+          }}
+        >
+          <strong>
+            {selectedPrompt.server} · /{selectedPrompt.command}
+          </strong>
+          <p>{selectedPrompt.description}</p>
+          <small>
+            Arguments are sent to this connected account. Do not enter
+            passwords, tokens, or verification codes.
+          </small>
+          {selectedPrompt.arguments.map((arg, i) => (
+            <label key={arg.name}>
+              {arg.name} ({arg.required ? "required" : "optional"})
+              <small id={`mcp-arg-help-${i}`}>{arg.description}</small>
+              <input
+                autoFocus={i === 0}
+                name={arg.name}
+                required={arg.required}
+                maxLength={MCP_CONTENT_LIMITS.argumentChars}
+                aria-describedby={`mcp-arg-help-${i}`}
+                value={args[arg.name] ?? ""}
+                onInput={(event) =>
+                  setArgs({ ...args, [arg.name]: event.currentTarget.value })
+                }
+                disabled={preparing}
+              />
+            </label>
+          ))}
+          <button
+            type="submit"
+            autoFocus={selectedPrompt.arguments.length === 0}
+            disabled={
+              preparing ||
+              (props.attachments?.length ?? 0) >= MCP_CONTENT_LIMITS.attachments
+            }
+          >
+            {preparing ? "Preparing…" : "Prepare preview"}
+          </button>
+          <button
+            type="button"
+            disabled={preparing}
+            onClick={() => {
+              setSelectedPrompt(null);
+              ReactEditor.focus(editor);
+            }}
+          >
+            Cancel
+          </button>
+        </form>
+      )}
+      {remoteError && (
+        <p role="alert" class="sidebar__error">
+          {remoteError}
+        </p>
+      )}
+      {preparing && !selectedPrompt && (
+        <p role="status">Preparing resource preview…</p>
+      )}
       <div class="composer__editor-row">
         <Editable
           className="composer__editor"
@@ -300,7 +358,8 @@ export function Composer(props: {
               ? "Connect OpenAI in settings to start."
               : props.working
                 ? "Enter queues, Ctrl/⌘+Enter steers…"
-                : props.placeholder ?? "Ask a task, / for prompts or skills, @ for resources or tabs…"
+                : (props.placeholder ??
+                  "Type a task, / for prompts or skills, @ for resources or tabs…")
           }
           renderElement={({ attributes, children, element }) =>
             element.type === "mention" ? (
@@ -337,7 +396,10 @@ export function Composer(props: {
                 return;
               }
             }
-            const action = composerKeyAction(event, props.working && props.canSteer);
+            const action = composerKeyAction(
+              event,
+              props.working && props.canSteer,
+            );
             if (action) {
               event.preventDefault();
               send(action === "steer");
@@ -386,7 +448,13 @@ export function Composer(props: {
             type="button"
             aria-label="Send message"
             title="Send message"
-            disabled={props.disabled || preparing || !!selectedPrompt || !text || text.length > 16000}
+            disabled={
+              props.disabled ||
+              preparing ||
+              !!selectedPrompt ||
+              !text ||
+              text.length > 16000
+            }
             onClick={() => send()}
           >
             <ArrowUp />
@@ -403,18 +471,61 @@ export function Composer(props: {
           class="tab-suggestions"
           id="tab-suggestions"
           role="listbox"
-          aria-label={skillMode ? "Skills and connected-account prompts" : "Tabs and connected-account resources"}
+          aria-label={
+            skillMode
+              ? "Skills and connected-account prompts"
+              : "Tabs and connected-account resources"
+          }
         >
-          <div class="tab-suggestions__heading">{skillMode ? "Skills and MCP prompts" : "Tabs and MCP resources"}</div>
-          {options.map((option, i) => <div key={i} role="option" id={`composer-option-${i}`} aria-selected={index === i} class="tab-suggestions__option"
-            onMouseDown={event => { event.preventDefault(); selectOption(option); }}>
-            {option.kind === "skill" ? <><strong>/{option.skill.name}</strong><small>Saved skill · {option.skill.description}</small></>
-              : option.kind === "tab" ? <><strong>{option.tab.title || option.tab.url}</strong><small>Tab · {option.tab.url}</small></>
-              : <><strong>{skillMode ? `/${option.choice.command}` : option.choice.name}</strong><small>{option.choice.server} · MCP {option.choice.kind} · {option.choice.description}</small></>}
-          </div>)}
-          {loadingContent && <p role="status">Loading connected-account content…</p>}
-          {!options.length && !loadingContent && <p>No matching {skillMode ? "skills or prompts" : "tabs or resources"}.</p>}
-
+          <div class="tab-suggestions__heading">
+            {skillMode ? "Skills and MCP prompts" : "Tabs and MCP resources"}
+          </div>
+          {options.map((option, i) => (
+            <div
+              key={i}
+              role="option"
+              id={`composer-option-${i}`}
+              aria-selected={index === i}
+              class="tab-suggestions__option"
+              onMouseDown={(event) => {
+                event.preventDefault();
+                selectOption(option);
+              }}
+            >
+              {option.kind === "skill" ? (
+                <>
+                  <strong>/{option.skill.name}</strong>
+                  <small>Saved skill · {option.skill.description}</small>
+                </>
+              ) : option.kind === "tab" ? (
+                <>
+                  <strong>{option.tab.title || option.tab.url}</strong>
+                  <small>Tab · {option.tab.url}</small>
+                </>
+              ) : (
+                <>
+                  <strong>
+                    {skillMode
+                      ? `/${option.choice.command}`
+                      : option.choice.name}
+                  </strong>
+                  <small>
+                    {option.choice.server} · MCP {option.choice.kind} ·{" "}
+                    {option.choice.description}
+                  </small>
+                </>
+              )}
+            </div>
+          ))}
+          {loadingContent && (
+            <p role="status">Loading connected-account content…</p>
+          )}
+          {!options.length && !loadingContent && (
+            <p>
+              No matching{" "}
+              {skillMode ? "skills or prompts" : "tabs or resources"}.
+            </p>
+          )}
         </div>
       )}
     </Slate>

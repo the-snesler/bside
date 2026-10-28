@@ -10,7 +10,7 @@
  */
 
 import type { McpContentChoice, McpContentSnapshot } from "@/lib/domain/mcp-content";
-import type { McpContentReply } from "@/lib/protocol";
+import type { McpContentReply, WorkspaceImageReply } from "@/lib/protocol";
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import type { Browser } from "wxt/browser";
 import { RUN_CANCELLED_SUFFIX, SIDEBAR_PORT_NAME } from "@/lib/protocol";
@@ -99,7 +99,15 @@ export interface BackgroundActions {
   closeSiteNote(): void;
   /** Undoes memory changes a turn made; the background reverts each only if nothing changed it since. */
   undoMemory(changeIds: string[]): void;
+  /** One of the open session's `/workspace` images, for model Markdown that shows it. */
+  loadWorkspaceImage(sessionId: string, path: string): Promise<WorkspaceImageLoad>;
 }
+
+/** A workspace image as the background answered, or `unavailable` when the sidebar got no answer. */
+export type WorkspaceImageLoad = WorkspaceImageReply | { ok: false; reason: "unavailable" };
+
+/** Images kept for re-renders (an answer moving from streaming to its turn); runs may change files, so it is cleared when one starts. */
+const WORKSPACE_IMAGE_CACHE = 8;
 
 const EMPTY_CONVERSATION: Conversation = {
   id: "", title: "", titleSource: "prompt", createdAt: 0, updatedAt: 0, pinned: false, itemCount: 0, lastModelId: null, usage: EMPTY_USAGE, items: [],
@@ -139,6 +147,8 @@ export function useBackground(): BackgroundState & BackgroundActions {
   /** Undo requests awaiting their reply, by request id. */
   const undoRequestsRef = useRef(new Map<string, string>());
   const contentRequests = useRef(new Map<string, (reply: McpContentReply) => void>());
+  const imageRequests = useRef(new Map<string, (reply: WorkspaceImageLoad) => void>());
+  const imageCache = useRef(new Map<string, Promise<WorkspaceImageLoad>>());
   const conversationIdRef = useRef("");
   conversationIdRef.current = state.conversation.id;
 
@@ -153,6 +163,12 @@ export function useBackground(): BackgroundState & BackgroundActions {
         contentRequests.current.delete(event.payload.requestId);
         return;
       }
+      if (event.type === "workspace.image.loaded") {
+        imageRequests.current.get(event.payload.requestId)?.(event.payload.result);
+        imageRequests.current.delete(event.payload.requestId);
+        return;
+      }
+      if (event.type === "run.started") imageCache.current.clear();
       if (event.type === "mcp.content.accepted") {
         setState(prev => ({ ...prev, mcpAttachments: prev.mcpAttachments.filter(item => !event.payload.ids.includes(item.id)) }));
         return;
@@ -201,6 +217,9 @@ export function useBackground(): BackgroundState & BackgroundActions {
       portRef.current = null;
       for (const resolve of contentRequests.current.values()) resolve({ ok: false, error: { code: "PROTOCOL_ERROR", phase: "setup", retryable: false, message: "The sidebar disconnected. Choose the content again." } });
       contentRequests.current.clear();
+      for (const resolve of imageRequests.current.values()) resolve({ ok: false, reason: "unavailable" });
+      imageRequests.current.clear();
+      imageCache.current.clear();
     };
   }, []);
 
@@ -210,6 +229,23 @@ export function useBackground(): BackgroundState & BackgroundActions {
     contentRequests.current.set(request.id, result => { clearTimeout(timer); resolve(result); });
     portRef.current.postMessage(request);
   });
+  const loadWorkspaceImage = useCallback<BackgroundActions["loadWorkspaceImage"]>((sessionId, path) => {
+    const key = `${sessionId}\n${path}`;
+    const cached = imageCache.current.get(key);
+    if (cached) return cached;
+    const request = new Promise<WorkspaceImageLoad>((resolve) => {
+      if (!portRef.current) { resolve({ ok: false, reason: "unavailable" }); return; }
+      const id = crypto.randomUUID();
+      const timer = setTimeout(() => { imageRequests.current.delete(id); resolve({ ok: false, reason: "unavailable" }); }, 15_000);
+      imageRequests.current.set(id, (reply) => { clearTimeout(timer); resolve(reply); });
+      portRef.current.postMessage({ v: 1, id, type: "workspace.image", sessionId, path } satisfies SidebarCommand);
+    });
+    imageCache.current.set(key, request);
+    while (imageCache.current.size > WORKSPACE_IMAGE_CACHE) imageCache.current.delete(imageCache.current.keys().next().value!);
+    // Only images are kept: a file that is missing now may be saved later.
+    void request.then((reply) => { if (!reply.ok && imageCache.current.get(key) === request) imageCache.current.delete(key); });
+    return request;
+  }, []);
   const listMcpContent: BackgroundActions["listMcpContent"] = async kind => {
     const result = await requestContent({ v: 1, id: crypto.randomUUID(), type: "mcp.content.list", kind, sessionId: conversationIdRef.current });
     if (!result.ok) throw new Error(result.error.message);
@@ -353,7 +389,7 @@ export function useBackground(): BackgroundState & BackgroundActions {
     ...state, sendPrompt, steer, removeQueued, sendQueued, retryRun, cancelRun, approveAction, denyAction, resolveHelp, newChat, listSessions, openSession, renameSession, pinSession,
     listMcpContent, prepareMcpContent, dismissMcpContent,
     dismissAsk: (askId: string) => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "ask.dismiss", askId } satisfies SidebarCommand),
-    deleteSession, downloadContext, rememberSite, saveSiteNote, closeSiteNote, undoMemory, listTabs, listSkills: () => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "skills.list" } satisfies SidebarCommand), focusTab, closeAgentTabs, watchTab, unwatchTab, takeOverTab, saveSettings,
+    deleteSession, downloadContext, rememberSite, saveSiteNote, closeSiteNote, undoMemory, loadWorkspaceImage, listTabs, listSkills: () => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "skills.list" } satisfies SidebarCommand), focusTab, closeAgentTabs, watchTab, unwatchTab, takeOverTab, saveSettings,
   };
 }
 

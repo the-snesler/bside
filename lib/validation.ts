@@ -258,6 +258,12 @@ export const WORKSPACE_BINARY_TYPES: Readonly<Record<string, string>> = {
 /** Binary types the model can look at with `fs.view`. */
 export const VIEWABLE_IMAGE_TYPES: readonly string[] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
+/** A file name whose extension makes it an image (not a PDF or text file). */
+export function isViewableImagePath(name: string): boolean {
+  const type = binaryTypeFor(name);
+  return type !== null && VIEWABLE_IMAGE_TYPES.includes(type);
+}
+
 /** The binary type a file name's extension stands for, or null for a text file. */
 export function binaryTypeFor(name: string): string | null {
   const dot = name.lastIndexOf(".");

@@ -26,10 +26,10 @@ export interface SidebarHubDelegate {
   getSnapshot(): Promise<RuntimeSnapshot>;
   releaseContentOwner?(owner: object): void;
   handleCommand(command: SidebarCommand, owner?: object): Promise<{ markdown: string; filename: string } | { tabs: TabMention[] } | { skills: SkillSummary[] } | { sessions: ConversationSummary[] } |
-    { origin: string | null; note: SiteNote | null } | { note: SiteNote | null; error: string | null } | { undone: string[]; error: string | null } | { contentReply: import("@/lib/protocol").McpContentReply } | void>;
+    { origin: string | null; note: SiteNote | null } | { note: SiteNote | null; error: string | null } | { undone: string[]; error: string | null } | { contentReply: import("@/lib/protocol").McpContentReply } | { workspaceImage: import("@/lib/protocol").WorkspaceImageReply } | void>;
 }
 
-type RunEvent = Exclude<SidebarEvent, { type: "mcp.content.reply" | "mcp.content.accepted" | "state.snapshot" | "page.attached" | "agent-tabs.changed" | "queue.changed" | "ask.changed" | "composer.focus" | "context.exported" | "tabs.listed" | "skills.listed" | "session.listed" | "siteNote.loaded" | "siteNote.saved" | "memory.undone" }>;
+type RunEvent = Exclude<SidebarEvent, { type: "mcp.content.reply" | "mcp.content.accepted" | "state.snapshot" | "page.attached" | "agent-tabs.changed" | "queue.changed" | "ask.changed" | "composer.focus" | "context.exported" | "tabs.listed" | "skills.listed" | "session.listed" | "siteNote.loaded" | "siteNote.saved" | "memory.undone" | "workspace.image.loaded" }>;
 
 export class SidebarHub {
   delegate: SidebarHubDelegate | null = null;
@@ -194,6 +194,9 @@ export class SidebarHub {
     } satisfies SidebarEvent);
     if (message.type === "memory.undo" && result && "undone" in result) port.postMessage({
       v: 1, type: "memory.undone", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: { requestId: message.id, ...result },
+    } satisfies SidebarEvent);
+    if (message.type === "workspace.image" && result && "workspaceImage" in result) port.postMessage({
+      v: 1, type: "workspace.image.loaded", runId: null, conversationId: message.sessionId, seq: this.#lastSeq, at: Date.now(), payload: { requestId: message.id, result: result.workspaceImage },
     } satisfies SidebarEvent);
     if (message.type === "context.export" && result && "markdown" in result) port.postMessage({
       v: 1, type: "context.exported", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(),

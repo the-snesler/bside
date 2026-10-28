@@ -34,7 +34,7 @@ import { MAX_HELP_NOTE_CHARS } from "@/lib/domain/tools";
 import { findMcpServer } from "@/lib/mcp/servers";
 import { mcpServerIcon } from "@/lib/ui/mcp-icons";
 import type { AgentTabSummary, ApprovalRequest, HelpOutcome, HelpRequest } from "@/lib/protocol";
-import { Markdown } from "@/lib/ui/Markdown";
+import { Markdown, type MarkdownImages } from "@/lib/ui/Markdown";
 import { McpContentChip } from "@/lib/ui/McpContentChip";
 import { AskChip } from "@/lib/ui/AskChip";
 import { Mascot, type MascotMood } from "@/lib/ui/Mascot";
@@ -332,6 +332,8 @@ export function TurnTrace(props: {
   agentTabs?: readonly AgentTabSummary[];
   onShowTab?: (tabId: number) => void;
   onResolveHelp?: (callId: string, outcome: HelpOutcome, note: string) => void;
+  /** Where the chat's `/workspace` images shown in its messages come from. */
+  images?: MarkdownImages;
 }) {
   const { turn, active, pendingApproval } = props;
   const pendingHelp = props.pendingHelp ?? null;
@@ -400,7 +402,7 @@ export function TurnTrace(props: {
               </div>
             ) : (
               <div key={group.id} class="trace__message">
-                <Markdown text={group.text} />
+                <Markdown text={group.text} images={props.images} />
               </div>
             ),
           )}

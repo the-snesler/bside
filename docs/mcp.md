@@ -133,4 +133,3 @@ The Connections page (Settings › Agent › Connections) lists the directory wi
 - **More directory servers** (Linear, GitHub, Atlassian, Google) will be added by demand, each with its own CSP review.
 - **The native-messaging bridge** for local stdio servers, and bside as an MCP server, are out of this cycle.
 - **OpenAI-hosted MCP** (`type: "mcp"`) is not planned: OpenAI would hold the user's server credentials.
-- **Live verification.** No Notion or Todoist account was available while building this. Discovery and metadata were checked against the live servers, but registration, consent, token exchange, revocation, tool calls, prompts, and resources were tested only against fakes (`tests/helpers/mcp-server.ts`). The Connections page and composer were tested in happy-dom. Native Firefox sidebar/options verification remains pending; this environment has no Firefox executable.

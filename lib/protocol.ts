@@ -36,7 +36,7 @@ import { isCustomInstructionsText, isSiteNote, isSiteOrigin, type SiteNote } fro
 import { isMemoryDraft, isMemoryName, MEMORY_WRITE_POLICIES, type MemoryApproval, type MemoryChange, type MemoryDraft, type MemoryEntry, type MemorySettingsV1 } from "@/lib/domain/memory";
 import { isMcpToolName, MCP_TRUST_LEVELS, type McpApproval, type McpServerStatus, type McpTrust } from "@/lib/domain/mcp";
 import { isMcpServerId } from "@/lib/mcp/servers";
-import { isSessionId, MAX_SESSION_TITLE_LEN, validateDomAction, validateElementTarget, validateHttpUrl } from "@/lib/validation";
+import { isSessionId, isViewableImagePath, isWorkspacePath, MAX_SESSION_TITLE_LEN, validateDomAction, validateElementTarget, validateHttpUrl } from "@/lib/validation";
 import type { AskContextV1 } from "@/lib/domain/ask";
 import { isTaskDraft, isTaskId, type TaskDraft, type ScheduledTask, type ScheduledSource, type NotificationSettingsV1 } from "@/lib/domain/automation";
 
@@ -547,6 +547,12 @@ export type SidebarCommand =
    * requesting sidebar only.
    */
   | { v: 1; id: string; type: "memory.undo"; changeIds: string[] }
+  /**
+   * Reads one of the open session's `/workspace` images so the sidebar can show
+   * it where model Markdown references it. Not a run effect and never sent to
+   * the model. Answered with `workspace.image.loaded` to the requesting sidebar only.
+   */
+  | { v: 1; id: string; type: "workspace.image"; sessionId: string; path: string }
   /** Exports one session with its scratch files; run diagnostics, model input, and tool output are included only for the latest run's session. Answered with `context.exported` to the requesting sidebar only. */
   | { v: 1; id: string; type: "context.export"; sessionId: string }
   | { v: 1; id: string; type: "state.subscribe"; lastSeq: number | null }
@@ -601,6 +607,11 @@ export type McpContentReply =
   | { ok: false; error: NormalizedError };
 
 export type HelpOutcome = "done" | "unable";
+
+/** A `/workspace` image's base64 bytes, or why there are none (another session, no such image file). */
+export type WorkspaceImageReply =
+  | { ok: true; mimeType: string; data: string }
+  | { ok: false; reason: "session" | "missing" };
 
 const isAskId = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 64;
 const isContentIds = (value: unknown): value is string[] => Array.isArray(value) && value.length <= MCP_CONTENT_LIMITS.attachments && value.every(isAskId) && new Set(value).size === value.length;
@@ -684,6 +695,7 @@ export type SidebarEvent =
   | EventBase<"siteNote.saved", { requestId: string; note: SiteNote | null; error: string | null }>
   /** The change ids undone, and a safe `error` for any that were not. */
   | EventBase<"memory.undone", { requestId: string; undone: string[]; error: string | null }>
+  | EventBase<"workspace.image.loaded", { requestId: string; result: WorkspaceImageReply }>
   | EventBase<"state.snapshot", RuntimeSnapshot>
   | EventBase<"session.listed", { sessions: ConversationSummary[] }>
   | EventBase<"page.attached", AttachedPage | null>
@@ -730,6 +742,7 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
     return Array.isArray(candidate.changeIds) && candidate.changeIds.length > 0 && candidate.changeIds.length <= 64 &&
       candidate.changeIds.every((id) => typeof id === "string" && id.length > 0 && id.length <= 64);
   }
+  if (candidate.type === "workspace.image") return isSessionId(candidate.sessionId) && isWorkspacePath(candidate.path) && isViewableImagePath(candidate.path);
   if (candidate.type === "context.export") return isSessionId(candidate.sessionId);
   if (candidate.type === "session.create" || candidate.type === "session.list") return true;
   if (candidate.type === "session.open") return isSessionId(candidate.sessionId);

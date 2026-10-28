@@ -1,6 +1,6 @@
 import { McpContentChip } from "@/lib/ui/McpContentChip";
 import { Fragment } from "preact";
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import History from "~icons/tabler/history";
 import Settings from "~icons/tabler/settings";
 import MessagePlus from "~icons/tabler/message-plus";
@@ -86,6 +86,7 @@ export function App() {
     closeSiteNote,
     memoryUndo,
     undoMemory,
+    loadWorkspaceImage,
     ask,
     dismissAsk,
     focusVersion,
@@ -112,6 +113,7 @@ export function App() {
     provider.models.find((model) => model.id === settings.modelId) ??
     provider.models[0];
   const turns = buildTurns(conversation.items, runHere);
+  const images = useMemo(() => ({ sessionId: conversation.id, load: loadWorkspaceImage }), [conversation.id, loadWorkspaceImage]);
   const pendingApproval = runHere ? activeRun.pendingApproval : null;
   const pendingHelp = runHere ? activeRun.pendingHelp : null;
 
@@ -233,7 +235,7 @@ export function App() {
                               <p class="summary-marker__note">
                                 bside now sees this summary instead of the turns above. They stay here and in exports.
                               </p>
-                              <Markdown text={turn.summary} />
+                              <Markdown text={turn.summary} images={images} />
                             </details>
                           </li>
                         )}
@@ -276,6 +278,7 @@ export function App() {
                               agentTabs={chatAgentTabs}
                               onShowTab={watchTab}
                               onResolveHelp={resolveHelp}
+                              images={images}
                             />
                           </li>
                         )}
@@ -290,7 +293,7 @@ export function App() {
                         )}
                         {turn.answer && (
                           <li class="timeline__item timeline__item--assistant">
-                            <Markdown text={turn.answer.text} />
+                            <Markdown text={turn.answer.text} images={images} />
                           </li>
                         )}
                         {usage && (
@@ -303,7 +306,7 @@ export function App() {
                   })}
                   {runHere && activeRun.partialAssistantText && (
                     <li class="timeline__item timeline__item--assistant timeline__item--streaming">
-                      <Markdown text={activeRun.partialAssistantText} />
+                      <Markdown text={activeRun.partialAssistantText} images={images} />
                     </li>
                   )}
                 </ul>

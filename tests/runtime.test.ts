@@ -18,7 +18,7 @@ import {
   saveOpenAICredential, appendConversationItem, createSession, ensureOpenSession, getConversation, getOpenAICredential, getOpenSessionId,
   listSessions, loadMessageQueue, saveHistorySettings, saveMessageQueue, saveRunCheckpoint, setOpenSessionId, updateSession,
   getAppSettings, saveAppSettings, getSiteNotes, getRunCheckpoint,
-  getScheduledTasks, getNotificationSettings, saveNotificationSettings,
+  getScheduledTasks, getNotificationSettings, saveNotificationSettings, workspaceStore,
 } from "@/lib/storage";
 import type { ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
 import { isTurnStart } from "@/lib/domain/conversation";
@@ -416,6 +416,34 @@ describe("BackgroundRuntime: memory", () => {
     expect(asking.received.find((event) => event.type === "memory.undone")?.payload).toEqual({ requestId: "undo", undone: [change.id], error: null });
     expect(other.received.some((event) => event.type === "memory.undone")).toBe(false);
     expect(await listMemories()).toEqual([]);
+  });
+
+  it("reads the open session's workspace images for the requesting sidebar only", async () => {
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const sessionId = (await runtime.getSnapshot()).conversation.id;
+    const store = workspaceStore(sessionId);
+    await store.write({ slot: 0, path: "/workspace/shot.png", kind: "binary", mimeType: "image/png", data: "iVBORw0KGgo=", bytes: 8 });
+    await store.write({ slot: 1, path: "/workspace/doc.pdf", kind: "binary", mimeType: "application/pdf", data: "JVBERi0=", bytes: 5 });
+    await store.write({ slot: 2, path: "/workspace/notes.png.md", kind: "text", content: "hi" });
+    const image = (path: string, session = sessionId) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), type: "workspace.image", sessionId: session, path });
+    expect(await image("/workspace/shot.png")).toEqual({ workspaceImage: { ok: true, mimeType: "image/png", data: "iVBORw0KGgo=" } });
+    expect(await image("/workspace/gone.png")).toEqual({ workspaceImage: { ok: false, reason: "missing" } });
+    expect(await image("/workspace/shot.png", "another-session")).toEqual({ workspaceImage: { ok: false, reason: "session" } });
+
+    const [asking, other] = [fakePort(), fakePort()];
+    hub.handleConnect(asking);
+    hub.handleConnect(other);
+    await asking.send({ v: 1, id: "img", type: "workspace.image", sessionId, path: "/workspace/shot.png" });
+    for (const path of ["/workspace/doc.pdf", "/workspace/notes.png.md", "/workspace/../shot.png", "https://example.com/a.png"]) {
+      await asking.send({ v: 1, id: path, type: "workspace.image", sessionId, path });
+    }
+    await vi.waitFor(() => expect(asking.received.filter((event) => event.type === "workspace.image.loaded")).toHaveLength(1));
+    expect(asking.received.find((event) => event.type === "workspace.image.loaded")?.payload).toEqual({
+      requestId: "img", result: { ok: true, mimeType: "image/png", data: "iVBORw0KGgo=" },
+    });
+    expect(other.received.some((event) => event.type === "workspace.image.loaded")).toBe(false);
   });
 });
 

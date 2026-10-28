@@ -74,7 +74,7 @@ import {
   deleteOpenAICredential as deleteStoredCredential,
 } from "@/lib/storage";
 import type { RunStatus } from "@/lib/storage";
-import { validatePromptText, validateSessionTitle } from "@/lib/validation";
+import { validatePromptText, validateSessionTitle, VIEWABLE_IMAGE_TYPES } from "@/lib/validation";
 import type { ContextArtifact } from "@/lib/domain/tools";
 import type { Conversation, ConversationItem, ConversationSummary, QueuedMessage, UserMessageItem } from "@/lib/domain/conversation";
 import { isTurnStart, MAX_QUEUED_MESSAGES, PROMPT_MENTION_PATTERN, retentionCutoff } from "@/lib/domain/conversation";
@@ -762,6 +762,14 @@ export class BackgroundRuntime {
     }
     if (command.type === "siteNote.save") return saveSiteNoteFromSidebar(command.note);
     if (command.type === "memory.undo") return undoMemoryChanges(command.changeIds);
+    if (command.type === "workspace.image") {
+      // Only the open session's files, as the sidebar shows them; a read, never a run effect.
+      if (command.sessionId !== await this.#openSession()) return { workspaceImage: { ok: false, reason: "session" } };
+      const file = (await loadWorkspaceFiles(command.sessionId)).find((entry) => entry.path === command.path);
+      return { workspaceImage: file?.kind === "binary" && VIEWABLE_IMAGE_TYPES.includes(file.mimeType)
+        ? { ok: true, mimeType: file.mimeType, data: file.data }
+        : { ok: false, reason: "missing" } };
+    }
     if (command.type === "session.list") return { sessions: await listSessions() };
     if (command.type === "session.create" || command.type === "session.open" || command.type === "session.delete" ||
       command.type === "session.rename" || command.type === "session.pin") {
