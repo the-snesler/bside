@@ -1344,7 +1344,7 @@ describe("BackgroundRuntime: a run that throws outside its agent loop", () => {
 
     const runEvents = port.received.filter((event) => event.runId !== null);
     expect(runEvents.map((event) => [event.type, event.seq])).toEqual([["run.failed", 1]]);
-    expect(runEvents[0]).toMatchObject({ conversationId: (await openConversation()).id, payload: { code: "PROTOCOL_ERROR", retryable: false } });
+    expect(runEvents[0]).toMatchObject({ conversationId: await ensureOpenSession(), payload: { code: "PROTOCOL_ERROR", retryable: false } });
     expect(spy).toHaveBeenCalledTimes(2);
     expect(provider.requests).toHaveLength(0);
   });
