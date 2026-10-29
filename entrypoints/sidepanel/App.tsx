@@ -475,9 +475,8 @@ export function App() {
               <PermissionModeSelect mode={permissionMode} onChange={savePermissionMode} />
               <select
                 aria-label="Model"
-                title="Model"
+                title={runHere ? "Model: applies from your next message; the running turn keeps its own" : "Model"}
                 value={settings.modelId}
-                disabled={runHere}
                 onChange={(event) => {
                   const next = provider.models.find(
                     (candidate) => candidate.id === event.currentTarget.value,
@@ -501,9 +500,8 @@ export function App() {
               </select>
               <select
                 aria-label="Reasoning effort"
-                title="Reasoning effort"
+                title={runHere ? "Reasoning effort: applies from your next message; the running turn keeps its own" : "Reasoning effort"}
                 value={settings.reasoningEffort}
-                disabled={runHere}
                 onChange={(event) =>
                   saveSettings({
                     ...settings,

@@ -2581,6 +2581,54 @@ describe("BackgroundRuntime: watching an agent tab", () => {
     expect(badge.pending).toBe(false);
   });
 
+  it("keeps ! on while two overlapping runs wait, routing the toolbar to the longest-waiting one until both resolve", async () => {
+    const { badge, texts } = helpBadge();
+    const { send, runtime, provider } = await setup([], [], undefined, badge);
+    // Rounds in request order: A asks for help, B asks for confirmation, then A and B answer.
+    scripted(provider, [
+      [{ type: "tool.call", call: { id: "help_1", name: "request_user_help", arguments: { tab: "/agent-tabs/5/page.md", kind: "login", reason: "Sign in to Grocer." } } }, { type: "turn.completed", replayState: null }],
+      [{ type: "tool.call", call: { id: "confirm", name: "request_action_confirmation", arguments: { title: "Send", message: "Send it?", artifact: "Draft" } } }, { type: "turn.completed", replayState: null }],
+      [{ type: "text.delta", delta: "A done." }, { type: "turn.completed", replayState: null }],
+      [{ type: "text.delta", delta: "B done." }, { type: "turn.completed", replayState: null }],
+    ]);
+    const runIn = async (sessionId: string) => (await runtime.getSnapshot()).runs.find((run) => run.conversationId === sessionId);
+    const runA = send({ type: "run.start", prompt: "Order my groceries" });
+    await vi.waitFor(async () => expect((await runIn(owner))?.status).toBe("awaiting-help"));
+    const a = (await runIn(owner))!.runId;
+    await send({ type: "session.create" });
+    const other = (await getOpenSessionId())!;
+    expect(other).not.toBe(owner);
+    const runB = send({ type: "run.start", prompt: "Send the draft" });
+    await vi.waitFor(async () => expect((await runIn(other))?.status).toBe("awaiting-approval"));
+    const b = (await runIn(other))!.runId;
+    expect(badge.waitingRuns()).toEqual([a, b]);
+    expect(texts.at(-1)).toBe("!");
+
+    // The toolbar opens the chat that has waited longest: A's, though B's chat is on screen.
+    await runtime.openAttentionSession();
+    expect(await getOpenSessionId()).toBe(owner);
+
+    // Resolving A leaves B waiting: ! stays, and the toolbar now routes to B.
+    await send({ type: "help.resolve", runId: a, callId: "help_1", outcome: "done", note: "" });
+    await runA;
+    expect(await runIn(owner)).toBeUndefined();
+    expect(badge.waitingRuns()).toEqual([b]);
+    expect(badge.pending).toBe(true);
+    expect(texts.at(-1)).toBe("!");
+    await runtime.openAttentionSession();
+    expect(await getOpenSessionId()).toBe(other);
+
+    // Resolving B as well clears it.
+    await send({ type: "action.approve", runId: b, callId: "confirm" });
+    await runB;
+    expect(badge.waitingRuns()).toEqual([]);
+    expect(badge.pending).toBe(false);
+    expect(texts.at(-1)).toBe("");
+    expect((await runtime.getSnapshot()).runs).toEqual([]);
+    expect((await getConversation(owner))!.items.findLast((item) => item.kind === "message")).toMatchObject({ role: "assistant", text: "A done." });
+    expect((await getConversation(other))!.items.findLast((item) => item.kind === "message")).toMatchObject({ role: "assistant", text: "B done." });
+  });
+
   it("ignores a help answer for another call or run, and passes on the user's note", async () => {
     const { send, runtime, provider } = await setup();
     helpRun(provider, "5");

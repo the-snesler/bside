@@ -656,10 +656,12 @@ describe("sidebar UI contracts", () => {
     expect(root.querySelector('.queue__item [aria-label="Send now"]')).not.toBeNull();
     expect(root.querySelector(".sidebar__error")?.textContent).toContain("Rate limited.");
     expect(root.querySelector<HTMLSelectElement>('select[aria-label="Model"]')!.disabled).toBe(false);
-    // This chat's own run clears its failure and holds the model selects.
+    // This chat's own run clears its failure; the model selects stay usable for its next message.
     await emit({ runId: "r3", conversationId: "a", type: "run.started", payload: { prompt: "Again", page: null, ask: null, retry: false } });
     expect(root.querySelector(".sidebar__error")).toBeNull();
-    expect(root.querySelector<HTMLSelectElement>('select[aria-label="Model"]')!.disabled).toBe(true);
+    const modelSelect = root.querySelector<HTMLSelectElement>('select[aria-label="Model"]')!;
+    expect(modelSelect.disabled).toBe(false);
+    expect(modelSelect.title).toContain("applies from your next message");
     expect(composer.props).toMatchObject({ disabled: false, running: true, working: true });
     render(null, root);
   });
