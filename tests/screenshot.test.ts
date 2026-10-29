@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { FULL_PAGE_MAX_CSS, SCREENSHOT_MAX_BYTES, SCREENSHOT_MAX_DIMENSION, TabController } from "@/lib/background/tab-controller";
+import { FULL_PAGE_MAX_CSS, SCREENSHOT_MAX_BYTES, SCREENSHOT_MAX_DIMENSION, TabController, VisibilityLock } from "@/lib/background/tab-controller";
 import type { CaptureOptions, TabControllerBrowserApi, TabSnapshot } from "@/lib/background/tab-controller";
 import type { CaptureGeometry } from "@/lib/domain/tools";
 import type { PageResponse } from "@/lib/protocol";
@@ -148,5 +148,50 @@ describe("TabController.screenshot", () => {
   it("rejects an unreadable capture", async () => {
     const { controller } = setup({ capture: async () => "data:text/html;base64,PGI+" });
     expect(await (await controller()).screenshot(VIEWPORT)).toMatchObject({ ok: false, error: { code: "TAB_CHANGED" } });
+  });
+
+  it("lets one run at a time show a hidden tab for a capture, across controllers sharing the visibility lock", async () => {
+    const log: string[] = [];
+    const tabs: TabSnapshot[] = [7, 8].map((id) => ({ id, url: `https://example.com/${id}`, title: "Example", hidden: true }));
+    const shown = new Set<number>();
+    let mostShown = 0;
+    const api: TabControllerBrowserApi = {
+      tabs: {
+        query: vi.fn(async () => tabs),
+        update: vi.fn(async () => {}),
+        goBack: vi.fn(async () => {}),
+        show: vi.fn(async (tabId: number) => {
+          log.push(`show ${tabId}`);
+          tabs.find((tab) => tab.id === tabId)!.hidden = false;
+          shown.add(tabId);
+          mostShown = Math.max(mostShown, shown.size);
+        }),
+        hide: vi.fn(async (tabId: number) => {
+          log.push(`hide ${tabId}`);
+          tabs.find((tab) => tab.id === tabId)!.hidden = true;
+          shown.delete(tabId);
+          return [tabId];
+        }),
+        // A hidden tab never paints; a shown one takes a moment.
+        captureTab: vi.fn(async (tabId: number) => {
+          if (tabs.find((tab) => tab.id === tabId)!.hidden) throw new Error("no paint");
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          return jpeg();
+        }),
+        sendMessage: vi.fn(async (tabId: number, message: unknown) => {
+          const request = message as { id: string; type: string };
+          if (request.type === "page.capture-prepare") return { v: 1, id: request.id, ok: true, type: "page.capture-prepare", geometry: { ...GEOMETRY, url: `https://example.com/${tabId}` } };
+          return { v: 1, id: request.id, ok: true, type: "page.capture-done" };
+        }),
+        onUpdated: { addListener: () => {}, removeListener: () => {} },
+      },
+    };
+    const visibility = new VisibilityLock();
+    const [a, b] = await Promise.all([7, 8].map((id) => new TabController(api, async () => false, undefined, undefined, visibility).forTab(id)));
+    const outcomes = await Promise.all([a!.screenshot(VIEWPORT), b!.screenshot(VIEWPORT)]);
+    expect(outcomes.map((outcome) => outcome.ok)).toEqual([true, true]);
+    expect(mostShown).toBe(1);
+    expect(log).toEqual(["show 7", "hide 7", "show 8", "hide 8"]);
+    expect(tabs.every((tab) => tab.hidden)).toBe(true);
   });
 });
