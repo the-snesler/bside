@@ -70,7 +70,7 @@ import {
   getOpenAICredential,
   migrateCredentials,
   clearChatGPTSignInNotice,
-  recoverInterruptedRun,
+  recoverInterruptedRuns,
   saveAppSettings,
   saveOpenAICredential,
   saveRunCheckpoint,
@@ -187,6 +187,16 @@ interface ActiveRun {
   usage: RunUsageV1 | null;
   lastCheckpointAt: number;
   diagnostics: RunDiagnostics;
+  /** When the slot was claimed; the duration of a run that ended before its agent loop counts from here. */
+  claimedAt: number;
+  /** The sidebar hub's run buffer was started for this run, so a terminal event must follow. */
+  announced: boolean;
+  /** The turn's user message is persisted (a retry's already was), so the run's digest and usage belong after it. */
+  turnPersisted: boolean;
+  /** The terminal event that was (or is being) published; set once, before publishing. */
+  outcome: "completed" | "cancelled" | "failed" | null;
+  /** Set when `#endRun` starts: the run writes no more checkpoints, and it ends only once. */
+  ended: boolean;
 }
 
 interface AskAcceptance {
@@ -361,10 +371,13 @@ export class BackgroundRuntime {
       getPermissionSettings().then((settings) => { this.#permissionMode = settings.mode; }),
       migrateConversation()
         .catch(() => console.warn("[bside] Could not migrate the saved conversation; will retry at next startup."))
-        .then(() => recoverInterruptedRun())
-        .then(async (sessionId) => {
-          if (!sessionId) return;
-          this.#retryable.set(sessionId, { hadPageEffect: lastTurnMayHaveCommitted((await getConversation(sessionId))?.items ?? []) });
+        .then(() => recoverInterruptedRuns())
+        .then(async (recovered) => {
+          // Each interrupted run's session may retry its turn, unless that attempt may have committed an effect.
+          for (const { sessionId } of recovered) {
+            const items = await getConversation(sessionId).then((conversation) => conversation?.items ?? []).catch(() => null);
+            if (items) this.#retryable.set(sessionId, { hadPageEffect: lastTurnMayHaveCommitted(items) });
+          }
         })
         .finally(() => this.#openSession())
         .finally(() => restored.catch(() => {}))
@@ -1269,27 +1282,11 @@ export class BackgroundRuntime {
         if (this.#disposed) return { status: "unavailable" };
         // #startRun claims the run's slot synchronously. Do not hold the
         // scheduler/session lock for the provider request or a user pause.
-        void this.#startRun(sessionId, task.prompt, undefined, { scheduled, runId }).catch(async () => {
+        // #startRun ends its own run on any exception; this only covers one
+        // that escapes before it does.
+        void this.#startRun(sessionId, task.prompt, undefined, { scheduled, runId }).catch(async (error: unknown) => {
           const run = this.#run(runId);
-          if (!run) return;
-          run.status = "cancelling";
-          run.controller.abort();
-          this.#approvalBadge?.set(false);
-          void this.#notifications?.clearRun(runId);
-          await clearRunCheckpoint().catch(() => {});
-          const error: NormalizedError = { code: "PROTOCOL_ERROR", message: "The scheduled run stopped unexpectedly. Its earlier actions may have taken effect.", retryable: false, phase: "persistence" };
-          await appendConversationItem(sessionId, { id: crypto.randomUUID(), kind: "run-digest", digest: { version: 1, status: "failed", error: error.message, entries: [], omittedEntries: 0 }, at: this.#clock.now() }).catch(() => {});
-          await touchSession(sessionId, { scheduled }).catch(() => {});
-          this.#sidebarHub.startRun(sessionId);
-          this.#sidebarHub.publishRunEvent(runId, "run.failed", error);
-          await this.#scheduler.updateRun(task.id, runId, "failed").catch(() => {});
-          await this.#syncScheduleBadge();
-          await this.#publishSessions();
-          await this.#settleSteers(sessionId);
-          this.#removeRun(run);
-          this.#refreshShield();
-          void this.#notifications?.finished(runId, sessionId, { scheduled: true, durationMs: 0, status: "failed" });
-          await this.#sidebarHub.broadcastSnapshot();
+          if (run) await this.#abandonRun(run, error);
         });
         return { status: "started", runId, sessionId };
       });
@@ -1560,6 +1557,11 @@ export class BackgroundRuntime {
       usage: null,
       lastCheckpointAt: 0,
       diagnostics: { record: null, latestContext: null, outputs: [], outputChars: 0, outputTruncated: false },
+      claimedAt: this.#clock.now(),
+      announced: false,
+      turnPersisted: retry,
+      outcome: null,
+      ended: false,
     };
     this.#runs.set(runId, run);
 
@@ -1592,6 +1594,8 @@ export class BackgroundRuntime {
       if (retry) run.scheduled = conversation.items.findLast(isTurnStart)?.scheduled;
       controller.signal.throwIfAborted();
     } catch (error) {
+      // Not announced and no checkpoint yet: the run gives up its slot and reports why.
+      run.ended = true;
       this.#removeRun(run);
       await this.#settleSteers(sessionId);
       this.#notice = toNormalizedError(error, "setup").message;
@@ -1609,83 +1613,95 @@ export class BackgroundRuntime {
       return;
     }
 
-    this.#sidebarHub.startRun(sessionId);
-    // A watched tab of this session now says bside is working in it.
-    this.#refreshShield();
+    // From here every exit reaches a terminal state: an exception anywhere
+    // below (capture, persistence, settings, the agent loop, or its own
+    // terminal path) ends the run through `#abandonRun`, which is a no-op once
+    // the run has ended.
+    try {
+      this.#sidebarHub.startRun(sessionId);
+      run.announced = true;
+      // A watched tab of this session now says bside is working in it.
+      this.#refreshShield();
 
-    // The active tab is an agent tab while the user watches one. The run's
-    // own is attached under /agent-tabs; another session's stays invisible to it.
-    const askOwner = ask ? this.#workspace.agentTabs.get(ask.tabId)?.sessionId : undefined;
-    const captureOutcome = run.scheduled ? await this.#captureScheduledPage(tabController, run) : ask
-      ? askOwner && askOwner !== sessionId ? null : await tabController.capturePage(ask.tabId)
-      : await tabController.captureActivePage();
-    const captured = captureOutcome?.ok ? captureOutcome.value : null;
-    const capturedOwner = captured ? this.#workspace.agentTabs.get(captured.snapshot.tabId)?.sessionId : undefined;
-    // Attaching a user's tab is the run's first use of it, so it takes the
-    // lease; one another run holds is left out, and the turn says so.
-    const pageInUse = captured && capturedOwner === undefined && !this.#workspace.acquireLease(captured.snapshot.tabId, runId)
-      ? { tabId: captured.snapshot.tabId } : null;
-    const artifact: ContextArtifact | null = captured && !pageInUse && (capturedOwner === undefined || capturedOwner === sessionId)
-      ? { ...captured.artifact, target: { kind: "tab", tabId: captured.snapshot.tabId, mount: capturedOwner ? "agent-tabs" : "tabs" }, snapshot: captured.snapshot }
-      : null;
+      // The active tab is an agent tab while the user watches one. The run's
+      // own is attached under /agent-tabs; another session's stays invisible to it.
+      const askOwner = ask ? this.#workspace.agentTabs.get(ask.tabId)?.sessionId : undefined;
+      const captureOutcome = run.scheduled ? await this.#captureScheduledPage(tabController, run) : ask
+        ? askOwner && askOwner !== sessionId ? null : await tabController.capturePage(ask.tabId)
+        : await tabController.captureActivePage();
+      const captured = captureOutcome?.ok ? captureOutcome.value : null;
+      const capturedOwner = captured ? this.#workspace.agentTabs.get(captured.snapshot.tabId)?.sessionId : undefined;
+      // Attaching a user's tab is the run's first use of it, so it takes the
+      // lease; one another run holds is left out, and the turn says so.
+      const pageInUse = captured && capturedOwner === undefined && !this.#workspace.acquireLease(captured.snapshot.tabId, runId)
+        ? { tabId: captured.snapshot.tabId } : null;
+      const artifact: ContextArtifact | null = captured && !pageInUse && (capturedOwner === undefined || capturedOwner === sessionId)
+        ? { ...captured.artifact, target: { kind: "tab", tabId: captured.snapshot.tabId, mount: capturedOwner ? "agent-tabs" : "tabs" }, snapshot: captured.snapshot }
+        : null;
 
-    let items = conversation.items;
-    if (!retry) {
-      // Notes for the attached page and mentioned tabs ride on the message as a snapshot, so replay never changes.
-      const sites = matchSiteNotes(personal.siteNotes, [...(artifact ? [artifact.url] : []), ...(ask ? [ask.pageUrl] : []), ...[...prompt!.matchAll(PROMPT_MENTION_PATTERN)].map((match) => match[4]!)]);
-      const item: UserMessageItem = {
-        id: queuedId ?? crypto.randomUUID(),
-        kind: "message",
-        role: "user",
-        text: prompt!,
-        skill,
-        ...(ask ? { ask } : {}),
-        ...(run.scheduled ? { scheduled: run.scheduled } : {}),
-        ...((selection?.content ?? accepted?.content)?.length ? { content: selection?.content ?? accepted?.content } : {}),
-        ...(sites.length ? { sites } : {}),
-        context: artifact ? { artifactId: artifact.artifactId, kind: "page", title: artifact.title, url: artifact.url, capturedAt: artifact.capturedAt } : null,
-        at: Date.now(),
-      };
-      try { await appendConversationItem(sessionId, item); }
-      catch (error) {
-        if (run.scheduled) throw error;
-        this.#removeRun(run);
-        await this.#settleSteers(sessionId);
-        this.#refreshShield();
-        this.#notice = "Could not save this message. Its prepared attachments are still available; try sending again.";
-        await this.#sidebarHub.broadcastSnapshot();
-        return;
+      let items = conversation.items;
+      if (!retry) {
+        // Notes for the attached page and mentioned tabs ride on the message as a snapshot, so replay never changes.
+        const sites = matchSiteNotes(personal.siteNotes, [...(artifact ? [artifact.url] : []), ...(ask ? [ask.pageUrl] : []), ...[...prompt!.matchAll(PROMPT_MENTION_PATTERN)].map((match) => match[4]!)]);
+        const item: UserMessageItem = {
+          id: queuedId ?? crypto.randomUUID(),
+          kind: "message",
+          role: "user",
+          text: prompt!,
+          skill,
+          ...(ask ? { ask } : {}),
+          ...(run.scheduled ? { scheduled: run.scheduled } : {}),
+          ...((selection?.content ?? accepted?.content)?.length ? { content: selection?.content ?? accepted?.content } : {}),
+          ...(sites.length ? { sites } : {}),
+          context: artifact ? { artifactId: artifact.artifactId, kind: "page", title: artifact.title, url: artifact.url, capturedAt: artifact.capturedAt } : null,
+          at: Date.now(),
+        };
+        try { await appendConversationItem(sessionId, item); }
+        catch (error) {
+          if (run.scheduled) throw error;
+          // Nothing of the turn was written or published, so the run just gives up its slot.
+          run.ended = true;
+          this.#removeRun(run);
+          await this.#settleSteers(sessionId);
+          this.#refreshShield();
+          this.#notice = "Could not save this message. Its prepared attachments are still available; try sending again.";
+          await this.#sidebarHub.broadcastSnapshot();
+          return;
+        }
+        selection?.commit();
+        askSelection?.commit();
+        run.turnPersisted = true;
+        items = [...items, item];
+        if (queuedId) await this.#changeQueue(sessionId, queue => {
+          this.#queueClaims.delete(queuedId);
+          return queue.filter(message => message.id !== queuedId);
+        });
       }
-      selection?.commit();
-      askSelection?.commit();
-      items = [...items, item];
-      if (queuedId) await this.#changeQueue(sessionId, queue => {
-        this.#queueClaims.delete(queuedId);
-        return queue.filter(message => message.id !== queuedId);
-      });
-    }
-    const userIndex = items.findLastIndex(isTurnStart);
-    const userItem = items[userIndex] as UserMessageItem;
-    this.#retryable.delete(sessionId);
+      const userIndex = items.findLastIndex(isTurnStart);
+      const userItem = items[userIndex] as UserMessageItem;
+      this.#retryable.delete(sessionId);
 
-    this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt: userItem.text, page: userItem.context, ask: userItem.ask ?? null, content: userItem.content, retry, ...(userItem.scheduled ? { scheduled: userItem.scheduled } : {}) });
-    await this.#writeCheckpoint(run, "running", "");
+      this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt: userItem.text, page: userItem.context, ask: userItem.ask ?? null, content: userItem.content, retry, ...(userItem.scheduled ? { scheduled: userItem.scheduled } : {}) });
+      await this.#writeCheckpoint(run, "running", "");
 
-    // Pi owns assistant/tool replay during this run. Persisted tool items are
-    // display/audit records only; earlier runs reach the model as message
-    // text, run digests, and the latest compaction summary (see AgentLoop).
-    // History ends at this turn's user message: on a retry, the failed
-    // attempt's interim/partial assistant text and digest stay stored but are
-    // not sent, so the model answers the original prompt afresh against a new
-    // page capture. Its page effects are never replayed. A compaction the
-    // failed attempt made is kept, so it is not summarized again, and so are
-    // its delivered steers, which are the user's guidance for this turn.
-    const transcript = [...items.slice(0, userIndex + 1), ...items.slice(userIndex + 1).filter((item) =>
-      item.kind === "compaction" || (item.kind === "message" && item.role === "user"))];
-    for (const item of transcript.slice(userIndex)) {
-      if (item.kind === "message" && item.role === "user" && item.skill) scope.skills.set(item.skill.name, item.skill);
+      // Pi owns assistant/tool replay during this run. Persisted tool items are
+      // display/audit records only; earlier runs reach the model as message
+      // text, run digests, and the latest compaction summary (see AgentLoop).
+      // History ends at this turn's user message: on a retry, the failed
+      // attempt's interim/partial assistant text and digest stay stored but are
+      // not sent, so the model answers the original prompt afresh against a new
+      // page capture. Its page effects are never replayed. A compaction the
+      // failed attempt made is kept, so it is not summarized again, and so are
+      // its delivered steers, which are the user's guidance for this turn.
+      const transcript = [...items.slice(0, userIndex + 1), ...items.slice(userIndex + 1).filter((item) =>
+        item.kind === "compaction" || (item.kind === "message" && item.role === "user"))];
+      for (const item of transcript.slice(userIndex)) {
+        if (item.kind === "message" && item.role === "user" && item.skill) scope.skills.set(item.skill.name, item.skill);
+      }
+      await this.#runAgentLoop(runId, transcript, catalog, personal, artifact, auth, pageInUse);
+    } catch (error) {
+      await this.#abandonRun(run, error);
     }
-    await this.#runAgentLoop(runId, transcript, catalog, personal, artifact, auth, pageInUse);
   }
 
   async #captureScheduledPage(tabs: TabController, run: ActiveRun): Promise<Awaited<ReturnType<TabController["captureActivePage"]>>> {
@@ -1869,21 +1885,11 @@ export class BackgroundRuntime {
       if (digest) await appendConversationItem(run.sessionId, { id: crypto.randomUUID(), kind: "run-digest", digest, at: Date.now() }).catch(() => {});
       if (run.usage) await appendConversationItem(run.sessionId, { id: `usage-${runId}`, kind: "run-usage", usage: run.usage, at: Date.now() }).catch(() => {});
     };
-    const finish = async () => {
-      await clearRunCheckpoint();
-      await touchSession(run.sessionId, { usage: run.usage ?? undefined }).catch(() => {});
-      if (run.scheduled) await this.#scheduler.updateRun(run.scheduled.taskId, runId, result.status).catch(() => {});
-      if (run.scheduled) await this.#syncScheduleBadge();
-      void this.#notifications?.finished(runId, run.sessionId, { scheduled: !!run.scheduled, durationMs: this.#clock.now() - runStartedAt, status: result.status });
-      this.#removeRun(run);
-      this.#refreshShield();
-      // After the run slot is released, so no steer can be accepted for this run any more.
-      await this.#settleSteers(run.sessionId);
-      await this.#publishSessions();
-    };
+    const finish = () => this.#endRun(run, result.status, this.#clock.now() - runStartedAt);
     if (result.status === "completed") {
       const messageId = result.finalMessageId ?? (await this.#persistEmptyFinalMessage(run.sessionId));
       await persistDigestAndUsage();
+      run.outcome = "completed";
       this.#sidebarHub.publishRunEvent(runId, "run.completed", { messageId });
       await finish();
       await this.#dispatchFollowUp(run.sessionId);
@@ -1892,6 +1898,7 @@ export class BackgroundRuntime {
     if (result.status === "cancelled") {
       const messageId = result.partialText ? await this.#persistCancelledMessage(run.sessionId, result.partialText) : null;
       await persistDigestAndUsage();
+      run.outcome = "cancelled";
       this.#sidebarHub.publishRunEvent(runId, "run.cancelled", { partialText: result.partialText, messageId });
       this.#retryable.set(run.sessionId, { hadPageEffect: result.hadPageEffect });
       await finish();
@@ -1903,9 +1910,80 @@ export class BackgroundRuntime {
     // committed a real effect on the page.
     const error: NormalizedError = result.hadPageEffect ? { ...result.error, retryable: false } : result.error;
     await persistDigestAndUsage();
+    run.outcome = "failed";
     this.#sidebarHub.publishRunEvent(runId, "run.failed", error);
     this.#retryable.set(run.sessionId, { hadPageEffect: result.hadPageEffect });
     await finish();
+  }
+
+  /**
+   * The terminal path every announced run takes exactly once, however it
+   * ended: clears its checkpoint, adds its usage to the session total, records
+   * the outcome for its scheduled task and notifications, releases its slot
+   * and tab leases, and turns its undelivered steers into follow-ups. Each
+   * step fails on its own, and the slot is released even if one throws.
+   */
+  async #endRun(run: ActiveRun, status: "completed" | "cancelled" | "failed", durationMs: number): Promise<void> {
+    if (run.ended) return;
+    // Synchronously, so no checkpoint write can be queued behind the clear below.
+    run.ended = true;
+    try {
+      await clearRunCheckpoint(run.runId).catch(() => {});
+      await touchSession(run.sessionId, { usage: run.usage ?? undefined, ...(run.scheduled ? { scheduled: run.scheduled } : {}) }).catch(() => {});
+      if (run.scheduled) {
+        await this.#scheduler.updateRun(run.scheduled.taskId, run.runId, status).catch(() => {});
+        await this.#syncScheduleBadge().catch(() => {});
+      }
+      void this.#notifications?.finished(run.runId, run.sessionId, { scheduled: !!run.scheduled, durationMs, status }).catch(() => {});
+    } finally {
+      this.#removeRun(run);
+      this.#refreshShield();
+    }
+    // After the run slot is released, so no steer can be accepted for this run any more.
+    await this.#settleSteers(run.sessionId).catch(() => {});
+    await this.#publishSessions().catch(() => {});
+  }
+
+  /**
+   * Ends a run that threw before reaching its terminal state (or during its
+   * terminal path): stops it, writes a failed digest and its usage after its
+   * turn, offers retry unless the turn may have committed an effect,
+   * publishes `run.failed` unless a terminal event already went out, and then
+   * takes `#endRun`. A no-op for a run that already ended.
+   */
+  async #abandonRun(run: ActiveRun, error: unknown): Promise<void> {
+    if (run.ended || this.#run(run.runId) !== run) return;
+    if (!run.outcome) {
+      run.outcome = "failed";
+      run.status = "cancelling";
+      run.controller.abort();
+      run.pendingApproval = null;
+      run.pendingHelp = null;
+      this.#approvalBadge?.set([...this.#runs.values()].some((other) => other !== run && (other.pendingApproval || other.pendingHelp)));
+      const failure: NormalizedError = {
+        code: "PROTOCOL_ERROR",
+        message: error instanceof ProviderStreamError ? error.message : "The run stopped unexpectedly. Its earlier actions may have taken effect.",
+        retryable: false,
+        phase: "persistence",
+      };
+      if (run.diagnostics.record) Object.assign(run.diagnostics.record, { endedAt: Date.now(), status: "failed", error: failure });
+      if (run.turnPersisted) {
+        const digest = buildRunDigest(run.agentLoop.digestSteps(), "failed", failure.message)
+          ?? { version: 1, status: "failed", error: failure.message, entries: [], omittedEntries: 0 };
+        await appendConversationItem(run.sessionId, { id: `digest-${run.runId}`, kind: "run-digest", digest, at: Date.now() }).catch(() => {});
+        if (run.usage) await appendConversationItem(run.sessionId, { id: `usage-${run.runId}`, kind: "run-usage", usage: run.usage, at: Date.now() }).catch(() => {});
+        // Effects are not known here, so a turn that started a program or a write is treated as having committed one.
+        const items = await getConversation(run.sessionId).then((conversation) => conversation?.items ?? []).catch(() => null);
+        this.#retryable.set(run.sessionId, { hadPageEffect: items === null || lastTurnMayHaveCommitted(items) });
+      }
+      if (!run.announced) {
+        this.#sidebarHub.startRun(run.sessionId);
+        run.announced = true;
+      }
+      this.#sidebarHub.publishRunEvent(run.runId, "run.failed", failure);
+    }
+    await this.#endRun(run, run.outcome, this.#clock.now() - run.claimedAt);
+    await this.#sidebarHub.broadcastSnapshot().catch(() => {});
   }
 
   /** Restarts the idle period of every agent tab used since `since`, so tabs a long run used are not closed right after it ends. */
@@ -1941,10 +2019,16 @@ export class BackgroundRuntime {
     await this.#writeCheckpoint(run, run.status, run.partialAssistantText);
   }
 
+  /**
+   * Saves the run's own checkpoint. The save is queued synchronously, before
+   * this returns its promise, and never once the run has ended, so a late
+   * write cannot recreate a checkpoint `#endRun` cleared.
+   */
   async #writeCheckpoint(run: ActiveRun, status: RunLifecycleStatus, partialAssistantText: string): Promise<void> {
+    if (run.ended) return;
     const checkpointStatus: RunStatus = status === "cancelling" ? "cancelled" : status;
     await saveRunCheckpoint({
-      version: 2,
+      version: 3,
       runId: run.runId,
       sessionId: run.sessionId,
       status: checkpointStatus,

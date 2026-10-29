@@ -25,7 +25,9 @@ import {
   migrateConversation,
   migrateCredentials,
   pruneSessions,
-  recoverInterruptedRun,
+  listRunCheckpoints,
+  recoverInterruptedRuns,
+  clearRunCheckpoint,
   saveAppSettings,
   saveHistorySettings,
   saveOpenAICredential,
@@ -36,6 +38,7 @@ import {
 } from "@/lib/storage";
 import { titleFromPrompt, type ConversationItem } from "@/lib/domain/conversation";
 import { EMPTY_USAGE, type RunUsageV1 } from "@/lib/domain/usage";
+import type { RunCheckpointV3 } from "@/lib/storage";
 
 const message = (id: string, text = id): ConversationItem => ({ id, kind: "message", role: "assistant", text, at: 1 });
 const prompt = (id: string, text: string): ConversationItem => ({ id, kind: "message", role: "user", text, context: null, at: 1 });
@@ -81,8 +84,9 @@ describe("storage: defaults", () => {
     expect(status).toEqual({ configured: false, maskedSuffix: null });
   });
 
-  it("returns null run checkpoint when nothing is stored", async () => {
-    expect(await getRunCheckpoint()).toBeNull();
+  it("returns no run checkpoints when nothing is stored", async () => {
+    expect(await getRunCheckpoint("r1")).toBeNull();
+    expect(await listRunCheckpoints()).toEqual([]);
   });
 });
 
@@ -114,12 +118,17 @@ describe("storage: malformed-version rejection", () => {
         updatedAt: 1,
       },
     });
-    expect(await getRunCheckpoint()).toBeNull();
+    expect(await listRunCheckpoints()).toEqual([]);
+    expect(await browser.storage.local.get(null)).toEqual({});
   });
 
-  it("discards a run checkpoint with an invalid session id", async () => {
-    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: "../escape", status: "running", partialAssistantText: "", usage: null, lastSeq: 0, updatedAt: 1 });
-    expect(await getRunCheckpoint()).toBeNull();
+  it("refuses to save a run checkpoint with an invalid session or run id, and discards a stored one", async () => {
+    const bad = { version: 3, runId: "r1", sessionId: "../escape", status: "running", partialAssistantText: "", usage: null, lastSeq: 0, updatedAt: 1 } as const;
+    await expect(saveRunCheckpoint(bad)).rejects.toThrow();
+    await expect(saveRunCheckpoint({ ...bad, sessionId: "s1", runId: "../r1" })).rejects.toThrow();
+    await browser.storage.local.set({ "runCheckpoint:r1": bad, runCheckpoints: { version: 1, runIds: ["r1"] } });
+    expect(await getRunCheckpoint("r1")).toBeNull();
+    expect(await browser.storage.local.get(null)).toEqual({ runCheckpoints: { version: 1, runIds: [] } });
   });
 });
 
@@ -637,27 +646,82 @@ describe("storage: legacy conversation migration", () => {
       runCheckpoint: { version: 1, runId: "r0", status: "running", partialAssistantText: "Half", lastSeq: 1, updatedAt: 1 },
     });
     await migrateConversation();
-    expect(await recoverInterruptedRun()).toBe("default");
+    expect(await recoverInterruptedRuns()).toEqual([{ runId: "r0", sessionId: "default" }]);
     expect((await getConversation("default"))?.items.at(-1)).toMatchObject({ id: "interrupted-r0", text: expect.stringContaining("Half") });
   });
 });
 
+describe("storage: per-run checkpoints", () => {
+  const checkpoint = (runId: string, sessionId: string, patch: Partial<RunCheckpointV3> = {}): RunCheckpointV3 =>
+    ({ version: 3, runId, sessionId, status: "running", partialAssistantText: "", usage: null, lastSeq: 1, updatedAt: 10, ...patch });
+
+  it("keeps each run's checkpoint under its own key, so concurrent writes and clears never clobber another run's", async () => {
+    const a = await sessionWith(0);
+    const b = await sessionWith(0);
+    // Interleaved, unawaited writes from two runs, as two live runs checkpoint at once.
+    await Promise.all([
+      saveRunCheckpoint(checkpoint("run-a", a, { partialAssistantText: "A1" })),
+      saveRunCheckpoint(checkpoint("run-b", b, { partialAssistantText: "B1" })),
+      saveRunCheckpoint(checkpoint("run-a", a, { partialAssistantText: "A2" })),
+      saveRunCheckpoint(checkpoint("run-b", b, { partialAssistantText: "B2", status: "awaiting-help" })),
+    ]);
+    expect(await getRunCheckpoint("run-a")).toMatchObject({ sessionId: a, partialAssistantText: "A2" });
+    expect(await getRunCheckpoint("run-b")).toMatchObject({ sessionId: b, partialAssistantText: "B2", status: "awaiting-help" });
+    expect((await listRunCheckpoints()).map((c) => c.runId)).toEqual(["run-a", "run-b"]);
+
+    // One run ending while the other writes leaves the other's intact and indexed.
+    await Promise.all([clearRunCheckpoint("run-a"), saveRunCheckpoint(checkpoint("run-b", b, { partialAssistantText: "B3" }))]);
+    expect(await getRunCheckpoint("run-a")).toBeNull();
+    expect(await listRunCheckpoints()).toEqual([checkpoint("run-b", b, { partialAssistantText: "B3" })]);
+    expect(await browser.storage.local.get("runCheckpoints")).toEqual({ runCheckpoints: { version: 1, runIds: ["run-b"] } });
+  });
+
+  it("migrates the single version 2 record to its run's own record", async () => {
+    const sessionId = await sessionWith(0);
+    const usage = runUsage({ runId: "run-old", input: 5 });
+    await browser.storage.local.set({ runCheckpoint: { ...checkpoint("run-old", sessionId, { usage }), version: 2 }, runCheckpoint$: { v: 2 } });
+    expect(await listRunCheckpoints()).toEqual([checkpoint("run-old", sessionId, { usage })]);
+    const stored = await browser.storage.local.get(null);
+    expect(stored).not.toHaveProperty("runCheckpoint");
+    expect(stored).not.toHaveProperty("runCheckpoint$");
+    expect(stored["runCheckpoint:run-old"]).toEqual(checkpoint("run-old", sessionId, { usage }));
+  });
+
+  it("deletes malformed records, mismatched ids, and dangling index entries, keeping the valid ones", async () => {
+    const sessionId = await sessionWith(0);
+    await saveRunCheckpoint(checkpoint("run-1", sessionId));
+    await saveRunCheckpoint(checkpoint("run-3", sessionId));
+    await browser.storage.local.set({
+      "runCheckpoint:run-2": { version: 3, runId: "run-2", status: "nonsense" },
+      "runCheckpoint:run-4": checkpoint("run-5", sessionId),
+      runCheckpoints: { version: 1, runIds: ["run-1", "run-2", "run-3", "run-4", "run-gone"] },
+    });
+    expect((await listRunCheckpoints()).map((c) => c.runId)).toEqual(["run-1", "run-3"]);
+    const stored = await browser.storage.local.get(null);
+    expect(Object.keys(stored).filter((key) => key.startsWith("runCheckpoint")).toSorted())
+      .toEqual(["runCheckpoint:run-1", "runCheckpoint:run-3", "runCheckpoints"]);
+    expect(stored.runCheckpoints).toEqual({ version: 1, runIds: ["run-1", "run-3"] });
+  });
+
+  it("treats a malformed index as empty and rebuilds it from the next save", async () => {
+    const sessionId = await sessionWith(0);
+    await browser.storage.local.set({ runCheckpoints: { version: 1, runIds: ["../x"] } });
+    expect(await listRunCheckpoints()).toEqual([]);
+    await saveRunCheckpoint(checkpoint("run-1", sessionId));
+    expect(await browser.storage.local.get("runCheckpoints")).toEqual({ runCheckpoints: { version: 1, runIds: ["run-1"] } });
+  });
+});
+
 describe("storage: interrupted run recovery", () => {
+  const checkpoint = (runId: string, sessionId: string, patch: Partial<RunCheckpointV3> = {}): RunCheckpointV3 =>
+    ({ version: 3, runId, sessionId, status: "running", partialAssistantText: "", usage: null, lastSeq: 1, updatedAt: 10, ...patch });
+
   it("converts a checkpoint left running into a visible interrupted assistant message in the run's session", async () => {
     const other = await sessionWith(0);
     const sessionId = await sessionWith(1);
-    await saveRunCheckpoint({
-      version: 2,
-      runId: "run-1",
-      sessionId,
-      status: "running",
-      partialAssistantText: "The page says",
-      usage: null,
-      lastSeq: 3,
-      updatedAt: 10,
-    });
+    await saveRunCheckpoint(checkpoint("run-1", sessionId, { partialAssistantText: "The page says", lastSeq: 3 }));
 
-    expect(await recoverInterruptedRun()).toBe(sessionId);
+    expect(await recoverInterruptedRuns()).toEqual([{ runId: "run-1", sessionId }]);
 
     const conversation = await getConversation(sessionId);
     expect(conversation?.items).toHaveLength(2);
@@ -670,54 +734,91 @@ describe("storage: interrupted run recovery", () => {
     }
     expect((await getConversation(other))?.items).toEqual([]);
     expect((await listSessions()).find((session) => session.id === sessionId)?.itemCount).toBe(2);
-    expect(await getRunCheckpoint()).toBeNull();
+    expect(await listRunCheckpoints()).toEqual([]);
   });
 
-  it("persists the usage an interrupted run had checkpointed and adds it to the session total", async () => {
+  it("recovers every interrupted run into its own session, each with its own digest and usage", async () => {
+    const a = await sessionWith(0);
+    const b = await sessionWith(0);
+    await appendConversationItem(a, prompt("ua", "Read A"));
+    await appendConversationItem(a, { id: "ca", kind: "tool-call", call: { id: "call_a", name: "browser_program", arguments: { source: 'return fs.read("/tabs/1/page.md");' } }, at: 2 });
+    await appendConversationItem(b, prompt("ub", "Read B"));
+    await appendConversationItem(b, { id: "cb", kind: "tool-call", call: { id: "call_b", name: "current_time", arguments: {} }, at: 2 });
+    const usageA = runUsage({ runId: "run-a", input: 400, output: 40, costUsd: 0.001 });
+    const usageB = runUsage({ runId: "run-b", input: 100, output: 10, costUsd: 0.0005 });
+    await saveRunCheckpoint(checkpoint("run-a", a, { usage: usageA, partialAssistantText: "Half of A" }));
+    await saveRunCheckpoint(checkpoint("run-b", b, { usage: usageB, status: "awaiting-approval" }));
+
+    expect(await recoverInterruptedRuns()).toEqual([{ runId: "run-a", sessionId: a }, { runId: "run-b", sessionId: b }]);
+
+    const itemsA = (await getConversation(a))!.items;
+    expect(itemsA.slice(2).map((item) => item.id)).toEqual(["interrupted-run-a", "digest-run-a", "usage-run-a"]);
+    expect(itemsA[2]).toMatchObject({ text: expect.stringContaining("Half of A") });
+    expect(itemsA[3]).toMatchObject({ kind: "run-digest", digest: { status: "interrupted" } });
+    expect(JSON.stringify(itemsA[3])).toContain("/tabs/1/page.md");
+    expect(itemsA[4]).toMatchObject({ kind: "run-usage", usage: usageA });
+    const itemsB = (await getConversation(b))!.items;
+    // B only asked for the time, which no digest records.
+    expect(itemsB.slice(2).map((item) => item.id)).toEqual(["interrupted-run-b", "usage-run-b"]);
+    expect(itemsB[3]).toMatchObject({ kind: "run-usage", usage: usageB });
+    const sessions = await listSessions();
+    expect(sessions.find((s) => s.id === a)?.usage).toMatchObject({ input: 400, output: 40, costUsd: 0.001 });
+    expect(sessions.find((s) => s.id === b)?.usage).toMatchObject({ input: 100, output: 10, costUsd: 0.0005 });
+    expect(await listRunCheckpoints()).toEqual([]);
+  });
+
+  it("is idempotent: recovering a run whose items were already written appends nothing twice and counts usage once", async () => {
     const sessionId = await sessionWith(1);
     const usage = runUsage({ runId: "run-5", input: 400, output: 40, costUsd: 0.001 });
-    await saveRunCheckpoint({ version: 2, runId: "run-5", sessionId, status: "running", partialAssistantText: "", usage, lastSeq: 2, updatedAt: 10 });
-    await recoverInterruptedRun();
-    expect((await getConversation(sessionId))?.items.slice(1).map((item) => item.kind === "run-usage" ? [item.id, item.usage] : item.kind))
-      .toEqual(["message", ["usage-run-5", usage]]);
+    const saved = checkpoint("run-5", sessionId, { usage });
+    await saveRunCheckpoint(saved);
+    await recoverInterruptedRuns();
+    // As if the background died after appending but before clearing the checkpoint.
+    await saveRunCheckpoint(saved);
+    await recoverInterruptedRuns();
+    expect((await getConversation(sessionId))?.items.slice(1).map((item) => item.kind === "run-usage" ? [item.id, item.usage] : item.id))
+      .toEqual(["interrupted-run-5", ["usage-run-5", usage]]);
     expect((await listSessions())[0]?.usage).toMatchObject({ responses: 1, input: 400, output: 40, costUsd: 0.001 });
+    expect(await listRunCheckpoints()).toEqual([]);
   });
 
-  it("converts a checkpoint left awaiting-approval into a visible interrupted message", async () => {
-    const sessionId = await sessionWith(0);
-    await saveRunCheckpoint({
-      version: 2,
-      runId: "run-2",
-      sessionId,
-      status: "awaiting-approval",
-      partialAssistantText: "",
-      usage: null,
-      lastSeq: 1,
-      updatedAt: 10,
+  it("recovers the other runs when one checkpoint is corrupt and one session cannot be written", async () => {
+    const a = await sessionWith(0);
+    const b = await sessionWith(0);
+    const c = await sessionWith(0);
+    await saveRunCheckpoint(checkpoint("run-a", a));
+    await saveRunCheckpoint(checkpoint("run-b", b));
+    await saveRunCheckpoint(checkpoint("run-c", c));
+    await browser.storage.local.set({ "runCheckpoint:run-b": { version: 3, runId: "run-b", sessionId: b, status: 7 } });
+    // Session a's writes fail this time; its checkpoint stays for the next startup.
+    const setItems = browser.storage.local.set.bind(browser.storage.local);
+    const spy = vi.spyOn(browser.storage.local, "set").mockImplementation(async (items) => {
+      if (Object.keys(items).some((key) => key.startsWith(`conversation:${a}`))) throw new Error("quota");
+      return setItems(items);
     });
+    expect(await recoverInterruptedRuns()).toEqual([{ runId: "run-c", sessionId: c }]);
+    spy.mockRestore();
+    expect((await getConversation(c))?.items.map((item) => item.id)).toEqual(["interrupted-run-c"]);
+    expect((await getConversation(b))?.items).toEqual([]);
+    expect((await listRunCheckpoints()).map((saved) => saved.runId)).toEqual(["run-a"]);
 
-    await recoverInterruptedRun();
-
-    expect((await getConversation(sessionId))?.items).toHaveLength(1);
-    expect(await getRunCheckpoint()).toBeNull();
+    expect(await recoverInterruptedRuns()).toEqual([{ runId: "run-a", sessionId: a }]);
+    expect((await getConversation(a))?.items.map((item) => item.id)).toEqual(["interrupted-run-a"]);
   });
 
   it("silently clears a checkpoint that already reached a terminal status, or whose session is gone", async () => {
     const sessionId = await sessionWith(0);
-    for (const checkpoint of [
-      { version: 2, runId: "run-3", sessionId, status: "completed", partialAssistantText: "", usage: null, lastSeq: 1, updatedAt: 10 },
-      { version: 2, runId: "run-4", sessionId: "deleted", status: "running", partialAssistantText: "", usage: null, lastSeq: 1, updatedAt: 10 },
-    ] as const) {
-      await saveRunCheckpoint(checkpoint);
-      expect(await recoverInterruptedRun()).toBeNull();
-      expect(await getRunCheckpoint()).toBeNull();
+    for (const saved of [checkpoint("run-3", sessionId, { status: "completed" }), checkpoint("run-4", "deleted")]) {
+      await saveRunCheckpoint(saved);
+      expect(await recoverInterruptedRuns()).toEqual([]);
+      expect(await listRunCheckpoints()).toEqual([]);
     }
     expect((await getConversation(sessionId))?.items).toEqual([]);
     expect(await getConversation("deleted")).toBeNull();
   });
 
   it("does nothing when there is no checkpoint", async () => {
-    expect(await recoverInterruptedRun()).toBeNull();
+    expect(await recoverInterruptedRuns()).toEqual([]);
     expect(await listSessions()).toEqual([]);
   });
 });

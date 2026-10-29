@@ -18,7 +18,7 @@ import { ProviderStreamError } from "@/lib/providers/openai";
 import {
   saveOpenAICredential, appendConversationItem, createSession, ensureOpenSession, getConversation, getOpenAICredential, getOpenSessionId,
   listSessions, loadMessageQueue, saveHistorySettings, saveMessageQueue, saveRunCheckpoint, setOpenSessionId, updateSession,
-  getAppSettings, saveAppSettings, getSiteNotes, getRunCheckpoint,
+  getAppSettings, saveAppSettings, getSiteNotes, getRunCheckpoint, listRunCheckpoints,
   getScheduledTasks, getNotificationSettings, saveNotificationSettings, workspaceStore,
 } from "@/lib/storage";
 import type { ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
@@ -1177,7 +1177,7 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
     await seed({ id: "u1", kind: "message", role: "user", text: "Click submit", context: null, at: 1 });
     // The checkpoint does not record effects, so a program the interrupted attempt started may have committed one.
     await seed({ id: "c1", kind: "tool-call", call: { id: "call_1", name: "browser_program", arguments: { source: click } }, at: 2 });
-    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
+    await saveRunCheckpoint({ version: 3, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
     const provider = new FakeProvider();
     const { runtime, port } = setup(provider);
     await runtime.initialize();
@@ -1217,7 +1217,7 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
     await saveOpenAICredential("sk-test");
     await seed({ id: "u1", kind: "message", role: "user", text: "Add a task", context: null, at: 1 });
     await seed({ id: "c1", kind: "tool-call", call: { id: "call_1", name: "mcp__todoist__add-tasks", arguments: {}, mcp: { server: "todoist", tool: "add-tasks", readOnly: false } }, at: 2 });
-    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
+    await saveRunCheckpoint({ version: 3, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
     const provider = new FakeProvider();
     const { runtime, port } = setup(provider);
     await runtime.initialize();
@@ -1229,7 +1229,7 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
     await saveOpenAICredential("sk-test");
     await seed({ id: "u1", kind: "message", role: "user", text: "Find my tasks", context: null, at: 1 });
     await seed({ id: "c1", kind: "tool-call", call: { id: "call_1", name: "mcp__todoist__find-tasks", arguments: {}, mcp: { server: "todoist", tool: "find-tasks", readOnly: true } }, at: 2 });
-    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
+    await saveRunCheckpoint({ version: 3, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
     const provider = new FakeProvider();
     const { runtime } = setup(provider);
     await runtime.initialize();
@@ -1240,7 +1240,7 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
   it("keeps a turn retryable across a failed retry that committed no page effect", async () => {
     await saveOpenAICredential("sk-test");
     await seed({ id: "u1", kind: "message", role: "user", text: "Read it", context: null, at: 1 });
-    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
+    await saveRunCheckpoint({ version: 3, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
     const provider = new FakeProvider();
     let round = 0;
     provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
@@ -1254,6 +1254,74 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
     await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
     await runtime.handleCommand({ v: 1, id: "retry-again", type: "run.retry" });
     expect(provider.requests).toHaveLength(2);
+    expect((await openConversation()).items.at(-1)).toMatchObject({ role: "assistant", text: "Done." });
+  });
+
+  it("recovers every interrupted run at startup in its own session, deciding retry per session", async () => {
+    await saveOpenAICredential("sk-test");
+    const clicked = await seed({ id: "u1", kind: "message", role: "user", text: "Click submit", context: null, at: 1 });
+    await seed({ id: "c1", kind: "tool-call", call: { id: "call_1", name: "browser_program", arguments: { source: click } }, at: 2 });
+    const read = (await createSession()).id;
+    await appendConversationItem(read, { id: "u2", kind: "message", role: "user", text: "Find my tasks", context: null, at: 1 });
+    await appendConversationItem(read, { id: "c2", kind: "tool-call", call: { id: "call_2", name: "mcp__todoist__find-tasks", arguments: {}, mcp: { server: "todoist", tool: "find-tasks", readOnly: true } }, at: 2 });
+    const usage = { version: 1 as const, runId: "r2", billing: "api-key" as const, modelId: "gpt-5.6-terra", responses: 1, input: 90, cacheRead: 0, cacheWrite: 0, output: 9, reasoning: 0, costUsd: 0.001 };
+    await saveRunCheckpoint({ version: 3, runId: "r1", sessionId: clicked, status: "running", partialAssistantText: "Clicking", usage: null, lastSeq: 2, updatedAt: 1 });
+    await saveRunCheckpoint({ version: 3, runId: "r2", sessionId: read, status: "awaiting-help", partialAssistantText: "", usage, lastSeq: 3, updatedAt: 1 });
+    const provider = new FakeProvider();
+    const { runtime, port } = setup(provider);
+    await runtime.initialize();
+
+    expect((await getConversation(clicked))?.items.map((item) => item.id)).toEqual(["u1", "c1", "interrupted-r1", "digest-r1"]);
+    expect((await getConversation(read))?.items.map((item) => item.id)).toEqual(["u2", "c2", "interrupted-r2", "digest-r2", "usage-r2"]);
+    expect((await listSessions()).find((session) => session.id === read)?.usage).toMatchObject({ input: 90, output: 9 });
+    expect(await listRunCheckpoints()).toEqual([]);
+
+    // The open session's attempt may have clicked, so it is not retried; the other only read, so it is.
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    refusedRetry(provider, port, 0);
+    await runtime.handleCommand({ v: 1, id: "open", type: "session.open", sessionId: read });
+    await runtime.handleCommand({ v: 1, id: "retry-read", type: "run.retry" });
+    expect(provider.requests).toHaveLength(1);
+  });
+});
+
+describe("BackgroundRuntime: a run that throws outside its agent loop", () => {
+  it("still ends: releases its slot, clears its checkpoint, records a failed digest, and lets the session run again", async () => {
+    await saveOpenAICredential("sk-test");
+    const provider = new FakeProvider();
+    provider.script = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
+    const hub = new SidebarHub();
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+    await runtime.initialize();
+
+    // The run's settings read (in #runAgentLoop, after the user message and checkpoint) fails once.
+    const get = browser.storage.local.get.bind(browser.storage.local);
+    let failed = false;
+    const spy = vi.spyOn(browser.storage.local, "get").mockImplementation(async (keys) => {
+      const wanted = typeof keys === "string" ? [keys] : Array.isArray(keys) ? keys : [];
+      if (!failed && wanted.includes("appSettings")) {
+        failed = true;
+        throw new Error("storage unavailable");
+      }
+      return get(keys as never);
+    });
+    await runtime.handleCommand({ v: 1, id: "first", type: "run.start", prompt: "First" });
+    await vi.waitFor(() => expect(failed).toBe(true));
+    spy.mockRestore();
+
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).activeRun).toBeNull());
+    expect(provider.requests).toHaveLength(0);
+    expect(port.received.filter((event) => event.type === "run.failed")).toHaveLength(1);
+    expect(port.received.find((event) => event.type === "run.failed")?.payload).toMatchObject({ code: "PROTOCOL_ERROR", retryable: false });
+    expect(await listRunCheckpoints()).toEqual([]);
+    expect((await openConversation()).items.map((item) => item.kind === "run-digest" ? `digest:${item.digest.status}` : item.id).at(-1)).toBe("digest:failed");
+
+    // The session (and, while the single-run gate stands, every session) is free again.
+    await runtime.handleCommand({ v: 1, id: "second", type: "run.start", prompt: "Second" });
+    expect(provider.requests).toHaveLength(1);
     expect((await openConversation()).items.at(-1)).toMatchObject({ role: "assistant", text: "Done." });
   });
 });
@@ -1347,7 +1415,7 @@ describe("BackgroundRuntime: approval badge", () => {
     const sessionId = await ensureOpenSession();
     await appendConversationItem(sessionId, { id: "u1", kind: "message", role: "user", text: "Order my groceries", context: null, at: 1 });
     await appendConversationItem(sessionId, { id: "c1", kind: "tool-call", call: { id: "help_1", name: "request_user_help", arguments: { tab: "/agent-tabs/5/page.md", kind: "login", reason: "Sign in." } }, at: 2 });
-    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId, status: "awaiting-help", partialAssistantText: "", usage: null, lastSeq: 3, updatedAt: 1 });
+    await saveRunCheckpoint({ version: 3, runId: "r1", sessionId, status: "awaiting-help", partialAssistantText: "", usage: null, lastSeq: 3, updatedAt: 1 });
     const { badge, texts } = fakeBadge();
     const provider = new FakeProvider();
     provider.script = [{ type: "text.delta", delta: "Retried." }, { type: "turn.completed", replayState: null }];
@@ -1363,7 +1431,7 @@ describe("BackgroundRuntime: approval badge", () => {
   });
 
   it("clears a stale badge at startup while recovering an interrupted approval", async () => {
-    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "awaiting-approval", partialAssistantText: "", usage: null, lastSeq: 3, updatedAt: 1 });
+    await saveRunCheckpoint({ version: 3, runId: "r1", sessionId: await ensureOpenSession(), status: "awaiting-approval", partialAssistantText: "", usage: null, lastSeq: 3, updatedAt: 1 });
     const { badge, texts } = fakeBadge();
     const runtime = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), approvalBadge: badge });
     await runtime.initialize();
@@ -1453,7 +1521,7 @@ describe("BackgroundRuntime: run.retry", () => {
   it("re-runs a turn interrupted by a background restart", async () => {
     await saveOpenAICredential("sk-test");
     await seed({ id: "u1", kind: "message", role: "user", text: "Before restart", context: null, at: 1 });
-    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "Half", usage: null, lastSeq: 2, updatedAt: 1 });
+    await saveRunCheckpoint({ version: 3, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "Half", usage: null, lastSeq: 2, updatedAt: 1 });
     const provider = new FakeProvider();
     scriptedRounds(provider, [answer("After restart.")]);
     const { runtime } = setup(provider);
@@ -1903,7 +1971,7 @@ describe("BackgroundRuntime: Phase 0 integration (regression)", () => {
   it("finishes interrupted-run recovery and starts the idle sweep even when agent-tab restoration fails", async () => {
     await saveOpenAICredential("sk-test");
     await seed({ id: "u1", kind: "message", role: "user", text: "Before restart", context: null, at: 1 });
-    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
+    await saveRunCheckpoint({ version: 3, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
     const { api, factory } = fakeTabsApi([userTab]);
     api.tabs.query.mockRejectedValueOnce(new Error("Tabs unavailable."));
     const { clock, sweep } = manualClock();
@@ -2343,7 +2411,7 @@ describe("BackgroundRuntime: watching an agent tab", () => {
     expect(port.received.some((event) => event.type === "help.requested")).toBe(true);
     expect(badge.pending).toBe(true);
     expect(texts.at(-1)).toBe("!");
-    expect((await getRunCheckpoint())?.status).toBe("awaiting-help");
+    expect((await getRunCheckpoint(snapshot.activeRun!.runId))?.status).toBe("awaiting-help");
 
     // Another watched tab of the run says bside is working; Show tab watches the help tab with no shield.
     await send({ type: "tabs.watch", tabId: 6 });
@@ -2653,7 +2721,7 @@ describe("BackgroundRuntime: sessions", () => {
     const interrupted = await createSessionWith(prompt("u1", "Interrupted task"));
     const open = await createSessionWith(prompt("u2", "Other chat"));
     await setOpenSessionId(open);
-    await saveRunCheckpoint({ version: 2, runId: "r9", sessionId: interrupted, status: "running", partialAssistantText: "Half", usage: null, lastSeq: 1, updatedAt: 1 });
+    await saveRunCheckpoint({ version: 3, runId: "r9", sessionId: interrupted, status: "running", partialAssistantText: "Half", usage: null, lastSeq: 1, updatedAt: 1 });
     const { runtime, send, snapshot, provider } = await setup(["After restart."]);
     await runtime.initialize();
 
@@ -2938,7 +3006,7 @@ describe("BackgroundRuntime: run digests and context continuity", () => {
   it("rebuilds a digest from the persisted calls of a run interrupted by a restart", async () => {
     await seed({ id: "u1", kind: "message", role: "user", text: "Before restart", context: null, at: 1 });
     await seed({ id: "t1", kind: "tool-call", call: { id: "call_1", name: "browser_program", arguments: { source: 'return await web.search("orchids");' } }, at: 2 });
-    await saveRunCheckpoint({ version: 2, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
+    await saveRunCheckpoint({ version: 3, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
     const { runtime } = setup([[{ type: "text.delta", delta: "Ok." }, done]]);
     await runtime.initialize();
     const items = (await openConversation()).items;
@@ -3284,13 +3352,11 @@ describe("BackgroundRuntime: usage visibility", () => {
     // Wait for the checkpoint itself, not a fixed number of ticks: on a slow
     // machine the first round's usage lands after `tick()` returns.
     await vi.waitFor(async () => {
-      const { runCheckpoint } = await fakeBrowser.storage.local.get("runCheckpoint") as { runCheckpoint?: { usage: unknown } };
-      expect(runCheckpoint?.usage).toMatchObject({ input: 700, responses: 1 });
+      expect((await listRunCheckpoints())[0]?.usage).toMatchObject({ input: 700, responses: 1 });
     });
     const snapshot = await runtime.getSnapshot();
     expect(snapshot.activeRun?.usage).toMatchObject({ input: 700, responses: 1 });
-    const { runCheckpoint } = await fakeBrowser.storage.local.get("runCheckpoint") as { runCheckpoint: { usage: unknown } };
-    expect(runCheckpoint.usage).toEqual(snapshot.activeRun?.usage);
+    expect((await getRunCheckpoint(snapshot.activeRun!.runId))?.usage).toEqual(snapshot.activeRun?.usage);
 
     // The background dies; the next one recovers the run from its checkpoint.
     const restarted = new BackgroundRuntime(new SidebarHub(), { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
