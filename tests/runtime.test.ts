@@ -2621,6 +2621,33 @@ describe("BackgroundRuntime: sessions", () => {
     expect(texts((await snapshot()).conversation)).toEqual(["Flaky", "Recovered."]);
   });
 
+  it("keeps a failed turn retryable while a run in another chat starts and ends", async () => {
+    const { send, snapshot, provider } = await setup([new ProviderStreamError("Rate limited.", "RATE_LIMIT"), "Other answer.", "Recovered."]);
+    await send({ type: "run.start", prompt: "Flaky" });
+    const failed = (await snapshot()).conversation.id;
+    await send({ type: "session.create" });
+    await send({ type: "run.start", prompt: "Something else" });
+    expect(provider.requests).toHaveLength(2);
+
+    await send({ type: "session.open", sessionId: failed });
+    await send({ type: "run.retry" });
+    expect(provider.requests).toHaveLength(3);
+    expect(texts((await snapshot()).conversation)).toEqual(["Flaky", "Recovered."]);
+  });
+
+  it("keeps run diagnostics for the eight chats that ran most recently", async () => {
+    const { send, snapshot } = await setup();
+    const exported = async (sessionId: string) => (await send({ type: "context.export", sessionId }) as { markdown: string }).markdown;
+    const sessions: string[] = [];
+    for (let index = 0; index < 9; index += 1) {
+      await send({ type: "session.create" });
+      await send({ type: "run.start", prompt: `Chat ${index}` });
+      sessions.push((await snapshot()).conversation.id);
+    }
+    expect(await exported(sessions[0]!)).toContain("No run recorded for this chat");
+    for (const id of sessions.slice(1)) expect(await exported(id)).toContain('"providerResponses"');
+  });
+
   it("recovers an interrupted run into its own session, not the open one", async () => {
     const interrupted = await createSessionWith(prompt("u1", "Interrupted task"));
     const open = await createSessionWith(prompt("u2", "Other chat"));
@@ -2757,7 +2784,7 @@ describe("BackgroundRuntime: history drawer support", () => {
     expect(await history({ type: "history.deleteAll" })).toMatchObject({ ok: true, sessionCount: 1, notice: "Deleted 2 chats." });
   });
 
-  it("exports any chat by id, with run diagnostics only for the latest run's chat", async () => {
+  it("exports any chat by id, each with its own latest run's diagnostics", async () => {
     const provider = new FakeProvider();
     provider.script = [{ type: "text.delta", delta: "Answer." }, { type: "turn.completed", replayState: null }];
     const { runtime, send, port } = await setup(provider);
@@ -2772,10 +2799,14 @@ describe("BackgroundRuntime: history drawer support", () => {
     const alphaExport = await exportOf(alpha);
     expect(alphaExport).toContain("Alpha question");
     expect(alphaExport).not.toContain("Beta question");
-    expect(alphaExport).toContain("No run recorded for this chat");
+    // Beta's later run leaves alpha's diagnostics in place, and neither shows the other's model input.
+    expect(alphaExport).toContain('"providerResponses": 1');
+    expect(alphaExport?.split("## Conversation log")[0]).toContain("Alpha question");
+    expect(alphaExport?.split("## Conversation log")[0]).not.toContain("Beta question");
     const betaExport = await exportOf(beta);
     expect(betaExport).toContain("Beta question");
     expect(betaExport).toContain('"providerResponses": 1');
+    expect(betaExport).not.toContain("Alpha question");
     expect(betaExport).not.toContain("sk-test");
 
     expect(await exportOf("missing")).toBeUndefined();
