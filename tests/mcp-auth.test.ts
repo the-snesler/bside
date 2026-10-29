@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OAuthPopup } from "@/lib/background/oauth-popup";
 import { ProviderStreamError } from "@/lib/providers/openai";
 import { McpAuth } from "@/lib/mcp/auth";
+import { McpClient } from "@/lib/mcp/client";
 import { mcpFetch, type Fetcher } from "@/lib/mcp/egress";
 import { McpError } from "@/lib/mcp/errors";
 import { findMcpServer, type McpServer } from "@/lib/mcp/servers";
@@ -231,6 +232,47 @@ describe("MCP OAuth: tokens", () => {
     expect(await auth.token(signal())).toBe("access-2");
     // A fresh instance reads the refreshed tokens back from sealed storage.
     expect(await new McpAuth(notion, popup(), fake.fetcher).token(signal())).toBe("access-2");
+  });
+
+  it("refreshes a rejected token only while it is still current", async () => {
+    const { fake, auth } = await connected();
+    expect(await auth.refresh(signal(), "access-1")).toBe("access-2");
+    // Another request refused with the old token uses the new one rather than rotating again.
+    expect(await auth.refresh(signal(), "access-1")).toBe("access-2");
+    expect(fake.requests).toHaveLength(1);
+    expect(await auth.refresh(signal(), "access-2")).toBe("access-3");
+    expect(fake.requests).toHaveLength(2);
+  });
+
+  it("rotates the tokens once when concurrent tool calls from several runs are refused with the same token", async () => {
+    const tokenServed = Promise.withResolvers<void>();
+    let refused = 0;
+    let issued = 0;
+    const { fake } = await connected({
+      "https://mcp.notion.com/token": () => {
+        issued += 1;
+        if (issued > 1) tokenServed.resolve();
+        return json({ access_token: `access-${issued}`, refresh_token: `refresh-${issued}`, token_type: "Bearer", expires_in: 3600 });
+      },
+      "https://mcp.notion.com/mcp": async ({ body, init }) => {
+        const message = JSON.parse(body) as { id?: number; method: string };
+        if (message.method === "initialize") return new Response(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2025-11-25", capabilities: { tools: {} } } }),
+          { headers: { "Content-Type": "application/json", "Mcp-Session-Id": "session-1" } });
+        if (message.method === "notifications/initialized") return new Response(null, { status: 202 });
+        if ((init.headers as Record<string, string>).Authorization === "Bearer access-1") {
+          // The second refusal arrives only after the first call's refresh finished.
+          if (refused++ > 0) { await tokenServed.promise; await new Promise((resolve) => setTimeout(resolve, 10)); }
+          return new Response(null, { status: 401 });
+        }
+        return json({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: "ok" }] } });
+      },
+    });
+    const client = new McpClient(notion, fake.fetcher, new McpAuth(notion, popup(), fake.fetcher));
+    const results = await Promise.all([client.callTool("search", {}, signal()), client.callTool("search", {}, signal())]);
+    expect(results.map((result) => result.text)).toEqual(["ok", "ok"]);
+    expect(fake.requests.filter((request) => request.url === "https://mcp.notion.com/token")).toHaveLength(1);
+    // Both calls share one protocol session.
+    expect(fake.requests.filter((request) => request.body.includes("\"initialize\""))).toHaveLength(1);
   });
 
   it("keeps the old refresh token when the server does not rotate it", async () => {

@@ -144,11 +144,18 @@ export class McpAuth implements McpTokenSource {
 
   /**
    * Refreshes the access token (single-flight; concurrent callers share one
-   * request). If the server refuses the refresh token, or there is none, the
-   * saved tokens are deleted and this fails with `REAUTH`. A network failure
-   * leaves them in place.
+   * request). `rejected`: the token a server refused. If the saved token has
+   * changed since (another caller already refreshed it), that one is used
+   * instead of refreshing again, so several requests refused at once rotate
+   * the tokens only once. If the server refuses the refresh token, or there
+   * is none, the saved tokens are deleted and this fails with `REAUTH`. A
+   * network failure leaves them in place.
    */
-  async refresh(signal: AbortSignal): Promise<string> {
+  async refresh(signal: AbortSignal, rejected?: string): Promise<string> {
+    if (!this.#refreshing && rejected !== undefined) {
+      const credential = await this.#load();
+      if (credential && credential.accessToken !== rejected) return this.token(signal);
+    }
     this.#refreshing ??= this.#refresh().finally(() => { this.#refreshing = null; });
     return raceSignal(this.#refreshing, signal, this.#server);
   }
