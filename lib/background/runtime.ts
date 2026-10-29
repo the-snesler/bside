@@ -357,8 +357,8 @@ export class BackgroundRuntime {
 
   /** Runs once at background startup, before any Port connects. */
   async initialize(): Promise<void> {
-    // An interrupted run can no longer be awaiting approval.
-    this.#approvalBadge?.set(false);
+    // An interrupted run can no longer be awaiting approval or help.
+    this.#approvalBadge?.clearAll();
     // Each step fails safe on its own: a failed migration retries next startup,
     // a failed recovery offers no retry, and a failed restore leaves no agent
     // tabs owned. None may cut another short. Recovery runs after the
@@ -579,25 +579,28 @@ export class BackgroundRuntime {
     this.#workspace.releaseTab(tabId);
   }
 
-  /** Idle auto-close. Skipped entirely while any run is active, so a tab a run may be using is never closed under it, and never closes the watched tab. */
+  /**
+   * Idle auto-close. Spares every tab of a session with an active run (a run
+   * may be using any of its session's tabs, whatever their last use) and the
+   * watched tab; other sessions' idle tabs close while runs are active.
+   */
   async #closeIdleAgentTabs(): Promise<void> {
-    if (this.#anyRun()) return;
     const cutoff = this.#clock.now() - AGENT_TAB_IDLE_MS;
     await this.#closeAgentTabs((tab, id) => id !== this.#watching?.tabId && tab.lastUsedAt <= cutoff);
   }
 
   /**
-   * Closes owned agent tabs matching `shouldClose`. With `stopForRun`, stops
-   * as soon as any run starts; without it, the caller guarantees `shouldClose`
-   * never matches an active run's session.
+   * Closes owned agent tabs matching `shouldClose`. With `spareRunning`, skips
+   * every tab whose session has an active run, checked again before each
+   * close, since a run may start in a session meanwhile; without it, the
+   * caller guarantees `shouldClose` never matches an active run's session.
    */
-  async #closeAgentTabs(shouldClose: (tab: AgentTab, id: number) => boolean, stopForRun = true): Promise<void> {
+  async #closeAgentTabs(shouldClose: (tab: AgentTab, id: number) => boolean, spareRunning = true): Promise<void> {
     const tabController = this.#tabControllerFactory();
     for (const id of [...this.#workspace.agentTabs.keys()]) {
       // Re-read after every await: a run may have started or used the tab meanwhile.
       const tab = this.#workspace.agentTabs.get(id);
-      if (stopForRun && this.#anyRun()) break;
-      if (tab === undefined || !shouldClose(tab, id)) continue;
+      if (tab === undefined || (spareRunning && this.#runFor(tab.sessionId)) || !shouldClose(tab, id)) continue;
       try {
         await tabController.closeTab(id);
       } catch {
@@ -841,14 +844,15 @@ export class BackgroundRuntime {
       return;
     }
     if (command.type === "tabs.closeAgentTabs") {
-      // Refused rather than deferred while any run is active: a run may be using
-      // these tabs, and a deferred close would fire after the user moved on.
-      if (this.#anyRun()) return;
+      // Refused rather than deferred while the chat has an active run: it may be
+      // using these tabs, and a deferred close would fire after the user moved
+      // on. Other chats' runs never use them, so they do not matter.
+      if (this.#runFor(command.sessionId)) return;
       await this.#closeAgentTabs((tab) => tab.sessionId === command.sessionId);
       return;
     }
     if (command.type === "settings.save") {
-      if (this.#anyRun()) return;
+      // Accepted while runs are active: each run read its model and effort when it started.
       await this.handleSettingsRequest(command);
       return;
     }
@@ -1146,7 +1150,10 @@ export class BackgroundRuntime {
       let notice: string | null = null;
       if (request.type === "credentials.chatgpt.notice.dismiss") await clearChatGPTSignInNotice();
       else if (request.type !== "credentials.openai.status") {
-        if (this.#anyRun()) throw new ProviderStreamError("Wait for the active run to finish before changing or testing credentials.", "INVALID_REQUEST");
+        // Refused while any run exists, in any chat: every run shares the one
+        // credential (and ChatGPT's token refresh), so changing or testing it
+        // would pull authentication out from under runs in progress.
+        if (this.#anyRun()) throw new ProviderStreamError("Wait for active runs to finish before changing or testing credentials.", "INVALID_REQUEST");
         if (request.type === "credentials.openai.save") {
           await this.#provider.validateAuth({ providerId: "openai", method: "api-key", secret: request.apiKey }, new AbortController().signal);
           await saveOpenAICredential(request.apiKey);
@@ -1247,12 +1254,26 @@ export class BackgroundRuntime {
     await this.#runSessionCommand({ v: 1, id: crypto.randomUUID(), type: "session.open", sessionId });
   }
 
+  /**
+   * The toolbar click while the badge asks for attention (after it opened the
+   * sidebar synchronously): opens the chat of the run that has waited longest
+   * for the user, else the most recent unread scheduled results.
+   */
   async openAttentionSession(): Promise<void> {
     await this.#ready;
-    const waiting = [...this.#runs.values()].find((run) => run.pendingApproval || run.pendingHelp);
+    const waiting = this.#longestWaitingRun();
     const sessionId = waiting ? waiting.sessionId :
       (await this.#scheduler.list()).filter((t) => t.unread).toSorted((a, b) => (b.lastRun?.startedAt ?? 0) - (a.lastRun?.startedAt ?? 0))[0]?.sessionId;
     if (sessionId) await this.openResultsSession(sessionId);
+  }
+
+  /** The active run that has waited longest for the user's confirmation or help, as the badge ordered them. */
+  #longestWaitingRun(): ActiveRun | undefined {
+    for (const runId of this.#approvalBadge?.waitingRuns() ?? []) {
+      const run = this.#run(runId);
+      if (run) return run;
+    }
+    return undefined;
   }
 
   async #syncScheduleBadge(): Promise<void> {
@@ -1261,7 +1282,10 @@ export class BackgroundRuntime {
 
   async #launchScheduled(task: ScheduledTask, scheduledAt: number, recordStart: RecordTaskStart): Promise<TaskDispatch> {
     if (this.#disposed) return { status: "unavailable" };
-    // Busy while the task's results session has a run, and for now while any run does.
+    // Busy only while the task's own results session has a run (another
+    // chat's run does not block it), and for now while any run does
+    // (`#singleRunGate`). `#scheduledStarting` and pending session ops are
+    // brief locks, not runs.
     const busy = () => this.#singleRunGate() || (task.sessionId !== null && this.#runFor(task.sessionId) !== undefined);
     if (busy() || this.#scheduledStarting || this.#sessionOpsPending > 0) return { status: "skipped-busy" };
     this.#scheduledStarting = true;
@@ -1312,8 +1336,11 @@ export class BackgroundRuntime {
     }
     const provider = await this.#getProviderDefinition();
     const model = provider.models.find((model) => model.id === request.settings.modelId);
-    if (this.#anyRun() || !model || !model.reasoningEfforts.includes(request.settings.reasoningEffort))
-      return { v: 1, id: request.id, ok: false, error: toNormalizedError(new ProviderStreamError("The model/reasoning selection is unavailable or a run is active.", "INVALID_REQUEST"), "setup") };
+    // Saved even while runs are active: a run reads its model and effort once,
+    // when its agent loop starts (`#runAgentLoop`), and keeps them for every
+    // round and compaction, so a change applies to runs started after it.
+    if (!model || !model.reasoningEfforts.includes(request.settings.reasoningEffort))
+      return { v: 1, id: request.id, ok: false, error: toNormalizedError(new ProviderStreamError("The model/reasoning selection is unavailable.", "INVALID_REQUEST"), "setup") };
     await saveAppSettings(request.settings);
     await this.#sidebarHub.broadcastSnapshot();
     return { v: 1, id: request.id, ok: true, settings: request.settings, provider, notice: null };
@@ -1836,7 +1863,7 @@ export class BackgroundRuntime {
         flushDelta();
         run.pendingApproval = request;
         run.status = request ? "awaiting-approval" : "running";
-        this.#approvalBadge?.set(request !== null);
+        this.#syncWaiting(run);
         if (request) void this.#notifications?.pending(runId, run.sessionId, "approval");
         else void this.#notifications?.clearPending(runId);
         if (run.scheduled) void this.#scheduler.updateRun(run.scheduled.taskId, runId, request ? "awaiting-approval" : "running").catch(() => {});
@@ -1847,7 +1874,7 @@ export class BackgroundRuntime {
         flushDelta();
         run.pendingHelp = request;
         if (run.status !== "cancelling") run.status = request ? "awaiting-help" : "running";
-        this.#approvalBadge?.set(request !== null);
+        this.#syncWaiting(run);
         if (request) void this.#notifications?.pending(runId, run.sessionId, "help");
         else void this.#notifications?.clearPending(runId);
         if (run.scheduled) void this.#scheduler.updateRun(run.scheduled.taskId, runId, request ? "awaiting-help" : "running").catch(() => {});
@@ -1870,7 +1897,6 @@ export class BackgroundRuntime {
     if (result.status === "failed") record.error = result.error;
     if (this.#run(runId) !== run) return;
     flushDelta();
-    this.#approvalBadge?.set(false);
 
     // Written after the run's last message, so a replayed digest follows the
     // answer it describes, and before the terminal event, so a run started
@@ -1933,6 +1959,7 @@ export class BackgroundRuntime {
       }
       void this.#notifications?.finished(run.runId, run.sessionId, { scheduled: !!run.scheduled, durationMs, status }).catch(() => {});
     } finally {
+      this.#approvalBadge?.clearRun(run.runId);
       this.#removeRun(run);
       this.#refreshShield();
     }
@@ -1956,7 +1983,7 @@ export class BackgroundRuntime {
       run.controller.abort();
       run.pendingApproval = null;
       run.pendingHelp = null;
-      this.#approvalBadge?.set([...this.#runs.values()].some((other) => other !== run && (other.pendingApproval || other.pendingHelp)));
+      this.#syncWaiting(run);
       const failure: NormalizedError = {
         code: "PROTOCOL_ERROR",
         message: error instanceof ProviderStreamError ? error.message : "The run stopped unexpectedly. Its earlier actions may have taken effect.",
@@ -2036,11 +2063,20 @@ export class BackgroundRuntime {
     });
   }
 
+  /**
+   * Tells the badge whether `run` waits for the user: a confirmation or help
+   * request is open and the run is not being cancelled. The badge keeps the
+   * order runs began waiting in, for the toolbar click.
+   */
+  #syncWaiting(run: ActiveRun): void {
+    this.#approvalBadge?.setPending(run.runId, !run.ended && run.status !== "cancelling" && (run.pendingApproval !== null || run.pendingHelp !== null));
+  }
+
   #cancelRun(runId: string): void {
     const run = this.#run(runId);
     if (!run || run.status === "cancelling") return;
     run.status = "cancelling";
-    this.#approvalBadge?.set(false);
+    this.#syncWaiting(run);
     void this.#notifications?.clearPending(runId);
     run.controller.abort();
   }

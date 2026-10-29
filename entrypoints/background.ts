@@ -57,7 +57,10 @@ export default defineBackground({
         "sidebarAction",
       );
       // Both calls stay synchronous in the click handler to keep the user
-      // gesture; a pending approval or help request opens the sidebar rather than closing it.
+      // gesture; a pending approval or help request (in any run) or unread
+      // scheduled results open the sidebar rather than closing it. The chat
+      // to show (the run that has waited longest, else the newest unread
+      // results) is then selected asynchronously.
       void (approvalBadge.attention ? sidebarAction.open() : sidebarAction.toggle());
       if (approvalBadge.attention) void runtime.openAttentionSession();
     });
