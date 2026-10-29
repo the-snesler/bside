@@ -521,7 +521,7 @@ export type SidebarCommand =
   | { v: 1; id: string; type: "skills.list" }
   | { v: 1; id: string; type: "tabs.list" }
   | { v: 1; id: string; type: "tabs.focus"; tabId: number }
-  /** Closes one session's hidden agent tabs (the sidebar sends the open session's); refused while a run is active. */
+  /** Closes one session's hidden agent tabs (the sidebar sends the open session's); refused while that session has an active run. */
   | { v: 1; id: string; type: "tabs.closeAgentTabs"; sessionId: string }
   /**
    * Shows one of the open session's agent tabs next to the active tab and switches to it, so the user can watch it.

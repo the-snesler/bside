@@ -1454,6 +1454,42 @@ describe("BackgroundRuntime: approval badge", () => {
     expect(provider.requests).toHaveLength(1);
   });
 
+  it("routes the toolbar click to the waiting run's chat from another chat, and to nothing once it ends", async () => {
+    const { badge } = fakeBadge();
+    const { runtime, run, runId } = await startAwaitingApproval(badge);
+    const waitingSession = (await getOpenSessionId())!;
+    await runtime.handleCommand({ v: 1, id: "new", type: "session.create" });
+    const other = (await getOpenSessionId())!;
+    expect(other).not.toBe(waitingSession);
+    // Named, so leaving it does not delete it as an untouched new chat.
+    await runtime.handleCommand({ v: 1, id: "name", type: "session.rename", sessionId: other, title: "Other" });
+    expect(badge.waitingRuns()).toEqual([runId]);
+    await runtime.openAttentionSession();
+    expect(await getOpenSessionId()).toBe(waitingSession);
+
+    await runtime.handleCommand({ v: 1, id: "approve", type: "action.approve", runId, callId: "call_1" });
+    await run;
+    expect(badge.attention).toBe(false);
+    await runtime.handleCommand({ v: 1, id: "open", type: "session.open", sessionId: other });
+    await runtime.openAttentionSession();
+    expect(await getOpenSessionId()).toBe(other);
+  });
+
+  it("saves model settings while a run waits, but refuses credential changes", async () => {
+    const { badge } = fakeBadge();
+    const { runtime, run, runId } = await startAwaitingApproval(badge);
+    const { settings, provider } = await runtime.handleSettingsRequest({ v: 1, id: "get", type: "settings.get" }) as Extract<Awaited<ReturnType<BackgroundRuntime["handleSettingsRequest"]>>, { ok: true }>;
+    const model = provider.models.find((candidate) => candidate.reasoningEfforts.some((effort) => effort !== settings.reasoningEffort))!;
+    const next = { ...settings, modelId: model.id, reasoningEffort: model.reasoningEfforts.find((effort) => effort !== settings.reasoningEffort)! };
+    expect(await runtime.handleSettingsRequest({ v: 1, id: "save", type: "settings.save", settings: next })).toMatchObject({ ok: true, settings: next });
+    expect((await runtime.getSnapshot()).settings).toEqual(next);
+    expect(await runtime.handleCredentialRequest({ v: 1, id: "key", type: "credentials.openai.save", apiKey: "sk-test-other" }))
+      .toMatchObject({ ok: false, error: { message: expect.stringContaining("Wait for active runs") } });
+    expect((await getOpenAICredential())?.apiKey).toBe("sk-test");
+    await runtime.handleCommand({ v: 1, id: "approve", type: "action.approve", runId, callId: "call_1" });
+    await run;
+  });
+
   it("clears a stale badge at startup while recovering an interrupted approval", async () => {
     await saveRunCheckpoint({ version: 3, runId: "r1", sessionId: await ensureOpenSession(), status: "awaiting-approval", partialAssistantText: "", usage: null, lastSeq: 3, updatedAt: 1 });
     const { badge, texts } = fakeBadge();
@@ -1931,6 +1967,53 @@ describe("BackgroundRuntime: closing agent tabs", () => {
     expect(tabs.map((tab) => tab.id)).toEqual([1]);
   });
 
+  it("closes another chat's agent tabs while a run is active, refusing only the running chat's", async () => {
+    const { clock } = manualClock();
+    const other = (await createSession()).id;
+    const tabs = [userTab, agentTab(5), agentTab(6)];
+    const { factory } = fakeTabsApi(tabs, new Map<number, unknown>([[5, tag(clock.now())], [6, tag(clock.now(), "agent", other)]]));
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const { provider, release } = blockingProvider();
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory, clock });
+    hub.delegate = runtime;
+    await runtime.initialize();
+
+    const run = runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Wait" });
+    await untilRequested(provider);
+    await runtime.handleCommand({ v: 1, id: "close", type: "tabs.closeAgentTabs", sessionId: owner });
+    expect(tabs.map((tab) => tab.id)).toEqual([1, 5, 6]);
+    await runtime.handleCommand({ v: 1, id: "close", type: "tabs.closeAgentTabs", sessionId: other });
+    expect(tabs.map((tab) => tab.id)).toEqual([1, 5]);
+    release();
+    await run;
+  });
+
+  it("auto-closes idle tabs of chats without a run while another chat's run is active", async () => {
+    const { clock, advance, sweep } = manualClock();
+    const other = (await createSession()).id;
+    const tabs = [userTab, agentTab(5), agentTab(6)];
+    // Last used before the run started, so the run's end does not restart its idle period.
+    const { factory } = fakeTabsApi(tabs, new Map<number, unknown>([[5, tag(clock.now() - minute)], [6, tag(clock.now(), "agent", other)]]));
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const { provider, release } = blockingProvider();
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory, clock });
+    hub.delegate = runtime;
+    await runtime.initialize();
+
+    const run = runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Wait" });
+    await untilRequested(provider);
+    advance(AGENT_TAB_IDLE_MS + minute);
+    await sweep();
+    // Both are idle; only the running chat's tab is spared.
+    expect(tabs.map((tab) => tab.id)).toEqual([1, 5]);
+    release();
+    await run;
+    await sweep();
+    expect(tabs.map((tab) => tab.id)).toEqual([1]);
+  });
+
   it("auto-closes restored agent tabs once their tagged last use is older than the idle period", async () => {
     const { clock, advance, sweep } = manualClock();
     const tabs = [userTab, agentTab(5), agentTab(6)];
@@ -2388,6 +2471,30 @@ describe("BackgroundRuntime: watching an agent tab", () => {
     await switchTo(2);
     expect(shields(api).at(-1)).toEqual([5, "off"]);
     expect(await contentSays(runtime, 5)).toBe("off");
+  });
+
+  it("says bside is working only on a watched tab whose own chat has a run", async () => {
+    const other = (await createSession()).id;
+    const { api, send, runtime, provider } = await setup(
+      [{ id: 7, url: "https://agent-7.test/", title: "Agent seven", hidden: true, windowId: 1, index: 4, active: false }], [[7, tag(1, "agent", other)]]);
+    const gate = Promise.withResolvers<void>();
+    provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      await gate.promise;
+      yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+    } });
+    const run = send({ type: "run.start", prompt: "Think" });
+    await untilRequested(provider);
+    await send({ type: "tabs.watch", tabId: 5 });
+    expect(shields(api).at(-1)).toEqual([5, "working"]);
+    // Another chat's watched tab is idle while this chat's run works.
+    await send({ type: "session.open", sessionId: other });
+    await send({ type: "tabs.watch", tabId: 7 });
+    expect(shields(api).at(-1)).toEqual([7, "idle"]);
+    expect(await contentSays(runtime, 7)).toBe("idle");
+    expect(await contentSays(runtime, 7, "shield.takeover")).toBe("off");
+    gate.resolve();
+    await run;
+    expect(await contentSays(runtime, 7)).toBe("off");
   });
 
   it("drops the shield for the rest of the watch when the user takes over, from the page or the sidebar", async () => {
