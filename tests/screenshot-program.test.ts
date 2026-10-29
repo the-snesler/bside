@@ -74,7 +74,7 @@ function setupProgram(maxImages = 3, options: { files?: ScratchFiles; memory?: b
   state.adoptTab(2, "s1");
   const files = options.files ?? new ScratchFiles();
   const memory = options.memory ? runMemory("s1", "r1") : undefined;
-  const program = new BrowserProgram(new TabController(fake.api, async () => false), { state, sessionId: "s1", files, maxImages, memory }, () => {});
+  const program = new BrowserProgram(new TabController(fake.api, async () => false), { state, runId: "r1", sessionId: "s1", files, maxImages, memory }, () => {});
   const run = (source: string) => program.execute(source, new AbortController().signal);
   return { ...fake, state, program, run, files };
 }
@@ -149,7 +149,7 @@ describe("page.screenshot()", () => {
 
   it("takes no images when the scope sets no cap", async () => {
     const fake = fakeTabs();
-    const program = new BrowserProgram(new TabController(fake.api), { state: new WorkspaceState(), sessionId: "s1", files: new ScratchFiles() }, () => {});
+    const program = new BrowserProgram(new TabController(fake.api), { state: new WorkspaceState(), runId: "r1", sessionId: "s1", files: new ScratchFiles() }, () => {});
     const result = await program.execute('await browser.tab("/tabs/1/page.md").screenshot();', new AbortController().signal);
     expect(result).toMatchObject({ ok: false, code: "LIMIT_EXCEEDED" });
   });
@@ -309,7 +309,7 @@ async function runLoop(provider: ScriptedProvider, options: { memory?: boolean }
   const items: ConversationItem[] = [];
   const contexts: string[] = [];
   const outputs: string[] = [];
-  const scope = options.memory ? { state: new WorkspaceState(), sessionId: "s1", files: new ScratchFiles(), memory: runMemory("s1", "run1") } : undefined;
+  const scope = options.memory ? { state: new WorkspaceState(), runId: "r1", sessionId: "s1", files: new ScratchFiles(), memory: runMemory("s1", "run1") } : undefined;
   const loop = new AgentLoop(provider, new TabController(fake.api, async () => false), new SidebarHub(), scope);
   const result = await loop.run({
     runId: "run1", conversationId: "s1", modelId: TEST_MODEL.id, reasoningEffort: "medium",

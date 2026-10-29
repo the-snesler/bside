@@ -33,7 +33,7 @@ it("reads the fixture's table and grid and operates its hover menu, sortable lis
       return { ok: true, type: "page.execute", result, documentId: registry.documentId };
     },
   } });
-  const program = new BrowserProgram(controller, { state: new WorkspaceState(), sessionId: "s1", files: new ScratchFiles() }, () => {});
+  const program = new BrowserProgram(controller, { state: new WorkspaceState(), runId: "r1", sessionId: "s1", files: new ScratchFiles() }, () => {});
   const signal = new AbortController().signal;
   const run = async (source: string) => {
     const result = await program.execute(`const page = browser.tab("/tabs/1/page.md");\n${source}`, signal);

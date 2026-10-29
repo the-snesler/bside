@@ -148,7 +148,7 @@ describe("frame refs in browser programs", () => {
     const tab = checkoutTab();
     const controller = new TabController(tab.api, undefined, new FrameAliases());
     const state = new WorkspaceState();
-    const program = new BrowserProgram(controller, { state, sessionId: "s1", files: new ScratchFiles() }, () => {});
+    const program = new BrowserProgram(controller, { state, runId: "r1", sessionId: "s1", files: new ScratchFiles() }, () => {});
     const signal = new AbortController().signal;
     const run = (source: string) => program.execute(`const page = browser.tab("/tabs/1/page.md");\n${source}`, signal);
     return { tab, state, run };
@@ -244,7 +244,7 @@ describe("frame content and memory provenance", () => {
     const frames = new FrameAliases();
     const signal = new AbortController().signal;
     const start = (runId: string) => {
-      const program = new BrowserProgram(new TabController(tab.api, undefined, frames), { state, sessionId: "s1", files: new ScratchFiles(), memory: runMemory("s1", runId) }, () => {});
+      const program = new BrowserProgram(new TabController(tab.api, undefined, frames), { state, runId: "r1", sessionId: "s1", files: new ScratchFiles(), memory: runMemory("s1", runId) }, () => {});
       return { program, run: (source: string) => program.execute(`const page = browser.tab("/tabs/1/page.md");\n${source}`, signal) };
     };
     return { tab, start };
@@ -350,7 +350,7 @@ describe("screenshots of elements inside frames", () => {
     const { api, frames, captureTab } = nestedFrames({ viewport: { x: 0, y: 50, width: 300, height: 200 }, element: { x: 10, y: 60, width: 100, height: 40 } });
     const state = new WorkspaceState();
     state.observed.set(1, { documentId: "doc-top", frames: { f1: "doc-https://pay.example/", f2: "doc-https://captcha.example/" } });
-    const program = new BrowserProgram(new TabController(api, async () => false, frames), { state, sessionId: "s1", files: new ScratchFiles(), maxImages: 4 }, () => {});
+    const program = new BrowserProgram(new TabController(api, async () => false, frames), { state, runId: "r1", sessionId: "s1", files: new ScratchFiles(), maxImages: 4 }, () => {});
     const signal = new AbortController().signal;
     const viaOption = await program.execute('return await browser.tab("/tabs/1/page.md").screenshot({ref: "f2:e1"});', signal);
     expect(viaOption.ok, viaOption.summary).toBe(true);
@@ -380,7 +380,7 @@ describe("the frames fixture", () => {
       frame.getElementById("result")!.textContent = `Card accepted: ending ${(frame.getElementById("card") as HTMLInputElement).value.slice(-4)}`;
       tab.frames.get(0)!.document.getElementById("status")!.textContent = "Payment received. Order confirmed.";
     });
-    const program = new BrowserProgram(new TabController(tab.api, undefined, new FrameAliases()), { state: new WorkspaceState(), sessionId: "s1", files: new ScratchFiles() }, () => {});
+    const program = new BrowserProgram(new TabController(tab.api, undefined, new FrameAliases()), { state: new WorkspaceState(), runId: "r1", sessionId: "s1", files: new ScratchFiles() }, () => {});
     const signal = new AbortController().signal;
 
     const read = await program.execute('const page = browser.tab("/tabs/1/page.md"); return await page.snapshot();', signal);

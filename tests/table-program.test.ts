@@ -22,7 +22,7 @@ function setup() {
   const controller = new TabController(tab.api, undefined, new FrameAliases());
   const state = new WorkspaceState();
   const onEffect = vi.fn();
-  const program = new BrowserProgram(controller, { state, sessionId: "s1", files: new ScratchFiles() }, onEffect);
+  const program = new BrowserProgram(controller, { state, runId: "r1", sessionId: "s1", files: new ScratchFiles() }, onEffect);
   const signal = new AbortController().signal;
   const run = (source: string) => program.execute(`const page = browser.tab("/tabs/1/page.md");\n${source}`, signal);
   return { tab, state, program, onEffect, run };

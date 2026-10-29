@@ -17,7 +17,7 @@ const CODES = new Set([
   "PROVIDER_UNAVAILABLE", "PROVIDER_RESPONSE_FAILED", "CONTEXT_OVERFLOW",
   "INVALID_TOOL_ARGUMENTS", "LIMIT_EXCEEDED", "PROTOCOL_ERROR", "UNSUPPORTED_PAGE",
   "TAB_CHANGED", "STALE_SNAPSHOT", "TARGET_MISSING", "NOT_INTERACTABLE",
-  "NAVIGATION_INTERRUPTED", "ACTION_DENIED", "SKIPPED", "TOOL_ERROR", "CONNECTION_ERROR",
+  "NAVIGATION_INTERRUPTED", "ACTION_DENIED", "SKIPPED", "TOOL_ERROR", "CONNECTION_ERROR", "TAB_IN_USE",
 ]);
 const code = (value: string | null) => value === null ? null : CODES.has(value) ? value : "OTHER";
 const number = (value: number) => Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;

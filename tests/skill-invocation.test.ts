@@ -45,7 +45,7 @@ describe("skill invocation", () => {
   it("exposes only read-only exact skill paths and no page effects", async () => {
     const effect = vi.fn();
     const program = new BrowserProgram(new TabController({ tabs: { query: vi.fn(async () => []), update: vi.fn(async () => {}), goBack: vi.fn(async () => {}), sendMessage: vi.fn(), onUpdated: { addListener: vi.fn(), removeListener: vi.fn() } } }), {
-      state: new WorkspaceState(), sessionId: "s1", files: new ScratchFiles(), skills: new Map([[skill.name, skill]]),
+      state: new WorkspaceState(), runId: "r1", sessionId: "s1", files: new ScratchFiles(), skills: new Map([[skill.name, skill]]),
     }, effect);
     const run = (source: string) => program.execute(source, new AbortController().signal);
     expect((await run('return fs.list("/skills");')).summary).toContain("Summarize the attached page");
