@@ -184,6 +184,27 @@ describe("ChatGPT subscription OAuth and encrypted storage", () => {
     expect(await h.auth.getAuth(new AbortController().signal)).toMatchObject({ secret: "test-access" });
   });
 
+  it("shares one refresh among concurrent runs, and one run's cancellation never fails another's", async () => {
+    const h = harness();
+    await h.auth.login();
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 3_600_000);
+    const cancelled = new AbortController();
+    const first = h.auth.getAuth(cancelled.signal);
+    const second = h.auth.getAuth(new AbortController().signal);
+    const third = h.auth.getAuth(new AbortController().signal);
+    cancelled.abort(new Error("run cancelled"));
+    await expect(first).rejects.toThrow("run cancelled");
+    expect((await second).secret).toBe("test-access-rotated");
+    expect(await third).toEqual(await second);
+    // Sign-in plus one refresh, sent without the cancelled caller's signal.
+    expect(h.tokenRequests).toHaveLength(2);
+    const refreshInit = h.fetcher.mock.calls.findLast(([url]) => String(url).endsWith("/oauth/token"))![1]!;
+    expect(refreshInit.signal?.aborted).toBe(false);
+    // The refreshed token is reused afterwards with no further request.
+    expect((await h.auth.getAuth(new AbortController().signal)).secret).toBe("test-access-rotated");
+    expect(h.tokenRequests).toHaveLength(2);
+  });
+
   it("retains saved credentials on refresh failure and sanitizes upstream error bodies", async () => {
     const h = harness({ refreshStatus: 500 });
     await h.auth.login();
