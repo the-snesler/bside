@@ -1,26 +1,37 @@
 /**
  * Owns the "agent-sidebar:v1" Port: answers `state.subscribe` with the
  * authoritative `state.snapshot` or a gap replay, broadcasts `page.attached`
- * whenever the active tab's attachability changes, and publishes run-local
- * sequenced events on behalf of `BackgroundRuntime` (the `delegate`). Port
+ * whenever the active tab's attachability changes, and publishes sequenced
+ * run events on behalf of `BackgroundRuntime` (the `delegate`). Port
  * disconnect is transport loss only — it never cancels anything.
  *
- * Sequence numbers and the 512-entry replay buffer are run-local: they reset
- * whenever a new run starts. Run events carry the run's session id, which may
- * differ from the session the sidebar has open. Reconnecting with no active run always gets a
- * full `state.snapshot`, since there is no run to gap-replay against.
+ * Every run has its own sequence numbers (1, 2, …) and replay buffer
+ * (`MAX_REPLAY_EVENTS_PER_RUN` events), registered by `startRun` with the
+ * run's session, which every event of the run carries and which may differ
+ * from the session the sidebar has open. All buffers together keep at most
+ * `MAX_REPLAY_EVENTS_TOTAL` events, dropping the oldest first. A run's buffer
+ * outlives its terminal event by `ENDED_RUN_GRACE_MS` (at most
+ * `MAX_ENDED_RUNS` such runs), so a reconnecting sidebar can still replay its
+ * end. Every other event carries seq 0 and never touches run seqs.
+ *
+ * `state.subscribe` names the last seq the sidebar applied per run. It is
+ * answered with each run's missed events when every run's buffer still covers
+ * them, and otherwise (or with `lastSeq: null`) with a full `state.snapshot`.
  */
 
 import type { Browser } from "wxt/browser";
-import { isSidebarCommand, SIDEBAR_PORT_NAME } from "@/lib/protocol";
-import type { AgentTabsState, AttachedPage, RuntimeSnapshot, SidebarCommand, SidebarEvent, TabMention } from "@/lib/protocol";
+import { isSidebarCommand, SIDEBAR_PORT_NAME, TERMINAL_RUN_EVENT_TYPES } from "@/lib/protocol";
+import type { AgentTabsState, AttachedPage, RunEvent, RuntimeSnapshot, SidebarCommand, SidebarEvent, TabMention } from "@/lib/protocol";
 import type { ConversationSummary, QueuedMessage } from "@/lib/domain/conversation";
 import type { SkillSummary } from "@/lib/domain/skills";
 import type { SiteNote } from "@/lib/domain/instructions";
 import type { AskContextV1 } from "@/lib/domain/ask";
 import type { PermissionMode } from "@/lib/domain/permissions";
 
-const MAX_REPLAY_EVENTS = 512;
+export const MAX_REPLAY_EVENTS_PER_RUN = 512;
+export const MAX_REPLAY_EVENTS_TOTAL = 2_048;
+export const ENDED_RUN_GRACE_MS = 60_000;
+export const MAX_ENDED_RUNS = 16;
 const UNSUPPORTED_HOSTNAME_SUFFIXES = [".mozilla.org", ".mozilla.com"];
 
 export interface SidebarHubDelegate {
@@ -30,39 +41,52 @@ export interface SidebarHubDelegate {
     { origin: string | null; note: SiteNote | null } | { note: SiteNote | null; error: string | null } | { undone: string[]; error: string | null } | { contentReply: import("@/lib/protocol").McpContentReply } | { workspaceImage: import("@/lib/protocol").WorkspaceImageReply } | void>;
 }
 
-type RunEvent = Exclude<SidebarEvent, { type: "mcp.content.reply" | "mcp.content.accepted" | "state.snapshot" | "page.attached" | "agent-tabs.changed" | "permissions.changed" | "queue.changed" | "ask.changed" | "composer.focus" | "context.exported" | "tabs.listed" | "skills.listed" | "session.listed" | "siteNote.loaded" | "siteNote.saved" | "memory.undone" | "workspace.image.loaded" }>;
+/** A buffered event and its place among every run's events. */
+interface Buffered {
+  order: number;
+  event: RunEvent;
+}
+
+interface RunLog {
+  conversationId: string;
+  /** The seq of the run's last published event. */
+  seq: number;
+  /** Its newest buffered events, oldest first. */
+  events: Buffered[];
+  /** When its terminal event was published. */
+  endedAt: number | null;
+}
 
 export class SidebarHub {
   delegate: SidebarHubDelegate | null = null;
 
   #ports = new Set<Browser.runtime.Port>();
   #attachment: AttachedPage | null = null;
-  #lastSeq = 0;
-  #eventLog: RunEvent[] = [];
-  #runConversationId: string | null = null;
+  #runs = new Map<string, RunLog>();
+  #buffered = 0;
+  #order = 0;
 
   currentAttachment(): AttachedPage | null {
     return this.#attachment;
   }
 
-  lastSeq(): number {
-    return this.#lastSeq;
+  /** The seq of a run's last published event; 0 for a run that has published none or is not registered. */
+  lastSeq(runId: string): number {
+    return this.#runs.get(runId)?.seq ?? 0;
   }
 
   publishAsk(ask: AskContextV1 | null): void {
-    const event: SidebarEvent = { v: 1, runId: null, conversationId: null, seq: this.#lastSeq, type: "ask.changed", at: Date.now(), payload: { ask } };
-    for (const port of this.#ports) port.postMessage(event);
+    this.#broadcast({ v: 1, runId: null, conversationId: null, seq: 0, type: "ask.changed", at: Date.now(), payload: { ask } });
   }
 
   contentAccepted(owner: object, ids: string[]): void {
     for (const port of this.#ports) if (port === owner) port.postMessage({
-      v: 1, type: "mcp.content.accepted", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: { ids },
+      v: 1, type: "mcp.content.accepted", runId: null, conversationId: null, seq: 0, at: Date.now(), payload: { ids },
     } satisfies SidebarEvent);
   }
 
   focusComposer(): void {
-    const event: SidebarEvent = { v: 1, runId: null, conversationId: null, seq: this.#lastSeq, type: "composer.focus", at: Date.now(), payload: null };
-    for (const port of this.#ports) port.postMessage(event);
+    this.#broadcast({ v: 1, runId: null, conversationId: null, seq: 0, type: "composer.focus", at: Date.now(), payload: null });
   }
 
   handleConnect(port: Browser.runtime.Port): void {
@@ -93,86 +117,65 @@ export class SidebarHub {
 
   /** Broadcasts every session's agent tabs and the watched one. Not run-sequenced, so it is safe mid-run and never clears sidebar error state. */
   publishAgentTabs(state: AgentTabsState): void {
-    const event: SidebarEvent = {
-      v: 1,
-      runId: null,
-      conversationId: null,
-      seq: this.#lastSeq,
-      type: "agent-tabs.changed",
-      at: Date.now(),
-      payload: state,
-    };
-    for (const port of this.#ports) port.postMessage(event);
+    this.#broadcast({ v: 1, runId: null, conversationId: null, seq: 0, type: "agent-tabs.changed", at: Date.now(), payload: state });
   }
 
   /** Broadcasts the permission mode after a sidebar changes it. Not run-sequenced, like `agent-tabs.changed`. */
   publishPermissionMode(mode: PermissionMode): void {
-    const event: SidebarEvent = {
-      v: 1,
-      runId: null,
-      conversationId: null,
-      seq: this.#lastSeq,
-      type: "permissions.changed",
-      at: Date.now(),
-      payload: { mode },
-    };
-    for (const port of this.#ports) port.postMessage(event);
+    this.#broadcast({ v: 1, runId: null, conversationId: null, seq: 0, type: "permissions.changed", at: Date.now(), payload: { mode } });
   }
 
   /** Broadcasts the session index after it changes. Not run-sequenced, like `agent-tabs.changed`. */
   publishSessions(sessions: ConversationSummary[]): void {
-    const event: SidebarEvent = {
-      v: 1,
-      runId: null,
-      conversationId: null,
-      seq: this.#lastSeq,
-      type: "session.listed",
-      at: Date.now(),
-      payload: { sessions },
-    };
-    for (const port of this.#ports) port.postMessage(event);
+    this.#broadcast({ v: 1, runId: null, conversationId: null, seq: 0, type: "session.listed", at: Date.now(), payload: { sessions } });
   }
 
   /** Broadcasts one session's message queue after it changes. Not run-sequenced, like `agent-tabs.changed`. */
   publishQueue(sessionId: string, messages: QueuedMessage[]): void {
-    const event: SidebarEvent = {
-      v: 1,
-      runId: null,
-      conversationId: sessionId,
-      seq: this.#lastSeq,
-      type: "queue.changed",
-      at: Date.now(),
-      payload: { messages },
-    };
-    for (const port of this.#ports) port.postMessage(event);
+    this.#broadcast({ v: 1, runId: null, conversationId: sessionId, seq: 0, type: "queue.changed", at: Date.now(), payload: { messages } });
   }
 
-  /** Called by BackgroundRuntime when a new run begins in `conversationId`: resets the run-local seq/replay buffer. */
-  startRun(conversationId: string): void {
-    this.#lastSeq = 0;
-    this.#eventLog = [];
-    this.#runConversationId = conversationId;
+  /**
+   * Registers a run of `conversationId` before its first event: its seqs start
+   * at 1 and its events carry that session. A run already registered keeps its
+   * seqs, so a late terminal event still follows its earlier ones.
+   */
+  startRun(runId: string, conversationId: string): void {
+    this.#prune();
+    if (this.#runs.has(runId)) return;
+    this.#runs.set(runId, { conversationId, seq: 0, events: [], endedAt: null });
   }
 
-  /** Publishes a run-local sequenced event to every connected port. */
+  /**
+   * Publishes a run's next sequenced event to every connected port. A run
+   * that was never registered (or has ended and been forgotten) has nothing to
+   * report to, so its events are dropped. After the terminal event the run
+   * stays replayable for `ENDED_RUN_GRACE_MS`.
+   */
   publishRunEvent<T extends RunEvent["type"]>(
     runId: string,
     type: T,
     payload: Extract<SidebarEvent, { type: T }>["payload"],
   ): void {
-    this.#lastSeq += 1;
+    const log = this.#runs.get(runId);
+    if (!log || log.endedAt !== null) return;
+    log.seq += 1;
     const event = {
       v: 1,
       runId,
-      conversationId: this.#runConversationId,
-      seq: this.#lastSeq,
+      conversationId: log.conversationId,
+      seq: log.seq,
       type,
       at: Date.now(),
       payload,
     } as Extract<SidebarEvent, { type: T }>;
-    this.#eventLog.push(event as RunEvent);
-    if (this.#eventLog.length > MAX_REPLAY_EVENTS) this.#eventLog.shift();
-    for (const port of this.#ports) port.postMessage(event);
+    log.events.push({ order: ++this.#order, event: event as RunEvent });
+    this.#buffered += 1;
+    if (log.events.length > MAX_REPLAY_EVENTS_PER_RUN) { log.events.shift(); this.#buffered -= 1; }
+    while (this.#buffered > MAX_REPLAY_EVENTS_TOTAL) this.#dropOldestEvent();
+    if (TERMINAL_RUN_EVENT_TYPES.has(type)) log.endedAt = Date.now();
+    this.#broadcast(event);
+    this.#prune();
   }
 
   /** Broadcasts the current full snapshot to every connected port (e.g. after a dropped run.start). */
@@ -190,50 +193,95 @@ export class SidebarHub {
     }
     const result = await this.delegate.handleCommand(message, port);
     if (result && "contentReply" in result) port.postMessage({
-      v: 1, type: "mcp.content.reply", runId: null, conversationId: "sessionId" in message ? message.sessionId ?? null : null, seq: this.#lastSeq, at: Date.now(), payload: { requestId: message.id, result: result.contentReply },
+      v: 1, type: "mcp.content.reply", runId: null, conversationId: "sessionId" in message ? message.sessionId ?? null : null, seq: 0, at: Date.now(), payload: { requestId: message.id, result: result.contentReply },
     } satisfies SidebarEvent);
     if (message.type === "skills.list" && result && "skills" in result) port.postMessage({
-      v: 1, type: "skills.listed", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: result,
+      v: 1, type: "skills.listed", runId: null, conversationId: null, seq: 0, at: Date.now(), payload: result,
     } satisfies SidebarEvent);
     if (message.type === "tabs.list" && result && "tabs" in result) port.postMessage({
-      v: 1, type: "tabs.listed", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: result,
+      v: 1, type: "tabs.listed", runId: null, conversationId: null, seq: 0, at: Date.now(), payload: result,
     } satisfies SidebarEvent);
     if (message.type === "session.list" && result && "sessions" in result) port.postMessage({
-      v: 1, type: "session.listed", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: result,
+      v: 1, type: "session.listed", runId: null, conversationId: null, seq: 0, at: Date.now(), payload: result,
     } satisfies SidebarEvent);
     if (message.type === "siteNote.get" && result && "origin" in result) port.postMessage({
-      v: 1, type: "siteNote.loaded", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: { requestId: message.id, ...result },
+      v: 1, type: "siteNote.loaded", runId: null, conversationId: null, seq: 0, at: Date.now(), payload: { requestId: message.id, ...result },
     } satisfies SidebarEvent);
     if (message.type === "siteNote.save" && result && "note" in result && "error" in result) port.postMessage({
-      v: 1, type: "siteNote.saved", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: { requestId: message.id, ...result },
+      v: 1, type: "siteNote.saved", runId: null, conversationId: null, seq: 0, at: Date.now(), payload: { requestId: message.id, ...result },
     } satisfies SidebarEvent);
     if (message.type === "memory.undo" && result && "undone" in result) port.postMessage({
-      v: 1, type: "memory.undone", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(), payload: { requestId: message.id, ...result },
+      v: 1, type: "memory.undone", runId: null, conversationId: null, seq: 0, at: Date.now(), payload: { requestId: message.id, ...result },
     } satisfies SidebarEvent);
     if (message.type === "workspace.image" && result && "workspaceImage" in result) port.postMessage({
-      v: 1, type: "workspace.image.loaded", runId: null, conversationId: message.sessionId, seq: this.#lastSeq, at: Date.now(), payload: { requestId: message.id, result: result.workspaceImage },
+      v: 1, type: "workspace.image.loaded", runId: null, conversationId: message.sessionId, seq: 0, at: Date.now(), payload: { requestId: message.id, result: result.workspaceImage },
     } satisfies SidebarEvent);
     if (message.type === "context.export" && result && "markdown" in result) port.postMessage({
-      v: 1, type: "context.exported", runId: null, conversationId: null, seq: this.#lastSeq, at: Date.now(),
+      v: 1, type: "context.exported", runId: null, conversationId: null, seq: 0, at: Date.now(),
       payload: { requestId: message.id, ...result },
     } satisfies SidebarEvent);
   }
 
-  async #handleSubscribe(port: Browser.runtime.Port, lastSeq: number | null): Promise<void> {
+  async #handleSubscribe(port: Browser.runtime.Port, known: Record<string, number> | null): Promise<void> {
     if (!this.delegate) return;
-    if (lastSeq !== null && this.#canReplay(lastSeq)) {
-      for (const event of this.#eventLog) {
-        if (event.seq > lastSeq) port.postMessage(event);
-      }
+    const replay = known ? this.#missedEvents(known) : null;
+    if (replay) {
+      for (const event of replay) port.postMessage(event);
       return;
     }
     const snapshot = await this.delegate.getSnapshot();
     this.#postSnapshot(port, snapshot);
   }
 
-  #canReplay(lastSeq: number): boolean {
-    if (this.#eventLog.length === 0) return lastSeq === this.#lastSeq;
-    return lastSeq >= (this.#eventLog[0]?.seq ?? Infinity) - 1 && lastSeq <= this.#lastSeq;
+  /**
+   * Every run's events after the seq the sidebar applied, in publication
+   * order, or `null` when any of them is no longer buffered: a named run this
+   * hub no longer knows, a seq ahead of the run's or before its buffer, or a
+   * run that ended without the sidebar knowing it. A run the sidebar does not
+   * name that is still in progress started after its state, so it replays
+   * from seq 0.
+   */
+  #missedEvents(known: Record<string, number>): RunEvent[] | null {
+    this.#prune();
+    for (const runId of Object.keys(known)) if (!this.#runs.has(runId)) return null;
+    const missed: Buffered[] = [];
+    for (const [runId, log] of this.#runs) {
+      const named = Object.prototype.hasOwnProperty.call(known, runId);
+      if (!named && log.endedAt !== null) return null;
+      const from = named ? known[runId]! : 0;
+      if (from > log.seq) return null;
+      if (from === log.seq) continue;
+      const first = log.events[0];
+      if (!first || first.event.seq > from + 1) return null;
+      for (const buffered of log.events) if (buffered.event.seq > from) missed.push(buffered);
+    }
+    return missed.sort((a, b) => a.order - b.order).map((buffered) => buffered.event);
+  }
+
+  /** Drops the oldest buffered event of all runs. */
+  #dropOldestEvent(): void {
+    let oldest: RunLog | null = null;
+    for (const log of this.#runs.values()) {
+      const first = log.events[0];
+      if (first && (!oldest || first.order < oldest.events[0]!.order)) oldest = log;
+    }
+    if (!oldest) { this.#buffered = 0; return; }
+    oldest.events.shift();
+    this.#buffered -= 1;
+  }
+
+  /** Forgets ended runs past their grace, and the oldest ended runs past `MAX_ENDED_RUNS`. */
+  #prune(now = Date.now()): void {
+    const ended = [...this.#runs].filter(([, log]) => log.endedAt !== null).sort(([, a], [, b]) => a.endedAt! - b.endedAt!);
+    ended.forEach(([runId, log], index) => {
+      if (now - log.endedAt! <= ENDED_RUN_GRACE_MS && ended.length - index <= MAX_ENDED_RUNS) return;
+      this.#runs.delete(runId);
+      this.#buffered -= log.events.length;
+    });
+  }
+
+  #broadcast(event: SidebarEvent): void {
+    for (const port of this.#ports) port.postMessage(event);
   }
 
   #postSnapshot(port: Browser.runtime.Port, snapshot: RuntimeSnapshot): void {
@@ -241,7 +289,7 @@ export class SidebarHub {
       v: 1,
       runId: null,
       conversationId: snapshot.conversation.id,
-      seq: this.#lastSeq,
+      seq: 0,
       type: "state.snapshot",
       at: Date.now(),
       payload: snapshot,

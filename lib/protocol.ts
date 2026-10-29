@@ -558,7 +558,13 @@ export type SidebarCommand =
   | { v: 1; id: string; type: "workspace.image"; sessionId: string; path: string }
   /** Exports one session with its scratch files; run diagnostics, model input, and tool output are included only for the latest run's session. Answered with `context.exported` to the requesting sidebar only. */
   | { v: 1; id: string; type: "context.export"; sessionId: string }
-  | { v: 1; id: string; type: "state.subscribe"; lastSeq: number | null }
+  /**
+   * `lastSeq: null` asks for a full `state.snapshot`. Otherwise it names the
+   * last event seq the sidebar applied for each run it knows (at most
+   * `MAX_SUBSCRIBE_RUNS`): the background replays every run's missed events
+   * when each run's buffer still covers them, else sends a full snapshot.
+   */
+  | { v: 1; id: string; type: "state.subscribe"; lastSeq: Record<string, number> | null }
   /** "New chat": opens an empty session (reusing the open one if it is an untouched new chat), which starts with an empty /workspace. */
   | { v: 1; id: string; type: "session.create" }
   /** Answered with `session.listed` to the requesting sidebar; every sidebar also gets `session.listed` whenever the index changes. */
@@ -620,6 +626,20 @@ const isAskId = (value: unknown): value is string => typeof value === "string" &
 const isContentIds = (value: unknown): value is string[] => Array.isArray(value) && value.length <= MCP_CONTENT_LIMITS.attachments && value.every(isAskId) && new Set(value).size === value.length;
 const isOptionalAskId = (value: unknown) => value === undefined || isAskId(value);
 
+/** A `state.subscribe` seq map: a plain object of at most `MAX_SUBSCRIBE_RUNS` run ids (≤64 characters) to non-negative integer seqs. */
+function isRunSeqs(value: unknown): value is Record<string, number> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) return false;
+  const keys = Reflect.ownKeys(value);
+  if (keys.length > MAX_SUBSCRIBE_RUNS) return false;
+  return keys.every((runId) => {
+    if (typeof runId !== "string" || !isAskId(runId)) return false;
+    const seq = (value as Record<string, unknown>)[runId];
+    return typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0;
+  });
+}
+
 export interface ApprovalRequest {
   call: ToolCall;
   origin: string;
@@ -661,26 +681,35 @@ export interface RuntimeSnapshot {
   queue: QueuedMessage[];
   /** The pending "Ask bside about…" chip from the page's context menu, shown beside the composer of any chat. */
   ask: AskContextV1 | null;
-  /** The single active run, which may belong to a session other than the open one. */
-  activeRun: {
-    runId: string;
-    conversationId: string;
-    status: "running" | "awaiting-approval" | "awaiting-help" | "cancelling";
-    partialAssistantText: string;
-    pendingApproval: ApprovalRequest | null;
-    pendingHelp: HelpRequest | null;
-    /** Usage of the run's provider responses so far; `null` until one reports tokens. */
-    usage: RunUsageV1 | null;
-  } | null;
-  lastSeq: number;
+  /** Every run in progress, at most one per session; each may belong to a session other than the open one. */
+  runs: RunState[];
   notice: string | null;
 }
+
+/** One run in progress, as of its event `lastSeq`. */
+export interface RunState {
+  runId: string;
+  /** The run's session. */
+  conversationId: string;
+  status: "running" | "awaiting-approval" | "awaiting-help" | "cancelling";
+  partialAssistantText: string;
+  pendingApproval: ApprovalRequest | null;
+  pendingHelp: HelpRequest | null;
+  /** Usage of the run's provider responses so far; `null` until one reports tokens. */
+  usage: RunUsageV1 | null;
+  /** The seq of the run's last event this state reflects (0 before its first); its next event is `lastSeq + 1`. */
+  lastSeq: number;
+}
+
+/** The most runs one `state.subscribe` may name. */
+export const MAX_SUBSCRIBE_RUNS = 64;
 
 export interface EventBase<T extends string, P> {
   v: 1;
   runId: string | null;
   /** Run events: the run's session. `state.snapshot`: the open session. Events not about one session: `null`. */
   conversationId: string | null;
+  /** Run events: 1, 2, … within their own run (each run counts separately). Every other event: 0. */
   seq: number;
   type: T;
   at: number;
@@ -729,6 +758,19 @@ export type SidebarEvent =
   | EventBase<"run.cancelled", { partialText: string; messageId: string | null }>
   | EventBase<"run.failed", NormalizedError>;
 
+/** The events sequenced per run (`seq` 1, 2, …); every other event carries seq 0. */
+export const RUN_EVENT_TYPES = [
+  "run.started", "assistant.delta", "tool.requested", "action.approval-required", "help.requested", "tool.result",
+  "steer.delivered", "run.usage", "run.completed", "run.cancelled", "run.failed",
+] as const satisfies readonly SidebarEvent["type"][];
+export type RunEvent = Extract<SidebarEvent, { type: (typeof RUN_EVENT_TYPES)[number] }> & { runId: string };
+/** A run's last event; nothing follows it. */
+export const TERMINAL_RUN_EVENT_TYPES: ReadonlySet<SidebarEvent["type"]> = new Set(["run.completed", "run.cancelled", "run.failed"]);
+
+export function isRunEvent(event: SidebarEvent): event is RunEvent {
+  return event.runId !== null && (RUN_EVENT_TYPES as readonly string[]).includes(event.type);
+}
+
 export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (!isEnvelope(value)) return false;
   const candidate = value as Record<string, unknown>;
@@ -760,7 +802,7 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
   }
   if (candidate.type === "session.pin") return isSessionId(candidate.sessionId) && typeof candidate.pinned === "boolean";
   if (candidate.type === "state.subscribe") {
-    return candidate.lastSeq === null || typeof candidate.lastSeq === "number";
+    return candidate.lastSeq === null || isRunSeqs(candidate.lastSeq);
   }
   if (candidate.type === "run.start") return typeof candidate.prompt === "string" && isOptionalAskId(candidate.askId) && (candidate.contentIds === undefined || (isContentIds(candidate.contentIds) && isSessionId(candidate.sessionId)));
   if (candidate.type === "run.steer") return typeof candidate.runId === "string" && typeof candidate.text === "string" && isOptionalAskId(candidate.askId) && (candidate.contentIds === undefined || (isContentIds(candidate.contentIds) && isSessionId(candidate.sessionId)));

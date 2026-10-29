@@ -772,8 +772,6 @@ export class BackgroundRuntime {
     ]);
     const notice = this.#notice;
     this.#notice = null;
-    // The single-run gate keeps this to at most one run.
-    const run = this.#anyRun();
     return {
       conversation,
       credential: { ...credential, configured: credential.chatgpt.connected || credential.configured },
@@ -785,18 +783,17 @@ export class BackgroundRuntime {
       agentTabs: this.#agentTabsState,
       queue: [...await this.#queue(conversation.id)],
       ask: this.#ask,
-      activeRun: run
-        ? {
-            runId: run.runId,
-            conversationId: run.sessionId,
-            status: run.status,
-            partialAssistantText: run.partialAssistantText,
-            pendingApproval: run.pendingApproval,
-            pendingHelp: run.pendingHelp,
-            usage: run.usage,
-          }
-        : null,
-      lastSeq: this.#sidebarHub.lastSeq(),
+      // Read together with each run's seq, so its next event is exactly lastSeq + 1.
+      runs: [...this.#runs.values()].map((run) => ({
+        runId: run.runId,
+        conversationId: run.sessionId,
+        status: run.status,
+        partialAssistantText: run.partialAssistantText,
+        pendingApproval: run.pendingApproval,
+        pendingHelp: run.pendingHelp,
+        usage: run.usage,
+        lastSeq: this.#sidebarHub.lastSeq(run.runId),
+      })),
       notice,
     };
   }
@@ -1618,7 +1615,7 @@ export class BackgroundRuntime {
     // terminal path) ends the run through `#abandonRun`, which is a no-op once
     // the run has ended.
     try {
-      this.#sidebarHub.startRun(sessionId);
+      this.#sidebarHub.startRun(runId, sessionId);
       run.announced = true;
       // A watched tab of this session now says bside is working in it.
       this.#refreshShield();
@@ -1977,7 +1974,7 @@ export class BackgroundRuntime {
         this.#retryable.set(run.sessionId, { hadPageEffect: items === null || lastTurnMayHaveCommitted(items) });
       }
       if (!run.announced) {
-        this.#sidebarHub.startRun(run.sessionId);
+        this.#sidebarHub.startRun(run.runId, run.sessionId);
         run.announced = true;
       }
       this.#sidebarHub.publishRunEvent(run.runId, "run.failed", failure);
@@ -2034,7 +2031,7 @@ export class BackgroundRuntime {
       status: checkpointStatus,
       partialAssistantText,
       usage: run.usage,
-      lastSeq: this.#sidebarHub.lastSeq(),
+      lastSeq: this.#sidebarHub.lastSeq(run.runId),
       updatedAt: Date.now(),
     });
   }
