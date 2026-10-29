@@ -7,8 +7,8 @@
  * read — they only ever see what this file publishes through SidebarHub.
  *
  * Per-round provider/tool orchestration is delegated to `AgentLoop`; this
- * file owns run lifecycle (the run registry and its start gate, checkpointing,
- * persistence) and everything outside an active run (credentials, settings).
+ * file owns run lifecycle (the run registry, at most one run per session,
+ * checkpointing, persistence) and everything outside a run (credentials, settings).
  */
 
 import { PreparedMcpContent, type ContentAcceptance } from "@/lib/background/mcp-content";
@@ -216,20 +216,22 @@ export class BackgroundRuntime {
   /** Connected accounts' tools; none when absent. */
   #mcp: McpConnections | null;
   #scheduler: TaskScheduler;
-  #scheduledStarting = false;
+  /** Results sessions a scheduled launch is preparing to start a run in; no other run starts there meanwhile. */
+  #scheduledStarting = new Set<string>();
   #notifications: RunNotifications | null;
   #sweepTimer: unknown;
   #disposed = false;
   #queueOps: Promise<unknown> = Promise.resolve();
-  #queueClaims = new Set<string>();
+  /** Follow-ups claimed for a run that is starting, by message id, with their session. */
+  #queueClaims = new Map<string, string>();
   #preparedContent = new PreparedMcpContent();
 
   releaseContentOwner(owner: object): void { this.#preparedContent.releaseOwner(owner); }
 
   /**
-   * Active runs by run id. A session has at most one; `#singleRunGate` keeps
-   * it to one in all for now. Look runs up through `#runFor` (a session's
-   * run), `#run` (one run by id), and `#anyRun`/`#runs` (any or every run).
+   * Active runs by run id: at most one per session, any number of sessions
+   * at once. Look runs up through `#runFor` (a session's run), `#run` (one
+   * run by id), and `#anyRun`/`#runs` (any or every run).
    */
   #runs = new Map<string, ActiveRun>();
   #notice: string | null = null;
@@ -238,7 +240,12 @@ export class BackgroundRuntime {
   /** Cached `local:openConversation`; resolved lazily so every path sees a real session. */
   #openSessionId: string | null = null;
   #sessionOps: Promise<void> = Promise.resolve();
-  #sessionOpsPending = 0;
+  /**
+   * Sessions a pending session command may switch away from or delete, with
+   * how many commands hold each; `"*"` holds every session ("Delete all
+   * history"). No sidebar run or follow-up starts in a held session.
+   */
+  #heldSessions = new Map<string, number>();
   #lastRetentionAt = -Infinity;
   /**
    * Sessions whose last turn ended failed, cancelled, or interrupted, so
@@ -728,7 +735,7 @@ export class BackgroundRuntime {
     return this.#runs.get(runId);
   }
 
-  /** Some active run, for checks that hold while any run is active (and, while at most one exists, the run itself). */
+  /** Some active run, for checks that hold while any run is active. */
   #anyRun(): ActiveRun | undefined {
     return this.#runs.values().next().value;
   }
@@ -736,15 +743,6 @@ export class BackgroundRuntime {
   /** Every session with an active run: deletion and pruning spare them all. */
   #runSessions(): string[] {
     return [...this.#runs.values()].map((run) => run.sessionId);
-  }
-
-  /**
-   * The single-run rule: no run starts while another is active, in any
-   * session. Every start path checks this beside its own per-session check
-   * (`#runFor`); a later change lifts it to allow one run per session at once.
-   */
-  #singleRunGate(): boolean {
-    return this.#runs.size > 0;
   }
 
   /** Releases a run's slot and its leases on the user's tabs, unless another run has already replaced it. */
@@ -981,20 +979,53 @@ export class BackgroundRuntime {
   }
 
   /**
-   * Serializes session changes. While one that `blocksRuns` is pending,
-   * `run.start` and `run.retry` are refused, so a run never starts in a
-   * session that is being switched away from or deleted.
+   * Serializes session changes. While one is pending, the sessions it `holds`
+   * (from the moment it is queued) start no run but a scheduled one, so a
+   * run never starts in a session that is being switched away from or
+   * deleted. Other sessions' runs start and end as usual.
    */
-  #queueSessionOp<T>(task: () => Promise<T>, blocksRuns = true): Promise<T> {
-    if (blocksRuns) this.#sessionOpsPending += 1;
+  #queueSessionOp<T>(task: () => Promise<T>, holds: readonly string[] = []): Promise<T> {
+    const release = this.#holdSessions(holds);
     const op = this.#sessionOps.then(task);
     this.#sessionOps = op.then(() => {}, () => {});
-    return op.finally(() => { if (blocksRuns) this.#sessionOpsPending -= 1; });
+    return op.finally(release);
+  }
+
+  /** Holds sessions (see `#heldSessions`) until the returned release is called, once. */
+  #holdSessions(ids: readonly string[]): () => void {
+    for (const id of ids) this.#heldSessions.set(id, (this.#heldSessions.get(id) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      for (const id of ids) {
+        const count = (this.#heldSessions.get(id) ?? 1) - 1;
+        if (count > 0) this.#heldSessions.set(id, count);
+        else this.#heldSessions.delete(id);
+      }
+    };
+  }
+
+  /** Whether a pending session command holds `sessionId`, or a scheduled launch is preparing a run there. */
+  #sessionHeld(sessionId: string): boolean {
+    return this.#heldSessions.has("*") || this.#heldSessions.has(sessionId) || this.#scheduledStarting.has(sessionId);
+  }
+
+  /**
+   * The sessions a session command holds: the open one (it may be switched
+   * away from, and deleted if untouched) and, for a delete, the deleted one.
+   * Renaming and pinning hold none.
+   */
+  #sessionsHeldBy(command: SessionCommand): string[] {
+    if (command.type === "session.rename" || command.type === "session.pin") return [];
+    // Resolved during startup, before any sidebar command runs; held in full otherwise.
+    const open = this.#openSessionId === null ? ["*"] : [this.#openSessionId];
+    return command.type === "session.delete" ? [...open, command.sessionId] : open;
   }
 
   /** Applies a session command, then republishes the snapshot and the session list. */
   async #runSessionCommand(command: SessionCommand): Promise<void> {
-    try { await this.#queueSessionOp(() => this.#applySessionCommand(command)); }
+    try { await this.#queueSessionOp(() => this.#applySessionCommand(command), this.#sessionsHeldBy(command)); }
     catch { this.#notice = "Could not update chats. Try again."; }
     if (command.type === "session.open") {
       await this.#scheduler.markRead(await this.#openSession()).catch(() => {});
@@ -1019,8 +1050,9 @@ export class BackgroundRuntime {
    */
   async #applyRetention(): Promise<number> {
     this.#lastRetentionAt = this.#clock.now();
-    // Never blocks runs: a run only starts in the open session, which is kept,
-    // or as a follow-up in the session whose run just completed, which was just updated.
+    // Holds no session: a run only starts in the open session, which is kept,
+    // as a follow-up in the session whose run just completed, which was just
+    // updated, or as a scheduled run, which starts under this same lock.
     const deleted = await this.#queueSessionOp(async () => {
       const cutoff = retentionCutoff((await getHistorySettings()).retention, this.#clock.now());
       const keep = [await this.#openSession(), ...this.#runSessions()];
@@ -1030,7 +1062,7 @@ export class BackgroundRuntime {
       const orphaned = (tab: AgentTab) => !live.has(tab.sessionId);
       if ([...this.#workspace.agentTabs.values()].some(orphaned)) await this.#closeAgentTabs(orphaned, false);
       return ids;
-    }, false);
+    });
     if (deleted.length > 0) await this.#publishSessions();
     return deleted.length;
   }
@@ -1052,7 +1084,7 @@ export class BackgroundRuntime {
       }
       await this.#forgetSessions(deleted, true);
       return { deleted, kept };
-    });
+    }, ["*"]);
     await this.#sidebarHub.broadcastSnapshot();
     await this.#publishSessions();
     const count = `Deleted ${deleted.length} ${deleted.length === 1 ? "chat" : "chats"}.`;
@@ -1134,12 +1166,19 @@ export class BackgroundRuntime {
     }
   }
 
-  /** Opens `id`. The previous session is deleted if it is untouched, so abandoned new chats do not pile up. */
+  /**
+   * Opens `id`. The previous session is deleted if it is untouched, so
+   * abandoned new chats do not pile up. It is held until then: a run started
+   * there after the check below would lose its session.
+   */
   async #switchSession(id: string): Promise<void> {
     const previous = await this.#openSession();
-    await setOpenSessionId(id);
-    this.#openSessionId = id;
-    if (previous !== id && !this.#runFor(previous) && await isSessionUntouched(previous)) await deleteSession(previous);
+    const release = this.#holdSessions([previous]);
+    try {
+      await setOpenSessionId(id);
+      this.#openSessionId = id;
+      if (previous !== id && !this.#runFor(previous) && await isSessionUntouched(previous)) await deleteSession(previous);
+    } finally { release(); }
   }
 
   async handleCredentialRequest(request: CredentialRequest): Promise<CredentialResponse> {
@@ -1282,13 +1321,15 @@ export class BackgroundRuntime {
 
   async #launchScheduled(task: ScheduledTask, scheduledAt: number, recordStart: RecordTaskStart): Promise<TaskDispatch> {
     if (this.#disposed) return { status: "unavailable" };
-    // Busy only while the task's own results session has a run (another
-    // chat's run does not block it), and for now while any run does
-    // (`#singleRunGate`). `#scheduledStarting` and pending session ops are
-    // brief locks, not runs.
-    const busy = () => this.#singleRunGate() || (task.sessionId !== null && this.#runFor(task.sessionId) !== undefined);
-    if (busy() || this.#scheduledStarting || this.#sessionOpsPending > 0) return { status: "skipped-busy" };
-    this.#scheduledStarting = true;
+    // Busy only while the task's results session has a run (or another launch
+    // is preparing one there); runs in other chats never delay it. A first run
+    // gets a new session, which nothing else can start a run in.
+    const results = task.sessionId;
+    const busy = () => results !== null && this.#runFor(results) !== undefined;
+    if (busy() || (results !== null && this.#scheduledStarting.has(results))) return { status: "skipped-busy" };
+    // Held from here until the run claims its slot, so a sidebar start or a
+    // follow-up there cannot take the session between the check and the start.
+    if (results !== null) this.#scheduledStarting.add(results);
     try {
       return await this.#queueSessionOp(async (): Promise<TaskDispatch> => {
         if (busy()) return { status: "skipped-busy" };
@@ -1311,7 +1352,7 @@ export class BackgroundRuntime {
         });
         return { status: "started", runId, sessionId };
       });
-    } finally { this.#scheduledStarting = false; }
+    } finally { if (results !== null) this.#scheduledStarting.delete(results); }
   }
 
   async #getCredentialStatus() {
@@ -1508,9 +1549,10 @@ export class BackgroundRuntime {
   /** Claim under the queue lock, then start outside it: a run itself delivers/removes queue entries. */
   async #runQueued(sessionId: string, messageId?: string): Promise<boolean> {
     const message = await this.#withQueueLock(async () => {
-      if (this.#runFor(sessionId) || this.#singleRunGate() || this.#queueClaims.size || this.#sessionOpsPending > 0 || this.#scheduledStarting) return undefined;
+      // One claim per session at a time: a claimed follow-up is already starting this session's run.
+      if (this.#runFor(sessionId) || [...this.#queueClaims.values()].includes(sessionId) || this.#sessionHeld(sessionId)) return undefined;
       const candidate = (await this.#readQueue(sessionId)).find(item => item.mode === "follow-up" && (messageId === undefined || item.id === messageId));
-      if (candidate) this.#queueClaims.add(candidate.id);
+      if (candidate) this.#queueClaims.set(candidate.id, sessionId);
       return candidate;
     });
     if (!message) return false;
@@ -1540,7 +1582,9 @@ export class BackgroundRuntime {
     if (this.#disposed) return;
     const retry = rawPrompt === null;
     const retryable = this.#retryable.get(sessionId);
-    if (this.#runFor(sessionId) || this.#singleRunGate() || (!accepted?.scheduled && (this.#sessionOpsPending > 0 || this.#scheduledStarting)) || (retry && !retryable)) {
+    // A session runs at most one run; any number of sessions may run at once.
+    // A scheduled run starts under the session lock, so session commands cannot hold its session.
+    if (this.#runFor(sessionId) || (!accepted?.scheduled && this.#sessionHeld(sessionId)) || (retry && !retryable)) {
       await this.#sidebarHub.broadcastSnapshot();
       return;
     }
@@ -1557,9 +1601,9 @@ export class BackgroundRuntime {
       return;
     }
 
-    // Claim the run's slot synchronously, before any `await`, so a second
-    // `run.start` arriving before credential lookup resolves still sees an
-    // active run and is dropped rather than racing into a second run.
+    // Claim the session's slot synchronously, before any `await`, so a second
+    // start in this session arriving before credential lookup resolves still
+    // sees its run and is dropped rather than racing into a second run there.
     const runId = accepted?.runId ?? crypto.randomUUID();
     const controller = new AbortController();
     const tabController = this.#tabControllerFactory();

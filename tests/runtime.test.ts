@@ -515,7 +515,7 @@ beforeEach(() => {
   fakeBrowser.reset();
 });
 
-describe("BackgroundRuntime: single active run", () => {
+describe("BackgroundRuntime: one run per session", () => {
   it("queues a second run.start as a follow-up while the run is active, without a second user message", async () => {
     await saveOpenAICredential("sk-test");
     const hub = new SidebarHub();
@@ -543,7 +543,7 @@ describe("BackgroundRuntime: single active run", () => {
     expect(provider.requests).toHaveLength(1);
   });
 
-  it("never starts two runs at once even when run.start arrives twice before credential lookup resolves; the second follows the first", async () => {
+  it("never starts two runs in one session even when run.start arrives twice before credential lookup resolves; the second follows the first", async () => {
     await saveOpenAICredential("sk-test");
     const hub = new SidebarHub();
     const provider = new FakeProvider();
@@ -1319,7 +1319,7 @@ describe("BackgroundRuntime: a run that throws outside its agent loop", () => {
     expect(await listRunCheckpoints()).toEqual([]);
     expect((await openConversation()).items.map((item) => item.kind === "run-digest" ? `digest:${item.digest.status}` : item.id).at(-1)).toBe("digest:failed");
 
-    // The session (and, while the single-run gate stands, every session) is free again.
+    // The session is free again.
     await runtime.handleCommand({ v: 1, id: "second", type: "run.start", prompt: "Second" });
     expect(provider.requests).toHaveLength(1);
     expect((await openConversation()).items.at(-1)).toMatchObject({ role: "assistant", text: "Done." });
@@ -2732,7 +2732,7 @@ describe("BackgroundRuntime: sessions", () => {
   });
 
   it("lets another session be viewed while the run keeps writing to its own session", async () => {
-    const { send, snapshot, port } = await setup(["Older answer.", null]);
+    const { send, snapshot, port } = await setup(["Older answer.", null, "Meanwhile answer."]);
     await send({ type: "run.start", prompt: "Older chat" });
     const older = (await snapshot()).conversation.id;
     await send({ type: "session.create" });
@@ -2747,14 +2747,15 @@ describe("BackgroundRuntime: sessions", () => {
     expect(port.received.filter((event) => event.type === "run.started").at(-1)?.conversationId).toBe(running);
     expect(port.received.filter((event) => event.type === "state.snapshot").at(-1)?.conversationId).toBe(older);
 
-    // Still one run globally: a second run is refused in the session on screen.
+    // The chat on screen has no run of its own, so it starts one beside the other chat's.
     await send({ type: "run.start", prompt: "Meanwhile" });
-    expect(texts((await snapshot()).conversation)).toEqual(["Older chat", "Older answer."]);
+    expect(texts((await snapshot()).conversation)).toEqual(["Older chat", "Older answer.", "Meanwhile", "Meanwhile answer."]);
+    expect((await snapshot()).runs.map((other) => other.conversationId)).toEqual([running]);
 
     await send({ type: "run.cancel", runId: viewing.runs[0]!.runId });
     await run;
     expect(texts((await getConversation(running))!)).toEqual(["Long task", expect.stringContaining("Stopped")]);
-    expect(texts((await snapshot()).conversation)).toEqual(["Older chat", "Older answer."]);
+    expect(texts((await snapshot()).conversation)).toEqual(["Older chat", "Older answer.", "Meanwhile", "Meanwhile answer."]);
   });
 
   it("refuses to delete the active run's session, and deleting the open session opens the most recent one", async () => {
@@ -3236,27 +3237,29 @@ describe("BackgroundRuntime: talk while it works", () => {
   it("starts a queued follow-up as the next turn once the run completes, in the run's chat even after switching chats", async () => {
     const { runtime, port, provider } = setup();
     const gate = Promise.withResolvers<void>();
-    scripted(provider, [{ events: answer("A done."), gate: gate.promise }, { events: answer("B done.") }]);
+    scripted(provider, [{ events: answer("A done."), gate: gate.promise }, { events: answer("C done.") }, { events: answer("B done.") }]);
     const run = send(runtime, { type: "run.start", prompt: "A" });
     await untilRequested(provider);
     const first = (await runtime.getSnapshot()).conversation.id;
     await send(runtime, { type: "run.start", prompt: "B" });
     expect(await queueOf(runtime)).toEqual(["follow-up:B"]);
     await send(runtime, { type: "session.create" });
-    // Another chat cannot queue for, or start beside, the run.
+    const second = (await runtime.getSnapshot()).conversation.id;
+    // Another chat does not queue for the run: it runs its own turn beside it.
     await send(runtime, { type: "run.start", prompt: "C" });
     expect(await queueOf(runtime)).toEqual([]);
+    expect(userTexts((await openConversation()).items)).toEqual(["C"]);
 
     gate.resolve();
     await run;
     const chat = await getConversation(first);
     expect(userTexts(chat!.items)).toEqual(["A", "B"]);
     expect(chat!.items.at(-1)).toMatchObject({ role: "assistant", text: "B done." });
-    expect((await openConversation()).items).toEqual([]);
-    expect(provider.requests).toHaveLength(2);
-    expect(provider.requests[1]!.sessionId).toBe(first);
-    expect(provider.requests[1]!.context.messages.map((message) => message.role)).toEqual(["user", "assistant", "user"]);
-    expect(port.received.filter((event) => event.type === "run.started").map((event) => event.conversationId)).toEqual([first, first]);
+    expect((await openConversation()).items.at(-1)).toMatchObject({ role: "assistant", text: "C done." });
+    expect(provider.requests).toHaveLength(3);
+    expect(provider.requests.map((request) => request.sessionId)).toEqual([first, second, first]);
+    expect(provider.requests[2]!.context.messages.map((message) => message.role)).toEqual(["user", "assistant", "user"]);
+    expect(port.received.filter((event) => event.type === "run.started").map((event) => event.conversationId)).toEqual([first, second, first]);
     expect(await loadMessageQueue(first)).toEqual([]);
   });
 
@@ -3653,22 +3656,55 @@ describe("BackgroundRuntime: scheduled automation", () => {
     expect(texts.at(-1)).toBe("");
   });
 
-  it("skips busy ticks without interrupting a user run, including repeated alarms", async () => {
+  const userTextsOf = (items: ConversationItem[]) => items.flatMap((item) => item.kind === "message" && item.role === "user" ? [item.text] : []);
+
+  it("runs a tick while an unrelated chat runs, leaving that run and the open chat alone", async () => {
     const { provider, release } = blockingProvider();
     const { runtime, advance, taskId, openId } = await setup(provider);
     const userRun = runtime.handleCommand({ v: 1, id: "user", type: "run.start", prompt: "User work" });
     await untilRequested(provider);
     const activeId = (await runtime.getSnapshot()).runs[0]!.runId;
     advance(300_000);
-    await Promise.all([runtime.handleAlarm(SCHEDULE_ALARM), runtime.handleAlarm(SCHEDULE_ALARM)]);
-    expect((await getScheduledTasks())[0]).toMatchObject({ lastTick: { status: "skipped-busy" }, lastRun: null, sessionId: null });
-    expect((await runtime.getSnapshot()).runs[0]!.runId).toBe(activeId);
-    expect(provider.requests).toHaveLength(1);
-    release(); await userRun;
-    expect((await getScheduledTasks())[0]!.lastRun).toBeNull();
+    await runtime.handleAlarm(SCHEDULE_ALARM);
+    await untilRequested(provider, 2);
+    const task = (await getScheduledTasks())[0]!;
+    expect(task).toMatchObject({ lastTick: { status: "started" }, lastRun: { status: "running" } });
+    expect(task.sessionId).not.toBe(openId);
+    const runs = (await runtime.getSnapshot()).runs;
+    expect(runs.map((run) => run.conversationId).sort()).toEqual([openId, task.sessionId].sort());
+    expect(runs.find((run) => run.conversationId === openId)!.runId).toBe(activeId);
     expect(await getOpenSessionId()).toBe(openId);
-    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); await ended(taskId);
+    release(); await userRun; await ended(taskId);
+    expect(userTextsOf((await getConversation(openId))!.items)).toEqual(["User work"]);
+    expect(userTextsOf((await getConversation(task.sessionId!))!.items)).toEqual([draft.prompt]);
+  });
+
+  it("skips ticks while its results session has a run, including repeated alarms", async () => {
+    const provider = new FakeProvider();
+    const gate = Promise.withResolvers<void>();
+    let round = 0;
+    provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      if (round++ === 1) await gate.promise;
+      yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+    } });
+    const { runtime, advance, taskId } = await setup(provider);
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
+    const results = (await ended(taskId)).sessionId!;
+    // The user opens the results and asks a follow-up there, which keeps running.
+    await runtime.openResultsSession(results);
+    const userRun = runtime.handleCommand({ v: 1, id: "user", type: "run.start", prompt: "User work" });
+    await untilRequested(provider, 2);
+    const activeId = (await runtime.getSnapshot()).runs[0]!.runId;
+    advance(300_000);
+    await Promise.all([runtime.handleAlarm(SCHEDULE_ALARM), runtime.handleAlarm(SCHEDULE_ALARM)]);
+    expect((await getScheduledTasks())[0]).toMatchObject({ lastTick: { status: "skipped-busy" }, sessionId: results });
+    expect((await runtime.getSnapshot()).runs.map((run) => run.runId)).toEqual([activeId]);
     expect(provider.requests).toHaveLength(2);
+    gate.resolve(); await userRun;
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
+    await vi.waitFor(() => expect(provider.requests).toHaveLength(3));
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).runs).toEqual([]));
+    expect(userTextsOf((await getConversation(results))!.items)).toEqual([draft.prompt, "User work", draft.prompt]);
   });
 
   it("keeps an unsent context-menu draft separate from an automatic run", async () => {
@@ -3800,16 +3836,16 @@ describe("BackgroundRuntime: scheduled automation", () => {
     expect(fake.requests.some((request) => request.body.includes('"tools/call"'))).toBe(false);
   });
 
-  it("never runs two due tasks simultaneously", async () => {
+  it("runs two due tasks at once, each in its own results session", async () => {
     const { provider, release } = blockingProvider();
     const { runtime, advance, taskId } = await setup(provider);
     await runtime.handleAutomationRequest({ v: 1, id: "second", type: "automation.save", taskId: null, task: { ...draft, name: "Second task" } });
-    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); await untilRequested(provider);
+    advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); await untilRequested(provider, 2);
     const tasks = await getScheduledTasks();
-    expect(tasks.filter((t) => t.lastRun)).toHaveLength(1);
-    expect(tasks[1]!.lastTick?.status).toBe("skipped-busy");
-    expect(provider.requests).toHaveLength(1);
-    release(); await ended(taskId);
+    expect(tasks.map((t) => t.lastTick?.status)).toEqual(["started", "started"]);
+    expect(new Set(tasks.map((t) => t.sessionId)).size).toBe(2);
+    expect((await runtime.getSnapshot()).runs).toHaveLength(2);
+    release(); await ended(taskId); await ended(tasks[1]!.id);
   });
 
   it("pauses scheduled confirmation until the user responds and preserves ! priority", async () => {
@@ -4300,5 +4336,244 @@ describe("user-tab leases", () => {
     expect(modelInput(provider)).toContain("Orchid launch");
     // Attaching and reading took the lease; the run's end released it.
     expect(workspace.leases.size).toBe(0);
+  });
+});
+
+describe("BackgroundRuntime: concurrent runs", () => {
+  /** A scripted round's steps: events, gates (promises) it waits on (or cancellation), and errors it throws. */
+  type Step = ScriptedProviderEvent | Promise<void> | Error;
+  const done: ScriptedProviderEvent = { type: "turn.completed", replayState: null };
+  const delta = (text: string): ScriptedProviderEvent => ({ type: "text.delta", delta: text });
+  const answer = (text: string): Step[] => [delta(text), done];
+  const confirm: ScriptedProviderEvent = { type: "tool.call", call: { id: "confirm", name: "request_action_confirmation", arguments: { title: "Send", message: "Send it?", artifact: "Draft" } } };
+  const read: ScriptedProviderEvent = { type: "tool.call", call: { id: "read", name: "browser_program", arguments: { source: 'return fs.read("/tabs/1/page.md");' } } };
+
+  /** Answers each session from its own rounds, so two runs' streams can be interleaved at will. */
+  class RoutedProvider extends FakeProvider {
+    bySession = new Map<string, Step[][]>();
+    override streamTurn(request: ProviderTurnRequest, _auth: ProviderAuth, signal: AbortSignal) {
+      this.requests.push(splitSystemMessage(request));
+      const steps = this.bySession.get(request.sessionId ?? "")?.shift() ?? answer("Extra.");
+      return toPiStream({ [Symbol.asyncIterator]: async function* () {
+        for (const step of steps) {
+          if (step instanceof Error) throw step;
+          if (!(step instanceof Promise)) { yield step; continue; }
+          await new Promise<void>((resolve, reject) => {
+            void step.then(resolve);
+            signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+          });
+        }
+      } }, signal);
+    }
+  }
+
+  async function setup(options: { tabControllerFactory?: () => TabController; workspace?: WorkspaceState } = {}) {
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const provider = new RoutedProvider();
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: options.tabControllerFactory ?? unsupportedPageTabControllerFactory, workspace: options.workspace });
+    hub.delegate = runtime;
+    const port = fakePort();
+    hub.handleConnect(port);
+    const send = (command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+    const open = async () => (await runtime.getSnapshot()).conversation.id;
+    const runIn = async (sessionId: string) => (await runtime.getSnapshot()).runs.find((run) => run.conversationId === sessionId);
+    /** Starts a run in a new chat (or the empty open one) with these rounds; returns once the run reached the provider. */
+    const startChat = async (prompt: string, rounds: Step[][]) => {
+      await send({ type: "session.create" });
+      const sessionId = await open();
+      provider.bySession.set(sessionId, rounds);
+      const before = provider.requests.length;
+      const finished = send({ type: "run.start", prompt });
+      await untilRequested(provider, before + 1);
+      // From its event, since a quick run may already have ended.
+      const runId = port.received.findLast((event) => event.type === "run.started" && event.conversationId === sessionId)!.runId!;
+      return { sessionId, finished, runId };
+    };
+    return { runtime, provider, port, send, open, runIn, startChat };
+  }
+
+  const texts = (items: ConversationItem[]) => items.flatMap((item) => item.kind === "message" ? [`${item.role}:${item.text}`] : []);
+  const itemsOf = async (sessionId: string) => (await getConversation(sessionId))!.items;
+
+  it("runs two chats at once with interleaved streams, each writing only its own transcript", async () => {
+    const { provider, port, runIn, startChat } = await setup();
+    const gateA = Promise.withResolvers<void>();
+    const gateB = Promise.withResolvers<void>();
+    const a = await startChat("Task A", [[delta("A1 "), gateA.promise, delta("A2"), done]]);
+    await vi.waitFor(async () => expect((await runIn(a.sessionId))?.partialAssistantText).toBe("A1 "));
+    const b = await startChat("Task B", [[delta("B1 "), gateB.promise, delta("B2"), done]]);
+    await vi.waitFor(async () => expect((await runIn(b.sessionId))?.partialAssistantText).toBe("B1 "));
+    expect(a.sessionId).not.toBe(b.sessionId);
+
+    // B finishes first while A is still streaming.
+    gateB.resolve();
+    await b.finished;
+    expect(await runIn(b.sessionId)).toBeUndefined();
+    expect(await runIn(a.sessionId)).toMatchObject({ runId: a.runId, partialAssistantText: "A1 " });
+    gateA.resolve();
+    await a.finished;
+
+    expect(texts(await itemsOf(a.sessionId))).toEqual(["user:Task A", "assistant:A1 A2"]);
+    expect(texts(await itemsOf(b.sessionId))).toEqual(["user:Task B", "assistant:B1 B2"]);
+    expect(provider.requests.map((request) => request.sessionId)).toEqual([a.sessionId, b.sessionId]);
+    expect(JSON.stringify(provider.requests[1]!.context.messages)).not.toContain("Task A");
+    // Each run's events name its own chat and carry its own text.
+    for (const { runId, sessionId, text } of [{ ...a, text: "A1 A2" }, { ...b, text: "B1 B2" }]) {
+      const events = port.received.filter((event) => event.runId === runId);
+      expect(new Set(events.map((event) => event.conversationId))).toEqual(new Set([sessionId]));
+      expect(events.flatMap((event) => event.type === "assistant.delta" ? [event.payload.delta] : []).join("")).toBe(text);
+      expect(events.at(-1)?.type).toBe("run.completed");
+    }
+  });
+
+  it("routes a steer and follow-ups to the run of the chat they were sent in", async () => {
+    const { provider, send, open, runIn, startChat, runtime } = await setup();
+    const gateA = Promise.withResolvers<void>();
+    const gateB = Promise.withResolvers<void>();
+    const a = await startChat("Task A", [[gateA.promise, ...answer("A done.")], answer("A follow-up done.")]);
+    const b = await startChat("Task B", [[gateB.promise, ...answer("B done.")], answer("B steered."), answer("B follow-up done.")]);
+
+    // B is on screen: its steer and follow-up wait in B's queue only.
+    await send({ type: "run.steer", runId: b.runId, text: "Use tab 2" });
+    await send({ type: "run.start", prompt: "More B" });
+    expect((await runtime.getSnapshot()).queue.map((message) => `${message.mode}:${message.text}`)).toEqual(["steer:Use tab 2", "follow-up:More B"]);
+    // Opening A and sending there queues for A's run, not B's.
+    await send({ type: "session.open", sessionId: a.sessionId });
+    expect(await open()).toBe(a.sessionId);
+    await send({ type: "run.start", prompt: "More A" });
+    expect((await loadMessageQueue(a.sessionId)).map((message) => message.text)).toEqual(["More A"]);
+    expect((await loadMessageQueue(b.sessionId)).map((message) => message.text)).toEqual(["Use tab 2", "More B"]);
+    expect((await runIn(a.sessionId))?.runId).toBe(a.runId);
+
+    gateB.resolve();
+    await b.finished;
+    gateA.resolve();
+    await a.finished;
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).runs).toEqual([]));
+    expect(texts(await itemsOf(a.sessionId))).toEqual(["user:Task A", "assistant:A done.", "user:More A", "assistant:A follow-up done."]);
+    expect(texts(await itemsOf(b.sessionId))).toEqual(["user:Task B", "assistant:B done.", "user:Use tab 2", "assistant:B steered.", "user:More B", "assistant:B follow-up done."]);
+    expect((await itemsOf(b.sessionId)).find((item) => item.kind === "message" && item.text === "Use tab 2")).toMatchObject({ delivery: "steer" });
+    expect(JSON.stringify(provider.requests.filter((request) => request.sessionId === a.sessionId).map((request) => request.context.messages))).not.toMatch(/Use tab 2|More B/);
+  });
+
+  it("cancels or approves one run without touching the other", async () => {
+    const { send, runIn, startChat } = await setup();
+    const a = await startChat("Send the draft", [[confirm, done], answer("Sent.")]);
+    await vi.waitFor(async () => expect((await runIn(a.sessionId))?.status).toBe("awaiting-approval"));
+    const b = await startChat("Long task", [[delta("Working"), Promise.withResolvers<void>().promise]]);
+
+    // A command naming B's run never resolves A's confirmation.
+    await send({ type: "action.approve", runId: b.runId, callId: "confirm" });
+    expect(await runIn(a.sessionId)).toMatchObject({ status: "awaiting-approval", pendingApproval: { call: { id: "confirm" } } });
+    await send({ type: "run.cancel", runId: b.runId });
+    await b.finished;
+    expect(await runIn(b.sessionId)).toBeUndefined();
+    expect(await runIn(a.sessionId)).toMatchObject({ status: "awaiting-approval" });
+    expect(texts(await itemsOf(b.sessionId))).toEqual(["user:Long task", expect.stringContaining("assistant:Working")]);
+
+    await send({ type: "action.approve", runId: a.runId, callId: "confirm" });
+    await a.finished;
+    expect(texts(await itemsOf(a.sessionId))).toEqual(["user:Send the draft", "assistant:Sent."]);
+  });
+
+  it("queues a second run.start in a busy chat while another chat also runs", async () => {
+    const { provider, send, runtime, startChat } = await setup();
+    const gate = Promise.withResolvers<void>();
+    const a = await startChat("Task A", [[gate.promise, ...answer("A done.")]]);
+    const b = await startChat("Task B", [[gate.promise, ...answer("B done.")], answer("Again done.")]);
+    await send({ type: "run.start", prompt: "Again" });
+    const snapshot = await runtime.getSnapshot();
+    expect(snapshot.runs.map((run) => run.conversationId).sort()).toEqual([a.sessionId, b.sessionId].sort());
+    expect(snapshot.queue.map((message) => `${message.mode}:${message.text}`)).toEqual(["follow-up:Again"]);
+    expect(snapshot.conversation.items.filter(isTurnStart)).toHaveLength(1);
+    expect(await loadMessageQueue(a.sessionId)).toEqual([]);
+    expect(provider.requests).toHaveLength(2);
+    gate.resolve();
+    await Promise.all([a.finished, b.finished]);
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).runs).toEqual([]));
+    expect(texts(await itemsOf(b.sessionId))).toEqual(["user:Task B", "assistant:B done.", "user:Again", "assistant:Again done."]);
+  });
+
+  it("claims one slot for a racing double start or double retry in one chat while another chat runs", async () => {
+    const { provider, send, open, runtime, startChat } = await setup();
+    const gate = Promise.withResolvers<void>();
+    const a = await startChat("Task A", [[gate.promise, ...answer("A done.")]]);
+    await send({ type: "session.create" });
+    const b = await open();
+    provider.bySession.set(b, [answer("X done."), answer("Y done.")]);
+    // Both fired before yielding to the event loop at all: the second waits as a follow-up.
+    await Promise.all([send({ type: "run.start", prompt: "X" }), send({ type: "run.start", prompt: "Y" })]);
+    await vi.waitFor(async () => expect(texts(await itemsOf(b))).toEqual(["user:X", "assistant:X done.", "user:Y", "assistant:Y done."]));
+
+    // A failed turn retried twice at once runs once.
+    await vi.waitFor(async () => expect((await runtime.getSnapshot()).runs).toHaveLength(1));
+    await send({ type: "session.create" });
+    const c = await open();
+    provider.bySession.set(c, [[new ProviderStreamError("Rate limited.", "RATE_LIMIT")], answer("Recovered."), answer("Twice?")]);
+    await send({ type: "run.start", prompt: "Flaky" });
+    const before = provider.requests.length;
+    await Promise.all([send({ type: "run.retry" }), send({ type: "run.retry" })]);
+    expect(provider.requests.length - before).toBe(1);
+    expect(texts(await itemsOf(c))).toEqual(["user:Flaky", "assistant:Recovered."]);
+
+    expect((await runtime.getSnapshot()).runs.map((run) => run.runId)).toEqual([a.runId]);
+    gate.resolve();
+    await a.finished;
+  });
+
+  it("keeps a user tab leased to the run using it, refuses it to another live run, and releases it at the end", async () => {
+    const workspace = new WorkspaceState();
+    const { provider, startChat } = await setup({ tabControllerFactory: supportedPageTabControllerFactory, workspace });
+    const gate = Promise.withResolvers<void>();
+    // A attaches the active tab, which takes its lease, and keeps running.
+    const a = await startChat("Read this", [[gate.promise, ...answer("A done.")]]);
+    expect(workspace.leases.get(1)).toBe(a.runId);
+    expect(JSON.stringify(provider.requests[0]!.context.messages)).toContain("Orchid launch");
+
+    // B, in another chat, may neither attach nor read it while A holds it.
+    const b = await startChat("Read it too", [[read, done], answer("B done.")]);
+    await b.finished;
+    const bRequests = provider.requests.filter((request) => request.sessionId === b.sessionId);
+    expect(JSON.stringify(bRequests[0]!.context.messages)).toContain("another bside chat is using it");
+    expect(JSON.stringify(bRequests[1]!.context.messages)).toContain("TAB_IN_USE");
+    expect(JSON.stringify(bRequests.map((request) => request.context.messages))).not.toContain("Orchid launch");
+    expect(workspace.leases.get(1)).toBe(a.runId);
+
+    gate.resolve();
+    await a.finished;
+    expect(workspace.leases.size).toBe(0);
+    // Free again: the next run in another chat reads it.
+    const c = await startChat("And now?", [[read, done], answer("C done.")]);
+    await c.finished;
+    expect(JSON.stringify(provider.requests.at(-1)!.context.messages)).toContain("Orchid launch");
+    expect(workspace.leases.size).toBe(0);
+  });
+
+  it("recovers both of two live runs after a restart, each in its own chat", async () => {
+    const { startChat } = await setup();
+    const never = Promise.withResolvers<void>().promise;
+    const a = await startChat("Task A", [[delta("Half A"), never]]);
+    const b = await startChat("Task B", [[delta("Half B"), never]]);
+    await vi.waitFor(async () => expect((await listRunCheckpoints()).map((checkpoint) => checkpoint.sessionId).sort()).toEqual([a.sessionId, b.sessionId].sort()));
+
+    // A new background page over the same storage, as after a browser restart.
+    const provider = new FakeProvider();
+    provider.script = [delta("After restart."), done];
+    const hub = new SidebarHub();
+    const restarted = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
+    hub.delegate = restarted;
+    await restarted.initialize();
+
+    expect(await listRunCheckpoints()).toEqual([]);
+    expect((await restarted.getSnapshot()).runs).toEqual([]);
+    for (const { sessionId, runId } of [a, b]) expect((await itemsOf(sessionId)).map((item) => item.id)).toContain(`interrupted-${runId}`);
+    // Each chat may retry its own turn.
+    await restarted.handleCommand({ v: 1, id: "open-a", type: "session.open", sessionId: a.sessionId });
+    await restarted.handleCommand({ v: 1, id: "retry-a", type: "run.retry" });
+    await restarted.handleCommand({ v: 1, id: "open-b", type: "session.open", sessionId: b.sessionId });
+    await restarted.handleCommand({ v: 1, id: "retry-b", type: "run.retry" });
+    expect(provider.requests.map((request) => request.sessionId)).toEqual([a.sessionId, b.sessionId]);
+    restarted.dispose();
   });
 });
