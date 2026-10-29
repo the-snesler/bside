@@ -33,7 +33,7 @@ import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
 import type { AgentTab } from "@/lib/background/browser-program";
 import type { SidebarHub } from "@/lib/background/sidebar-hub";
-import { FrameAliases, TabController } from "@/lib/background/tab-controller";
+import { FrameAliases, TabController, VisibilityLock } from "@/lib/background/tab-controller";
 import { PdfReader, workerPdfExtractor } from "@/lib/background/pdf";
 import { browserSiteEnv } from "@/lib/sites";
 import type { SiteEnv } from "@/lib/sites/site-api";
@@ -320,11 +320,11 @@ export class BackgroundRuntime {
 
   constructor(
     sidebarHub: SidebarHub,
-    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController; sites?: SiteEnv; approvalBadge?: ApprovalBadge; clock?: RuntimeClock; mcp?: McpConnections; alarms?: SchedulerAlarms; notifications?: RunNotifications } = {},
+    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController; sites?: SiteEnv; approvalBadge?: ApprovalBadge; clock?: RuntimeClock; mcp?: McpConnections; alarms?: SchedulerAlarms; notifications?: RunNotifications; workspace?: WorkspaceState } = {},
   ) {
     this.#sidebarHub = sidebarHub;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
-    this.#workspace = new WorkspaceState(() => this.#clock.now());
+    this.#workspace = options.workspace ?? new WorkspaceState(() => this.#clock.now());
     this.#chatgpt = options.chatgpt ?? new ChatGPTAuth();
     this.#provider = options.provider ?? new OpenAIProvider(
       async (auth, signal) => auth.method === "chatgpt" ? this.#chatgpt.getAuth(signal) : auth,
@@ -334,7 +334,8 @@ export class BackgroundRuntime {
     // and one PDF reader, so a PDF is parsed once (in the bundled pdf-text worker, never in this page).
     const frameAliases = new FrameAliases();
     const pdfs = new PdfReader(workerPdfExtractor(() => new Worker(browser.runtime.getURL("/pdf-text.js"))));
-    this.#tabControllerFactory = options.tabControllerFactory ?? (() => new TabController(browser as unknown as TabControllerBrowserApi, undefined, frameAliases, pdfs));
+    const visibility = new VisibilityLock();
+    this.#tabControllerFactory = options.tabControllerFactory ?? (() => new TabController(browser as unknown as TabControllerBrowserApi, undefined, frameAliases, pdfs, visibility));
     this.#sites = options.sites ?? browserSiteEnv();
     this.#approvalBadge = options.approvalBadge ?? null;
     this.#mcp = options.mcp ?? null;
@@ -406,6 +407,11 @@ export class BackgroundRuntime {
     if (!tag) return;
     const tab = (await tabController.allTabs()).find((candidate) => candidate.id === tabId);
     if (tab && (await this.#claimTaggedTab(tabController, tabId, tag, tab.hidden ?? false))) await this.#queueAgentTabSync();
+  }
+
+  /** A closed tab's lease ends with it. */
+  handleTabRemoved(tabId: number): void {
+    this.#workspace.releaseLease(tabId);
   }
 
   /** Republishes an agent tab whose title, URL, or icon changed, so the sidebar's list stays current. */
@@ -725,9 +731,11 @@ export class BackgroundRuntime {
     return this.#runs.size > 0;
   }
 
-  /** Releases a run's slot, unless another run has already replaced it. */
+  /** Releases a run's slot and its leases on the user's tabs, unless another run has already replaced it. */
   #removeRun(run: ActiveRun): void {
-    if (this.#runs.get(run.runId) === run) this.#runs.delete(run.runId);
+    if (this.#runs.get(run.runId) !== run) return;
+    this.#runs.delete(run.runId);
+    this.#workspace.releaseRunLeases(run.runId);
   }
 
   /** Records `diagnostics` as `sessionId`'s latest run's, dropping the least recently run sessions past the bound. */
@@ -1535,7 +1543,7 @@ export class BackgroundRuntime {
     const controller = new AbortController();
     const tabController = this.#tabControllerFactory();
     // The session's scratch files load on the first program that uses them; memory is global and read at each use.
-    const scope = { state: this.#workspace, sessionId, files: new ScratchFiles(workspaceStore(sessionId)), skills: new Map<string, Skill>(), sites: this.#sites,
+    const scope = { state: this.#workspace, runId, sessionId, files: new ScratchFiles(workspaceStore(sessionId)), skills: new Map<string, Skill>(), sites: this.#sites,
       memory: runMemory(sessionId, runId) };
     const agentLoop = new AgentLoop(this.#provider, tabController, this.#sidebarHub, scope);
     const run: ActiveRun = {
@@ -1613,7 +1621,11 @@ export class BackgroundRuntime {
       : await tabController.captureActivePage();
     const captured = captureOutcome?.ok ? captureOutcome.value : null;
     const capturedOwner = captured ? this.#workspace.agentTabs.get(captured.snapshot.tabId)?.sessionId : undefined;
-    const artifact: ContextArtifact | null = captured && (capturedOwner === undefined || capturedOwner === sessionId)
+    // Attaching a user's tab is the run's first use of it, so it takes the
+    // lease; one another run holds is left out, and the turn says so.
+    const pageInUse = captured && capturedOwner === undefined && !this.#workspace.acquireLease(captured.snapshot.tabId, runId)
+      ? { tabId: captured.snapshot.tabId } : null;
+    const artifact: ContextArtifact | null = captured && !pageInUse && (capturedOwner === undefined || capturedOwner === sessionId)
       ? { ...captured.artifact, target: { kind: "tab", tabId: captured.snapshot.tabId, mount: capturedOwner ? "agent-tabs" : "tabs" }, snapshot: captured.snapshot }
       : null;
 
@@ -1673,7 +1685,7 @@ export class BackgroundRuntime {
     for (const item of transcript.slice(userIndex)) {
       if (item.kind === "message" && item.role === "user" && item.skill) scope.skills.set(item.skill.name, item.skill);
     }
-    await this.#runAgentLoop(runId, transcript, catalog, personal, artifact, auth);
+    await this.#runAgentLoop(runId, transcript, catalog, personal, artifact, auth, pageInUse);
   }
 
   async #captureScheduledPage(tabs: TabController, run: ActiveRun): Promise<Awaited<ReturnType<TabController["captureActivePage"]>>> {
@@ -1700,7 +1712,7 @@ export class BackgroundRuntime {
   }
 
   async #runAgentLoop(runId: string, transcript: ConversationItem[], catalog: SkillSummary[], personal: Personalization,
-    artifact: ContextArtifact | null, auth: ProviderAuth): Promise<void> {
+    artifact: ContextArtifact | null, auth: ProviderAuth, pageInUse: { tabId: number } | null): Promise<void> {
     const run = this.#run(runId);
     if (!run) return;
 
@@ -1745,6 +1757,7 @@ export class BackgroundRuntime {
       memoryIndex: personal.memoryIndex,
       ...(personal.mcpTools.length && this.#mcp ? { mcp: { tools: personal.mcpTools, call: this.#mcp.call.bind(this.#mcp) } } : {}),
       contextArtifact: artifact,
+      pageInUse,
       auth,
       onContext: (context) => { diagnostics.latestContext = context; },
       onUsage: (usage) => {

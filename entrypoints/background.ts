@@ -71,6 +71,8 @@ export default defineBackground({
       if (tab.id !== undefined) void runtime.handleTabCreated(tab.id);
     });
 
+    browser.tabs.onRemoved.addListener((tabId) => runtime.handleTabRemoved(tabId));
+
     browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
       if (changeInfo.status === "complete") {
         void sidebarHub.refreshAttachment();

@@ -9,6 +9,7 @@ import { RunNotifications } from "@/lib/background/notifications";
 import { taskDraft, type TaskDraft } from "@/lib/domain/automation";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
+import { WorkspaceState } from "@/lib/background/browser-program";
 import { TabController } from "@/lib/background/tab-controller";
 import { AGENT_TAB_TAG_KEY } from "@/lib/background/tab-controller";
 import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
@@ -4069,5 +4070,38 @@ describe("BackgroundRuntime: selected MCP content", () => {
     await port.send({ v: 1, id: "read", type: "mcp.content.list", kind: "resource", sessionId: f.sessionId });
     expect(port.received).toHaveLength(0);
     expect(f.provider.requests).toHaveLength(0);
+  });
+});
+
+describe("user-tab leases", () => {
+  it("leaves out an attached page another run holds, says so on the turn, and releases the run's own leases when it ends", async () => {
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const provider = new FakeProvider();
+    const workspace = new WorkspaceState();
+    workspace.acquireLease(1, "other-run");
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: supportedPageTabControllerFactory, workspace });
+    hub.delegate = runtime;
+
+    scripted(provider, programRound('return fs.read("/tabs/1/page.md");'));
+    await runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "What is this?" });
+    const first = JSON.stringify(provider.requests[0]?.context.messages);
+    expect(first).toContain("The user is looking at tab /tabs/1/page.md, but another bside chat is using it");
+    expect(first).not.toContain("Orchid launch");
+    expect(modelInput(provider)).toContain("TAB_IN_USE");
+    expect(modelInput(provider)).not.toContain("Orchid launch");
+    const user = (await openConversation()).items.find((item) => item.kind === "message" && item.role === "user");
+    expect(user).toMatchObject({ context: null });
+    // The other run's lease is untouched by this run's end.
+    expect(workspace.leases.get(1)).toBe("other-run");
+
+    workspace.releaseRunLeases("other-run");
+    scripted(provider, programRound('return fs.read("/tabs/1/page.md");'));
+    const before = provider.requests.length;
+    await runtime.handleCommand({ v: 1, id: "run2", type: "run.start", prompt: "And now?" });
+    expect(JSON.stringify(provider.requests[before]?.context.messages)).toContain("The user is looking at tab /tabs/1/page.md (list mounts");
+    expect(modelInput(provider)).toContain("Orchid launch");
+    // Attaching and reading took the lease; the run's end released it.
+    expect(workspace.leases.size).toBe(0);
   });
 });
