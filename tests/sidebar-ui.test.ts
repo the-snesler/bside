@@ -650,9 +650,71 @@ describe("sidebar UI contracts", () => {
     await act(() => (root.querySelector('.queue__item [aria-label="Send now"]') as HTMLButtonElement).click());
     expect(posted.at(-1)).toMatchObject({ type: "queue.send", sessionId: "a", messageId: "q2" });
 
-    // A run in another chat keeps this chat's composer disabled.
+    // A run in another chat leaves this chat's composer, queue, failure, and settings as they were.
     await emit({ runId: "r2", conversationId: "b", type: "run.started", payload: { prompt: "Elsewhere", page: null, ask: null, retry: false } });
-    expect(composer.props).toMatchObject({ disabled: true, working: false, canSteer: false });
+    expect(composer.props).toMatchObject({ disabled: false, running: false, working: false, canSteer: false });
+    expect(root.querySelector('.queue__item [aria-label="Send now"]')).not.toBeNull();
+    expect(root.querySelector(".sidebar__error")?.textContent).toContain("Rate limited.");
+    expect(root.querySelector<HTMLSelectElement>('select[aria-label="Model"]')!.disabled).toBe(false);
+    // This chat's own run clears its failure and holds the model selects.
+    await emit({ runId: "r3", conversationId: "a", type: "run.started", payload: { prompt: "Again", page: null, ask: null, retry: false } });
+    expect(root.querySelector(".sidebar__error")).toBeNull();
+    expect(root.querySelector<HTMLSelectElement>('select[aria-label="Model"]')!.disabled).toBe(true);
+    expect(composer.props).toMatchObject({ disabled: false, running: true, working: true });
+    render(null, root);
+  });
+
+  it("lists other chats' runs in a compact strip that opens them, collapsing to a count when there are many", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    const posted: Record<string, unknown>[] = [];
+    const listeners: Array<(message: unknown) => void> = [];
+    vi.spyOn(browser.runtime, "connect").mockReturnValue({
+      postMessage: (message: Record<string, unknown>) => posted.push(message),
+      onMessage: { addListener: (listener: (message: unknown) => void) => listeners.push(listener), removeListener: () => {} },
+      disconnect: () => {},
+    } as never);
+    const root = document.createElement("div");
+    document.body.append(root);
+    await act(() => render(h(App, {}), root));
+    const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) =>
+      act(() => listeners.forEach((listener) => listener({ v: 1, at: 1, ...event, seq: stamp(event) })));
+    const run = (runId: string, conversationId: string, patch: Partial<RuntimeSnapshot["runs"][number]> = {}) =>
+      ({ runId, conversationId, status: "running" as const, partialAssistantText: "", pendingApproval: null, pendingHelp: null, usage: null, lastSeq: 0, ...patch });
+    const session = (id: string, title: string): ConversationSummary =>
+      ({ id, title, titleSource: "prompt", createdAt: 0, updatedAt: 0, pinned: false, itemCount: 1, lastModelId: null, usage: EMPTY_USAGE });
+    const approval = { call: { id: "c", name: "request_action_confirmation", arguments: {} }, title: "Send", message: "Send?", artifact: "" } as never;
+    const help = { call: { id: "h", name: "request_user_help", arguments: {} }, tabId: 5, kind: "login", reason: "Sign in" } as never;
+    await emit({ runId: null, conversationId: null, type: "session.listed", payload: { sessions: [session("a", "Here"), session("b", "Trip <b>plans</b>"), session("c", "Invoices"), session("d", "")] } });
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), runs: [
+      run("ra", "a"), run("rb", "b"), run("rc", "c", { status: "awaiting-approval", pendingApproval: approval }),
+    ] } });
+    const items = () => [...root.querySelectorAll<HTMLButtonElement>(".other-runs__item")];
+    // This chat's own run is not listed; one needing the user comes first. Titles are text.
+    expect(items().map((item) => [item.querySelector(".other-runs__title")?.textContent, item.querySelector(".other-runs__state")?.textContent])).toEqual([
+      ["Invoices", "Needs confirmation"], ["Trip <b>plans</b>", "Working"],
+    ]);
+    expect(root.querySelector(".other-runs b")).toBeNull();
+    expect(composer.props).toMatchObject({ disabled: false, working: true });
+    await act(() => items()[1]!.click());
+    expect(posted.at(-1)).toMatchObject({ type: "session.open", sessionId: "b" });
+    expect(isSidebarCommand(posted.at(-1))).toBe(true);
+
+    // Past three, a count that expands, saying how many need the user.
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), runs: [
+      run("rb", "b"), run("rc", "c", { status: "awaiting-approval", pendingApproval: approval }), run("rd", "d", { status: "awaiting-help", pendingHelp: help }), run("re", "e"),
+    ] } });
+    const summary = root.querySelector<HTMLButtonElement>(".other-runs__summary")!;
+    expect(summary.textContent).toBe("4 other chats running2 need you");
+    expect(summary.getAttribute("aria-expanded")).toBe("false");
+    expect(items()).toHaveLength(0);
+    await act(() => summary.click());
+    expect(items().map((item) => item.querySelector(".other-runs__title")?.textContent)).toEqual(["Invoices", "New chat", "Trip <b>plans</b>", "Another chat"]);
+    expect(items()[1]!.querySelector(".other-runs__state")?.textContent).toBe("Needs your help");
+    expect(composer.props).toMatchObject({ disabled: false, running: false, working: false });
+
+    // No other chat runs: no strip.
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), runs: [run("ra", "a")] } });
+    expect(root.querySelector(".other-runs")).toBeNull();
     render(null, root);
   });
 
@@ -776,7 +838,7 @@ describe("history drawer", () => {
     const props: HistoryDrawerProps = {
       sessions: [summary("p", "Pinned trip", { pinned: true }), summary("a", "Alpha <b>bold</b>"), summary("b", "Beta", { updatedAt: now - 3 * 86_400_000 }), summary("e", "")],
       openId: "a",
-      run: { conversationId: "b", waitingFor: null },
+      runs: [{ conversationId: "b", waitingFor: null }],
       agentTabs: {},
       now,
       onOpen: vi.fn(), onRename: vi.fn(), onPin: vi.fn(), onExport: vi.fn(), onDelete: vi.fn(), onClose: vi.fn(),
@@ -806,6 +868,21 @@ describe("history drawer", () => {
     expect(row("Beta").querySelector(".history__meta")?.textContent).toBe("3d ago · Working");
     expect(labelled("Delete Beta").hasAttribute("disabled")).toBe(true);
     expect(document.activeElement).toBe(labelled("Search chats by title"));
+  });
+
+  it("marks every chat with a run: working, or needing the user for a confirmation or help", async () => {
+    await mount({ runs: [
+      { conversationId: "b", waitingFor: null }, { conversationId: "p", waitingFor: "confirmation" }, { conversationId: "e", waitingFor: "help" },
+    ] });
+    expect(row("Beta").querySelector(".history__status .live-dot")).not.toBeNull();
+    expect(row("Beta").querySelector(".history__meta")?.textContent).toBe("3d ago · Working");
+    expect(row("Pinned trip").querySelector(".history__status .needs-you")?.getAttribute("title")).toBe("Waiting for your confirmation");
+    expect(row("Pinned trip").querySelector(".history__meta")?.textContent).toBe("5m ago · Needs you: confirmation");
+    expect(row("New chat").querySelector(".history__status .needs-you")?.getAttribute("title")).toBe("Waiting for your help");
+    expect(row("Alpha <b>bold</b>").querySelector(".history__status")).toBeNull();
+    // Every chat with a run keeps it; none can be deleted while it runs.
+    for (const title of ["Beta", "Pinned trip", "New chat"]) expect(labelled(`Delete ${title}`).hasAttribute("disabled")).toBe(true);
+    expect(labelled("Delete Alpha <b>bold</b>").hasAttribute("disabled")).toBe(false);
   });
 
   it("shows each chat's running usage total compactly in its row", async () => {

@@ -593,7 +593,8 @@ function applyEvent(event: SidebarEvent, setState: (updater: (prev: BackgroundSt
       const run: RunState = { runId, conversationId, status: "running", partialAssistantText: "", pendingApproval: null, pendingHelp: null, usage: null, lastSeq: event.seq };
       return {
         ...prev,
-        lastError: null,
+        // A run starting in another chat leaves this chat's failure (and its Retry) in place.
+        lastError: conversationId === prev.conversation.id ? null : prev.lastError,
         runs: [...prev.runs.filter((other) => other.runId !== runId), run],
         // A retry re-runs the turn's existing user message rather than adding one.
         conversation: event.payload.retry ? prev.conversation : appendItem(prev, conversationId, userItem, event.at),

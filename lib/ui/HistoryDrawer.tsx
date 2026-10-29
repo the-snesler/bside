@@ -1,8 +1,9 @@
 /**
  * Sidebar history drawer: the background's session index (pinned first, then
  * most recent), filtered by title, with per-row open, rename, pin, export, and
- * delete. Deleting a chat that owns hidden agent tabs asks whether to close
- * them or keep them as ordinary tabs. Every action is a background command;
+ * delete. A chat with a run shows that it is working, or a "Needs you" mark
+ * while its run waits for a confirmation or help. Deleting a chat that owns
+ * hidden agent tabs asks whether to close them or keep them as ordinary tabs. Every action is a background command;
  * titles are untrusted text.
  */
 
@@ -21,8 +22,8 @@ export interface HistoryDrawerProps {
   /** In display order, as the background lists them. */
   sessions: readonly ConversationSummary[];
   openId: string;
-  /** The single active run, if any, and what it is waiting on the user for. */
-  run: { conversationId: string; waitingFor: "confirmation" | "help" | null } | null;
+  /** Every active run (at most one per chat), and what each is waiting on the user for. */
+  runs: readonly { conversationId: string; waitingFor: "confirmation" | "help" | null }[];
   /** Hidden agent tabs per session id. */
   agentTabs: Readonly<Record<string, number>>;
   now: number;
@@ -117,7 +118,7 @@ function Group({ label, sessions, ...props }: RowProps & { label: string | null 
 
 type RowMode = "idle" | "renaming" | "confirming";
 
-function Row({ session, openId, run, agentTabs, now, onOpen, onRename, onPin, onExport, onDelete, focusSearch }: Omit<RowProps, "sessions" | "onClose"> & { session: ConversationSummary }) {
+function Row({ session, openId, runs, agentTabs, now, onOpen, onRename, onPin, onExport, onDelete, focusSearch }: Omit<RowProps, "sessions" | "onClose"> & { session: ConversationSummary }) {
   const [mode, setMode] = useState<RowMode>("idle");
   const previousMode = useRef<RowMode>("idle");
   /** Set once a rename finished, so the blur that follows Enter or Escape does not finish it again. */
@@ -142,7 +143,8 @@ function Row({ session, openId, run, agentTabs, now, onOpen, onRename, onPin, on
 
   const label = session.title || UNTITLED;
   const isOpen = session.id === openId;
-  const runHere = run?.conversationId === session.id;
+  const run = runs.find((candidate) => candidate.conversationId === session.id);
+  const runHere = run !== undefined;
   const updated = new Date(session.updatedAt);
   const tabs = agentTabs[session.id] ?? 0;
   const tabsLabel = `${tabs} hidden ${tabs === 1 ? "tab" : "tabs"}`;
@@ -191,7 +193,18 @@ function Row({ session, openId, run, agentTabs, now, onOpen, onRename, onPin, on
             {isOpen && " · Current"}
             {session.scheduled && " · Scheduled"}
             {tabs > 0 && ` · ${tabsLabel}`}
-            {runHere && <span class="history__status">{run!.waitingFor === "confirmation" ? " · Needs confirmation" : run!.waitingFor === "help" ? " · Needs your help" : " · Working"}</span>}
+            {run && (
+              <span class="history__status" data-needs={run.waitingFor ? "" : undefined}>
+                {" · "}
+                {run.waitingFor ? (
+                  <span class="needs-you" title={run.waitingFor === "confirmation" ? "Waiting for your confirmation" : "Waiting for your help"}>
+                    Needs you<span class="visually-hidden">{run.waitingFor === "confirmation" ? ": confirmation" : ": help"}</span>
+                  </span>
+                ) : (
+                  <><span class="live-dot" aria-hidden="true" />Working</>
+                )}
+              </span>
+            )}
             {/* Last, so a narrow row truncates it before the status. */}
             {usage && <span class="history__usage" title={usage.title}>{` · ${usage.text}`}</span>}
           </span>

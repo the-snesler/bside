@@ -84,7 +84,7 @@ export function Composer(props: {
   onPrepareMcpContent?: (id: string, args: Record<string, string>) => Promise<void>;
   onDismissMcpContent?: (id: string) => void;
   disabled: boolean;
-  /** Any run is active: Stop is shown. */
+  /** This chat's run is active: Stop is shown. */
   running: boolean;
   /** This chat's run is working: sending queues a follow-up. */
   working: boolean;

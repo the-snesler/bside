@@ -428,8 +428,7 @@ summary.trace__line:focus-visible .trace__chevron,
   gap: 8px;
   margin: 8px 0 6px;
 }
-.trace__actions button,
-.run-elsewhere button {
+.trace__actions button {
   border: 1px solid color-mix(in srgb, var(--muted) 30%, transparent);
   background: var(--surface);
   padding: 6px 12px;
@@ -1044,19 +1043,72 @@ summary.trace__line:focus-visible .trace__chevron,
   border: 1px solid color-mix(in srgb, var(--muted) 25%, transparent);
   box-shadow: 0 2px 8px #0001;
 }
-.run-elsewhere {
+/* Other chats with runs (lib/ui/OtherRuns.tsx): one compact line each, or a count that expands. */
+.other-runs {
+  margin: 0 12px;
+  padding: 2px;
+  border-radius: 10px;
+  background: var(--surface);
+  font-size: 12px;
+}
+.other-runs__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.other-runs__item,
+.other-runs__summary {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin: 0 12px;
-  padding: 8px 12px;
-  font-size: 12px;
-  border-radius: 10px;
-  background: var(--surface);
+  width: 100%;
+  min-width: 0;
+  padding: 5px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
 }
-.run-elsewhere p {
+.other-runs__item:hover,
+.other-runs__summary:hover {
+  background: var(--raised);
+}
+.other-runs__title,
+.other-runs__count {
   flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.other-runs__state {
+  flex-shrink: 0;
+  color: var(--muted);
+}
+.other-runs__item[data-needs] .other-runs__state {
+  color: #d97706;
+  font-weight: 600;
+}
+.other-runs__summary .needs-you {
   margin: 0;
+}
+.other-runs__chevron {
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+  color: var(--muted);
+}
+.other-runs__mark {
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+.other-runs__mark--needs {
+  background: #d97706;
 }
 .history {
   position: absolute;
@@ -1157,6 +1209,18 @@ summary.trace__line:focus-visible .trace__chevron,
 }
 .history__status {
   color: var(--accent);
+}
+.history__status .live-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 4px;
+  vertical-align: 1px;
+}
+.history__status .needs-you {
+  margin: 0;
+  font-size: 10px;
+  line-height: 14px;
 }
 .history__actions {
   display: flex;
