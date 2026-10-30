@@ -6,7 +6,7 @@ import { Markdown } from "@/lib/ui/Markdown";
 import { composerKeyAction, parsePromptMentions, serializeDraft } from "@/lib/ui/Composer";
 import { useBottomScroll } from "@/lib/ui/use-bottom-scroll";
 import { useBackground } from "@/lib/ui/use-background";
-import { isSidebarCommand } from "@/lib/protocol";
+import { isRunEvent, isSidebarCommand } from "@/lib/protocol";
 import { buildTurns, formatDuration } from "@/lib/ui/turns";
 import { TurnTrace } from "@/lib/ui/TurnTrace";
 import { formatRelativeTime, HistoryDrawer } from "@/lib/ui/HistoryDrawer";
@@ -35,7 +35,7 @@ function snapshotFor(id: string): RuntimeSnapshot {
     provider: OPENAI_API_KEY_PROVIDER,
     settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
     permissionMode: "ask",
-    page: null, ask: null, agentTabs: { bySession: {}, watching: null, takenOver: false }, queue: [], activeRun: null, lastSeq: 0, notice: null,
+    page: null, ask: null, agentTabs: { bySession: {}, watching: null, takenOver: false }, queue: [], runs: [], notice: null,
   };
 }
 
@@ -49,7 +49,22 @@ const turnItems: ConversationItem[] = [
   { id: "a2", kind: "message", role: "assistant", text: "Okay, not submitted.", at: 64_000 },
 ];
 
+/** Each run's last stamped seq, and the seq stamped on each emitted event object (one per event, however many listeners get it). */
+const runSeqs = new Map<string, number>();
+const stamped = new WeakMap<object, number>();
+/** Sequences events like the hub: 1, 2, … within each run, 0 for every other event. */
+function stamp(event: { runId?: string | null; type?: string }): number {
+  const known = stamped.get(event);
+  if (known !== undefined) return known;
+  const runId = event.runId;
+  const seq = runId && isRunEvent({ ...event, runId } as SidebarEvent) ? (runSeqs.get(runId) ?? 0) + 1 : 0;
+  if (seq) runSeqs.set(runId!, seq);
+  stamped.set(event, seq);
+  return seq;
+}
+
 afterEach(() => {
+  runSeqs.clear();
   document.body.innerHTML = "";
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -213,7 +228,7 @@ describe("sidebar UI contracts", () => {
     document.body.append(root);
     await act(() => render(h(App, {}), root));
     const emit = (event: Omit<SidebarEvent, "v" | "conversationId" | "seq" | "at">) =>
-      act(() => listeners.forEach((listener) => listener({ v: 1, conversationId: "a", seq: 1, at: 5, ...event })));
+      act(() => listeners.forEach((listener) => listener({ v: 1, conversationId: "a", at: 5, ...event, seq: stamp(event) })));
     await emit({ runId: null, type: "state.snapshot", payload: snapshotFor("a") });
     const usage: RunUsageV1 = {
       version: 1, runId: "r1", billing: "api-key", modelId: "gpt-5.6-terra", responses: 1, input: 4_000, cacheRead: 8_100, cacheWrite: 200, output: 1_200, reasoning: 0, costUsd: 0.0123,
@@ -243,8 +258,8 @@ describe("sidebar UI contracts", () => {
     const root = document.createElement("div");
     document.body.append(root);
     await act(() => render(h(App, {}), root));
-    const emit = (event: Partial<SidebarEvent>) => act(() => listeners.forEach((listener) => listener({ v: 1, runId: null, conversationId: "s1", seq: 0, at: 1, ...event })));
-    await emit({ type: "state.snapshot", payload: { ...snapshotFor("s1"), activeRun: { runId: "r1", conversationId: "s1", status: "running", partialAssistantText: "", pendingApproval: null, pendingHelp: null, usage: null } } });
+    const emit = (event: Partial<SidebarEvent>) => act(() => listeners.forEach((listener) => listener({ v: 1, runId: null, conversationId: "s1", at: 1, ...event, seq: stamp(event) })));
+    await emit({ type: "state.snapshot", payload: { ...snapshotFor("s1"), runs: [{ runId: "r1", conversationId: "s1", status: "running", partialAssistantText: "", pendingApproval: null, pendingHelp: null, usage: null, lastSeq: 0 }] } });
     const select = root.querySelector<HTMLSelectElement>('select[aria-label="Permissions"]')!;
     expect([...select.options].map((option) => option.textContent)).toEqual(["Ask first", "Read-only", "Don't ask"]);
     expect(select.value).toBe("ask");
@@ -397,7 +412,7 @@ describe("sidebar UI contracts", () => {
     document.body.append(root);
     await act(() => render(h(Harness, {}), root));
     const emit = (event: Omit<SidebarEvent, "v" | "conversationId" | "seq" | "at">, conversationId: string | null = "s1") =>
-      act(() => listeners.forEach((listener) => listener({ v: 1, conversationId, seq: 1, at: 1, ...event })));
+      act(() => listeners.forEach((listener) => listener({ v: 1, conversationId, at: 1, ...event, seq: stamp(event) })));
     await emit({ runId: null, type: "state.snapshot", payload: snapshotFor("s1") });
 
     await emit({ runId: "r1", type: "run.started", payload: { prompt: "Find it", page: null, ask: null, retry: false } });
@@ -410,9 +425,125 @@ describe("sidebar UI contracts", () => {
 
     await emit({ runId: "r2", type: "run.started", payload: { prompt: "Find it", page: null, ask: null, retry: true } });
     expect(background!.conversation.items.filter((item) => item.kind === "message" && item.role === "user")).toHaveLength(1);
-    expect(background!.activeRun?.runId).toBe("r2");
+    expect(background!.runs.map((run) => run.runId)).toEqual(["r2"]);
     expect(background!.lastError).toBeNull();
     await act(() => render(null, root));
+  });
+
+  describe("per-run event sequencing", () => {
+    async function harness() {
+      const posted: Array<Record<string, unknown>> = [];
+      const listeners: Array<(message: unknown) => void> = [];
+      vi.spyOn(browser.runtime, "connect").mockReturnValue({
+        postMessage: (message: Record<string, unknown>) => posted.push(message),
+        onMessage: { addListener: (listener: (message: unknown) => void) => listeners.push(listener), removeListener: () => {} },
+        disconnect: () => {},
+      } as never);
+      const view: { current?: ReturnType<typeof useBackground> } = {};
+      function Harness() {
+        view.current = useBackground();
+        return null;
+      }
+      const root = document.createElement("div");
+      document.body.append(root);
+      await act(() => render(h(Harness, {}), root));
+      /** Delivers an event exactly as given, seq included. */
+      const deliver = (event: Omit<SidebarEvent, "v" | "at">) => act(() => listeners.forEach((listener) => listener({ v: 1, at: 1, ...event })));
+      const subscribes = () => posted.filter((message) => message.type === "state.subscribe");
+      return { view, posted, deliver, subscribes, unmount: () => act(() => render(null, root)) };
+    }
+    const started = (runId: string, conversationId: string, prompt: string) =>
+      ({ runId, conversationId, seq: 1, type: "run.started", payload: { prompt, page: null, ask: null, retry: false } }) as const;
+    const delta = (runId: string, conversationId: string, seq: number, text: string) =>
+      ({ runId, conversationId, seq, type: "assistant.delta", payload: { delta: text } }) as const;
+
+    it("updates each of two interleaved runs from its own events, and only the open session's conversation", async () => {
+      const { view, deliver, subscribes, unmount } = await harness();
+      await deliver({ runId: null, conversationId: "a", seq: 0, type: "state.snapshot", payload: snapshotFor("a") });
+      await deliver(started("ra", "a", "Here"));
+      await deliver(started("rb", "b", "Elsewhere"));
+      await deliver(delta("rb", "b", 2, "B1"));
+      await deliver(delta("ra", "a", 2, "A1"));
+      await deliver(delta("rb", "b", 3, "B2"));
+      expect(view.current!.runs).toMatchObject([
+        { runId: "ra", conversationId: "a", partialAssistantText: "A1", lastSeq: 2 },
+        { runId: "rb", conversationId: "b", partialAssistantText: "B1B2", lastSeq: 3 },
+      ]);
+      expect(view.current!.conversation.items.map((item) => item.kind === "message" ? item.text : item.kind)).toEqual(["Here"]);
+      expect(subscribes()).toHaveLength(1);
+
+      await deliver({ runId: "rb", conversationId: "b", seq: 4, type: "run.completed", payload: { messageId: "mb" } });
+      expect(view.current!.runs.map((run) => run.runId)).toEqual(["ra"]);
+      expect(view.current!.conversation.items).toHaveLength(1);
+      await unmount();
+    });
+
+    it("addresses run commands to the open session's run", async () => {
+      const { view, posted, deliver, unmount } = await harness();
+      await deliver({ runId: null, conversationId: "a", seq: 0, type: "state.snapshot", payload: { ...snapshotFor("a"), runs: [
+        { runId: "rb", conversationId: "b", status: "running", partialAssistantText: "", pendingApproval: null, pendingHelp: null, usage: null, lastSeq: 4 },
+        { runId: "ra", conversationId: "a", status: "running", partialAssistantText: "", pendingApproval: null, pendingHelp: null, usage: null, lastSeq: 2 },
+      ] } });
+      await act(() => view.current!.cancelRun());
+      await act(() => view.current!.approveAction("call-1"));
+      await act(() => view.current!.steer("Go on"));
+      expect(posted.slice(-3)).toMatchObject([{ type: "run.cancel", runId: "ra" }, { type: "action.approve", runId: "ra" }, { type: "run.steer", runId: "ra" }]);
+      await unmount();
+    });
+
+    it("skips duplicates, and on a gap skips the event and asks once for every run's missed events", async () => {
+      const { view, deliver, subscribes, unmount } = await harness();
+      await deliver({ runId: null, conversationId: "a", seq: 0, type: "state.snapshot", payload: { ...snapshotFor("a"), runs: [
+        { runId: "ra", conversationId: "a", status: "running", partialAssistantText: "A1", pendingApproval: null, pendingHelp: null, usage: null, lastSeq: 2 },
+        { runId: "rb", conversationId: "b", status: "running", partialAssistantText: "", pendingApproval: null, pendingHelp: null, usage: null, lastSeq: 7 },
+      ] } });
+      // Already reflected in the snapshot.
+      await deliver(delta("ra", "a", 2, "A1"));
+      expect(view.current!.runs[0]!.partialAssistantText).toBe("A1");
+
+      // ra's seq 3 never arrived; rb is unaffected.
+      await deliver(delta("ra", "a", 4, "A3"));
+      await deliver(delta("ra", "a", 5, "A4"));
+      await deliver(delta("rb", "b", 8, "B"));
+      expect(view.current!.runs.map((run) => run.partialAssistantText)).toEqual(["A1", "B"]);
+      expect(subscribes().slice(1)).toEqual([expect.objectContaining({ lastSeq: { ra: 2, rb: 7 } })]);
+      expect(isSidebarCommand(subscribes()[1])).toBe(true);
+
+      // The replay fills the gap and repeats what had already arrived.
+      for (const [seq, text] of [[3, "A2"], [4, "A3"], [5, "A4"]] as const) await deliver(delta("ra", "a", seq, text));
+      expect(view.current!.runs[0]).toMatchObject({ partialAssistantText: "A1A2A3A4", lastSeq: 5 });
+      expect(subscribes()).toHaveLength(2);
+      await unmount();
+    });
+
+    it("never reads non-run events as gaps", async () => {
+      const { view, deliver, subscribes, unmount } = await harness();
+      await deliver({ runId: null, conversationId: "a", seq: 0, type: "state.snapshot", payload: snapshotFor("a") });
+      await deliver(started("ra", "a", "Here"));
+      await deliver({ runId: null, conversationId: "a", seq: 0, type: "queue.changed", payload: { messages: [] } });
+      await deliver({ runId: null, conversationId: null, seq: 0, type: "ask.changed", payload: { ask: null } });
+      await deliver({ runId: null, conversationId: null, seq: 0, type: "permissions.changed", payload: { mode: "auto" } });
+      await deliver({ runId: null, conversationId: null, seq: 0, type: "session.listed", payload: { sessions: [] } });
+      await deliver(delta("ra", "a", 2, "Hi"));
+      expect(view.current!.runs[0]).toMatchObject({ partialAssistantText: "Hi", lastSeq: 2 });
+      expect(view.current!.permissionMode).toBe("auto");
+      expect(subscribes()).toHaveLength(1);
+      await unmount();
+    });
+
+    it("skips run events before the first snapshot, and a late duplicate of an ended run's events", async () => {
+      const { view, deliver, subscribes, unmount } = await harness();
+      await deliver(started("ra", "a", "Early"));
+      await deliver({ runId: null, conversationId: "a", seq: 0, type: "state.snapshot", payload: snapshotFor("a") });
+      expect(view.current!.runs).toEqual([]);
+      await deliver(started("rb", "a", "Now"));
+      await deliver({ runId: "rb", conversationId: "a", seq: 2, type: "run.completed", payload: { messageId: "m" } });
+      await deliver(started("rb", "a", "Now"));
+      expect(view.current!.runs).toEqual([]);
+      expect(view.current!.conversation.items.filter((item) => item.kind === "message" && item.role === "user")).toHaveLength(1);
+      expect(subscribes()).toHaveLength(1);
+      await unmount();
+    });
   });
 
   it("tracks a run in another session without adding its items to the open one", async () => {
@@ -431,16 +562,16 @@ describe("sidebar UI contracts", () => {
     document.body.append(root);
     await act(() => render(h(Harness, {}), root));
     const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) =>
-      act(() => listeners.forEach((listener) => listener({ v: 1, seq: 1, at: 1, ...event })));
+      act(() => listeners.forEach((listener) => listener({ v: 1, at: 1, ...event, seq: stamp(event) })));
     await emit({ runId: null, conversationId: "open", type: "state.snapshot", payload: snapshotFor("open") });
 
     await emit({ runId: "r1", conversationId: "other", type: "run.started", payload: { prompt: "Elsewhere", page: null, ask: null, retry: false } });
     await emit({ runId: "r1", conversationId: "other", type: "assistant.delta", payload: { delta: "Working" } });
     await emit({ runId: "r1", conversationId: "other", type: "tool.requested", payload: { call: { id: "c1", name: "browser_program", arguments: {} }, display: "" } });
-    expect(background!.activeRun).toMatchObject({ runId: "r1", conversationId: "other" });
+    expect(background!.runs[0]).toMatchObject({ runId: "r1", conversationId: "other" });
     expect(background!.conversation.items).toEqual([]);
     await emit({ runId: "r1", conversationId: "other", type: "run.failed", payload: { code: "RATE_LIMIT", message: "Rate limited.", retryable: true, phase: "provider" } });
-    expect(background!.activeRun).toBeNull();
+    expect(background!.runs).toEqual([]);
     expect(background!.lastError).toBeNull();
     await act(() => render(null, root));
   });
@@ -487,7 +618,7 @@ describe("sidebar UI contracts", () => {
     document.body.append(root);
     await act(() => render(h(App, {}), root));
     const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) =>
-      act(() => listeners.forEach((listener) => listener({ v: 1, seq: 1, at: 1, ...event })));
+      act(() => listeners.forEach((listener) => listener({ v: 1, at: 1, ...event, seq: stamp(event) })));
     await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: snapshotFor("a") });
     await emit({ runId: "r1", conversationId: "a", type: "run.started", payload: { prompt: "Find it", page: null, ask: null, retry: false } });
     expect(composer.props).toMatchObject({ disabled: false, running: true, working: true, canSteer: true });
@@ -519,9 +650,73 @@ describe("sidebar UI contracts", () => {
     await act(() => (root.querySelector('.queue__item [aria-label="Send now"]') as HTMLButtonElement).click());
     expect(posted.at(-1)).toMatchObject({ type: "queue.send", sessionId: "a", messageId: "q2" });
 
-    // A run in another chat keeps this chat's composer disabled.
+    // A run in another chat leaves this chat's composer, queue, failure, and settings as they were.
     await emit({ runId: "r2", conversationId: "b", type: "run.started", payload: { prompt: "Elsewhere", page: null, ask: null, retry: false } });
-    expect(composer.props).toMatchObject({ disabled: true, working: false, canSteer: false });
+    expect(composer.props).toMatchObject({ disabled: false, running: false, working: false, canSteer: false });
+    expect(root.querySelector('.queue__item [aria-label="Send now"]')).not.toBeNull();
+    expect(root.querySelector(".sidebar__error")?.textContent).toContain("Rate limited.");
+    expect(root.querySelector<HTMLSelectElement>('select[aria-label="Model"]')!.disabled).toBe(false);
+    // This chat's own run clears its failure; the model selects stay usable for its next message.
+    await emit({ runId: "r3", conversationId: "a", type: "run.started", payload: { prompt: "Again", page: null, ask: null, retry: false } });
+    expect(root.querySelector(".sidebar__error")).toBeNull();
+    const modelSelect = root.querySelector<HTMLSelectElement>('select[aria-label="Model"]')!;
+    expect(modelSelect.disabled).toBe(false);
+    expect(modelSelect.title).toContain("applies from your next message");
+    expect(composer.props).toMatchObject({ disabled: false, running: true, working: true });
+    render(null, root);
+  });
+
+  it("lists other chats' runs in a compact strip that opens them, collapsing to a count when there are many", async () => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    const posted: Record<string, unknown>[] = [];
+    const listeners: Array<(message: unknown) => void> = [];
+    vi.spyOn(browser.runtime, "connect").mockReturnValue({
+      postMessage: (message: Record<string, unknown>) => posted.push(message),
+      onMessage: { addListener: (listener: (message: unknown) => void) => listeners.push(listener), removeListener: () => {} },
+      disconnect: () => {},
+    } as never);
+    const root = document.createElement("div");
+    document.body.append(root);
+    await act(() => render(h(App, {}), root));
+    const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) =>
+      act(() => listeners.forEach((listener) => listener({ v: 1, at: 1, ...event, seq: stamp(event) })));
+    const run = (runId: string, conversationId: string, patch: Partial<RuntimeSnapshot["runs"][number]> = {}) =>
+      ({ runId, conversationId, status: "running" as const, partialAssistantText: "", pendingApproval: null, pendingHelp: null, usage: null, lastSeq: 0, ...patch });
+    const session = (id: string, title: string): ConversationSummary =>
+      ({ id, title, titleSource: "prompt", createdAt: 0, updatedAt: 0, pinned: false, itemCount: 1, lastModelId: null, usage: EMPTY_USAGE });
+    const approval = { call: { id: "c", name: "request_action_confirmation", arguments: {} }, title: "Send", message: "Send?", artifact: "" } as never;
+    const help = { call: { id: "h", name: "request_user_help", arguments: {} }, tabId: 5, kind: "login", reason: "Sign in" } as never;
+    await emit({ runId: null, conversationId: null, type: "session.listed", payload: { sessions: [session("a", "Here"), session("b", "Trip <b>plans</b>"), session("c", "Invoices"), session("d", "")] } });
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), runs: [
+      run("ra", "a"), run("rb", "b"), run("rc", "c", { status: "awaiting-approval", pendingApproval: approval }),
+    ] } });
+    const items = () => [...root.querySelectorAll<HTMLButtonElement>(".other-runs__item")];
+    // This chat's own run is not listed; one needing the user comes first. Titles are text.
+    expect(items().map((item) => [item.querySelector(".other-runs__title")?.textContent, item.querySelector(".other-runs__state")?.textContent])).toEqual([
+      ["Invoices", "Needs confirmation"], ["Trip <b>plans</b>", "Working"],
+    ]);
+    expect(root.querySelector(".other-runs b")).toBeNull();
+    expect(composer.props).toMatchObject({ disabled: false, working: true });
+    await act(() => items()[1]!.click());
+    expect(posted.at(-1)).toMatchObject({ type: "session.open", sessionId: "b" });
+    expect(isSidebarCommand(posted.at(-1))).toBe(true);
+
+    // Past three, a count that expands, saying how many need the user.
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), runs: [
+      run("rb", "b"), run("rc", "c", { status: "awaiting-approval", pendingApproval: approval }), run("rd", "d", { status: "awaiting-help", pendingHelp: help }), run("re", "e"),
+    ] } });
+    const summary = root.querySelector<HTMLButtonElement>(".other-runs__summary")!;
+    expect(summary.textContent).toBe("4 other chats running2 need you");
+    expect(summary.getAttribute("aria-expanded")).toBe("false");
+    expect(items()).toHaveLength(0);
+    await act(() => summary.click());
+    expect(items().map((item) => item.querySelector(".other-runs__title")?.textContent)).toEqual(["Invoices", "New chat", "Trip <b>plans</b>", "Another chat"]);
+    expect(items()[1]!.querySelector(".other-runs__state")?.textContent).toBe("Needs your help");
+    expect(composer.props).toMatchObject({ disabled: false, running: false, working: false });
+
+    // No other chat runs: no strip.
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), runs: [run("ra", "a")] } });
+    expect(root.querySelector(".other-runs")).toBeNull();
     render(null, root);
   });
 
@@ -538,7 +733,7 @@ describe("sidebar UI contracts", () => {
     document.body.append(root);
     await act(() => render(h(App, {}), root));
     const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) =>
-      act(() => listeners.forEach((listener) => listener({ v: 1, seq: 1, at: 1, ...event })));
+      act(() => listeners.forEach((listener) => listener({ v: 1, at: 1, ...event, seq: stamp(event) })));
     const page = { artifactId: "p", kind: "page" as const, title: "Issues", url: "https://gist.github.com/the-snesler/1", capturedAt: 1, tabId: 4 };
     await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), page } });
     const remember = root.querySelector<HTMLButtonElement>('[aria-label="Remember something about this site"]')!;
@@ -645,7 +840,7 @@ describe("history drawer", () => {
     const props: HistoryDrawerProps = {
       sessions: [summary("p", "Pinned trip", { pinned: true }), summary("a", "Alpha <b>bold</b>"), summary("b", "Beta", { updatedAt: now - 3 * 86_400_000 }), summary("e", "")],
       openId: "a",
-      run: { conversationId: "b", waitingFor: null },
+      runs: [{ conversationId: "b", waitingFor: null }],
       agentTabs: {},
       now,
       onOpen: vi.fn(), onRename: vi.fn(), onPin: vi.fn(), onExport: vi.fn(), onDelete: vi.fn(), onClose: vi.fn(),
@@ -675,6 +870,21 @@ describe("history drawer", () => {
     expect(row("Beta").querySelector(".history__meta")?.textContent).toBe("3d ago · Working");
     expect(labelled("Delete Beta").hasAttribute("disabled")).toBe(true);
     expect(document.activeElement).toBe(labelled("Search chats by title"));
+  });
+
+  it("marks every chat with a run: working, or needing the user for a confirmation or help", async () => {
+    await mount({ runs: [
+      { conversationId: "b", waitingFor: null }, { conversationId: "p", waitingFor: "confirmation" }, { conversationId: "e", waitingFor: "help" },
+    ] });
+    expect(row("Beta").querySelector(".history__status .live-dot")).not.toBeNull();
+    expect(row("Beta").querySelector(".history__meta")?.textContent).toBe("3d ago · Working");
+    expect(row("Pinned trip").querySelector(".history__status .needs-you")?.getAttribute("title")).toBe("Waiting for your confirmation");
+    expect(row("Pinned trip").querySelector(".history__meta")?.textContent).toBe("5m ago · Needs you: confirmation");
+    expect(row("New chat").querySelector(".history__status .needs-you")?.getAttribute("title")).toBe("Waiting for your help");
+    expect(row("Alpha <b>bold</b>").querySelector(".history__status")).toBeNull();
+    // Every chat with a run keeps it; none can be deleted while it runs.
+    for (const title of ["Beta", "Pinned trip", "New chat"]) expect(labelled(`Delete ${title}`).hasAttribute("disabled")).toBe(true);
+    expect(labelled("Delete Alpha <b>bold</b>").hasAttribute("disabled")).toBe(false);
   });
 
   it("shows each chat's running usage total compactly in its row", async () => {
@@ -794,7 +1004,7 @@ describe("history drawer", () => {
     document.body.append(root);
     await act(() => render(h(App, {}), root));
     expect(posted.map((message) => message.type)).toEqual(["state.subscribe", "session.list"]);
-    const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) => act(() => listeners.forEach((listener) => listener({ v: 1, seq: 0, at: 1, ...event })));
+    const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) => act(() => listeners.forEach((listener) => listener({ v: 1, at: 1, ...event, seq: stamp(event) })));
     await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: snapshotFor("a") });
     await emit({ runId: null, conversationId: null, type: "session.listed", payload: { sessions: [summary("a", "Alpha"), summary("b", "Beta")] } });
 
@@ -831,7 +1041,7 @@ describe("history drawer", () => {
     root = document.createElement("div");
     document.body.append(root);
     await act(() => render(h(App, {}), root));
-    const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) => act(() => listeners.forEach((listener) => listener({ v: 1, seq: 0, at: 1, ...event })));
+    const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) => act(() => listeners.forEach((listener) => listener({ v: 1, at: 1, ...event, seq: stamp(event) })));
     await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: snapshotFor("a") });
 
     expect(root.querySelector(".sidebar__title")?.textContent).toBe("New chat");
@@ -856,7 +1066,7 @@ describe("history drawer", () => {
     root = document.createElement("div");
     document.body.append(root);
     await act(() => render(h(App, {}), root));
-    const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) => act(() => listeners.forEach((listener) => listener({ v: 1, seq: 0, at: 1, ...event })));
+    const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) => act(() => listeners.forEach((listener) => listener({ v: 1, at: 1, ...event, seq: stamp(event) })));
     const tab = (id: number, patch: Partial<AgentTabSummary> = {}): AgentTabSummary => ({
       id, role: "agent", title: `Tab <i>${id}</i>`, url: `https://www.site-${id}.test/page`, favIconUrl: null, lastUsedAt: 0, ...patch,
     });
@@ -918,7 +1128,7 @@ describe("history drawer", () => {
     root = document.createElement("div");
     document.body.append(root);
     await act(() => render(h(App, {}), root));
-    const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) => act(() => listeners.forEach((listener) => listener({ v: 1, seq: 0, at: 1, ...event })));
+    const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) => act(() => listeners.forEach((listener) => listener({ v: 1, at: 1, ...event, seq: stamp(event) })));
     const tab = (id: number): AgentTabSummary => ({ id, role: id === 6 ? "search" : "agent", title: `Tab ${id}`, url: `https://site-${id}.test/`, favIconUrl: null, lastUsedAt: 0 });
     const bySession = { a: [tab(5), tab(6)] };
     await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: { ...snapshotFor("a"), agentTabs: { bySession, watching: null, takenOver: false } } });

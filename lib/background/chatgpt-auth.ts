@@ -146,16 +146,28 @@ export class ChatGPTAuth {
     });
   }
 
+  /**
+   * The current access token, refreshed first within 60 s of expiry. The
+   * refresh is single-flight: concurrent callers (several runs, each round's
+   * request) share one token request, since the refresh token rotates. It is
+   * not tied to any caller's signal, so one run's cancellation never fails
+   * another's refresh; each caller stops waiting on its own signal.
+   */
   async getAuth(signal: AbortSignal): Promise<ProviderAuth> {
     signal.throwIfAborted();
     const saved = await this.#load();
     if (!saved) throw new ProviderStreamError("Sign in with ChatGPT in settings before starting a conversation.", "AUTHENTICATION");
-    if (this.#refresh) return this.#refresh;
-    if (saved.expiresAt > Date.now() + 60_000) return { providerId: "openai", method: "chatgpt", secret: saved.accessToken };
-    this.#refresh = this.#operation(async () => {
+    if (!this.#refresh && saved.expiresAt > Date.now() + 60_000) return { providerId: "openai", method: "chatgpt", secret: saved.accessToken };
+    this.#refresh ??= this.#startRefresh();
+    return abortable(this.#refresh, signal);
+  }
+
+  #startRefresh(): Promise<ProviderAuth> {
+    const refresh: Promise<ProviderAuth> = this.#operation(async () => {
       const current = this.#credential;
       if (!current) throw new ProviderStreamError("Sign in with ChatGPT in settings before starting a conversation.", "AUTHENTICATION");
-      const token = await this.#tokens({ grant_type: "refresh_token", client_id: current.clientId, refresh_token: current.refreshToken, resource: RESOURCE }, signal);
+      // Bounded by the request's own timeout instead of a caller's signal.
+      const token = await this.#tokens({ grant_type: "refresh_token", client_id: current.clientId, refresh_token: current.refreshToken, resource: RESOURCE });
       let identity = { subject: current.subject, email: current.email };
       if (typeof token.id_token === "string") identity = await this.#verifyIdentity(token.id_token, current.clientId);
       if (identity.subject !== current.subject) throw new ProviderStreamError("ChatGPT refresh returned a different account. Reconnect in settings.", "AUTHENTICATION");
@@ -164,8 +176,10 @@ export class ChatGPTAuth {
       await this.#save(credential, models);
       this.#credential = credential;
       return { providerId: "openai", method: "chatgpt", secret: credential.accessToken } as const;
-    });
-    try { return await this.#refresh; } finally { this.#refresh = null; }
+    }).finally(() => { if (this.#refresh === refresh) this.#refresh = null; });
+    // Every caller may have stopped waiting; the failure is theirs to see, not an unhandled rejection.
+    refresh.catch(() => {});
+    return refresh;
   }
 
   /**
@@ -259,4 +273,13 @@ export class ChatGPTAuth {
     const sealed = await this.#deviceKey.seal(JSON.stringify(credential), ENCRYPTION_CONTEXT);
     await saveChatGPTCredential({ version: 2, ...sealed, models });
   }
+}
+
+/** `promise`, or the signal's abort reason as soon as the caller stops waiting. */
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  const { promise: aborted, reject } = Promise.withResolvers<never>();
+  const onAbort = () => reject(signal.reason);
+  signal.addEventListener("abort", onAbort, { once: true });
+  return Promise.race([promise, aborted]).finally(() => signal.removeEventListener("abort", onAbort));
 }

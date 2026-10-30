@@ -86,8 +86,8 @@ export type PageErrorCode =
 
 export interface ToolResult {
   ok: boolean;
-  /** `TOOL_ERROR`: a connected account's tool reported failure or the server rejected the call; `CONNECTION_ERROR`: bside could not reach or sign in to the server. */
-  code?: PageErrorCode | "ACTION_DENIED" | "LIMIT_EXCEEDED" | "INVALID_TOOL_ARGUMENTS" | "SKIPPED" | "TOOL_ERROR" | "CONNECTION_ERROR";
+  /** `TOOL_ERROR`: a connected account's tool reported failure or the server rejected the call; `CONNECTION_ERROR`: bside could not reach or sign in to the server; `TAB_IN_USE`: another run holds the user's tab, refused before any effect. */
+  code?: PageErrorCode | "ACTION_DENIED" | "LIMIT_EXCEEDED" | "INVALID_TOOL_ARGUMENTS" | "SKIPPED" | "TOOL_ERROR" | "CONNECTION_ERROR" | "TAB_IN_USE";
   summary: string;
   data?: JsonValue;
 }

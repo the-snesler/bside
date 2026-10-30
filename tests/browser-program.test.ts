@@ -78,7 +78,7 @@ function setup(options: { outline?: string; searchPage?: (url: string) => Partia
   const files = new ScratchFiles(scratch.store);
   const controller = new TabController(api);
   const memory = options.memory ? runMemory("s1", "r1") : undefined;
-  const program = new BrowserProgram(controller, { state, sessionId: "s1", files, sites: options.sites, memory }, effect);
+  const program = new BrowserProgram(controller, { state, runId: "r1", sessionId: "s1", files, sites: options.sites, memory }, effect);
   const run = (source: string) => program.execute(source, abort.signal);
   return { run, tabs, actions, api, effect, state, scratch, files, controller, abort, sendMessage, program, documents };
 }
@@ -264,7 +264,7 @@ describe("browser program tabs, files, and search", () => {
   it("keeps scratch files across runs, bounds them, and rejects host paths and traversal", async () => {
     const { run, state, files, controller } = setup();
     expect((await run('await fs.write("/workspace/notes.md", "hello"); await fs.move("/workspace/notes.md", "/workspace/saved.md");')).ok).toBe(true);
-    const nextRun = new BrowserProgram(controller, { state, sessionId: "s1", files }, () => {});
+    const nextRun = new BrowserProgram(controller, { state, runId: "r1", sessionId: "s1", files }, () => {});
     expect((await nextRun.execute('return fs.read("/workspace/saved.md");', new AbortController().signal)).summary).toContain("hello");
     for (const path of ["/etc/passwd", "/workspace/../secret", "/workspace/./secret", "/workspace//secret"]) {
       expect((await run(`return fs.read(${JSON.stringify(path)});`)).ok).toBe(false);
@@ -277,7 +277,7 @@ describe("browser program tabs, files, and search", () => {
     const scratch = memoryStore([{ slot: 3, path: "/workspace/kept.md", kind: "text", content: "from last week" }]);
     const files = new ScratchFiles(scratch.store);
     const { controller } = setup();
-    const program = new BrowserProgram(controller, { state: new WorkspaceState(), sessionId: "s1", files }, () => {});
+    const program = new BrowserProgram(controller, { state: new WorkspaceState(), runId: "r1", sessionId: "s1", files }, () => {});
     const run = (source: string) => program.execute(source, new AbortController().signal);
     expect(scratch.store.load).not.toHaveBeenCalled();
 
@@ -304,8 +304,8 @@ describe("browser program tabs, files, and search", () => {
   it("uploads from the run's own session workspace", async () => {
     const { controller, actions } = setup();
     const state = new WorkspaceState();
-    const mine = new BrowserProgram(controller, { state, sessionId: "a", files: new ScratchFiles(memoryStore([{ slot: 0, path: "/workspace/cv.txt", kind: "text", content: "Mine" }]).store) }, () => {});
-    const other = new BrowserProgram(controller, { state, sessionId: "b", files: new ScratchFiles() }, () => {});
+    const mine = new BrowserProgram(controller, { state, runId: "r1", sessionId: "a", files: new ScratchFiles(memoryStore([{ slot: 0, path: "/workspace/cv.txt", kind: "text", content: "Mine" }]).store) }, () => {});
+    const other = new BrowserProgram(controller, { state, runId: "r1", sessionId: "b", files: new ScratchFiles() }, () => {});
     const upload = 'await browser.tab("/tabs/1/page.md").getByRole("file").setInputFiles("/workspace/cv.txt");';
     expect((await other.execute(upload, new AbortController().signal)).summary).toContain("does not exist");
     expect((await mine.execute(upload, new AbortController().signal)).ok).toBe(true);
@@ -315,7 +315,7 @@ describe("browser program tabs, files, and search", () => {
   it("shows a run only its own session's agent tabs, and adopts moved tabs into its session", async () => {
     const { controller, tabs, state } = setup();
     const signal = new AbortController().signal;
-    const programFor = (sessionId: string) => new BrowserProgram(controller, { state, sessionId, files: new ScratchFiles() }, () => {});
+    const programFor = (sessionId: string) => new BrowserProgram(controller, { state, runId: "r1", sessionId, files: new ScratchFiles() }, () => {});
     const a = programFor("a");
     const b = programFor("b");
     expect((await a.execute('const page = await browser.open("https://example.com/a"); return page.path();', signal)).summary).toBe("/agent-tabs/2/page.md");
@@ -386,7 +386,7 @@ describe("browser program tabs, files, and search", () => {
     expect(api.tabs.update).not.toHaveBeenCalled();
 
     // Another session gets its own search tab rather than seeing this one.
-    const other = new BrowserProgram(new TabController(api), { state, sessionId: "s2", files: new ScratchFiles() }, () => {});
+    const other = new BrowserProgram(new TabController(api), { state, runId: "r1", sessionId: "s2", files: new ScratchFiles() }, () => {});
     expect((await other.execute('return web.search("box office 2020");', new AbortController().signal)).ok).toBe(true);
     expect(api.tabs.create).toHaveBeenCalledTimes(2);
     expect(state.searchTab("s2")).not.toBe(tabId);

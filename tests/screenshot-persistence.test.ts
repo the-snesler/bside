@@ -4,7 +4,7 @@ import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController, type CaptureOptions, type TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
 import type { CaptureGeometry, PageSnapshot } from "@/lib/domain/tools";
-import { getConversation, getOpenSessionId, getRunCheckpoint, saveOpenAICredential } from "@/lib/storage";
+import { getConversation, getOpenSessionId, listRunCheckpoints, saveOpenAICredential } from "@/lib/storage";
 import { splitSystemMessage, TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
 
 /** The fake image's base64; nothing persisted or exported may contain it. */
@@ -77,7 +77,7 @@ describe("screenshots are never persisted", () => {
     const stored = JSON.stringify(await browser.storage.local.get(null));
     expect(stored).not.toContain(IMAGE_BASE64);
     expect(stored).not.toContain("data:image");
-    expect(JSON.stringify(await getRunCheckpoint())).not.toContain(IMAGE_BASE64);
+    expect(JSON.stringify(await listRunCheckpoints())).not.toContain(IMAGE_BASE64);
     expect(stored).toContain("[screenshot 1024x768 of https://example.com/report]");
 
     const exported = (await runtime.handleCommand({ v: 1, id: "export", type: "context.export", sessionId }))?.markdown ?? "";

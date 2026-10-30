@@ -27,7 +27,7 @@ it("fills the real fixture by ref and role in one program and verifies a later s
       return { ok: true, type: "page.execute", result, documentId: registry.documentId };
     },
   } });
-  const program = new BrowserProgram(controller, { state: new WorkspaceState(), sessionId: "s1", files: new ScratchFiles() }, () => {});
+  const program = new BrowserProgram(controller, { state: new WorkspaceState(), runId: "r1", sessionId: "s1", files: new ScratchFiles() }, () => {});
   const signal = new AbortController().signal;
 
   const read = await program.execute('const page = browser.tab("/tabs/1/page.md"); return await page.snapshot();', signal);

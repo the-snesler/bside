@@ -129,6 +129,34 @@ describe("private run notifications", () => {
     expect(h.api.create).toHaveBeenCalledTimes(3);
   });
 
+  it("keeps interleaved runs' waits and results apart, each click opening its own run's chat", async () => {
+    const h = harness(true);
+    await h.notifications.pending("run-a", "session-a", "approval");
+    const a = notificationId(h);
+    await h.notifications.pending("run-b", "session-b", "help");
+    expect(h.visible.size).toBe(2);
+    const b = [...h.visible.keys()].find((id) => id !== a)!;
+    // Resolving one run's wait, or ending it, leaves the other's hint.
+    await h.notifications.clearPending("run-a");
+    expect([...h.visible.keys()]).toEqual([b]);
+    await h.notifications.pending("run-a", "session-a", "approval");
+    await h.notifications.finished("run-a", "session-a", completed);
+    expect(h.visible.has(b)).toBe(true);
+    expect(h.visible.size).toBe(2);
+    // run-b's late pending event for the same wait is deduplicated, not a new hint.
+    await h.notifications.pending("run-b", "session-b", "help");
+    expect(h.api.create).toHaveBeenCalledTimes(4);
+    h.api.onClicked.emit(b);
+    await flush();
+    expect(h.selectSession).toHaveBeenCalledExactlyOnceWith("session-b");
+    await h.notifications.finished("run-b", "session-b", { ...completed, durationMs: 1 });
+    // run-a's result stays; run-b's short run shows none.
+    expect(h.visible.size).toBe(1);
+    h.api.onClicked.emit(notificationId(h));
+    await flush();
+    expect(h.selectSession).toHaveBeenLastCalledWith("session-a");
+  });
+
   it("keeps a dismissed wait deduplicated until it resolves and ignores its stale click", async () => {
     const h = harness(true);
     await h.notifications.pending("run", "session", "approval");

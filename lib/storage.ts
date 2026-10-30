@@ -75,8 +75,13 @@ export interface ChatGPTRegistrationV1 {
 
 export type RunStatus = "running" | "awaiting-approval" | "awaiting-help" | "cancelled" | "failed" | "completed";
 
-export interface RunCheckpointV2 {
-  version: 2;
+/**
+ * One active run's recovery marker, stored per run under
+ * `local:runCheckpoint:<runId>` and listed in `local:runCheckpoints`, so
+ * concurrent runs checkpoint and recover independently.
+ */
+export interface RunCheckpointV3 {
+  version: 3;
   runId: string;
   /** The run's session; recovery appends the interrupted marker there. */
   sessionId: string;
@@ -112,9 +117,20 @@ const chatgptCredentialItem = storage.defineItem<ChatGPTCredentialV2>("local:cha
 const chatgptRegistrationItem = storage.defineItem<ChatGPTRegistrationV1>("local:chatgptRegistration", { version: 1 });
 const chatgptSignInNoticeItem = storage.defineItem<ChatGPTSignInNoticeV1>("local:chatgptSignInNotice", { version: 1 });
 
-const runCheckpointItem = storage.defineItem<RunCheckpointV2>("local:runCheckpoint", {
-  version: 2,
-});
+/** The single checkpoint record from before checkpoints were per run (versions 1 and 2); migrated on read. */
+const LEGACY_RUN_CHECKPOINT_KEY = "local:runCheckpoint";
+const RUN_CHECKPOINT_INDEX_KEY = "local:runCheckpoints";
+const runCheckpointKey = (runId: string) => `local:runCheckpoint:${runId}` as const;
+
+/** The run ids that have a checkpoint record. Only the checkpoint functions write it, under `withCheckpointLock`. */
+interface RunCheckpointIndexV1 {
+  version: 1;
+  runIds: string[];
+}
+
+/** Run ids are UUIDs; any short id that is safe inside a storage key is accepted. */
+const RUN_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+const MAX_RUN_CHECKPOINTS = 1_000;
 
 // ---------------------------------------------------------------------------
 // Shape validators — reject anything that doesn't match, never trust raw storage.
@@ -168,12 +184,13 @@ function isValidConversationItem(value: unknown): value is ConversationItem {
   return false;
 }
 
-function isValidRunCheckpoint(value: unknown): value is RunCheckpointV2 {
+function isValidRunCheckpoint(value: unknown): value is RunCheckpointV3 {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
   return (
-    v.version === 2 &&
+    v.version === 3 &&
     typeof v.runId === "string" &&
+    RUN_ID_PATTERN.test(v.runId) &&
     isSessionId(v.sessionId) &&
     (RUN_STATUSES as readonly string[]).includes(v.status as string) &&
     typeof v.partialAssistantText === "string" &&
@@ -1102,67 +1119,182 @@ export async function saveMessageQueue(sessionId: string, messages: readonly Que
 }
 
 // ---------------------------------------------------------------------------
-// Run checkpoint — run-local recovery marker, not the transcript itself.
+// Run checkpoints — run-local recovery markers, not the transcript itself.
+// One record per active run, so concurrent runs never overwrite each other's.
 // ---------------------------------------------------------------------------
 
-export async function getRunCheckpoint(): Promise<RunCheckpointV2 | null> {
-  const raw: unknown = await runCheckpointItem.getValue();
-  if (isValidRunCheckpoint(raw)) return raw;
-  // A pre-sessions checkpoint belonged to the legacy conversation.
-  const legacy = { ...(raw as object), version: 2, sessionId: LEGACY_SESSION_ID, usage: null };
-  if ((raw as { version?: unknown } | null)?.version === 1 && isValidRunCheckpoint(legacy)) return legacy;
-  if (raw !== null) await runCheckpointItem.removeValue();
-  return null;
+let checkpointLock: Promise<unknown> = Promise.resolve();
+
+/**
+ * Serializes every checkpoint read-modify-write, so the index stays exact
+ * while several runs save and clear at once. Exported functions take it
+ * once; the helpers they call never do.
+ */
+function withCheckpointLock<T>(task: () => Promise<T>): Promise<T> {
+  const result = checkpointLock.then(task);
+  checkpointLock = result.catch(() => {});
+  return result;
 }
 
-export async function saveRunCheckpoint(checkpoint: RunCheckpointV2): Promise<void> {
-  await runCheckpointItem.setValue(checkpoint);
+/** The indexed run ids; a malformed index is deleted and reads as empty. */
+async function readCheckpointIndex(): Promise<string[]> {
+  const raw = await storage.getItem<unknown>(RUN_CHECKPOINT_INDEX_KEY);
+  const v = raw as Partial<RunCheckpointIndexV1> | null;
+  if (v?.version === 1 && Array.isArray(v.runIds) && v.runIds.length <= MAX_RUN_CHECKPOINTS &&
+    v.runIds.every((id) => typeof id === "string" && RUN_ID_PATTERN.test(id)) && new Set(v.runIds).size === v.runIds.length) return v.runIds;
+  if (raw !== null) await storage.removeItem(RUN_CHECKPOINT_INDEX_KEY);
+  return [];
 }
 
-export async function clearRunCheckpoint(): Promise<void> {
-  await runCheckpointItem.removeValue();
+function checkpointIndex(runIds: readonly string[]): RunCheckpointIndexV1 {
+  return { version: 1, runIds: [...runIds] };
+}
+
+/** Writes one checkpoint; the first write for a run indexes it in the same `setItems`. */
+async function writeCheckpoint(checkpoint: RunCheckpointV3): Promise<void> {
+  const index = await readCheckpointIndex();
+  if (index.includes(checkpoint.runId)) {
+    await storage.setItem(runCheckpointKey(checkpoint.runId), checkpoint);
+    return;
+  }
+  if (index.length >= MAX_RUN_CHECKPOINTS) throw new Error("Too many run checkpoints.");
+  await storage.setItems([
+    { key: runCheckpointKey(checkpoint.runId), value: checkpoint },
+    { key: RUN_CHECKPOINT_INDEX_KEY, value: checkpointIndex([...index, checkpoint.runId]) },
+  ]);
+}
+
+/** Removes one run's record, then its index entry: a crash between the two leaves an id without a record, which the next listing prunes. */
+async function removeCheckpoints(runIds: readonly string[]): Promise<void> {
+  await storage.removeItems(runIds.map(runCheckpointKey));
+  const index = await readCheckpointIndex();
+  const kept = index.filter((id) => !runIds.includes(id));
+  if (kept.length !== index.length) await storage.setItem(RUN_CHECKPOINT_INDEX_KEY, checkpointIndex(kept));
+}
+
+/**
+ * Moves the single pre-per-run record (version 2, or version 1 from before
+ * sessions, which belonged to the legacy conversation) to its run's own
+ * record. Anything else under the old key is deleted.
+ */
+async function migrateLegacyCheckpoint(): Promise<void> {
+  const raw = await storage.getItem<unknown>(LEGACY_RUN_CHECKPOINT_KEY);
+  if (raw !== null && typeof raw === "object") {
+    const v = raw as Record<string, unknown>;
+    const upgraded = v.version === 2 ? { ...v, version: 3 }
+      : v.version === 1 ? { ...v, version: 3, sessionId: LEGACY_SESSION_ID, usage: null } : null;
+    if (isValidRunCheckpoint(upgraded) && (await storage.getItem(runCheckpointKey(upgraded.runId))) === null) await writeCheckpoint(upgraded);
+  }
+  await storage.removeItem(LEGACY_RUN_CHECKPOINT_KEY, { removeMeta: true });
+}
+
+/** One run's checkpoint; a malformed record is deleted. */
+export function getRunCheckpoint(runId: string): Promise<RunCheckpointV3 | null> {
+  return withCheckpointLock(async () => {
+    if (!RUN_ID_PATTERN.test(runId)) return null;
+    const raw = await storage.getItem<unknown>(runCheckpointKey(runId));
+    if (isValidRunCheckpoint(raw) && raw.runId === runId) return raw;
+    if (raw !== null) await removeCheckpoints([runId]);
+    return null;
+  });
+}
+
+/**
+ * Every run's checkpoint, after migrating the legacy record. Malformed
+ * records, records filed under another run's id, and index entries without
+ * a record are deleted; the rest come back in index order.
+ */
+export function listRunCheckpoints(): Promise<RunCheckpointV3[]> {
+  return withCheckpointLock(async () => {
+    await migrateLegacyCheckpoint();
+    const index = await readCheckpointIndex();
+    const raws = index.length ? await storage.getItems(index.map(runCheckpointKey)) : [];
+    const checkpoints: RunCheckpointV3[] = [];
+    const doomed: string[] = [];
+    index.forEach((runId, i) => {
+      const raw: unknown = raws[i]?.value ?? null;
+      if (isValidRunCheckpoint(raw) && raw.runId === runId) checkpoints.push(raw);
+      else doomed.push(runId);
+    });
+    if (doomed.length) await removeCheckpoints(doomed);
+    return checkpoints;
+  });
+}
+
+/** Saves one run's checkpoint without touching any other run's. An invalid checkpoint is refused. */
+export function saveRunCheckpoint(checkpoint: RunCheckpointV3): Promise<void> {
+  return withCheckpointLock(async () => {
+    if (!isValidRunCheckpoint(checkpoint)) throw new Error("Invalid run checkpoint.");
+    await writeCheckpoint(checkpoint);
+  });
+}
+
+/** Deletes one run's checkpoint; other runs' are untouched. */
+export function clearRunCheckpoint(runId: string): Promise<void> {
+  return withCheckpointLock(async () => {
+    if (RUN_ID_PATTERN.test(runId)) await removeCheckpoints([runId]);
+  });
 }
 
 const INTERRUPTED_SUFFIX ="\n\n[Interrupted: the extension restarted before this response finished.]";
 
+/** A run startup recovery marked interrupted, in its own session. */
+export interface RecoveredRun {
+  runId: string;
+  sessionId: string;
+}
+
 /**
  * Startup recovery: a checkpoint left "running"/"awaiting-approval"/"awaiting-help" means the
- * background died mid-run. Convert it into a visible interrupted assistant
- * message in the run's session rather than silently dropping it or claiming
- * stream resumption, followed by a digest of the calls it had started and
- * the usage it had checkpointed.
- * Returns the session a run was interrupted in, if any.
+ * background died mid-run. Each such run becomes a visible interrupted
+ * assistant message in its own session rather than being silently dropped or
+ * claiming stream resumption, followed by a digest of the calls it had
+ * started and the usage it had checkpointed. Other checkpoints are cleared.
+ *
+ * Runs recover independently: one whose session cannot be written keeps its
+ * checkpoint for the next startup and does not stop the rest. Item ids are
+ * deterministic (`interrupted-`, `digest-`, `usage-<runId>`) and skipped when
+ * already present, so recovering a run twice appends nothing twice; usage is
+ * added to the session total only with its item, so a crash between the two
+ * undercounts rather than double-counts.
+ * Returns the runs it recovered.
  */
-export async function recoverInterruptedRun(): Promise<string | null> {
-  const checkpoint = await getRunCheckpoint();
-  if (!checkpoint) return null;
+export async function recoverInterruptedRuns(): Promise<RecoveredRun[]> {
+  const recovered: RecoveredRun[] = [];
+  for (const checkpoint of await listRunCheckpoints()) {
+    try {
+      if (await recoverCheckpoint(checkpoint)) recovered.push({ runId: checkpoint.runId, sessionId: checkpoint.sessionId });
+    } catch {
+      console.warn("[bside] Could not recover an interrupted run; will retry at next startup.");
+    }
+  }
+  return recovered;
+}
+
+async function recoverCheckpoint(checkpoint: RunCheckpointV3): Promise<boolean> {
+  const { runId, sessionId } = checkpoint;
   if (checkpoint.status !== "running" && checkpoint.status !== "awaiting-approval" && checkpoint.status !== "awaiting-help") {
-    await clearRunCheckpoint();
-    return null;
+    await clearRunCheckpoint(runId);
+    return false;
   }
-  if (!(await listSessions()).some((session) => session.id === checkpoint.sessionId)) {
-    await clearRunCheckpoint();
-    return null;
+  const items = (await getConversation(sessionId))?.items;
+  if (!items) {
+    await clearRunCheckpoint(runId);
+    return false;
   }
+  const present = new Set(items.map((item) => item.id));
 
   const text = checkpoint.partialAssistantText
     ? `${checkpoint.partialAssistantText}${INTERRUPTED_SUFFIX}`
     : INTERRUPTED_SUFFIX.trim();
-
-  await appendConversationItem(checkpoint.sessionId, {
-    id: `interrupted-${checkpoint.runId}`,
-    kind: "message",
-    role: "assistant",
-    text,
-    at: Date.now(),
-  });
+  if (!present.has(`interrupted-${runId}`)) await appendConversationItem(sessionId, { id: `interrupted-${runId}`, kind: "message", role: "assistant", text, at: Date.now() });
   // The tool ledger died with the background; the persisted calls still say what the run did.
-  const digest = digestFromItems((await getConversation(checkpoint.sessionId))?.items ?? []);
-  if (digest) await appendConversationItem(checkpoint.sessionId, { id: `digest-${checkpoint.runId}`, kind: "run-digest", digest, at: Date.now() });
+  const digest = present.has(`digest-${runId}`) ? null : digestFromItems(items);
+  if (digest) await appendConversationItem(sessionId, { id: `digest-${runId}`, kind: "run-digest", digest, at: Date.now() });
   // Usage as of the last checkpoint; a response that ended after it is not counted.
-  const usage = checkpoint.usage && hasTokens(checkpoint.usage) ? checkpoint.usage : undefined;
-  if (usage) await appendConversationItem(checkpoint.sessionId, { id: `usage-${checkpoint.runId}`, kind: "run-usage", usage, at: Date.now() });
-  await touchSession(checkpoint.sessionId, { usage });
-  await clearRunCheckpoint();
-  return checkpoint.sessionId;
+  const usage = checkpoint.usage && hasTokens(checkpoint.usage) && !present.has(`usage-${runId}`) ? checkpoint.usage : undefined;
+  if (usage) await appendConversationItem(sessionId, { id: `usage-${runId}`, kind: "run-usage", usage, at: Date.now() });
+  await touchSession(sessionId, { usage });
+  await clearRunCheckpoint(runId);
+  return true;
 }

@@ -147,6 +147,8 @@ export function describeActivity(activity: Activity, pending: boolean, approval?
   if (!activity.result) return { Icon, title: running, status: "running" };
   if (activity.result.code === "SKIPPED") return { Icon, title: `Skipped ${running.charAt(0).toLowerCase()}${running.slice(1)}` };
   if (readOnlyRefused(activity)) return { Icon, title: "Not allowed in read-only mode" };
+  // Refused before any effect because another chat holds the user's tab: not a failure of this step.
+  if (activity.result.code === "TAB_IN_USE") return { Icon, title: "Another bside chat is using that tab" };
   return failed(activity) ? { Icon, title: error, status: "error" } : { Icon, title: done };
 }
 

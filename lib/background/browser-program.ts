@@ -21,7 +21,7 @@ export const PROGRAM_HELP = `Run a small browser/filesystem program. It is inter
 
 Output: bare expression statements (e.g. \`await x.click();\`) are printed, assignments are silent. Output over 40000 characters is cut with an explicit notice.
 
-Tabs: fs.list("/tabs") (user tabs), fs.list("/agent-tabs") (hidden tabs this chat opened). const page = browser.tab("/tabs/12/page.md"); const res = await browser.open("https://…") opens a hidden agent tab.
+Tabs: fs.list("/tabs") (user tabs), fs.list("/agent-tabs") (hidden tabs this chat opened). const page = browser.tab("/tabs/12/page.md"); const res = await browser.open("https://…") opens a hidden agent tab. A user tab another bside chat is using fails with TAB_IN_USE: open its URL with browser.open instead, or tell the user.
 Reading: await page.snapshot() returns the page outline: text in document order with interactive elements inlined as [e5 button "Save"], [e7 textbox "Email" type=email required value="…"], [e9 link "Docs" → /docs], [e3 combobox "Country" selected="…" options: …]. Includes open/closed shadow DOM and iframes: a cross-origin frame appears in place as [frame f2 "Title" (url)], its lines indented, then [/frame f2], and its refs carry the frame's name (f2:e4); a frame bside cannot read stays one [frame … not readable] line. Long pages are paged: snapshot({offset: 16000, maxChars: 16000}) continues where the notice says (maxChars ≤ 40000). fs.read(tabPath) equals snapshot(). A tab showing a PDF reads as its text ("PDF: N pages", then each page); it is read-only (no refs, actions, or screenshots), and page.savePdf("/workspace/name.pdf") saves the file.
 Tables: a line like [table e12 "Caption" 340 rows × 6 cols] (or [grid …]) marks a data table. await page.table("e12") (or page.ref("f2:e7").table(), page.getByRole("table", {name: "Caption"}).table()) returns {caption, headers, rows, totalRows, offset, nextOffset} as JSON, ${TABLE_LIMITS.defaultRows} rows at a time; page on with table("e12", {offset: 50, limit: 100}) (limit ≤ ${TABLE_LIMITS.maxRows}). Multi-row headers read "Group / Column", a spanned cell repeats in every row and column it covers, and a cell lists the refs of controls in it ("Alice [e14 link]"). Read rankings, cohorts, and comparisons from it rather than from outline text.
 Searching: await page.find("text") lists matching outline lines (with refs) and their offsets — use it on long pages instead of reading everything. await page.waitFor("text", 8000) waits up to 15000 ms for text to appear. await web.search("query") runs the user's own search engine in a hidden search tab and returns up to 10 results (title, URL, snippet), plus a short answer box when the engine shows one; open a result with browser.open(url) only when its snippet is not enough. If the engine shows a consent page or CAPTCHA, web.search fails and says so: ask the user with request_user_help on the search tab, then search again.
@@ -60,9 +60,18 @@ export interface ObservedPage {
 /** A ref as the model writes it: `e12`, or `f3:e12` in the frame named f3. */
 const REF_PATTERN = /^(?:f([1-9]\d{0,5}):)?e[1-9]\d{0,8}$/;
 
-/** Agent-tab ownership and observed documents, shared by every session; the runtime keeps one for the background's lifetime. */
+/** Why a run may not use a user's tab another run holds; safe to show the model. */
+export const TAB_IN_USE_MESSAGE = "Another bside chat is using this tab. Open the page in an agent tab, or wait for that chat to finish.";
+
+/** Agent-tab ownership, user-tab leases, and observed documents, shared by every session; the runtime keeps one for the background's lifetime. */
 export class WorkspaceState {
   agentTabs = new Map<number, AgentTab>();
+  /**
+   * The run holding each of the user's own tabs (`/tabs`): taken on the run's
+   * first use of the tab, released when the run ends or the tab closes or
+   * leaves `/tabs`. In memory only, so a restart releases every lease.
+   */
+  leases = new Map<number, string>();
   /** Documents of the latest outline shown to the model per tab; refs resolve against them. */
   observed = new Map<number, ObservedPage>();
   /** Called after agentTabs ownership changes so the runtime can persist it. */
@@ -72,7 +81,27 @@ export class WorkspaceState {
 
   adoptTab(tabId: number, sessionId: string, role: AgentTabRole = "agent"): void {
     this.agentTabs.set(tabId, { sessionId, role, lastUsedAt: this.now() });
+    // An agent tab belongs to its session, whose one run needs no lease.
+    this.leases.delete(tabId);
     this.onOwnershipChange();
+  }
+
+  /** Takes (or keeps) the lease on a user's tab for `runId`; false while another run holds it. */
+  acquireLease(tabId: number, runId: string): boolean {
+    const holder = this.leases.get(tabId);
+    if (holder !== undefined && holder !== runId) return false;
+    this.leases.set(tabId, runId);
+    return true;
+  }
+
+  /** Drops a tab's lease, whichever run holds it: the tab closed or left `/tabs`. */
+  releaseLease(tabId: number): void {
+    this.leases.delete(tabId);
+  }
+
+  /** Drops every lease `runId` holds; called at each of the run's terminal states. */
+  releaseRunLeases(runId: string): void {
+    for (const [tabId, holder] of this.leases) if (holder === runId) this.leases.delete(tabId);
   }
 
   releaseTab(tabId: number): void {
@@ -211,9 +240,10 @@ export interface MemoryAccess {
   remove(name: string, tainted: boolean): Promise<MemoryChange>;
 }
 
-/** What one run's programs operate on: shared agent-tab state, the run's session, that session's scratch files, and the global memory. */
+/** What one run's programs operate on: shared agent-tab state, the run (which leases the user's tabs it uses), its session, that session's scratch files, and the global memory. */
 export interface ProgramScope {
   state: WorkspaceState;
+  runId: string;
   sessionId: string;
   files: ScratchFiles;
   skills?: Map<string, Skill>;
@@ -535,6 +565,8 @@ export class BrowserProgram {
   /** Whether the user's permission mode is read-only now; set per program by the agent loop and read before each effect. */
   #readOnly: () => boolean = () => false;
   private readonly state: WorkspaceState;
+  /** The run whose programs these are: it holds the leases on the user's tabs they use. */
+  private readonly runId: string;
   /** The run's session: its agent tabs are this program's `/agent-tabs`, and `files` is its `/workspace`. */
   private readonly sessionId: string;
   private readonly files: ScratchFiles;
@@ -550,6 +582,7 @@ export class BrowserProgram {
       this.#handles.add(value as object);
     ({
       state: this.state,
+      runId: this.runId,
       sessionId: this.sessionId,
       files: this.files,
       sites: this.sites,
@@ -1638,6 +1671,7 @@ export class BrowserProgram {
   }
 
   async #controller(tabId: number): Promise<TabController> {
+    this.#lease(tabId);
     this.state.touchTab(tabId);
     // Whatever a page call returns may carry page text.
     this.#tainted = true;
@@ -1666,6 +1700,17 @@ export class BrowserProgram {
   /** Stops the program before an effect the user's read-only mode does not allow. */
   #refuseIfReadOnly(action: string): void {
     if (this.#readOnly()) throw new ProgramError(readOnlyRefusal(action), "ACTION_DENIED");
+  }
+
+  /**
+   * Takes the lease on a user's tab before any use of it (read, action,
+   * screenshot, navigation, move, close), so two runs never share one; the
+   * session's own agent tabs need none. A tab another run holds fails the
+   * call before any effect.
+   */
+  #lease(tabId: number): void {
+    if (this.#ownsTab(tabId) || this.state.acquireLease(tabId, this.runId)) return;
+    throw new ProgramError(`${this.#path(tabId)}: ${TAB_IN_USE_MESSAGE}`, "TAB_IN_USE");
   }
 
   #ownsTab(tabId: number): boolean {
@@ -1944,6 +1989,7 @@ export class BrowserProgram {
   ): Promise<Value> {
     const second = args[1];
     signal.throwIfAborted();
+    this.#lease(id);
     if (method === "read") {
       if (args.length > 2)
         throw new Error(
@@ -1958,6 +2004,7 @@ export class BrowserProgram {
       this.onEffect();
       await this.tabs.closeTab(id);
       this.state.releaseTab(id);
+      this.state.releaseLease(id);
       this.state.observed.delete(id);
       return `Closed ${path}.`;
     }

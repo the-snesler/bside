@@ -18,6 +18,7 @@ import {
   isPageSnapshotRequest,
   isSettingsRequest,
   isSidebarCommand,
+  MAX_SUBSCRIBE_RUNS,
 } from "@/lib/protocol";
 
 describe("isSidebarCommand: accepts every valid variant", () => {
@@ -25,8 +26,11 @@ describe("isSidebarCommand: accepts every valid variant", () => {
     expect(isSidebarCommand({ v: 1, id: "1", type: "state.subscribe", lastSeq: null })).toBe(true);
   });
 
-  it("accepts state.subscribe with a numeric lastSeq", () => {
-    expect(isSidebarCommand({ v: 1, id: "1", type: "state.subscribe", lastSeq: 42 })).toBe(true);
+  it("accepts state.subscribe with each run's last seq", () => {
+    expect(isSidebarCommand({ v: 1, id: "1", type: "state.subscribe", lastSeq: {} })).toBe(true);
+    expect(isSidebarCommand({ v: 1, id: "1", type: "state.subscribe", lastSeq: { r1: 42, r2: 0 } })).toBe(true);
+    const max = Object.fromEntries(Array.from({ length: MAX_SUBSCRIBE_RUNS }, (_, index) => [`run-${index}`, index]));
+    expect(isSidebarCommand({ v: 1, id: "1", type: "state.subscribe", lastSeq: max })).toBe(true);
   });
 
   it("accepts run.start", () => {
@@ -124,8 +128,22 @@ describe("isSidebarCommand: rejects malformed input", () => {
     expect(isSidebarCommand({ v: 1, id: "1", type: "run.resume" })).toBe(false);
   });
 
-  it("rejects state.subscribe with a non-numeric, non-null lastSeq", () => {
-    expect(isSidebarCommand({ v: 1, id: "1", type: "state.subscribe", lastSeq: "5" })).toBe(false);
+  it("rejects state.subscribe whose lastSeq is not a bounded map of run ids to seqs", () => {
+    const subscribe = (lastSeq: unknown) => isSidebarCommand({ v: 1, id: "1", type: "state.subscribe", lastSeq });
+    expect(subscribe("5")).toBe(false);
+    // The single global seq is gone: seqs are per run.
+    expect(subscribe(42)).toBe(false);
+    expect(subscribe([1, 2])).toBe(false);
+    expect(subscribe(new Map([["r1", 1]]))).toBe(false);
+    expect(subscribe({ r1: -1 })).toBe(false);
+    expect(subscribe({ r1: 1.5 })).toBe(false);
+    expect(subscribe({ r1: "1" })).toBe(false);
+    expect(subscribe({ r1: Number.MAX_SAFE_INTEGER + 1 })).toBe(false);
+    expect(subscribe({ "": 1 })).toBe(false);
+    expect(subscribe({ ["r".repeat(65)]: 1 })).toBe(false);
+    expect(subscribe({ [Symbol("r1")]: 1 })).toBe(false);
+    const tooMany = Object.fromEntries(Array.from({ length: MAX_SUBSCRIBE_RUNS + 1 }, (_, index) => [`run-${index}`, index]));
+    expect(subscribe(tooMany)).toBe(false);
   });
 
   it("rejects run.start with a non-string prompt", () => {

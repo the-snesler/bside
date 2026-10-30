@@ -105,7 +105,7 @@ describe("MCP Streamable HTTP client", () => {
       ? new Response("{\"error\":\"invalid_token secret-detail\"}", { status: 401 })
       : json({ jsonrpc: "2.0", id: body.id, result: { tools: [] } }));
     await new McpClient(notion, fake.fetcher, source).listTools(signal());
-    expect(source.refresh).toHaveBeenCalledOnce();
+    expect(source.refresh).toHaveBeenCalledExactlyOnceWith(expect.anything(), "access-1");
     expect(fake.sent.at(-1)!.headers.Authorization).toBe("Bearer access-2");
 
     const always = server(() => new Response("nope", { status: 401 }));

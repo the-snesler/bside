@@ -309,7 +309,7 @@ describe("PDFs in browser programs", () => {
     const setup = pdfSetup();
     const files = new ScratchFiles();
     const state = new WorkspaceState();
-    const program = new BrowserProgram(setup.controller, { state, sessionId: "s1", files }, () => {});
+    const program = new BrowserProgram(setup.controller, { state, runId: "r1", sessionId: "s1", files }, () => {});
     const run = (source: string) => program.execute(source, new AbortController().signal);
     return { ...setup, files, program, run };
   }
@@ -331,7 +331,7 @@ describe("PDFs in browser programs", () => {
     expect(saved.summary).toBe(`Saved the PDF ${REPORT_URL} to /workspace/q3.pdf (${REPORT.length} bytes).`);
     expect(await files.read("/workspace/q3.pdf")).toMatchObject({ kind: "binary", mimeType: "application/pdf", bytes: REPORT.length });
 
-    const fresh = new BrowserProgram(new TabController(pdfBrowser([], {}).api, undefined, undefined, new PdfReader(extractPdfText)), { state: new WorkspaceState(), sessionId: "s1", files }, () => {});
+    const fresh = new BrowserProgram(new TabController(pdfBrowser([], {}).api, undefined, undefined, new PdfReader(extractPdfText)), { state: new WorkspaceState(), runId: "r1", sessionId: "s1", files }, () => {});
     const read = await fresh.execute('return await fs.read("/workspace/q3.pdf");', new AbortController().signal);
     expect(read.ok, read.summary).toBe(true);
     expect(read.summary).toContain("File: /workspace/q3.pdf (PDF, read-only)\nBEGIN_UNTRUSTED_PAGE\nPDF: 2 pages · Q3 Report");

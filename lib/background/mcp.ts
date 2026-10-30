@@ -250,7 +250,7 @@ export class McpConnections {
     };
     return {
       token: (signal) => marking(() => connection.auth.token(signal)),
-      refresh: (signal) => marking(() => connection.auth.refresh(signal)),
+      refresh: (signal, rejected) => marking(() => connection.auth.refresh(signal, rejected)),
     };
   }
 

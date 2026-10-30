@@ -37,10 +37,13 @@ export interface McpCallOutcome {
   text: string;
 }
 
-/** Bearer tokens for one server; `refresh` is called once after a 401 and fails with `REAUTH` when it cannot. */
+/**
+ * Bearer tokens for one server; `refresh` is called once after a 401 with the
+ * token the server rejected, and fails with `REAUTH` when it cannot.
+ */
 export interface McpTokenSource {
   token(signal: AbortSignal): Promise<string>;
-  refresh(signal: AbortSignal): Promise<string>;
+  refresh(signal: AbortSignal, rejected?: string): Promise<string>;
 }
 
 interface Session {
@@ -254,8 +257,12 @@ export class McpClient {
 
   /** POSTs one message, refreshing the token once after a 401. */
   async #post(session: Session | null, message: RpcMessage, signal: AbortSignal, timeoutMs: number, callerSignal: AbortSignal = signal): Promise<Response> {
+    let token = "";
     for (let attempt = 0; ; attempt++) {
-      const token = attempt === 0 ? await this.#tokens.token(signal) : await this.#tokens.refresh(signal);
+      // Concurrent requests (calls from several runs) that were all refused
+      // with one token share one refresh: the source refreshes only a token
+      // that is still current.
+      token = attempt === 0 ? await this.#tokens.token(signal) : await this.#tokens.refresh(signal, token);
       const headers: Record<string, string> = {
         "Content-Type": "application/json", Accept: "application/json, text/event-stream", Authorization: `Bearer ${token}`,
       };

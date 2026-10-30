@@ -27,6 +27,12 @@ describe("trace read labels", () => {
     expect(describeActivity(activity(source, false), false)).toMatchObject({ title: "Couldn't read file content", status: "error" });
   });
 
+  it("labels a user tab another chat holds as such, not as a failure", () => {
+    const refused: Activity = { ...activity('fs.read("/tabs/12/page.md");'), endedAt: 1,
+      result: { ok: false, code: "TAB_IN_USE", summary: "0 statements completed. /tabs/12/page.md: Another bside chat is using this tab." } };
+    expect(describeActivity(refused, false)).toEqual({ Icon: expect.anything(), title: "Another bside chat is using that tab" });
+  });
+
   it("labels YouTube site calls", () => {
     const source = 'const both = await Promise.all([youtube.getMetadata("x"), youtube.getTranscript("x")]);';
     expect(describeActivity(activity(source), false).title).toBe("Reading YouTube");

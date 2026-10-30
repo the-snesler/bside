@@ -32,6 +32,7 @@ import { PROMPT_MENTION_PATTERN } from "@/lib/domain/conversation";
 import { describeAsk } from "@/lib/domain/ask";
 import { QUICK_ACTIONS } from "@/lib/domain/quick-actions";
 import { AskChip } from "@/lib/ui/AskChip";
+import { OtherRunsStrip, runAttention, type OtherRun } from "@/lib/ui/OtherRuns";
 
 const PERMISSION_MODE_OPTIONS: { mode: PermissionMode; label: string; title: string; Icon: typeof ShieldCheck }[] = [
   { mode: "ask", label: "Ask first", title: "Asks before sending, submitting, buying, or deleting", Icon: ShieldCheck },
@@ -74,7 +75,7 @@ export function App() {
   const {
     conversation,
     page: activePage,
-    activeRun,
+    runs,
     notice,
     lastError,
     credential,
@@ -137,17 +138,23 @@ export function App() {
     historyButton.current?.focus();
   };
 
-  // One run at a time across all chats; it may belong to a chat other than the one on screen.
-  // While it works in this chat, the composer queues follow-ups and steers it.
-  const runHere = activeRun !== null && activeRun.conversationId === conversation.id;
-  const composerDisabled = !credential.configured || (activeRun !== null && !runHere);
+  // At most one run per chat, and any number of chats may run at once. While
+  // this chat's run works, the composer queues follow-ups and steers it;
+  // runs in other chats never hold it back, and are listed in the strip.
+  const hereRun = runs.find((run) => run.conversationId === conversation.id) ?? null;
+  const runHere = hereRun !== null;
+  const otherRuns: OtherRun[] = runs.filter((run) => run.conversationId !== conversation.id).map((run) => {
+    const session = sessions.find((candidate) => candidate.id === run.conversationId);
+    return { sessionId: run.conversationId, title: session ? session.title : "Another chat", attention: runAttention(run), stopping: run.status === "cancelling" };
+  });
+  const composerDisabled = !credential.configured;
   const model =
     provider.models.find((model) => model.id === settings.modelId) ??
     provider.models[0];
   const turns = buildTurns(conversation.items, runHere);
   const images = useMemo(() => ({ sessionId: conversation.id, load: loadWorkspaceImage }), [conversation.id, loadWorkspaceImage]);
-  const pendingApproval = runHere ? activeRun.pendingApproval : null;
-  const pendingHelp = runHere ? activeRun.pendingHelp : null;
+  const pendingApproval = hereRun?.pendingApproval ?? null;
+  const pendingHelp = hereRun?.pendingHelp ?? null;
 
   // This chat's agent tabs ride on the composer. The attached page is one of
   // them while the user watches it; another chat's agent tab is never shown as attached.
@@ -220,20 +227,7 @@ export function App() {
       </header>
       <div class="sidebar__content">
         <div class="sidebar__chat" inert={historyOpen}>
-          {activeRun && !runHere && (
-            <div class="run-elsewhere" role="status">
-              <p>
-                {activeRun.pendingApproval
-                  ? "Another chat is waiting for your confirmation."
-                  : activeRun.pendingHelp
-                    ? "Another chat needs your help in one of its tabs."
-                    : "bside is working in another chat."}
-              </p>
-              <button type="button" onClick={() => openSession(activeRun.conversationId)}>
-                Show
-              </button>
-            </div>
-          )}
+          <OtherRunsStrip runs={otherRuns} onOpen={openSession} />
           <main class="sidebar__body" ref={scroll.viewport}>
             <div ref={scroll.content}>
               {turns.length === 0 && !runHere ? (
@@ -336,9 +330,9 @@ export function App() {
                       </Fragment>
                     );
                   })}
-                  {runHere && activeRun.partialAssistantText && (
+                  {hereRun?.partialAssistantText && (
                     <li class="timeline__item timeline__item--assistant timeline__item--streaming">
-                      <Markdown text={activeRun.partialAssistantText} images={images} />
+                      <Markdown text={hereRun.partialAssistantText} images={images} />
                     </li>
                   )}
                 </ul>
@@ -392,7 +386,7 @@ export function App() {
                       <span class="queue__text" title={text}>{text}</span>
                       {message.content?.map(item => <McpContentChip key={item.id} item={item} />)}
                       {message.ask && <span class="queue__label" title={describeAsk(message.ask).text}>{describeAsk(message.ask).label}</span>}
-                      {message.mode === "follow-up" && activeRun === null && (
+                      {message.mode === "follow-up" && !runHere && (
                         <button type="button" class="icon-button" aria-label="Send now" title="Send now" onClick={() => sendQueued(message.id)}>
                           <ArrowUp />
                         </button>
@@ -423,7 +417,7 @@ export function App() {
                   tabs={chatAgentTabs}
                   watching={watchedTab}
                   inUseSince={inUseSince}
-                  canClose={activeRun === null}
+                  canClose={!runHere}
                   helpTabId={helpTabId}
                   takenOver={agentTabs.takenOver}
                   now={Date.now()}
@@ -457,9 +451,9 @@ export function App() {
                 onPrepareMcpContent={prepareMcpContent}
                 onDismissMcpContent={dismissMcpContent}
                 disabled={composerDisabled}
-                running={!!activeRun}
+                running={runHere}
                 working={runHere}
-                canSteer={runHere && activeRun.status !== "cancelling"}
+                canSteer={hereRun !== null && hereRun.status !== "cancelling"}
                 configured={credential.configured}
                 draft={draft}
                 focusVersion={focusVersion}
@@ -481,9 +475,8 @@ export function App() {
               <PermissionModeSelect mode={permissionMode} onChange={savePermissionMode} />
               <select
                 aria-label="Model"
-                title="Model"
+                title={runHere ? "Model: applies from your next message; the running turn keeps its own" : "Model"}
                 value={settings.modelId}
-                disabled={!!activeRun}
                 onChange={(event) => {
                   const next = provider.models.find(
                     (candidate) => candidate.id === event.currentTarget.value,
@@ -507,9 +500,8 @@ export function App() {
               </select>
               <select
                 aria-label="Reasoning effort"
-                title="Reasoning effort"
+                title={runHere ? "Reasoning effort: applies from your next message; the running turn keeps its own" : "Reasoning effort"}
                 value={settings.reasoningEffort}
-                disabled={!!activeRun}
                 onChange={(event) =>
                   saveSettings({
                     ...settings,
@@ -530,7 +522,7 @@ export function App() {
           <HistoryDrawer
             sessions={sessions}
             openId={conversation.id}
-            run={activeRun && { conversationId: activeRun.conversationId, waitingFor: activeRun.pendingApproval ? "confirmation" : activeRun.pendingHelp ? "help" : null }}
+            runs={runs.map((run) => ({ conversationId: run.conversationId, waitingFor: runAttention(run) }))}
             agentTabs={agentTabCounts}
             now={Date.now()}
             onOpen={(sessionId) => {

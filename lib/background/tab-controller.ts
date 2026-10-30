@@ -118,6 +118,22 @@ export class FrameAliases {
   }
 }
 
+/**
+ * One background-wide turn for briefly showing a hidden tab to capture it
+ * (see `TabController.screenshot`), shared by every controller like
+ * `FrameAliases`, so concurrent runs never flip tab visibility at once.
+ */
+export class VisibilityLock {
+  #tail: Promise<void> = Promise.resolve();
+
+  /** Runs `task` after every task queued before it has settled. */
+  run<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.#tail.then(task);
+    this.#tail = result.then(() => {}, () => {});
+    return result;
+  }
+}
+
 /** A tab's outline, composed from its top frame and the cross-origin frames in it. */
 interface ComposedOutline {
   documentId: string;
@@ -239,19 +255,22 @@ export class TabController {
   #isBlank: BlankImageCheck;
   #frames: FrameAliases;
   #pdfs: PdfReader;
+  #visibility: VisibilityLock;
   #tabId: number | null = null;
   #url: string | null = null;
   #title: string | null = null;
 
   /**
    * Pass the background's one `FrameAliases` so every controller names a
-   * tab's frames the same way, and its one `PdfReader` so a PDF is parsed once.
+   * tab's frames the same way, its one `PdfReader` so a PDF is parsed once,
+   * and its one `VisibilityLock` so only one screenshot at a time shows a hidden tab.
    */
-  constructor(browserApi: TabControllerBrowserApi, isBlank: BlankImageCheck = isBlankImage, frames: FrameAliases = new FrameAliases(), pdfs: PdfReader = new PdfReader()) {
+  constructor(browserApi: TabControllerBrowserApi, isBlank: BlankImageCheck = isBlankImage, frames: FrameAliases = new FrameAliases(), pdfs: PdfReader = new PdfReader(), visibility: VisibilityLock = new VisibilityLock()) {
     this.#browserApi = browserApi;
     this.#isBlank = isBlank;
     this.#frames = frames;
     this.#pdfs = pdfs;
+    this.#visibility = visibility;
   }
 
   get frames(): FrameAliases {
@@ -279,7 +298,7 @@ export class TabController {
   async forTab(tabId: number): Promise<TabController> {
     const tab = (await this.listTabs()).find((tab) => tab.id === tabId);
     if (!tab) throw new Error("Tab is closed or unsupported.");
-    const controller = new TabController(this.#browserApi, this.#isBlank, this.#frames, this.#pdfs);
+    const controller = new TabController(this.#browserApi, this.#isBlank, this.#frames, this.#pdfs, this.#visibility);
     controller.#tabId = tabId;
     controller.#url = tab.url!;
     controller.#title = tab.title ?? "";
@@ -672,7 +691,8 @@ export class TabController {
    * a hidden tab still fails to capture or comes out blank, it is shown
    * without being activated, captured again, and hidden again; the hide runs
    * in `finally`, and Firefox never hides the active tab, so a tab the user
-   * switched to (or is watching) stays visible.
+   * switched to (or is watching) stays visible. That show-capture-hide runs
+   * under the shared `VisibilityLock`, one at a time across all runs.
    */
   async screenshot(request: ScreenshotRequest): Promise<PageOutcome<Screenshot>> {
     const tabId = this.#tabId;
@@ -756,17 +776,25 @@ export class TabController {
     } catch {
       // Retried below if the tab is hidden.
     }
-    const hidden = (await this.allTabs()).find((tab) => tab.id === tabId)?.hidden === true;
-    if (!hidden || !this.#browserApi.tabs.show || !this.#browserApi.tabs.hide) {
+    const { show, hide } = this.#browserApi.tabs;
+    if (!show || !hide) {
       if (first !== null) return first;
       throw new Error("Capture failed.");
     }
-    await this.#browserApi.tabs.show(tabId);
-    try {
-      return await capture(tabId, options);
-    } finally {
-      await this.#browserApi.tabs.hide(tabId).catch(() => []);
-    }
+    // Whether the tab is hidden is read inside the lock: another capture may just have shown it.
+    return this.#visibility.run(async () => {
+      const hidden = (await this.allTabs()).find((tab) => tab.id === tabId)?.hidden === true;
+      if (!hidden) {
+        if (first !== null) return first;
+        throw new Error("Capture failed.");
+      }
+      await show.call(this.#browserApi.tabs, tabId);
+      try {
+        return await capture(tabId, options);
+      } finally {
+        await hide.call(this.#browserApi.tabs, tabId).catch(() => []);
+      }
+    });
   }
 
   /**

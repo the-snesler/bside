@@ -4,17 +4,24 @@
  * inference request, tool loop, transcript authority, or credential read.
  * Between full `state.snapshot` syncs, run-lifecycle events are applied
  * incrementally so the composer/timeline update live without re-fetching.
- * The single active run may belong to another session than the open one: its
- * events always update `activeRun`, but change `conversation` only when their
+ * Each run in `runs` may belong to another session than the open one: its
+ * events always update that run, but change `conversation` only when their
  * `conversationId` is the open session's.
+ *
+ * Run events are sequenced per run. An event at or below its run's applied
+ * seq is a duplicate and is skipped; one past the next seq means events were
+ * missed, so it is skipped and `state.subscribe` names every run's applied
+ * seq, getting back the missed events or a full snapshot. Run events before
+ * the first snapshot are skipped (the snapshot or a later gap covers them).
+ * Every other event has seq 0 and is applied as it comes.
  */
 
 import type { McpContentChoice, McpContentSnapshot } from "@/lib/domain/mcp-content";
 import type { McpContentReply, WorkspaceImageReply } from "@/lib/protocol";
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import type { Browser } from "wxt/browser";
-import { RUN_CANCELLED_SUFFIX, SIDEBAR_PORT_NAME } from "@/lib/protocol";
-import type { HelpOutcome, NormalizedError, RuntimeSnapshot, SidebarCommand, SidebarEvent } from "@/lib/protocol";
+import { isRunEvent, MAX_SUBSCRIBE_RUNS, RUN_CANCELLED_SUFFIX, SIDEBAR_PORT_NAME, TERMINAL_RUN_EVENT_TYPES } from "@/lib/protocol";
+import type { HelpOutcome, NormalizedError, RunState, RuntimeSnapshot, SidebarCommand, SidebarEvent } from "@/lib/protocol";
 import type { Conversation, ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
 import type { AppSettingsV1 } from "@/lib/domain/provider";
 import type { PermissionMode } from "@/lib/domain/permissions";
@@ -109,6 +116,62 @@ export interface BackgroundActions {
 /** A workspace image as the background answered, or `unavailable` when the sidebar got no answer. */
 export type WorkspaceImageLoad = WorkspaceImageReply | { ok: false; reason: "unavailable" };
 
+/** Ended runs remembered so a late duplicate of their events is not mistaken for a new run. */
+const ENDED_RUNS_REMEMBERED = 32;
+
+/**
+ * The sidebar side of per-run sequencing: the seq applied for each run in
+ * progress, and of recently ended runs.
+ */
+export class RunSeqTracker {
+  #live = new Map<string, number>();
+  #ended = new Map<string, number>();
+  /** Each run's applied seq when a gap in it last asked for a replay. */
+  #asked = new Map<string, number>();
+  #synced = false;
+
+  /** A snapshot: its runs' seqs replace what was applied. */
+  reset(runs: readonly RunState[]): void {
+    this.#live = new Map(runs.map((run) => [run.runId, run.lastSeq]));
+    for (const run of runs) this.#ended.delete(run.runId);
+    this.#asked.clear();
+    this.#synced = true;
+  }
+
+  /**
+   * Whether to apply a run event: `apply` when it is its run's next one
+   * (recording it), `skip` for a duplicate or before the first snapshot,
+   * `gap` when earlier events are missing and no replay has been asked for
+   * at this point yet, and `wait` when one has.
+   */
+  accept(event: { runId: string; seq: number; type: SidebarEvent["type"] }): "apply" | "skip" | "gap" | "wait" {
+    if (!this.#synced) return "skip";
+    const ended = this.#ended.get(event.runId);
+    if (ended !== undefined && event.seq <= ended) return "skip";
+    const applied = this.#live.get(event.runId) ?? 0;
+    if (event.seq <= applied) return "skip";
+    if (event.seq > applied + 1) {
+      if (this.#asked.get(event.runId) === applied) return "wait";
+      this.#asked.set(event.runId, applied);
+      return "gap";
+    }
+    this.#asked.delete(event.runId);
+    if (TERMINAL_RUN_EVENT_TYPES.has(event.type)) {
+      this.#live.delete(event.runId);
+      this.#ended.set(event.runId, event.seq);
+      while (this.#ended.size > ENDED_RUNS_REMEMBERED) this.#ended.delete(this.#ended.keys().next().value!);
+    } else {
+      this.#live.set(event.runId, event.seq);
+    }
+    return "apply";
+  }
+
+  /** The `state.subscribe` seq map for a replay: the runs in progress, newest last, at most `MAX_SUBSCRIBE_RUNS`. */
+  known(): Record<string, number> {
+    return Object.fromEntries([...this.#live].slice(-MAX_SUBSCRIBE_RUNS));
+  }
+}
+
 /** Images kept for re-renders (an answer moving from streaming to its turn); runs may change files, so it is cleared when one starts. */
 const WORKSPACE_IMAGE_CACHE = 8;
 
@@ -131,8 +194,7 @@ const INITIAL_STATE: BackgroundState = {
   page: null,
   agentTabs: { bySession: {}, watching: null, takenOver: false },
   queue: [],
-  activeRun: null,
-  lastSeq: 0,
+  runs: [],
   notice: null,
   lastError: null,
   siteNote: null,
@@ -144,7 +206,7 @@ type Port = Browser.runtime.Port;
 export function useBackground(): BackgroundState & BackgroundActions {
   const [state, setState] = useState<BackgroundState>(INITIAL_STATE);
   const portRef = useRef<Port | null>(null);
-  const activeRunIdRef = useRef<string | null>(null);
+  const seqsRef = useRef(new RunSeqTracker());
   const exportRequestRef = useRef<string | null>(null);
   /** The site-note request awaiting its reply; replies to an older or closed editor are dropped. */
   const siteNoteRequestRef = useRef<string | null>(null);
@@ -155,6 +217,9 @@ export function useBackground(): BackgroundState & BackgroundActions {
   const imageCache = useRef(new Map<string, Promise<WorkspaceImageLoad>>());
   const conversationIdRef = useRef("");
   conversationIdRef.current = state.conversation.id;
+  /** The open session's run, which run commands (cancel, approve, deny, help, steer) address. */
+  const openRunIdRef = useRef<string | null>(null);
+  openRunIdRef.current = state.runs.find((run) => run.conversationId === state.conversation.id)?.runId ?? null;
 
   useEffect(() => {
     const port = browser.runtime.connect({ name: SIDEBAR_PORT_NAME });
@@ -207,7 +272,13 @@ export function useBackground(): BackgroundState & BackgroundActions {
         setState((prev) => ({ ...prev, memoryUndo: { ...prev.memoryUndo, [key]: { status: undone.length ? "undone" : "failed", error } } }));
         return;
       }
-      applyEvent(message as SidebarEvent, setState, activeRunIdRef);
+      if (event.type === "state.snapshot") seqsRef.current.reset(event.payload.runs);
+      if (isRunEvent(event)) {
+        const verdict = seqsRef.current.accept(event);
+        if (verdict === "gap") port.postMessage({ v: 1, id: crypto.randomUUID(), type: "state.subscribe", lastSeq: seqsRef.current.known() } satisfies SidebarCommand);
+        if (verdict !== "apply") return;
+      }
+      applyEvent(event, setState);
     };
     port.onMessage.addListener(onMessage);
 
@@ -273,7 +344,7 @@ export function useBackground(): BackgroundState & BackgroundActions {
   }, []);
 
   const steer = useCallback((text: string, askId?: string, contentIds?: string[]) => {
-    const runId = activeRunIdRef.current;
+    const runId = openRunIdRef.current;
     // With no run to steer, the background treats the text as a normal prompt.
     portRef.current?.postMessage(runId
       ? { v: 1, id: crypto.randomUUID(), type: "run.steer", runId, text, ...(askId ? { askId } : {}), ...(contentIds?.length ? { contentIds, sessionId: conversationIdRef.current } : {}) } satisfies SidebarCommand
@@ -291,28 +362,28 @@ export function useBackground(): BackgroundState & BackgroundActions {
   }, []);
 
   const cancelRun = useCallback(() => {
-    const runId = activeRunIdRef.current;
+    const runId = openRunIdRef.current;
     if (!runId) return;
     const command: SidebarCommand = { v: 1, id: crypto.randomUUID(), type: "run.cancel", runId };
     portRef.current?.postMessage(command);
   }, []);
 
   const approveAction = useCallback((callId: string) => {
-    const runId = activeRunIdRef.current;
+    const runId = openRunIdRef.current;
     if (!runId) return;
     const command: SidebarCommand = { v: 1, id: crypto.randomUUID(), type: "action.approve", runId, callId };
     portRef.current?.postMessage(command);
   }, []);
 
   const denyAction = useCallback((callId: string) => {
-    const runId = activeRunIdRef.current;
+    const runId = openRunIdRef.current;
     if (!runId) return;
     const command: SidebarCommand = { v: 1, id: crypto.randomUUID(), type: "action.deny", runId, callId };
     portRef.current?.postMessage(command);
   }, []);
 
   const resolveHelp = useCallback((callId: string, outcome: HelpOutcome, note: string) => {
-    const runId = activeRunIdRef.current;
+    const runId = openRunIdRef.current;
     if (!runId) return;
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "help.resolve", runId, callId, outcome, note } satisfies SidebarCommand);
   }, []);
@@ -407,38 +478,40 @@ function appendItem(prev: BackgroundState, conversationId: string | null, item: 
   return { ...prev.conversation, items: [...prev.conversation.items, item], ...(updatedAt === undefined ? {} : { updatedAt }) };
 }
 
-/**
- * The ended run's usage as the `run-usage` item the background persisted
- * under the same id, after the run's last message. A no-op when no response
- * reported tokens.
- */
-function endRun(prev: BackgroundState, conversationId: string | null, at: number): BackgroundState {
-  const usage = prev.activeRun?.usage;
-  const conversation = usage ? appendItem(prev, conversationId, { id: `usage-${usage.runId}`, kind: "run-usage", usage, at }) : prev.conversation;
-  return { ...prev, activeRun: null, conversation };
+function runOf(prev: BackgroundState, runId: string): RunState | undefined {
+  return prev.runs.find((run) => run.runId === runId);
 }
 
-function commitPendingText(prev: BackgroundState, conversationId: string | null): BackgroundState {
-  if (!prev.activeRun || !prev.activeRun.partialAssistantText) return prev;
+function patchRun(prev: BackgroundState, runId: string, patch: Partial<RunState>): BackgroundState {
+  return { ...prev, runs: prev.runs.map((run) => run.runId === runId ? { ...run, ...patch } : run) };
+}
+
+/**
+ * Drops an ended run, adding its usage as the `run-usage` item the background
+ * persisted under the same id, after the run's last message. The usage item
+ * is a no-op when no response reported tokens.
+ */
+function endRun(prev: BackgroundState, runId: string, conversationId: string | null, at: number): BackgroundState {
+  const usage = runOf(prev, runId)?.usage;
+  const conversation = usage ? appendItem(prev, conversationId, { id: `usage-${usage.runId}`, kind: "run-usage", usage, at }) : prev.conversation;
+  return { ...prev, runs: prev.runs.filter((run) => run.runId !== runId), conversation };
+}
+
+function commitPendingText(prev: BackgroundState, runId: string, conversationId: string | null): BackgroundState {
+  const run = runOf(prev, runId);
+  if (!run || !run.partialAssistantText) return prev;
   const message: ConversationItem = {
-    id: `${prev.activeRun.runId}-msg-${prev.conversation.items.length}`,
+    id: `${run.runId}-msg-${prev.conversation.items.length}`,
     kind: "message",
     role: "assistant",
-    text: prev.activeRun.partialAssistantText,
+    text: run.partialAssistantText,
     at: Date.now(),
   };
-  return {
-    ...prev,
-    activeRun: { ...prev.activeRun, partialAssistantText: "" },
-    conversation: appendItem(prev, conversationId, message),
-  };
+  return { ...patchRun(prev, runId, { partialAssistantText: "" }), conversation: appendItem(prev, conversationId, message) };
 }
 
-function applyEvent(
-  event: SidebarEvent,
-  setState: (updater: (prev: BackgroundState) => BackgroundState) => void,
-  activeRunIdRef: { current: string | null },
-): void {
+/** Applies one event. Run events update their own run (and record its seq); they change `conversation` only for the open session's run. */
+function applyEvent(event: SidebarEvent, setState: (updater: (prev: BackgroundState) => BackgroundState) => void): void {
   if (event.type === "ask.changed") {
     setState((prev) => ({ ...prev, ask: event.payload.ask }));
     return;
@@ -460,7 +533,6 @@ function applyEvent(
     return;
   }
   if (event.type === "state.snapshot") {
-    activeRunIdRef.current = event.payload.activeRun?.runId ?? null;
     setState((prev) => ({ ...prev, ...event.payload, lastError: null }));
     return;
   }
@@ -480,9 +552,16 @@ function applyEvent(
     setState((prev) => event.conversationId === prev.conversation.id ? { ...prev, queue: event.payload.messages } : prev);
     return;
   }
+  if (!isRunEvent(event)) return;
+  const runId = event.runId;
+  // Every state a run event leaves its run in reflects that event's seq.
+  const set = (updater: (prev: BackgroundState) => BackgroundState) => setState((prev) => {
+    const next = updater(prev);
+    return runOf(next, runId) ? patchRun(next, runId, { lastSeq: event.seq }) : next;
+  });
   if (event.type === "steer.delivered") {
-    setState((prev) => {
-      const committed = commitPendingText(prev, event.conversationId);
+    set((prev) => {
+      const committed = commitPendingText(prev, runId, event.conversationId);
       const delivered = event.payload.item;
       if (event.conversationId !== prev.conversation.id) return committed;
       return {
@@ -494,14 +573,13 @@ function applyEvent(
     return;
   }
   if (event.type === "run.usage") {
-    setState((prev) => prev.activeRun?.runId === event.runId ? { ...prev, activeRun: { ...prev.activeRun, usage: event.payload.usage } } : prev);
+    set((prev) => runOf(prev, runId) ? patchRun(prev, runId, { usage: event.payload.usage }) : prev);
     return;
   }
   if (event.type === "run.started") {
-    activeRunIdRef.current = event.runId;
-    setState((prev) => {
+    set((prev) => {
       const userItem: ConversationItem = {
-        id: `${event.runId}-user`,
+        id: `${runId}-user`,
         kind: "message",
         role: "user",
         text: event.payload.prompt,
@@ -512,10 +590,12 @@ function applyEvent(
         at: event.at,
       };
       const conversationId = event.conversationId!;
+      const run: RunState = { runId, conversationId, status: "running", partialAssistantText: "", pendingApproval: null, pendingHelp: null, usage: null, lastSeq: event.seq };
       return {
         ...prev,
-        lastError: null,
-        activeRun: { runId: event.runId as string, conversationId, status: "running", partialAssistantText: "", pendingApproval: null, pendingHelp: null, usage: null },
+        // A run starting in another chat leaves this chat's failure (and its Retry) in place.
+        lastError: conversationId === prev.conversation.id ? null : prev.lastError,
+        runs: [...prev.runs.filter((other) => other.runId !== runId), run],
         // A retry re-runs the turn's existing user message rather than adding one.
         conversation: event.payload.retry ? prev.conversation : appendItem(prev, conversationId, userItem, event.at),
       };
@@ -523,53 +603,51 @@ function applyEvent(
     return;
   }
   if (event.type === "assistant.delta") {
-    setState((prev) =>
-      prev.activeRun
-        ? { ...prev, activeRun: { ...prev.activeRun, partialAssistantText: prev.activeRun.partialAssistantText + event.payload.delta } }
-        : prev,
-    );
+    set((prev) => {
+      const run = runOf(prev, runId);
+      return run ? patchRun(prev, runId, { partialAssistantText: run.partialAssistantText + event.payload.delta }) : prev;
+    });
     return;
   }
   if (event.type === "tool.requested") {
-    setState((prev) => {
-      const committed = commitPendingText(prev, event.conversationId);
-      if (!committed.activeRun) return committed;
+    set((prev) => {
+      const committed = commitPendingText(prev, runId, event.conversationId);
+      if (!runOf(committed, runId)) return committed;
       const callItem: ConversationItem = { id: `${event.payload.call.id}-call`, kind: "tool-call", call: event.payload.call, at: event.at };
       return { ...committed, conversation: appendItem(committed, event.conversationId, callItem) };
     });
     return;
   }
   if (event.type === "action.approval-required") {
-    setState((prev) => {
-      const committed = commitPendingText(prev, event.conversationId);
-      if (!committed.activeRun) return committed;
+    set((prev) => {
+      const committed = commitPendingText(prev, runId, event.conversationId);
+      if (!runOf(committed, runId)) return committed;
       // A memory change under the Ask policy pauses a browser program whose call is already shown.
       const shown = committed.conversation.items.some((item) => item.kind === "tool-call" && item.call.id === event.payload.call.id);
       const callItem: ConversationItem = { id: `${event.payload.call.id}-call`, kind: "tool-call", call: event.payload.call, at: event.at };
       return {
-        ...committed,
-        activeRun: { ...committed.activeRun, status: "awaiting-approval", pendingApproval: event.payload },
+        ...patchRun(committed, runId, { status: "awaiting-approval", pendingApproval: event.payload }),
         conversation: shown ? committed.conversation : appendItem(committed, event.conversationId, callItem),
       };
     });
     return;
   }
   if (event.type === "help.requested") {
-    setState((prev) => {
-      const committed = commitPendingText(prev, event.conversationId);
-      if (!committed.activeRun) return committed;
+    set((prev) => {
+      const committed = commitPendingText(prev, runId, event.conversationId);
+      if (!runOf(committed, runId)) return committed;
       const callItem: ConversationItem = { id: `${event.payload.call.id}-call`, kind: "tool-call", call: event.payload.call, at: event.at };
       return {
-        ...committed,
-        activeRun: { ...committed.activeRun, status: "awaiting-help", pendingHelp: event.payload },
+        ...patchRun(committed, runId, { status: "awaiting-help", pendingHelp: event.payload }),
         conversation: appendItem(committed, event.conversationId, callItem),
       };
     });
     return;
   }
   if (event.type === "tool.result") {
-    setState((prev) => {
-      if (!prev.activeRun) return prev;
+    set((prev) => {
+      const run = runOf(prev, runId);
+      if (!run) return prev;
       const resultItem: ConversationItem = {
         id: `${event.payload.callId}-result`,
         kind: "tool-result",
@@ -578,56 +656,53 @@ function applyEvent(
         ...(event.payload.memory ? { memory: event.payload.memory } : {}),
         at: event.at,
       };
-      const stillPending = prev.activeRun.pendingApproval?.call.id === event.payload.callId ? null : prev.activeRun.pendingApproval;
-      const helpPending = prev.activeRun.pendingHelp?.call.id === event.payload.callId ? null : prev.activeRun.pendingHelp;
+      const stillPending = run.pendingApproval?.call.id === event.payload.callId ? null : run.pendingApproval;
+      const helpPending = run.pendingHelp?.call.id === event.payload.callId ? null : run.pendingHelp;
       return {
-        ...prev,
-        activeRun: {
-          ...prev.activeRun,
+        ...patchRun(prev, runId, {
           status: stillPending ? "awaiting-approval" : helpPending ? "awaiting-help" : "running",
           pendingApproval: stillPending,
           pendingHelp: helpPending,
-        },
+        }),
         conversation: appendItem(prev, event.conversationId, resultItem),
       };
     });
     return;
   }
   if (event.type === "run.completed") {
-    activeRunIdRef.current = null;
-    setState((prev) => {
-      if (!prev.activeRun) return prev;
-      if (!prev.activeRun.partialAssistantText) return endRun(prev, event.conversationId, event.at);
+    set((prev) => {
+      const run = runOf(prev, runId);
+      if (!run) return prev;
+      if (!run.partialAssistantText) return endRun(prev, runId, event.conversationId, event.at);
       const assistantItem: ConversationItem = {
         id: event.payload.messageId,
         kind: "message",
         role: "assistant",
-        text: prev.activeRun.partialAssistantText,
+        text: run.partialAssistantText,
         at: event.at,
       };
-      return endRun({ ...prev, conversation: appendItem(prev, event.conversationId, assistantItem, event.at) }, event.conversationId, event.at);
+      return endRun({ ...prev, conversation: appendItem(prev, event.conversationId, assistantItem, event.at) }, runId, event.conversationId, event.at);
     });
     return;
   }
   if (event.type === "run.cancelled") {
-    activeRunIdRef.current = null;
-    setState((prev) => {
-      if (!prev.activeRun) return prev;
-      if (!event.payload.messageId) return endRun(prev, event.conversationId, event.at);
+    set((prev) => {
+      const run = runOf(prev, runId);
+      if (!run) return prev;
+      if (!event.payload.messageId) return endRun(prev, runId, event.conversationId, event.at);
       const assistantItem: ConversationItem = {
         id: event.payload.messageId,
         kind: "message",
         role: "assistant",
-        text: `${prev.activeRun.partialAssistantText}${RUN_CANCELLED_SUFFIX}`,
+        text: `${run.partialAssistantText}${RUN_CANCELLED_SUFFIX}`,
         at: event.at,
       };
-      return endRun({ ...prev, conversation: appendItem(prev, event.conversationId, assistantItem, event.at) }, event.conversationId, event.at);
+      return endRun({ ...prev, conversation: appendItem(prev, event.conversationId, assistantItem, event.at) }, runId, event.conversationId, event.at);
     });
     return;
   }
   if (event.type === "run.failed") {
-    activeRunIdRef.current = null;
     // Retry targets the open session, so only a failure there offers it.
-    setState((prev) => ({ ...endRun(prev, event.conversationId, event.at), lastError: event.conversationId === prev.conversation.id ? event.payload : prev.lastError }));
+    set((prev) => ({ ...endRun(prev, runId, event.conversationId, event.at), lastError: event.conversationId === prev.conversation.id ? event.payload : prev.lastError }));
   }
 }
