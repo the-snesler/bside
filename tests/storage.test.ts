@@ -8,6 +8,7 @@ import {
   deleteAllSessions,
   deleteOpenAICredential,
   deleteSession,
+  deleteUntouchedSessions,
   ensureOpenSession,
   getAppSettings,
   getConversation,
@@ -21,6 +22,7 @@ import {
   saveMessageQueue,
   hasChatGPTSignInNotice,
   listSessions,
+  listTouchedSessions,
   loadWorkspaceFiles,
   migrateConversation,
   migrateCredentials,
@@ -592,6 +594,27 @@ describe("storage: history retention and bulk deletion", () => {
     expect(await getOpenSessionId()).toBeNull();
     expect((await listSessions()).map((session) => session.id).sort()).toEqual([pinned, kept, recent].sort());
     expect(await pruneSessions(200, [kept])).toEqual([]);
+  });
+
+  it("lists and deletes untouched new chats by their record, not the lagging index count, except kept ones", async () => {
+    const untouched = (await createSession()).id;
+    const kept = (await createSession()).id;
+    const named = (await createSession()).id;
+    await updateSession(named, { title: "Named" });
+    const pinned = (await createSession()).id;
+    await updateSession(pinned, { pinned: true });
+    // A message whose turn has not refreshed the index yet: its entry still counts 0 items.
+    const lagging = (await createSession()).id;
+    await appendConversationItem(lagging, { id: "u1", kind: "message", role: "user", text: "Hi", context: null, at: 1 });
+    expect((await listSessions()).find((session) => session.id === lagging)?.itemCount).toBe(0);
+    await browser.storage.local.set({ openConversation: { version: 1, id: untouched } });
+
+    expect((await listTouchedSessions([kept])).map((session) => session.id).sort()).toEqual([kept, named, pinned, lagging].sort());
+    expect(await deleteUntouchedSessions([kept])).toEqual([untouched]);
+    expect(await keysOf(untouched)).toEqual([]);
+    expect(await getOpenSessionId()).toBeNull();
+    expect((await listSessions()).map((session) => session.id).sort()).toEqual([kept, named, pinned, lagging].sort());
+    expect(await deleteUntouchedSessions([])).toEqual([kept]);
   });
 
   it("deletes every session except kept ones, pinned included", async () => {
