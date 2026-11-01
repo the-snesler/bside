@@ -65,9 +65,10 @@ export default defineBackground({
       if (approvalBadge.attention) void runtime.openAttentionSession();
     });
 
-    browser.tabs.onActivated.addListener(({ tabId }) => {
+    // Each window's sidebar follows its active tab: it shows the chat the tab is bound to, else an empty one.
+    browser.tabs.onActivated.addListener(({ tabId, windowId }) => {
       void sidebarHub.refreshAttachment();
-      void runtime.handleTabActivated(tabId);
+      void runtime.handleTabActivated(tabId, windowId);
     });
 
     browser.tabs.onCreated.addListener((tab) => {

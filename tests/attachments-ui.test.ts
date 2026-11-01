@@ -103,7 +103,7 @@ function snapshotFor(id: string, items: ConversationItem[] = []): RuntimeSnapsho
     provider: OPENAI_API_KEY_PROVIDER,
     settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
     permissionMode: "ask",
-    page: null, ask: null, agentTabs: { bySession: {}, watching: null, takenOver: false }, queue: [], runs: [], notice: null,
+    page: null, viewTabId: null, ask: null, agentTabs: { bySession: {}, watching: null, takenOver: false }, queue: [], runs: [], notice: null,
   };
 }
 

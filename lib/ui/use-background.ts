@@ -209,6 +209,7 @@ const INITIAL_STATE: BackgroundState = {
   settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
   permissionMode: "ask",
   page: null,
+  viewTabId: null,
   agentTabs: { bySession: {}, watching: null, takenOver: false },
   queue: [],
   runs: [],

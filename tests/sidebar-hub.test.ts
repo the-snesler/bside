@@ -265,11 +265,11 @@ describe("SidebarHub: views", () => {
     await Promise.all([subscribed, listed]);
     expect(snapshotsOf(port)).toEqual(["chat-7"]);
     expect(commands).toEqual([{ type: "session.list", owner: port }]);
-    expect(hub.views()).toEqual([{ kind: "sidebar", windowId: 7, sessionId: "chat-7" }]);
+    expect(hub.views()).toEqual([{ kind: "sidebar", windowId: 7, sessionId: "chat-7", tabId: null }]);
     expect(hub.viewOf(port)).toEqual(hub.views()[0]);
     // A second attach is ignored: a Port is one view for its lifetime.
     await port.send({ v: 1, id: "again", type: "view.attach", windowId: 8 });
-    expect(hub.views()).toEqual([{ kind: "sidebar", windowId: 7, sessionId: "chat-7" }]);
+    expect(hub.views()).toEqual([{ kind: "sidebar", windowId: 7, sessionId: "chat-7", tabId: null }]);
   });
 
   it("refuses a malformed attach and never answers a Port whose attach failed", async () => {
@@ -293,6 +293,18 @@ describe("SidebarHub: views", () => {
     expect(asked).toEqual([["chat-1", "chat-2"]]);
     expect(snapshotsOf(one)).toEqual(["chat-1"]);
     expect(snapshotsOf(two)).toEqual(["chat-2"]);
+  });
+
+  it("sends snapshots only to the views named, such as those that followed their window's tab to another chat", async () => {
+    const { hub, asked } = recordingHub();
+    const one = await connect(hub, 1);
+    const two = await connect(hub, 2);
+    asked.length = 0;
+    hub.viewOf(two)!.sessionId = "chat-2b";
+    await hub.broadcastSnapshot([hub.viewOf(two)!]);
+    expect(asked).toEqual([["chat-2b"]]);
+    expect(snapshotsOf(one)).toEqual([]);
+    expect(snapshotsOf(two)).toEqual(["chat-2b"]);
   });
 
   it("sends each window's views that window's active page, and only when it changes", async () => {

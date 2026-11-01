@@ -11,7 +11,7 @@ import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { WorkspaceState } from "@/lib/background/browser-program";
 import { TabController } from "@/lib/background/tab-controller";
-import { AGENT_TAB_TAG_KEY } from "@/lib/background/tab-controller";
+import { AGENT_TAB_TAG_KEY, CHAT_TAB_KEY } from "@/lib/background/tab-controller";
 import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import type { RuntimeClock } from "@/lib/background/runtime";
 import { ProviderStreamError } from "@/lib/providers/openai";
@@ -42,6 +42,12 @@ const fallbackId = () => ensureOpenSession();
 async function inOpenChat(command: Record<string, unknown>): Promise<Record<string, unknown>> {
   const named = command.type === "run.start" || command.type === "run.steer" || command.type === "run.retry";
   return named && command.sessionId === undefined ? { ...command, sessionId: await fallbackId() } : command;
+}
+
+/** A run command naming the chat a sidebar's view shows when it names none, as that sidebar would send it. */
+function inView(hub: SidebarHub, port: object, command: Record<string, unknown>): Record<string, unknown> {
+  const named = command.type === "run.start" || command.type === "run.steer" || command.type === "run.retry";
+  return named && command.sessionId === undefined ? { ...command, sessionId: hub.viewOf(port)!.sessionId } : command;
 }
 
 /** The open session, as the sidebar shows it; empty before any session exists. */
@@ -502,10 +508,22 @@ function fakePort(): FakePort {
   } as unknown as FakePort;
 }
 
-/** Connects a sidebar Port and attaches it as the view of `windowId`, as the sidebar does when it loads. */
-async function attachView<P extends FakePort>(hub: SidebarHub, port: P, windowId = 1): Promise<P> {
+/**
+ * Connects a sidebar Port and attaches it as the view of `windowId`, as the
+ * sidebar does when it loads. Unless `fallback` is false, the view then opens
+ * the fallback chat (the one commands without a Port act on), as a sidebar
+ * would whose window's active tab is bound to it; most suites test one chat
+ * seen from both sides.
+ */
+async function attachView<P extends FakePort>(hub: SidebarHub, port: P, windowId = 1, fallback = true): Promise<P> {
   hub.handleConnect(port);
   await port.send({ v: 1, id: crypto.randomUUID(), type: "view.attach", windowId });
+  if (fallback) {
+    // What opening it pushed (a snapshot, the session list) is not what a test observes.
+    const before = port.received.length;
+    await port.send({ v: 1, id: crypto.randomUUID(), type: "session.open", sessionId: await ensureOpenSession() });
+    port.received.splice(before);
+  }
   return port;
 }
 
@@ -1399,13 +1417,14 @@ describe("BackgroundRuntime: approval badge", () => {
   async function startAwaitingApproval(badge: ApprovalBadge) {
     await saveOpenAICredential("sk-test");
     const hub = new SidebarHub();
-    const runtime = new BackgroundRuntime(hub, { provider: confirmationProvider(), tabControllerFactory: supportedPageTabControllerFactory, approvalBadge: badge });
+    const runtime = new BackgroundRuntime(hub, { provider: confirmationProvider(), tabControllerFactory: supportedPageTabControllerFactory, approvalBadge: badge,
+      windows: { getLastFocused: async () => ({ id: 1 }) } });
     hub.delegate = runtime;
     const run = runtime.handleCommand({ v: 1, id: "start", type: "run.start", sessionId: await fallbackId(), prompt: "Submit it" });
     await tick(200);
     const snapshot = await runtime.getSnapshot();
     expect(snapshot.runs[0]?.status).toBe("awaiting-approval");
-    return { runtime, run, runId: snapshot.runs[0]!.runId };
+    return { runtime, hub, run, runId: snapshot.runs[0]!.runId };
   }
 
   it("sets the badge while awaiting approval and clears it when approved and the run completes", async () => {
@@ -1477,23 +1496,24 @@ describe("BackgroundRuntime: approval badge", () => {
 
   it("routes the toolbar click to the waiting run's chat from another chat, and to nothing once it ends", async () => {
     const { badge } = fakeBadge();
-    const { runtime, run, runId } = await startAwaitingApproval(badge);
+    const { runtime, hub, run, runId } = await startAwaitingApproval(badge);
     const waitingSession = (await getOpenSessionId())!;
-    await runtime.handleCommand({ v: 1, id: "new", type: "session.create" });
-    const other = (await getOpenSessionId())!;
+    // The focused window's sidebar shows another chat.
+    const port = await attachView(hub, fakePort(), 1, false);
+    const other = hub.viewOf(port)!.sessionId;
     expect(other).not.toBe(waitingSession);
     // Named, so leaving it does not delete it as an untouched new chat.
     await runtime.handleCommand({ v: 1, id: "name", type: "session.rename", sessionId: other, title: "Other" });
     expect(badge.waitingRuns()).toEqual([runId]);
     await runtime.openAttentionSession();
-    expect(await getOpenSessionId()).toBe(waitingSession);
+    expect(hub.viewOf(port)!.sessionId).toBe(waitingSession);
 
     await runtime.handleCommand({ v: 1, id: "approve", type: "action.approve", runId, callId: "call_1" });
     await run;
     expect(badge.attention).toBe(false);
-    await runtime.handleCommand({ v: 1, id: "open", type: "session.open", sessionId: other });
+    await port.send({ v: 1, id: "open", type: "session.open", sessionId: other });
     await runtime.openAttentionSession();
-    expect(await getOpenSessionId()).toBe(other);
+    expect(hub.viewOf(port)!.sessionId).toBe(other);
   });
 
   it("saves model settings while a run waits, but refuses credential changes", async () => {
@@ -2326,7 +2346,9 @@ describe("BackgroundRuntime: session-scoped workspace and agent tabs", () => {
     await updateSession(other, { pinned: true });
     const { runtime } = await setup(tabs, tags, clock);
     expect(await getConversation(old)).toBeNull();
-    expect(tabs.map((tab) => tab.id)).toEqual([1, 7, 8]);
+    // No sidebar shows the owner chat yet, so retention pruned it too.
+    expect(await getConversation(owner)).toBeNull();
+    expect(tabs.map((tab) => tab.id)).toEqual([1, 7]);
 
     await runtime.handleHistoryRequest({ v: 1, id: "all", type: "history.deleteAll" });
     expect(tabs.map((tab) => tab.id)).toEqual([1]);
@@ -2397,7 +2419,7 @@ describe("BackgroundRuntime: watching an agent tab", () => {
     const port = fakePort();
     await attachView(hub, port);
     const provider = new FakeProvider();
-    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: fake.factory, clock, approvalBadge });
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: fake.factory, clock, approvalBadge, windows: { getLastFocused: async () => ({ id: 1 }) } });
     hub.delegate = runtime;
     await runtime.initialize();
     const send = async (command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...await inOpenChat(command) } as SidebarCommand);
@@ -2405,7 +2427,7 @@ describe("BackgroundRuntime: watching an agent tab", () => {
     const switchTo = async (tabId: number) => { activate(tabId); await runtime.handleTabActivated(tabId); };
     const state = (id: number) => { const tab = tabs.find((candidate) => candidate.id === id)!; return { hidden: tab.hidden, active: tab.active }; };
     const watching = async () => (await runtime.getSnapshot()).agentTabs.watching;
-    return { ...fake, api, tabs, port, provider, runtime, send, switchTo, state, watching };
+    return { ...fake, api, tabs, hub, port, provider, runtime, send, switchTo, state, watching };
   }
 
   it("shows the chat's agent tab beside the active tab, switches to it, and hides it again once the user switches away", async () => {
@@ -2661,7 +2683,10 @@ describe("BackgroundRuntime: watching an agent tab", () => {
 
   it("keeps ! on while two overlapping runs wait, routing the toolbar to the longest-waiting one until both resolve", async () => {
     const { badge, texts } = helpBadge();
-    const { send, runtime, provider } = await setup([], [], undefined, badge);
+    const { send, runtime, provider, hub } = await setup([], [], undefined, badge);
+    // Window 1's sidebar, where the toolbar click opens chats.
+    const sidebar = await attachView(hub, fakePort(), 1, false);
+    const shown = () => hub.viewOf(sidebar)!.sessionId;
     // Rounds in request order: A asks for help, B asks for confirmation, then A and B answer.
     scripted(provider, [
       [{ type: "tool.call", call: { id: "help_1", name: "request_user_help", arguments: { tab: "/agent-tabs/5/page.md", kind: "login", reason: "Sign in to Grocer." } } }, { type: "turn.completed", replayState: null }],
@@ -2684,7 +2709,7 @@ describe("BackgroundRuntime: watching an agent tab", () => {
 
     // The toolbar opens the chat that has waited longest: A's, though B's chat is on screen.
     await runtime.openAttentionSession();
-    expect(await getOpenSessionId()).toBe(owner);
+    expect(shown()).toBe(owner);
 
     // Resolving A leaves B waiting: ! stays, and the toolbar now routes to B.
     await send({ type: "help.resolve", runId: a, callId: "help_1", outcome: "done", note: "" });
@@ -2694,7 +2719,7 @@ describe("BackgroundRuntime: watching an agent tab", () => {
     expect(badge.pending).toBe(true);
     expect(texts.at(-1)).toBe("!");
     await runtime.openAttentionSession();
-    expect(await getOpenSessionId()).toBe(other);
+    expect(shown()).toBe(other);
 
     // Resolving B as well clears it.
     await send({ type: "action.approve", runId: b, callId: "confirm" });
@@ -3032,11 +3057,13 @@ describe("BackgroundRuntime: history drawer support", () => {
     hub.delegate = runtime;
     const port = fakePort();
     await attachView(hub, port);
-    // From the sidebar, whose view shows the chat it last opened (and makes it the fallback).
-    const send = async (command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...await inOpenChat(command) } as SidebarCommand, port);
+    // From the sidebar; a run command names the chat its view shows.
+    const send = async (command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...inView(hub, port, command) } as SidebarCommand, port);
     const history = (request: Record<string, unknown>) => runtime.handleHistoryRequest({ v: 1, id: crypto.randomUUID(), ...request } as never);
     const listed = () => port.received.flatMap((event) => event.type === "session.listed" ? [event.payload.sessions] : []);
-    return { hub, runtime, port, send, history, listed, sweep };
+    /** The sidebar's own snapshot: the chat its view shows. */
+    const snapshot = () => runtime.getSnapshot(hub.viewOf(port));
+    return { hub, runtime, port, send, history, listed, sweep, snapshot };
   }
 
   it("prunes unpinned chats past retention at startup, keeping pinned, open, and recent ones", async () => {
@@ -3057,14 +3084,14 @@ describe("BackgroundRuntime: history drawer support", () => {
 
   it("keeps everything by default, and applies a shorter retention from the options page at once, sparing the active run's chat", async () => {
     const { provider, release } = blockingProvider();
-    const { runtime, send, history, listed } = await setup(provider);
+    const { runtime, send, history, listed, snapshot } = await setup(provider);
     await runtime.initialize();
     const old = await createSessionWith(prompt("u1", "Old"));
-    const running = (await runtime.getSnapshot()).conversation.id;
+    const running = (await snapshot()).conversation.id;
     const run = send({ type: "run.start", prompt: "Long task" });
     await untilRequested(provider);
     await send({ type: "session.create" });
-    const open = (await runtime.getSnapshot()).conversation.id;
+    const open = (await snapshot()).conversation.id;
     vi.setSystemTime(Date.now() + 40 * DAY);
 
     expect(await history({ type: "history.retention.save", retention: "forever" })).toMatchObject({ ok: true, sessionCount: 3, notice: null });
@@ -3079,10 +3106,10 @@ describe("BackgroundRuntime: history drawer support", () => {
   });
 
   it("re-applies retention on the first sweep an hour after the last pass", async () => {
-    const { runtime, send, sweep } = await setup();
+    const { runtime, send, sweep, snapshot } = await setup();
     await runtime.initialize();
     await saveHistorySettings({ version: 1, retention: "7d" });
-    const stale = (await runtime.getSnapshot()).conversation.id;
+    const stale = (await snapshot()).conversation.id;
     await send({ type: "session.rename", sessionId: stale, title: "Kept until left" });
     await send({ type: "session.create" });
     vi.setSystemTime(Date.now() + 30 * 60_000);
@@ -3091,20 +3118,20 @@ describe("BackgroundRuntime: history drawer support", () => {
     vi.setSystemTime(Date.now() + 8 * DAY);
     await sweep();
     expect(await getConversation(stale)).toBeNull();
-    expect(await listSessionIds()).toEqual([(await runtime.getSnapshot()).conversation.id]);
+    expect(await listSessionIds()).toEqual([(await snapshot()).conversation.id]);
   });
 
   it("deletes all history except the active run's chat and opens a fresh empty chat", async () => {
     const { provider, release } = blockingProvider();
-    const { runtime, send, history, listed, port } = await setup(provider);
+    const { runtime, send, history, listed, port, hub, snapshot } = await setup(provider);
     await runtime.initialize();
     const pinned = await createSessionWith(prompt("u1", "Pinned"));
     await updateSession(pinned, { pinned: true });
-    const running = (await runtime.getSnapshot()).conversation.id;
+    const running = (await snapshot()).conversation.id;
     const run = send({ type: "run.start", prompt: "Long task" });
     await untilRequested(provider);
     await send({ type: "session.create" });
-    const viewing = (await runtime.getSnapshot()).conversation.id;
+    const viewing = (await snapshot()).conversation.id;
 
     const response = await history({ type: "history.deleteAll" });
     expect(response).toMatchObject({ ok: true, sessionCount: 2, notice: expect.stringContaining("active run was kept") });
@@ -3113,7 +3140,7 @@ describe("BackgroundRuntime: history drawer support", () => {
     expect([pinned, viewing, running]).not.toContain(fresh.conversationId);
     // The sidebar shows the fresh chat, which history lists once it has a message.
     expect(listed().at(-1)?.map((session) => session.id)).toEqual([running]);
-    expect(await getOpenSessionId()).toBe(fresh.conversationId);
+    expect(hub.viewOf(port)!.sessionId).toBe(fresh.conversationId);
     release();
     await run;
     expect((await getConversation(running))?.items[0]).toMatchObject({ role: "user", text: "Long task" });
@@ -3124,12 +3151,12 @@ describe("BackgroundRuntime: history drawer support", () => {
   it("exports any chat by id, each with its own latest run's diagnostics", async () => {
     const provider = new FakeProvider();
     provider.script = [{ type: "text.delta", delta: "Answer." }, { type: "turn.completed", replayState: null }];
-    const { runtime, send, port } = await setup(provider);
+    const { send, port, snapshot } = await setup(provider);
     await send({ type: "run.start", prompt: "Alpha question" });
-    const alpha = (await runtime.getSnapshot()).conversation.id;
+    const alpha = (await snapshot()).conversation.id;
     await send({ type: "session.create" });
     await send({ type: "run.start", prompt: "Beta question" });
-    const beta = (await runtime.getSnapshot()).conversation.id;
+    const beta = (await snapshot()).conversation.id;
     await send({ type: "session.open", sessionId: alpha });
 
     const exportOf = async (sessionId: string) => (await send({ type: "context.export", sessionId }) as { markdown: string } | undefined)?.markdown;
@@ -3153,11 +3180,11 @@ describe("BackgroundRuntime: history drawer support", () => {
   it("pushes the session list to every sidebar when a run titles a chat, when it ends, and on session commands", async () => {
     const provider = new FakeProvider();
     provider.script = [{ type: "text.delta", delta: "Answer." }, { type: "turn.completed", replayState: null }];
-    const { hub, runtime, send, listed, port } = await setup(provider);
+    const { hub, send, listed, port, snapshot } = await setup(provider);
     const other = fakePort();
-    await attachView(hub, other);
+    await attachView(hub, other, 2, false);
     await send({ type: "run.start", prompt: "Plan a @Trip (tab 4, /tabs/4/page.md, https://example.com/) today" });
-    const id = (await runtime.getSnapshot()).conversation.id;
+    const id = (await snapshot()).conversation.id;
     const lists = listed();
     expect(lists[0]).toEqual([expect.objectContaining({ id, title: "Plan a @Trip today", itemCount: 1 })]);
     expect(lists.at(-1)).toEqual([expect.objectContaining({ id, itemCount: 2 })]);
@@ -3752,13 +3779,16 @@ describe("BackgroundRuntime: scheduled automation", () => {
     const badge = new ApprovalBadge({ setBadgeText: ({ text }) => { texts.push(text); }, setBadgeBackgroundColor: () => {} });
     const hub = new SidebarHub();
     const alarms = { create: vi.fn(), clear: vi.fn(async () => true) };
-    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory, clock, alarms, approvalBadge: badge, notifications, mcp });
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory, clock, alarms, approvalBadge: badge, notifications, mcp, windows: { getLastFocused: async () => ({ id: 1 }) } });
     runtimes.push(runtime); hub.delegate = runtime;
     await runtime.initialize();
+    // The focused window's sidebar, showing the open chat: where results and attention clicks open chats.
+    const sidebar = await attachView(hub, fakePort());
+    const shown = () => hub.viewOf(sidebar)!.sessionId;
     const saved = await runtime.handleAutomationRequest({ v: 1, id: "save", type: "automation.save", taskId: null, task: draft });
     if (!saved.ok) throw new Error(saved.error.message);
     const taskId = saved.tasks[0]!.id;
-    return { runtime, provider, advance, api, tags, taskId, openId, badge, texts, alarms, hub };
+    return { runtime, provider, advance, api, tags, taskId, openId, badge, texts, alarms, hub, sidebar, shown };
   }
   const ended = async (taskId: string) => {
     await vi.waitFor(async () => expect((await getScheduledTasks()).find((t) => t.id === taskId)?.lastRun?.endedAt).toBeTypeOf("number"));
@@ -3768,7 +3798,7 @@ describe("BackgroundRuntime: scheduled automation", () => {
   it("runs in a dedicated owned agent tab/session, preserves open chat, and reuses the results session", async () => {
     const provider = new FakeProvider();
     provider.script = [{ type: "text.delta", delta: "Checked." }, { type: "turn.completed", replayState: null }];
-    const { runtime, advance, api, tags, taskId, openId, texts } = await setup(provider);
+    const { runtime, advance, api, tags, taskId, openId, texts, shown } = await setup(provider);
     advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
     const first = await ended(taskId);
     expect(first.sessionId).not.toBe(openId);
@@ -3786,8 +3816,9 @@ describe("BackgroundRuntime: scheduled automation", () => {
     advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); await ended(taskId);
     expect((await getScheduledTasks())[0]!.sessionId).toBe(first.sessionId);
     expect((await getConversation(first.sessionId!))!.items.filter(isTurnStart)).toHaveLength(2);
+    expect(shown()).toBe(openId);
     await runtime.openAttentionSession();
-    expect(await getOpenSessionId()).toBe(first.sessionId);
+    expect(shown()).toBe(first.sessionId);
     expect((await getScheduledTasks())[0]!.unread).toBe(false);
     expect(texts.at(-1)).toBe("");
   });
@@ -3823,12 +3854,13 @@ describe("BackgroundRuntime: scheduled automation", () => {
       if (round++ === 1) await gate.promise;
       yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
     } });
-    const { runtime, advance, taskId } = await setup(provider);
+    const { runtime, advance, taskId, sidebar, shown } = await setup(provider);
     advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
     const results = (await ended(taskId)).sessionId!;
     // The user opens the results and asks a follow-up there, which keeps running.
     await runtime.openResultsSession(results);
-    const userRun = runtime.handleCommand({ v: 1, id: "user", type: "run.start", sessionId: await fallbackId(), prompt: "User work" });
+    expect(shown()).toBe(results);
+    const userRun = runtime.handleCommand({ v: 1, id: "user", type: "run.start", sessionId: results, prompt: "User work" }, sidebar);
     await untilRequested(provider, 2);
     const activeId = (await runtime.getSnapshot()).runs[0]!.runId;
     advance(300_000);
@@ -3887,7 +3919,7 @@ describe("BackgroundRuntime: scheduled automation", () => {
     await mcp.connect("notion");
     const provider = new FakeProvider();
     provider.script = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
-    const { runtime, advance, api, taskId, hub } = await setup(provider, undefined, mcp);
+    const { runtime, advance, api, taskId, hub, sidebar } = await setup(provider, undefined, mcp);
     const capturing = Promise.withResolvers<void>();
     const resume = Promise.withResolvers<void>();
     const sendMessage = api.tabs.sendMessage.getMockImplementation()!;
@@ -3912,7 +3944,7 @@ describe("BackgroundRuntime: scheduled automation", () => {
       await capturing.promise;
       const sessionId = (await getScheduledTasks()).find(task => task.id === taskId)!.sessionId!;
       await runtime.openResultsSession(sessionId);
-      const port = fakePort(); await attachView(hub, port);
+      const port = sidebar;
       await port.send({ v: 1, id: "subscribe", type: "state.subscribe", lastSeq: null });
       const runId = (await runtime.getSnapshot()).runs[0]!.runId;
       const catalog = await runtime.handleCommand({ v: 1, id: "catalog", type: "mcp.content.list", sessionId, kind: "resource" }, port);
@@ -3921,14 +3953,14 @@ describe("BackgroundRuntime: scheduled automation", () => {
       if (!result || !("contentReply" in result) || !result.contentReply.ok || !("snapshot" in result.contentReply)) throw new Error("Missing resource preview");
       const prepared = result.contentReply.snapshot;
       await port.send({ v: 1, id: "steer", type: "run.steer", runId, text: "Explain the attachment", sessionId, contentIds: [prepared.id] });
-      await port.send({ v: 1, id: "remove-later", type: "run.steer", sessionId: await fallbackId(), runId, text: "Remove this guidance later" });
+      await port.send({ v: 1, id: "remove-later", type: "run.steer", sessionId, runId, text: "Remove this guidance later" });
       const pending = await loadMessageQueue(sessionId);
       expect(pending).toMatchObject([{ mode: "steer", content: [prepared] }, { mode: "steer" }]);
       resume.resolve();
       expect((await ended(taskId)).lastRun?.status).toBe("failed");
       await vi.waitFor(async () => expect((await runtime.getSnapshot()).runs).toEqual([]));
       const queue = pending.map(message => ({ ...message, mode: "follow-up" }));
-      expect((await runtime.getSnapshot()).queue).toEqual(queue);
+      expect((await runtime.getSnapshot(hub.viewOf(port))).queue).toEqual(queue);
       expect(await loadMessageQueue(sessionId)).toEqual(queue);
       expect(provider.requests).toHaveLength(0);
       expect(port.received.findLast(event => event.type === "state.snapshot")?.payload).toMatchObject({ runs: [], queue });
@@ -3991,7 +4023,7 @@ describe("BackgroundRuntime: scheduled automation", () => {
       { type: "tool.call", call: { id: "after", name: "browser_program", arguments: { source: 'return fs.write("/workspace/approved.txt", "approved");' } } },
       { type: "turn.completed", replayState: null },
     ], [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }]]);
-    const { runtime, advance, taskId, openId, badge, texts } = await setup(provider);
+    const { runtime, advance, taskId, openId, badge, texts, shown } = await setup(provider);
     advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
     await vi.waitFor(async () => expect((await runtime.getSnapshot()).runs[0]?.status).toBe("awaiting-approval"));
     const active = (await runtime.getSnapshot()).runs[0]!;
@@ -3999,7 +4031,8 @@ describe("BackgroundRuntime: scheduled automation", () => {
     expect(await getOpenSessionId()).toBe(openId);
     expect(provider.requests).toHaveLength(1);
     badge.setResults(true); await tick(); expect(texts.at(-1)).toBe("!");
-    await runtime.openAttentionSession(); expect(await getOpenSessionId()).toBe(active.conversationId);
+    expect(shown()).toBe(openId);
+    await runtime.openAttentionSession(); expect(shown()).toBe(active.conversationId);
     await runtime.handleCommand({ v: 1, id: "approve", type: "action.approve", runId: active.runId, callId: "confirm" });
     const task = await ended(taskId);
     expect((await getConversation(task.sessionId!))!.items.some((item) => item.kind === "tool-result" && item.callId === "after" && item.result.ok)).toBe(true);
@@ -4077,7 +4110,7 @@ describe("BackgroundRuntime: scheduled automation", () => {
     await vi.waitFor(() => expect(create).toHaveBeenCalledOnce());
     const wire = JSON.stringify(create.mock.calls); expect(wire).not.toContain("PRIVATE"); expect(wire).not.toContain("example.test"); expect(wire).not.toContain(draft.prompt);
     clicked!(create.mock.calls[0]![0]); expect(openSidebar).toHaveBeenCalledOnce();
-    await vi.waitFor(async () => expect(await getOpenSessionId()).toBe(task.sessionId));
+    await vi.waitFor(() => expect(setupResult.shown()).toBe(task.sessionId));
     await runtime.handleAutomationRequest({ v: 1, id: "disable", type: "automation.notifications.save", enabled: false });
     expect(await getNotificationSettings()).toEqual({ version: 1, enabled: false });
   });
@@ -4753,7 +4786,8 @@ describe("BackgroundRuntime: sidebar views", () => {
     return Object.assign(port, { close: () => { for (const listener of listeners) listener(); } });
   }
 
-  async function setup(options: { provider?: FakeProvider; focused?: number | null; tabControllerFactory?: () => TabController } = {}) {
+  /** `fallback` false: each sidebar shows the chat its window's tab gives it (these windows report no active tab, so a new empty one). */
+  async function setup(options: { provider?: FakeProvider; focused?: number | null; tabControllerFactory?: () => TabController; fallback?: boolean } = {}) {
     await saveOpenAICredential("sk-test");
     const hub = new SidebarHub();
     const provider = options.provider ?? new FakeProvider();
@@ -4763,8 +4797,8 @@ describe("BackgroundRuntime: sidebar views", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: options.tabControllerFactory ?? unsupportedPageTabControllerFactory, windows });
     hub.delegate = runtime;
     await runtime.initialize();
-    const one = await attachView(hub, closablePort(), 1);
-    const two = await attachView(hub, closablePort(), 2);
+    const one = await attachView(hub, closablePort(), 1, options.fallback);
+    const two = await attachView(hub, closablePort(), 2, options.fallback);
     const send = (port: FakePort, command: Record<string, unknown>) => port.send({ v: 1, id: crypto.randomUUID(), ...command });
     const shows = (port: FakePort) => hub.viewOf(port)!.sessionId;
     /** The last snapshot a sidebar was sent. */
@@ -4773,20 +4807,22 @@ describe("BackgroundRuntime: sidebar views", () => {
   }
 
   it("lets two windows show different chats, each snapshot carrying its own chat and queue", async () => {
-    const { runtime, hub, one, two, send, shows, last } = await setup();
+    const { runtime, hub, one, two, send, shows, last } = await setup({ fallback: false });
+    // Each sidebar starts on its own empty chat.
     const first = shows(one);
-    expect(shows(two)).toBe(first);
-    await send(one, { type: "run.start", prompt: "Question one", sessionId: first });
-    await send(two, { type: "session.create" });
     const second = shows(two);
     expect(second).not.toBe(first);
+    await send(one, { type: "run.start", prompt: "Question one", sessionId: first });
+    // New chat in a view already showing an empty chat keeps it.
+    await send(two, { type: "session.create" });
+    expect(shows(two)).toBe(second);
     expect(shows(one)).toBe(first);
     expect(last(one)?.conversation.id).toBe(first);
     expect(last(two)?.conversation).toMatchObject({ id: second, items: [] });
-    // The new chat is the one a newly opened sidebar shows.
-    expect(await getOpenSessionId()).toBe(second);
-    const three = await attachView(hub, fakePort(), 3);
-    expect(hub.viewOf(three)!.sessionId).toBe(second);
+    // A newly opened sidebar gets an empty chat of its own, and the fallback is not written.
+    const three = await attachView(hub, fakePort(), 3, false);
+    expect([first, second]).not.toContain(hub.viewOf(three)!.sessionId);
+    expect(await getOpenSessionId()).toBeNull();
     await send(two, { type: "run.start", prompt: "Question two", sessionId: second });
     expect(texts(await getConversation(first))).toEqual(["Question one", "Done."]);
     expect(texts(await getConversation(second))).toEqual(["Question two", "Done."]);
@@ -4867,6 +4903,7 @@ describe("BackgroundRuntime: sidebar views", () => {
   it("deletes an untouched chat only once no view shows it, and never lists one", async () => {
     const { hub, one, two, send, shows } = await setup();
     const untouched = shows(one);
+    expect(shows(two)).toBe(untouched);
     const listed = async (port: FakePort) => {
       await send(port, { type: "session.list" });
       return (port.received.findLast((event) => event.type === "session.listed")!.payload as { sessions: ConversationSummary[] }).sessions.map((session) => session.id);
@@ -4882,14 +4919,14 @@ describe("BackgroundRuntime: sidebar views", () => {
     await vi.waitFor(async () => expect(await getConversation(untouched)).toBeNull());
     expect(hub.views().map((view) => view.sessionId)).toEqual([named]);
 
-    // A chat shown in a closed sidebar that is also the fallback stays, for the next sidebar to show.
+    // An empty chat goes with the last sidebar that showed it; the next sidebar gets its own.
     await send(one, { type: "session.create" });
     const fresh = shows(one);
     (one as ReturnType<typeof closablePort>).close();
-    await tick();
-    expect(await getConversation(fresh)).not.toBeNull();
-    const again = await attachView(hub, fakePort(), 1);
-    expect(hub.viewOf(again)!.sessionId).toBe(fresh);
+    await vi.waitFor(async () => expect(await getConversation(fresh)).toBeNull());
+    const again = await attachView(hub, fakePort(), 1, false);
+    expect([fresh, named]).not.toContain(hub.viewOf(again)!.sessionId);
+    expect((await listSessions()).map((session) => session.id).sort()).toEqual([named, hub.viewOf(again)!.sessionId].sort());
   });
 
   it("drops untouched chats an earlier background left at startup, keeping the fallback", async () => {
@@ -4963,12 +5000,11 @@ describe("BackgroundRuntime: sidebar views", () => {
     expect(two.received.at(-1)?.type === "composer.focus" || two.received.some((event) => event.type === "composer.focus")).toBe(true);
     expect(one.received.some((event) => event.type === "composer.focus")).toBe(false);
 
-    // The focused window's sidebar has not attached yet: the click decides what it shows once it does.
+    // The focused window has no sidebar: no view changes (see "tab chats" for the tab it binds).
     focus.window = 5;
     await runtime.openResultsSession(results);
     expect([shows(one), shows(two)]).toEqual([before, fresh]);
-    const five = await attachView(hub, fakePort(), 5);
-    expect(hub.viewOf(five)!.sessionId).toBe(results);
+    void hub;
   });
 
   it("moves every view that showed a deleted chat, and gives each a fresh chat after Delete all history", async () => {
@@ -4978,16 +5014,334 @@ describe("BackgroundRuntime: sidebar views", () => {
     await send(one, { type: "session.open", sessionId: shared });
     await send(two, { type: "session.open", sessionId: shared });
     await send(one, { type: "session.delete", sessionId: shared, closeAgentTabs: true });
-    expect(shows(one)).toBe(other);
-    expect(shows(two)).toBe(other);
+    // Each view follows its tab again, which no chat is bound to: an empty chat of its own.
+    for (const port of [one, two]) {
+      expect([shared, other]).not.toContain(shows(port));
+      expect((await getConversation(shows(port)))!.items).toEqual([]);
+    }
+    expect(shows(one)).not.toBe(shows(two));
 
+    await send(one, { type: "session.open", sessionId: other });
     expect(await runtime.handleHistoryRequest({ v: 1, id: "all", type: "history.deleteAll" })).toMatchObject({ ok: true });
     expect(shows(one)).not.toBe(other);
-    expect(shows(two)).not.toBe(other);
     expect(shows(one)).not.toBe(shows(two));
     for (const port of [one, two]) expect((await getConversation(shows(port)))!.items).toEqual([]);
-    expect([shows(one), shows(two)]).toContain(await getOpenSessionId());
   });
 
   const texts = (conversation: { items: ConversationItem[] } | null) => conversation!.items.flatMap((item) => item.kind === "message" ? [item.text] : []);
+});
+
+describe("BackgroundRuntime: tab chats", () => {
+  type WorldTab = { id: number; windowId: number; index: number; url: string; title: string; hidden: boolean; active: boolean };
+
+  /**
+   * Two windows of tabs with `sessions` tab values, like Firefox: window 1
+   * (focused) has tabs 11, 12 and a new-tab page 13; window 2 has tab 21.
+   * Every web page answers snapshots with its own text.
+   */
+  function tabWorld(values: Map<string, unknown>, extra: WorldTab[]) {
+    const tabs: WorldTab[] = [
+      { id: 11, windowId: 1, index: 0, url: "https://a.test/", title: "A", hidden: false, active: true },
+      { id: 12, windowId: 1, index: 1, url: "https://b.test/", title: "B", hidden: false, active: false },
+      { id: 13, windowId: 1, index: 2, url: "about:newtab", title: "New Tab", hidden: false, active: false },
+      { id: 21, windowId: 2, index: 0, url: "https://c.test/", title: "C", hidden: false, active: true },
+      ...extra,
+    ];
+    const open = (tabId: number) => { if (!tabs.some((tab) => tab.id === tabId)) throw new Error("Invalid tab ID"); };
+    const key = (tabId: number, name: string) => `${tabId}:${name}`;
+    function activate(tabId: number) {
+      const tab = tabs.find((candidate) => candidate.id === tabId)!;
+      for (const other of tabs) if (other.windowId === tab.windowId) other.active = other === tab;
+      tab.hidden = false;
+    }
+    const api = {
+      tabs: {
+        query: vi.fn(async (query: { active?: boolean; windowId?: number; lastFocusedWindow?: boolean }) => tabs
+          .filter((tab) => (query.active === undefined || tab.active === query.active) && (query.windowId === undefined || tab.windowId === query.windowId) && (!query.lastFocusedWindow || tab.windowId === 1))
+          .map((tab) => ({ ...tab }))),
+        update: vi.fn(async (tabId: number, properties: { url: string } | { active: true }) => { if ("active" in properties) activate(tabId); }),
+        hide: vi.fn(async (tabId: number) => { tabs.find((tab) => tab.id === tabId)!.hidden = true; return [tabId]; }),
+        show: vi.fn(async (tabId: number) => { tabs.find((tab) => tab.id === tabId)!.hidden = false; }),
+        goBack: vi.fn(async () => {}),
+        sendMessage: vi.fn(async (tabId: number, message: unknown) => {
+          const request = message as { id: string; type: string };
+          const tab = tabs.find((candidate) => candidate.id === tabId)!;
+          const text = `PAGE_${tabId}`;
+          if (request.type === "page.health") return { v: 1, id: request.id, ok: true, type: "page.health", url: tab.url };
+          if (request.type === "page.snapshot") return { v: 1, id: request.id, ok: true, type: "page.snapshot", snapshot: {
+            version: 2, tabId, documentId: `doc-${tabId}`, url: tab.url, title: tab.title, text, offset: 0, end: text.length, totalChars: text.length, selectionText: "" } };
+          throw new Error("no content script");
+        }),
+        onUpdated: { addListener: vi.fn(), removeListener: vi.fn() },
+      },
+      sessions: {
+        getTabValue: vi.fn(async (tabId: number, name: string): Promise<unknown> => { open(tabId); return structuredClone(values.get(key(tabId, name))); }),
+        setTabValue: vi.fn(async (tabId: number, name: string, value: unknown) => { open(tabId); values.set(key(tabId, name), structuredClone(value)); }),
+        removeTabValue: vi.fn(async (tabId: number, name: string) => { open(tabId); values.delete(key(tabId, name)); }),
+      },
+    } satisfies TabControllerBrowserApi;
+    /** The chat a tab's value names, as Firefox keeps it with the tab. */
+    const chatValue = (tabId: number) => (values.get(key(tabId, CHAT_TAB_KEY)) as { sessionId?: string } | undefined)?.sessionId;
+    return { tabs, values, api, activate, chatValue, factory: () => new TabController(api) };
+  }
+
+  /** The runtime over `tabWorld`, started, with window 1's and window 2's sidebars attached unless `attach` is false. */
+  async function setup(options: { provider?: FakeProvider; values?: Map<string, unknown>; extra?: WorldTab[]; attach?: boolean } = {}) {
+    await saveOpenAICredential("sk-test");
+    const world = tabWorld(options.values ?? new Map(), options.extra ?? []);
+    const hub = new SidebarHub();
+    const provider = options.provider ?? new FakeProvider();
+    if (!options.provider) provider.script = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
+    const focus = { window: 1 };
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: world.factory, windows: { getLastFocused: async () => ({ id: focus.window }) } });
+    hub.delegate = runtime;
+    await runtime.initialize();
+    const one = fakePort();
+    const two = fakePort();
+    if (options.attach !== false) { await attachView(hub, one, 1, false); await attachView(hub, two, 2, false); }
+    const send = (port: FakePort, command: Record<string, unknown>) => port.send({ v: 1, id: crypto.randomUUID(), ...inView(hub, port, command) });
+    const shows = (port: FakePort) => hub.viewOf(port)!.sessionId;
+    /** The user switches to a tab in its window's tab strip. */
+    const switchTo = async (tabId: number) => {
+      world.activate(tabId);
+      await runtime.handleTabActivated(tabId, world.tabs.find((tab) => tab.id === tabId)!.windowId);
+    };
+    return { ...world, hub, runtime, provider, one, two, send, shows, switchTo, focus };
+  }
+
+  const items = async (sessionId: string) => (await getConversation(sessionId))?.items.flatMap((item) => item.kind === "message" ? [item.text] : []);
+  /** A provider whose first round reads `path` with a program and whose second answers. */
+  const reading = (path: string) => {
+    const provider = new FakeProvider();
+    provider.script = () => {
+      const done = JSON.stringify(provider.requests.at(-1)?.context.messages).includes("toolResult");
+      const events: ScriptedProviderEvent[] = done
+        ? [{ type: "text.delta", delta: "Read it." }, { type: "turn.completed", replayState: null }]
+        : [{ type: "tool.call", call: { id: "read", name: "browser_program", arguments: { source: `await fs.read("${path}");` } } }, { type: "turn.completed", replayState: null }];
+      return { [Symbol.asyncIterator]: async function* () { yield* events; } };
+    };
+    return provider;
+  };
+
+  it("shows each tab's own chat, a fresh empty chat for a tab no chat is bound to, and the tab's chat again on switching back", async () => {
+    const { one, two, send, shows, switchTo, chatValue } = await setup();
+    const chatA = shows(one);
+    expect(await items(chatA)).toEqual([]);
+    await send(one, { type: "run.start", prompt: "About A" });
+    expect(await items(chatA)).toEqual(["About A", "Done."]);
+    await vi.waitFor(() => expect(chatValue(11)).toBe(chatA));
+
+    // Tab B has no chat: a fresh empty one; A keeps its own.
+    await switchTo(12);
+    const emptyB = shows(one);
+    expect(emptyB).not.toBe(chatA);
+    expect(await items(emptyB)).toEqual([]);
+    expect(chatValue(12)).toBeUndefined();
+    expect(one.received.findLast((event) => event.type === "state.snapshot")?.payload).toMatchObject({ conversation: { id: emptyB }, viewTabId: 12 });
+
+    // Back to A: its chat reappears, and B's empty chat, shown nowhere now, is gone.
+    await switchTo(11);
+    expect(shows(one)).toBe(chatA);
+    expect(one.received.findLast((event) => event.type === "state.snapshot")?.payload).toMatchObject({ conversation: { id: chatA }, viewTabId: 11 });
+    expect(await getConversation(emptyB)).toBeNull();
+
+    // A new-tab page has a chat like any other tab.
+    await switchTo(13);
+    const chatNewTab = shows(one);
+    await send(one, { type: "run.start", prompt: "About nothing" });
+    await vi.waitFor(() => expect(chatValue(13)).toBe(chatNewTab));
+    await switchTo(11);
+    expect(shows(one)).toBe(chatA);
+    await switchTo(13);
+    expect(shows(one)).toBe(chatNewTab);
+    expect((await listSessions()).map((session) => session.id).sort()).toEqual([chatA, chatNewTab, shows(two)].sort());
+  });
+
+  it("keeps one empty chat for the unbound tabs of a window, rather than one per switch", async () => {
+    const { one, two, shows, switchTo } = await setup();
+    const empty = shows(one);
+    const count = (await listSessions()).length;
+    await switchTo(12);
+    expect(shows(one)).toBe(empty);
+    await switchTo(13);
+    expect(shows(one)).toBe(empty);
+    expect((await listSessions()).length).toBe(count);
+    // Another window's switches leave this one alone.
+    const other = shows(two);
+    await switchTo(21);
+    expect(shows(two)).toBe(other);
+    expect(shows(one)).toBe(empty);
+  });
+
+  it("binds the tabs a run leases to its chat without switching a view, even the one showing that tab", async () => {
+    const provider = reading("/tabs/21/page.md");
+    const { one, two, send, shows, switchTo, chatValue } = await setup({ provider });
+    const chat = shows(one);
+    const before = shows(two);
+    await send(one, { type: "run.start", prompt: "Read tab C" });
+    expect(JSON.stringify(provider.requests.at(-1)?.context.messages)).toContain("PAGE_21");
+    // The page it attached (tab A, where it was sent) and the tab it read are both the chat's now.
+    await vi.waitFor(() => expect([chatValue(11), chatValue(21)]).toEqual([chat, chat]));
+    // Window two shows tab C, whose binding changed under it: it stays put until the user switches.
+    expect(shows(two)).toBe(before);
+    await switchTo(21);
+    expect(shows(two)).toBe(chat);
+  });
+
+  it.each(["follow-up", "steer"] as const)("binds the tab a %s was sent from to the chat it went to", async (mode) => {
+    const gate = Promise.withResolvers<void>();
+    const provider = reading("/tabs/11/page.md");
+    const read = provider.script as () => AsyncIterable<ScriptedProviderEvent>;
+    provider.script = () => JSON.stringify(provider.requests.at(-1)?.context.messages).includes("Hold")
+      ? { [Symbol.asyncIterator]: async function* () { await gate.promise; yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent; } }
+      : read();
+    const { hub, runtime, one, two, send, shows, chatValue } = await setup({ provider });
+    // Chat X runs from tab A with a chip from tab B, so its run holds B's lease, not A's.
+    runtime.setAsk(buildAskContext("selection", { selectionText: "From B" }, { id: 12, url: "https://b.test/", title: "B" }, "ask-b", 1)!, 1);
+    const x = shows(one);
+    const holding = send(one, { type: "run.start", prompt: "Hold", askId: "ask-b" });
+    await untilRequested(provider);
+    await vi.waitFor(() => expect([chatValue(11), chatValue(12)]).toEqual([x, x]));
+    // Chat Y, in window two, reads tab A: A is Y's now, though window one still shows X for it.
+    await send(two, { type: "run.start", prompt: "Read tab A" });
+    await vi.waitFor(() => expect(chatValue(11)).toBe(shows(two)));
+    expect(shows(one)).toBe(x);
+
+    const runId = (await runtime.getSnapshot(hub.viewOf(one))).runs.find((run) => run.conversationId === x)!.runId;
+    if (mode === "steer") await send(one, { type: "run.steer", runId, text: "Also this" });
+    else await send(one, { type: "run.start", prompt: "Afterwards" });
+    expect((await loadMessageQueue(x)).map((message) => message.mode)).toEqual([mode]);
+    await vi.waitFor(() => expect(chatValue(11)).toBe(x));
+    gate.resolve(); await holding;
+  });
+
+  it("New chat unbinds the tab, so it shows an empty chat until something binds it again", async () => {
+    const { one, send, shows, switchTo, chatValue } = await setup();
+    await send(one, { type: "run.start", prompt: "About A" });
+    const chat = shows(one);
+    await vi.waitFor(() => expect(chatValue(11)).toBe(chat));
+    await send(one, { type: "session.create" });
+    expect(shows(one)).not.toBe(chat);
+    await vi.waitFor(() => expect(chatValue(11)).toBeUndefined());
+    await switchTo(12);
+    await switchTo(11);
+    expect(shows(one)).not.toBe(chat);
+    expect(await items(shows(one))).toEqual([]);
+    expect(await items(chat)).toEqual(["About A", "Done."]);
+  });
+
+  it("binds the tab to a chat opened from history, never to an untouched one", async () => {
+    const { one, two, send, shows, switchTo, chatValue } = await setup();
+    const named = await createSessionWith(prompt("u1", "Earlier"));
+    await send(one, { type: "session.open", sessionId: named });
+    expect(shows(one)).toBe(named);
+    await vi.waitFor(() => expect(chatValue(11)).toBe(named));
+    await switchTo(12);
+    await switchTo(11);
+    expect(shows(one)).toBe(named);
+    // Window two's empty chat, opened in window one, binds nothing.
+    const empty = shows(two);
+    await switchTo(12);
+    await send(one, { type: "session.open", sessionId: empty });
+    expect(shows(one)).toBe(empty);
+    expect(chatValue(12)).toBeUndefined();
+  });
+
+  it("shows an agent tab's owning chat when it is in front, and never gives it a chat value", async () => {
+    const owner = await createSessionWith(prompt("u1", "Owner"));
+    const values = new Map<string, unknown>([[`5:${AGENT_TAB_TAG_KEY}`, { v: 2, role: "agent", sessionId: owner, lastUsedAt: Date.now() }]]);
+    const { one, send, shows, switchTo, chatValue, values: stored } = await setup({ values, extra: [{ id: 5, windowId: 1, index: 3, url: "https://agent.test/", title: "Agent", hidden: true, active: false }] });
+    // The user watches it (Firefox shows and activates it).
+    await switchTo(5);
+    expect(shows(one)).toBe(owner);
+    await send(one, { type: "run.start", prompt: "More here" });
+    expect(await items(owner)).toEqual(["Owner", "More here", "Done."]);
+    expect(chatValue(5)).toBeUndefined();
+    expect(stored.get(`5:${AGENT_TAB_TAG_KEY}`)).toMatchObject({ sessionId: owner });
+  });
+
+  it("restores bindings from tab values at startup and for restored tabs, dropping values that name no chat", async () => {
+    const kept = await createSessionWith(prompt("u1", "Kept"));
+    const values = new Map<string, unknown>([
+      [`11:${CHAT_TAB_KEY}`, { v: 1, sessionId: kept }],
+      [`12:${CHAT_TAB_KEY}`, { v: 1, sessionId: "gone-chat" }],
+      [`13:${CHAT_TAB_KEY}`, { v: 9, sessionId: kept }],
+    ]);
+    const { runtime, one, shows, switchTo, chatValue, tabs, values: stored } = await setup({ values });
+    expect(shows(one)).toBe(kept);
+    expect([chatValue(11), chatValue(12), stored.has(`13:${CHAT_TAB_KEY}`)]).toEqual([kept, undefined, false]);
+
+    // Firefox restores a closed tab (a new id, the old value) after startup.
+    tabs.push({ id: 14, windowId: 1, index: 3, url: "https://d.test/", title: "D", hidden: false, active: false });
+    stored.set(`14:${CHAT_TAB_KEY}`, { v: 1, sessionId: kept });
+    tabs.push({ id: 15, windowId: 1, index: 4, url: "https://e.test/", title: "E", hidden: false, active: false });
+    stored.set(`15:${CHAT_TAB_KEY}`, { v: 1, sessionId: "gone-chat" });
+    await runtime.handleTabCreated(14);
+    await runtime.handleTabCreated(15);
+    await switchTo(12);
+    await switchTo(14);
+    expect(shows(one)).toBe(kept);
+    await vi.waitFor(() => expect(stored.has(`15:${CHAT_TAB_KEY}`)).toBe(false));
+
+    // A closed tab's binding ends with it.
+    runtime.handleTabRemoved(14);
+    tabs.splice(tabs.findIndex((tab) => tab.id === 14), 1);
+    await switchTo(11);
+    expect(shows(one)).toBe(kept);
+  });
+
+  it("unbinds a deleted chat's tabs, and each view that showed it follows its tab to an empty chat", async () => {
+    const { runtime, one, two, send, shows, switchTo, chatValue } = await setup();
+    await send(one, { type: "run.start", prompt: "About A" });
+    const chat = shows(one);
+    await switchTo(12);
+    await send(one, { type: "session.open", sessionId: chat });
+    await send(two, { type: "session.open", sessionId: chat });
+    await vi.waitFor(() => expect([chatValue(11), chatValue(12), chatValue(21)]).toEqual([chat, chat, chat]));
+    await send(one, { type: "session.delete", sessionId: chat, closeAgentTabs: true });
+    await vi.waitFor(() => expect([chatValue(11), chatValue(12), chatValue(21)]).toEqual([undefined, undefined, undefined]));
+    expect(shows(one)).not.toBe(chat);
+    expect(shows(two)).not.toBe(chat);
+    expect(shows(one)).not.toBe(shows(two));
+
+    // Delete all history and retention unbind too.
+    await send(one, { type: "run.start", prompt: "Again" });
+    const again = shows(one);
+    await vi.waitFor(() => expect(chatValue(12)).toBe(again));
+    expect(await runtime.handleHistoryRequest({ v: 1, id: "all", type: "history.deleteAll" })).toMatchObject({ ok: true });
+    await vi.waitFor(() => expect(chatValue(12)).toBeUndefined());
+    expect(shows(one)).not.toBe(again);
+  });
+
+  it("prunes a bound chat no view shows by retention, and unbinds its tabs", async () => {
+    const { runtime, one, send, shows, switchTo, chatValue } = await setup();
+    await send(one, { type: "run.start", prompt: "About A" });
+    const chat = shows(one);
+    await vi.waitFor(() => expect(chatValue(11)).toBe(chat));
+    await switchTo(12);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + 40 * 24 * 60 * 60_000);
+      expect(await runtime.handleHistoryRequest({ v: 1, id: "r", type: "history.retention.save", retention: "30d" })).toMatchObject({ ok: true });
+    } finally { vi.useRealTimers(); }
+    expect(await getConversation(chat)).toBeNull();
+    await vi.waitFor(() => expect(chatValue(11)).toBeUndefined());
+  });
+
+  it("binds the focused window's active tab for a results click before its sidebar attaches, and New chat unbinds it", async () => {
+    const results = await createSessionWith(prompt("u1", "Results"));
+    const { hub, runtime, chatValue, focus } = await setup({ attach: false });
+    await runtime.openResultsSession(results);
+    await vi.waitFor(() => expect(chatValue(11)).toBe(results));
+    const sidebar = await attachView(hub, fakePort(), 1, false);
+    expect(hub.viewOf(sidebar)!.sessionId).toBe(results);
+
+    focus.window = 2;
+    await runtime.openResultsSession(results);
+    await vi.waitFor(() => expect(chatValue(21)).toBe(results));
+    await runtime.newChat();
+    await vi.waitFor(() => expect(chatValue(21)).toBeUndefined());
+    const second = await attachView(hub, fakePort(), 2, false);
+    expect(hub.viewOf(second)!.sessionId).not.toBe(results);
+  });
 });

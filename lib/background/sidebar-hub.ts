@@ -41,15 +41,18 @@ export const MAX_ENDED_RUNS = 16;
 const UNSUPPORTED_HOSTNAME_SUFFIXES = [".mozilla.org", ".mozilla.com"];
 
 /**
- * One attached sidebar: the window it belongs to and the session it shows.
- * The runtime picks `sessionId` when the view attaches and changes it only
- * through that view's session commands (and when the session is deleted);
- * it is `""` until the view has attached.
+ * One attached sidebar: the window it belongs to, the session it shows, and
+ * the tab it shows that session for. The runtime picks `sessionId` and
+ * `tabId` when the view attaches, and changes them when its window's active
+ * tab changes, through that view's own session commands, and when the
+ * session is deleted; `sessionId` is `""` until the view has attached.
  */
 export interface ChatView {
   readonly kind: "sidebar";
   readonly windowId: number;
   sessionId: string;
+  /** The tab whose chat the view shows: its window's active tab as the view last followed it; null when the window reported none. */
+  tabId: number | null;
 }
 
 export interface SidebarHubDelegate {
@@ -253,10 +256,13 @@ export class SidebarHub {
     this.#prune();
   }
 
-  /** Sends every attached view its own current full snapshot (e.g. after a dropped run.start). */
-  async broadcastSnapshot(): Promise<void> {
+  /**
+   * Sends every attached view (or only the views in `only`) its own current
+   * full snapshot (e.g. after a dropped run.start, or to views that switched chats).
+   */
+  async broadcastSnapshot(only?: readonly ChatView[]): Promise<void> {
     if (!this.delegate) return;
-    const targets = [...this.#ports].filter(([, connection]) => connection.view?.sessionId);
+    const targets = [...this.#ports].filter(([, connection]) => connection.view?.sessionId && (!only || only.includes(connection.view)));
     if (targets.length === 0) return;
     const snapshots = await this.delegate.getSnapshots(targets.map(([, connection]) => connection.view!));
     targets.forEach(([port, connection], index) => {
@@ -320,7 +326,7 @@ export class SidebarHub {
   async #attach(port: Browser.runtime.Port, connection: Connection, windowId: number): Promise<void> {
     if (connection.attaching || !this.delegate) return;
     connection.attaching = true;
-    const view: ChatView = { kind: "sidebar", windowId, sessionId: "" };
+    const view: ChatView = { kind: "sidebar", windowId, sessionId: "", tabId: null };
     connection.view = view;
     try {
       await this.delegate.attachView(view);

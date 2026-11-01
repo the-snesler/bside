@@ -93,7 +93,8 @@ async function fixture(options: { provider?: FakeProvider; credential?: boolean 
   const port = fakePort();
   await attachView(hub, port);
   await port.send({ v: 1, id: "subscribe", type: "state.subscribe", lastSeq: null });
-  const sessionId = (await runtime.getSnapshot()).conversation.id;
+  // The chat the sidebar shows: its window has no active tab, so an empty one.
+  const sessionId = hub.viewOf(port)!.sessionId;
   const prepare = async (name: string, mimeType: string, bytes: Uint8Array, sender = port, session = sessionId) => {
     const id = crypto.randomUUID();
     await sender.send({ v: 1, id, type: "attachment.prepare", sessionId: session, name, mimeType, data: b64(bytes) });
@@ -366,6 +367,7 @@ describe("BackgroundRuntime: attached files", () => {
     const photo = await f.prepared("photo.png", "image/png", PNG);
     const other = fakePort();
     await attachView(f.hub, other);
+    await other.send({ v: 1, id: "open", type: "session.open", sessionId: f.sessionId });
     await other.send({ v: 1, id: "a", type: "run.start", prompt: "See", sessionId: f.sessionId, attachmentIds: [photo.id] });
     expect(await f.notice()).toContain("no longer available");
     expect(await f.uploads()).toEqual([]);

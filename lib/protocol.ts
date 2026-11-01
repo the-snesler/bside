@@ -528,9 +528,10 @@ export type SidebarCommand =
    * The Port's first command: attaches it as the sidebar view of window
    * `windowId` (the sidebar reads it from `windows.getCurrent()`). The
    * background answers nothing to a Port before it attaches; commands sent
-   * earlier wait for it. The view shows one session, the chat the background
-   * picks for it (see `RuntimeSnapshot.conversation`), and every command that
-   * names or implies "the open session" is checked against that view.
+   * earlier wait for it. The view shows one session: the chat its window's
+   * active tab is bound to, else an empty one, and it follows the window's
+   * active tab from then on (see `RuntimeSnapshot.conversation`). Every
+   * command that names or implies "the open session" is checked against that view.
    */
   | { v: 1; id: string; type: "view.attach"; windowId: number }
   | { v: 1; id: string; type: "skills.list" }
@@ -581,7 +582,7 @@ export type SidebarCommand =
    * when each run's buffer still covers them, else sends a full snapshot.
    */
   | { v: 1; id: string; type: "state.subscribe"; lastSeq: Record<string, number> | null }
-  /** "New chat": shows an empty session in this view (reusing its own if it is an untouched new chat), which starts with an empty /workspace. */
+  /** "New chat": unbinds this view's tab and shows an empty session in this view (reusing its own if it is an untouched new chat), which starts with an empty /workspace. */
   | { v: 1; id: string; type: "session.create" }
   /**
    * Answered with `session.listed` to the requesting sidebar; every sidebar also gets `session.listed` whenever the index changes.
@@ -589,12 +590,14 @@ export type SidebarCommand =
    */
   | { v: 1; id: string; type: "session.list" }
   /**
-   * Shows a session in this view. Allowed while a run is active elsewhere; the run keeps its own session. An untouched
+   * Shows a session in this view and binds the view's tab to it (unless the session is an untouched new chat, or the tab
+   * is an agent tab). Allowed while a run is active elsewhere; the run keeps its own session. An untouched
    * new chat (no items, pin, or user title) that no view shows any more and that has no run is deleted.
    */
   | { v: 1; id: string; type: "session.open"; sessionId: string }
   /**
-   * Refused for the active run's session. Every view showing it then shows the most recent remaining one, or a new empty one.
+   * Refused for the active run's session. Its tabs are unbound, and every view showing it then shows its tab's chat again
+   * (an empty one, unless the tab is bound to another chat or is another chat's agent tab).
    * The session's scratch files are deleted with it; its agent tabs are closed, or with `closeAgentTabs: false` shown and handed to the user.
    */
   | { v: 1; id: string; type: "session.delete"; sessionId: string; closeAgentTabs: boolean }
@@ -725,6 +728,13 @@ export interface RuntimeSnapshot {
   permissionMode: PermissionMode;
   /** The active tab of this view's window, when it can be attached. */
   page: AttachedPage | null;
+  /**
+   * The tab this view shows its chat for (its window's active tab, whatever
+   * page it shows), or null when the window reported none. One empty chat
+   * stands for every tab no chat is bound to, so the sidebar keeps that
+   * chat's unsent text per tab.
+   */
+  viewTabId: number | null;
   agentTabs: AgentTabsState;
   /** The view's session's queued follow-ups and undelivered steers, oldest first. */
   queue: QueuedMessage[];
