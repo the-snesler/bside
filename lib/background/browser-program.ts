@@ -79,6 +79,8 @@ export class WorkspaceState {
   observed = new Map<number, ObservedPage>();
   /** Called after agentTabs ownership changes so the runtime can persist it. */
   onOwnershipChange: () => void = () => {};
+  /** Called when a run newly takes the lease on a user's tab (not when it keeps one), so the runtime can bind the tab to the run's chat. */
+  onLease: (tabId: number, runId: string) => void = () => {};
 
   constructor(readonly now: () => number = Date.now) {}
 
@@ -92,8 +94,9 @@ export class WorkspaceState {
   /** Takes (or keeps) the lease on a user's tab for `runId`; false while another run holds it. */
   acquireLease(tabId: number, runId: string): boolean {
     const holder = this.leases.get(tabId);
-    if (holder !== undefined && holder !== runId) return false;
+    if (holder !== undefined) return holder === runId;
     this.leases.set(tabId, runId);
+    this.onLease(tabId, runId);
     return true;
   }
 

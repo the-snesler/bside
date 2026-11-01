@@ -5,7 +5,8 @@
  * a fixed settle/probe sequence. The bound tab never changes once captured; a
  * newly opened tab is never implicitly adopted. forTab creates a separate
  * controller for an explicitly selected workspace tab. Agent-tab ownership is
- * recorded as a session tab value (`AGENT_TAB_TAG_KEY`) on the tab itself.
+ * recorded as a session tab value (`AGENT_TAB_TAG_KEY`) on the tab itself,
+ * and so is the chat a user's tab is bound to (`CHAT_TAB_KEY`).
  * Screenshots go through `tabs.captureTab`, bounded here (see `screenshot`).
  *
  * A tab's outline is its top frame's, with each cross-origin frame's own
@@ -165,6 +166,18 @@ export interface AgentTabTagV1 {
   v: 1;
   role: (typeof AGENT_TAB_ROLES)[number];
   lastUsedAt: number;
+}
+
+export const CHAT_TAB_KEY = "bside.chat";
+
+/**
+ * Session value naming the chat a user's tab is bound to: the sidebar shows
+ * that chat while the tab is in front. Firefox keeps it with the tab like
+ * `AgentTabTagV2`. Agent tabs never carry one; they show their owning chat.
+ */
+export interface ChatTabValueV1 {
+  v: 1;
+  sessionId: string;
 }
 
 export type TabSnapshot = {
@@ -383,6 +396,30 @@ export class TabController {
   async untagAgentTab(tabId: number): Promise<void> {
     if (!this.#browserApi.sessions) throw new Error("Session tab values are unavailable.");
     await this.#browserApi.sessions.removeTabValue(tabId, AGENT_TAB_TAG_KEY);
+  }
+
+  /** The chat the tab is bound to: `undefined` when it has no chat value, `null` when its value is malformed. */
+  async chatTabValue(tabId: number): Promise<ChatTabValueV1 | null | undefined> {
+    const value = await this.#browserApi.sessions?.getTabValue(tabId, CHAT_TAB_KEY);
+    if (value === undefined) return undefined;
+    return isChatTabValue(value) ? value : null;
+  }
+
+  async setChatTabValue(tabId: number, value: ChatTabValueV1): Promise<void> {
+    if (!this.#browserApi.sessions) throw new Error("Session tab values are unavailable.");
+    await this.#browserApi.sessions.setTabValue(tabId, CHAT_TAB_KEY, value);
+  }
+
+  async removeChatTabValue(tabId: number): Promise<void> {
+    if (!this.#browserApi.sessions) throw new Error("Session tab values are unavailable.");
+    await this.#browserApi.sessions.removeTabValue(tabId, CHAT_TAB_KEY);
+  }
+
+  /** The id of the active tab of `windowId`, whatever page it shows, or null when the window reports none. */
+  async activeTabId(windowId: number): Promise<number | null> {
+    const tabs = await this.#browserApi.tabs.query({ active: true, windowId });
+    const tab = tabs.find((candidate) => candidate.active === true && (candidate.windowId === undefined || candidate.windowId === windowId));
+    return tab?.id ?? null;
   }
 
   /**
@@ -1046,6 +1083,12 @@ function isAgentTabTag(value: unknown): value is AgentTabTagV2 | AgentTabTagV1 {
   const v = value as Record<string, unknown>;
   return (v.v === 1 || (v.v === 2 && isSessionId(v.sessionId))) && (AGENT_TAB_ROLES as readonly unknown[]).includes(v.role) &&
     typeof v.lastUsedAt === "number" && Number.isFinite(v.lastUsedAt);
+}
+
+function isChatTabValue(value: unknown): value is ChatTabValueV1 {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return v.v === 1 && isSessionId(v.sessionId) && Object.keys(v).length === 2;
 }
 
 function pageError(code: PageErrorCode, message: string): { ok: false; error: NormalizedError } {
