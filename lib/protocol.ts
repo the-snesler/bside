@@ -583,7 +583,10 @@ export type SidebarCommand =
   | { v: 1; id: string; type: "state.subscribe"; lastSeq: Record<string, number> | null }
   /** "New chat": shows an empty session in this view (reusing its own if it is an untouched new chat), which starts with an empty /workspace. */
   | { v: 1; id: string; type: "session.create" }
-  /** Answered with `session.listed` to the requesting sidebar; every sidebar also gets `session.listed` whenever the index changes. */
+  /**
+   * Answered with `session.listed` to the requesting sidebar; every sidebar also gets `session.listed` whenever the index changes.
+   * Untouched new chats (no items, pin, or user title) without a run are left out of both.
+   */
   | { v: 1; id: string; type: "session.list" }
   /**
    * Shows a session in this view. Allowed while a run is active elsewhere; the run keeps its own session. An untouched

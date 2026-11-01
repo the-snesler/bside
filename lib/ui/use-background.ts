@@ -233,6 +233,8 @@ export function useBackground(): BackgroundState & BackgroundActions {
   const imageRequests = useRef(new Map<string, (reply: WorkspaceImageLoad) => void>());
   const imageCache = useRef(new Map<string, Promise<WorkspaceImageLoad>>());
   const conversationIdRef = useRef("");
+  /** Whether a `session.listed` has come, so `sessions` is the background's list rather than the initial empty one. */
+  const sessionsListedRef = useRef(false);
   conversationIdRef.current = state.conversation.id;
   /** The open session's run, which run commands (cancel, approve, deny, help, steer) address. */
   const openRunIdRef = useRef<string | null>(null);
@@ -382,6 +384,7 @@ export function useBackground(): BackgroundState & BackgroundActions {
         return;
       }
       if (event.type === "state.snapshot") seqsRef.current.reset(event.payload.runs);
+      if (event.type === "session.listed") sessionsListedRef.current = true;
       if (isRunEvent(event)) {
         const verdict = seqsRef.current.accept(event);
         if (verdict === "gap") port.postMessage({ v: 1, id: crypto.randomUUID(), type: "state.subscribe", lastSeq: seqsRef.current.known() } satisfies SidebarCommand);
@@ -418,10 +421,12 @@ export function useBackground(): BackgroundState & BackgroundActions {
 
   // A chat that opens again prepares its waiting files.
   useEffect(() => { void pumpFiles(); }, [state.conversation.id]);
-  // Files of a chat that no longer exists (an untouched chat is deleted once no sidebar shows it) are dropped.
+  // Files of a chat that no longer exists are dropped: once the session list
+  // has come, one left out of it other than the open chat (history never
+  // lists untouched new chats, and one is deleted once no sidebar shows it).
   useEffect(() => {
-    const listed = new Set(state.sessions.map((session) => session.id));
-    if (!listed.has(state.conversation.id)) return;
+    if (!state.conversation.id || !sessionsListedRef.current) return;
+    const listed = new Set([...state.sessions.map((session) => session.id), state.conversation.id]);
     const gone = filesRef.current.filter((file) => !listed.has(file.sessionId));
     if (!gone.length) return;
     const port = portRef.current;

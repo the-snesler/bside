@@ -242,6 +242,20 @@ describe("pending files in the sidebar", () => {
     await f.unmount();
   });
 
+  it("keeps the files of the open chat, which history does not list while it is untouched, and drops those of a chat that went", async () => {
+    const f = await mountHook();
+    const summary = (id: string) => ({ id, title: "", titleSource: "prompt" as const, createdAt: 0, updatedAt: 0, pinned: false, itemCount: 1, lastModelId: null, usage: EMPTY_USAGE });
+    await act(() => f.view.current!.attachFiles([new File(["a"], "a.txt")], "picker"));
+    await settle();
+    // The list leaves out the untouched open chat: its file stays.
+    await f.emit({ runId: null, conversationId: null, type: "session.listed", payload: { sessions: [summary("s9")] } });
+    expect(f.view.current!.pendingFiles.map((file) => file.sessionId)).toEqual(["s1"]);
+    // The sidebar moves to another untouched chat, and the one it left is deleted: its file goes, though the open chat is not listed either.
+    await f.emit({ runId: null, conversationId: "s2", type: "state.snapshot", payload: snapshotFor("s2") });
+    expect(f.view.current!.pendingFiles).toEqual([]);
+    await f.unmount();
+  });
+
   it("keeps the attachments of a started run on its optimistic user message", async () => {
     const f = await mountHook();
     const ref: AttachmentRefV1 = { v: 1, path: "/workspace/uploads/cv.pdf", name: "CV.pdf", mimeType: "application/pdf", bytes: 2_000, text: false };

@@ -2798,11 +2798,13 @@ describe("BackgroundRuntime: sessions", () => {
     const fresh = (await snapshot()).conversation;
     expect(fresh.id).not.toBe(empty);
     expect(fresh.items).toEqual([]);
+    // History never lists the untouched new chat, though the sidebar shows it.
     const { sessions } = await send({ type: "session.list" }) as { sessions: ConversationSummary[] };
     expect(sessions.map((session) => [session.id, session.title, session.itemCount])).toEqual([
-      [fresh.id, "", 0], [empty, "First question", 2],
+      [empty, "First question", 2],
     ]);
-    expect(sessions[1]?.lastModelId).toBe("gpt-5.6-terra");
+    expect(sessions[0]?.lastModelId).toBe("gpt-5.6-terra");
+    expect((await listSessions()).map((session) => session.id)).toContain(fresh.id);
   });
 
   it("New chat leaves the previous chat's run diagnostics in its export and starts without them", async () => {
@@ -3069,7 +3071,9 @@ describe("BackgroundRuntime: history drawer support", () => {
     const saved = await history({ type: "history.retention.save", retention: "30d" });
     expect(saved).toMatchObject({ ok: true, settings: { version: 1, retention: "30d" }, sessionCount: 2, notice: expect.stringContaining("Deleted 1 chat") });
     expect(await getConversation(old)).toBeNull();
-    expect(listed().at(-1)?.map((session) => session.id).sort()).toEqual([running, open].sort());
+    // The untouched new chat the sidebar shows is kept, but never listed.
+    expect(listed().at(-1)?.map((session) => session.id)).toEqual([running]);
+    expect(await getConversation(open)).not.toBeNull();
     release();
     await run;
   });
@@ -3107,7 +3111,8 @@ describe("BackgroundRuntime: history drawer support", () => {
     const fresh = port.received.findLast((event) => event.type === "state.snapshot")!;
     expect(fresh.type === "state.snapshot" && fresh.payload.conversation).toMatchObject({ items: [] });
     expect([pinned, viewing, running]).not.toContain(fresh.conversationId);
-    expect(listed().at(-1)?.map((session) => session.id).sort()).toEqual([running, fresh.conversationId].sort());
+    // The sidebar shows the fresh chat, which history lists once it has a message.
+    expect(listed().at(-1)?.map((session) => session.id)).toEqual([running]);
     expect(await getOpenSessionId()).toBe(fresh.conversationId);
     release();
     await run;
@@ -4859,13 +4864,19 @@ describe("BackgroundRuntime: sidebar views", () => {
     expect((await runtime.getSnapshot()).agentTabs.watching).toBe(5);
   });
 
-  it("deletes an untouched chat only once no view shows it", async () => {
+  it("deletes an untouched chat only once no view shows it, and never lists one", async () => {
     const { hub, one, two, send, shows } = await setup();
     const untouched = shows(one);
+    const listed = async (port: FakePort) => {
+      await send(port, { type: "session.list" });
+      return (port.received.findLast((event) => event.type === "session.listed")!.payload as { sessions: ConversationSummary[] }).sessions.map((session) => session.id);
+    };
+    expect(await listed(one)).toEqual([]);
     const named = await createSessionWith(prompt("u1", "Earlier"));
     // Window one leaves the untouched chat; window two still shows it.
     await send(one, { type: "session.open", sessionId: named });
     expect(await getConversation(untouched)).not.toBeNull();
+    expect(await listed(one)).toEqual([named]);
     // Window two's sidebar closes: nothing shows it any more.
     (two as ReturnType<typeof closablePort>).close();
     await vi.waitFor(async () => expect(await getConversation(untouched)).toBeNull());
@@ -4879,6 +4890,17 @@ describe("BackgroundRuntime: sidebar views", () => {
     expect(await getConversation(fresh)).not.toBeNull();
     const again = await attachView(hub, fakePort(), 1);
     expect(hub.viewOf(again)!.sessionId).toBe(fresh);
+  });
+
+  it("drops untouched chats an earlier background left at startup, keeping the fallback", async () => {
+    const kept = await createSession();
+    const abandoned = await createSession();
+    const named = await createSessionWith(prompt("u1", "Keep me"));
+    await setOpenSessionId(kept.id);
+    const { hub, one } = await setup();
+    expect(await getConversation(abandoned.id)).toBeNull();
+    expect((await listSessions()).map((session) => session.id).sort()).toEqual([kept.id, named].sort());
+    expect(hub.viewOf(one)!.sessionId).toBe(kept.id);
   });
 
   it("keeps the Ask chip and composer focus to the window it was clicked in", async () => {

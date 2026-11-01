@@ -49,6 +49,7 @@ import {
   createSession,
   deleteAllSessions,
   deleteSession,
+  deleteUntouchedSessions,
   ensureOpenSession,
   getAppSettings,
   getConversation,
@@ -64,6 +65,7 @@ import {
   workspaceStore,
   removeWorkspaceFiles,
   listSessions,
+  listTouchedSessions,
   migrateConversation,
   pruneSessions,
   saveHistorySettings,
@@ -459,6 +461,7 @@ export class BackgroundRuntime {
         })
         .finally(() => this.#fallbackSession())
         .finally(() => restored.catch(() => {}))
+        .then(() => this.#dropAbandonedChats())
         .then(() => this.#applyRetention()),
       restored,
     ]).then(async () => {
@@ -475,6 +478,20 @@ export class BackgroundRuntime {
       void this.#closeIdleAgentTabs();
       if (this.#clock.now() - this.#lastRetentionAt >= RETENTION_SWEEP_MS) void this.#applyRetention().catch(() => {});
     }, AGENT_TAB_SWEEP_MS);
+  }
+
+  /**
+   * At startup, before any sidebar attaches: deletes the untouched new chats
+   * an earlier background left (the views that showed them closed with it),
+   * which history never lists. The fallback stays, and so does a chat that
+   * owns agent tabs. A failure leaves them for the next startup.
+   */
+  async #dropAbandonedChats(): Promise<void> {
+    try {
+      const owners = [...this.#workspace.agentTabs.values()].map((tab) => tab.sessionId);
+      const deleted = await deleteUntouchedSessions([await this.#fallbackSession(), ...owners]);
+      await this.#closeScratchFiles(deleted);
+    } catch { /* Retried at the next startup. */ }
   }
 
   dispose(): void {
@@ -1080,7 +1097,7 @@ export class BackgroundRuntime {
         ? { ok: true, mimeType: file.mimeType, data: file.data }
         : { ok: false, reason: "missing" } };
     }
-    if (command.type === "session.list") return { sessions: await listSessions() };
+    if (command.type === "session.list") return { sessions: await this.#listedSessions() };
     if (command.type === "session.create" || command.type === "session.open" || command.type === "session.delete" ||
       command.type === "session.rename" || command.type === "session.pin") {
       await this.#runSessionCommand(command, () => [view]);
@@ -1319,9 +1336,18 @@ export class BackgroundRuntime {
     } catch { return null; }
   }
 
+  /**
+   * The session index as sidebars list it: untouched new chats are left out
+   * (an empty chat appears in history once it has a message, a pin, or a
+   * title), unless a run already writes to one.
+   */
+  #listedSessions(): Promise<ConversationSummary[]> {
+    return listTouchedSessions(this.#runSessions());
+  }
+
   /** Pushes the session index to every sidebar. A failed read is skipped; the next change republishes. */
   async #publishSessions(): Promise<void> {
-    try { this.#sidebarHub.publishSessions(await listSessions()); }
+    try { this.#sidebarHub.publishSessions(await this.#listedSessions()); }
     catch { /* The lists stay as they were. */ }
   }
 
