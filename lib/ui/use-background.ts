@@ -18,6 +18,8 @@
 
 import type { McpContentChoice, McpContentSnapshot } from "@/lib/domain/mcp-content";
 import type { McpContentReply, WorkspaceImageReply } from "@/lib/protocol";
+import { ATTACHMENT_LIMITS, type AttachmentPrepareResult } from "@/lib/domain/attachments";
+import { attachedFileName, checkFiles, fileToBase64, type FileSource, type PendingFile } from "@/lib/ui/attachments";
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import type { Browser } from "wxt/browser";
 import { isRunEvent, MAX_SUBSCRIBE_RUNS, RUN_CANCELLED_SUFFIX, SIDEBAR_PORT_NAME, TERMINAL_RUN_EVENT_TYPES } from "@/lib/protocol";
@@ -53,6 +55,10 @@ export const memoryUndoKey = (changeIds: readonly string[]) => changeIds.join(" 
 export interface BackgroundState extends RuntimeSnapshot {
   focusVersion: number;
   mcpAttachments: McpContentSnapshot[];
+  /** Files attached in this sidebar and not sent yet, of every chat; the composer shows the open chat's. */
+  pendingFiles: PendingFile[];
+  /** Why the files the user last picked, pasted, or dropped were not all attached (too large, empty, too many), for the open chat. */
+  fileNotice: { sessionId: string; text: string } | null;
   tabs: TabMention[];
   /** The session index, pinned first, then most recent. Requested on connect and pushed by the background whenever it changes. */
   sessions: ConversationSummary[];
@@ -66,6 +72,11 @@ export interface BackgroundActions {
   listMcpContent(kind: "prompt" | "resource"): Promise<{ choices: McpContentChoice[]; errors: import("@/lib/protocol").NormalizedError[] }>;
   prepareMcpContent(choiceId: string, args: Record<string, string>): Promise<void>;
   dismissMcpContent(id: string): void;
+  /** Attaches files to the open chat's next message: checked here, then read and prepared one at a time. */
+  attachFiles(files: File[], source: FileSource): void;
+  /** Removes a pending file (dismissing it in the background once prepared). */
+  removeFile(key: string): void;
+  clearFileNotice(): void;
   listTabs(): void;
   listSkills(): void;
   focusTab(tabId: number): void;
@@ -81,9 +92,9 @@ export interface BackgroundActions {
   /** Sets the permission mode; allowed mid-run, where it applies at the run's next gated call. */
   savePermissionMode(mode: PermissionMode): void;
   /** Starts a run, or queues a follow-up while this chat's run is working. */
-  sendPrompt(prompt: string, askId?: string, contentIds?: string[]): void;
+  sendPrompt(prompt: string, askId?: string, contentIds?: string[], attachmentIds?: string[]): void;
   /** Guidance for the running turn, delivered at its next tool boundary. */
-  steer(text: string, askId?: string, contentIds?: string[]): void;
+  steer(text: string, askId?: string, contentIds?: string[], attachmentIds?: string[]): void;
   dismissAsk(askId: string): void;
   removeQueued(messageId: string): void;
   sendQueued(messageId: string): void;
@@ -183,6 +194,8 @@ const INITIAL_STATE: BackgroundState = {
   ask: null,
   focusVersion: 0,
   mcpAttachments: [],
+  pendingFiles: [],
+  fileNotice: null,
   skills: [],
   tabs: [],
   sessions: [],
@@ -221,6 +234,87 @@ export function useBackground(): BackgroundState & BackgroundActions {
   const openRunIdRef = useRef<string | null>(null);
   openRunIdRef.current = state.runs.find((run) => run.conversationId === state.conversation.id)?.runId ?? null;
 
+  // Pending files: the list in a ref (state mirrors it), the Port each
+  // prepared id belongs to (a new Port makes them stale), and the
+  // `attachment.prepare` requests awaiting their private reply.
+  const filesRef = useRef<PendingFile[]>([]);
+  const preparedBy = useRef(new Map<string, Port>());
+  const fileRequests = useRef(new Map<string, (result: AttachmentPrepareResult) => void>());
+  const pumpingRef = useRef(false);
+  const changeFiles = (update: (files: PendingFile[]) => PendingFile[]) => {
+    const next = update(filesRef.current);
+    if (next === filesRef.current) return;
+    filesRef.current = next;
+    const live = new Set(next.map((file) => file.key));
+    for (const key of preparedBy.current.keys()) if (!live.has(key)) preparedBy.current.delete(key);
+    setState((prev) => ({ ...prev, pendingFiles: next }));
+  };
+  const patchFile = (key: string, patch: Partial<PendingFile>) => changeFiles((files) => files.map((file) => file.key === key ? { ...file, ...patch } : file));
+  const dismissFileIds = (port: Port, sessionId: string, attachmentIds: string[]) => {
+    if (attachmentIds.length) port.postMessage({ v: 1, id: crypto.randomUUID(), type: "attachment.dismiss", sessionId, attachmentIds } satisfies SidebarCommand);
+  };
+
+  /** Reads one file and sends it with `attachment.prepare` on `port`, resolving with the background's private answer. */
+  const prepareFile = async (port: Port, item: PendingFile): Promise<AttachmentPrepareResult> => {
+    let data: string;
+    try { data = await fileToBase64(item.file); }
+    catch { return { error: `${item.name} could not be read. Remove it and attach it again.` }; }
+    if (portRef.current !== port) return { error: "The sidebar disconnected." };
+    return new Promise((resolve) => {
+      const id = crypto.randomUUID();
+      const timer = setTimeout(() => { fileRequests.current.delete(id); resolve({ error: `Attaching ${item.name} timed out. Remove it and attach it again.` }); }, 60_000);
+      fileRequests.current.set(id, (result) => { clearTimeout(timer); resolve(result); });
+      port.postMessage({
+        v: 1, id, type: "attachment.prepare", sessionId: item.sessionId, name: item.name.slice(0, ATTACHMENT_LIMITS.rawName),
+        mimeType: item.file.type.length <= ATTACHMENT_LIMITS.rawMimeType ? item.file.type : "", data,
+      } satisfies SidebarCommand);
+    });
+  };
+
+  /**
+   * Prepares waiting files one at a time, each only while its chat is open
+   * (the background accepts files for the open chat only). A file removed
+   * while it was being prepared is dismissed; one refused because its chat
+   * or Port changed meanwhile waits to be prepared again.
+   */
+  const pumpFiles = async () => {
+    if (pumpingRef.current) return;
+    pumpingRef.current = true;
+    try {
+      for (;;) {
+        const port = portRef.current;
+        const next = filesRef.current.find((file) => file.status === "waiting" && file.sessionId === conversationIdRef.current);
+        if (!port || !next) return;
+        patchFile(next.key, { status: "uploading", error: null });
+        const result = await prepareFile(port, next);
+        const current = filesRef.current.find((file) => file.key === next.key);
+        const stillWanted = current?.status === "uploading";
+        if ("attachment" in result) {
+          const { attachment } = result;
+          if (stillWanted && portRef.current === port) {
+            preparedBy.current.set(next.key, port);
+            patchFile(next.key, { status: "ready", id: attachment.id, name: attachment.name, mimeType: attachment.mimeType, bytes: attachment.bytes });
+            continue;
+          }
+          if (portRef.current === port) dismissFileIds(port, next.sessionId, [attachment.id]);
+          if (stillWanted) patchFile(next.key, { status: "waiting" });
+        } else if (stillWanted) {
+          const moved = conversationIdRef.current !== next.sessionId || portRef.current !== port;
+          patchFile(next.key, moved ? { status: "waiting" } : { status: "failed", error: result.error });
+        }
+      }
+    } finally {
+      pumpingRef.current = false;
+    }
+  };
+
+  /** Prepared ids die with the Port that prepared them: on a new Port, their files are prepared again before a send can use them. */
+  const requeueStaleFiles = (port: Port) => {
+    changeFiles((files) => files.some((file) => file.status === "ready" && preparedBy.current.get(file.key) !== port)
+      ? files.map((file) => file.status === "ready" && preparedBy.current.get(file.key) !== port ? { ...file, status: "waiting", id: null } : file)
+      : files);
+  };
+
   useEffect(() => {
     const port = browser.runtime.connect({ name: SIDEBAR_PORT_NAME });
     portRef.current = port;
@@ -230,6 +324,17 @@ export function useBackground(): BackgroundState & BackgroundActions {
       if (event.type === "mcp.content.reply") {
         contentRequests.current.get(event.payload.requestId)?.(event.payload.result);
         contentRequests.current.delete(event.payload.requestId);
+        return;
+      }
+      if (event.type === "attachment.prepared") {
+        fileRequests.current.get(event.payload.requestId)?.(event.payload.result);
+        fileRequests.current.delete(event.payload.requestId);
+        return;
+      }
+      if (event.type === "attachment.accepted") {
+        // The message carrying them is persisted: their chips go.
+        const ids = event.payload.ids;
+        changeFiles((files) => files.some((file) => file.id !== null && ids.includes(file.id)) ? files.filter((file) => file.id === null || !ids.includes(file.id)) : files);
         return;
       }
       if (event.type === "workspace.image.loaded") {
@@ -285,6 +390,8 @@ export function useBackground(): BackgroundState & BackgroundActions {
     const subscribe: SidebarCommand = { v: 1, id: crypto.randomUUID(), type: "state.subscribe", lastSeq: null };
     port.postMessage(subscribe);
     port.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.list" } satisfies SidebarCommand);
+    requeueStaleFiles(port);
+    void pumpFiles();
 
     return () => {
       port.onMessage.removeListener(onMessage);
@@ -295,8 +402,49 @@ export function useBackground(): BackgroundState & BackgroundActions {
       for (const resolve of imageRequests.current.values()) resolve({ ok: false, reason: "unavailable" });
       imageRequests.current.clear();
       imageCache.current.clear();
+      for (const resolve of fileRequests.current.values()) resolve({ error: "The sidebar disconnected." });
+      fileRequests.current.clear();
     };
   }, []);
+
+  // A chat that opens again prepares its waiting files.
+  useEffect(() => { void pumpFiles(); }, [state.conversation.id]);
+  // Files of a chat that no longer exists (an untouched chat is deleted when the user leaves it) are dropped.
+  useEffect(() => {
+    const listed = new Set(state.sessions.map((session) => session.id));
+    if (!listed.has(state.conversation.id)) return;
+    const gone = filesRef.current.filter((file) => !listed.has(file.sessionId));
+    if (!gone.length) return;
+    const port = portRef.current;
+    if (port) for (const file of gone) if (file.id && preparedBy.current.get(file.key) === port) dismissFileIds(port, file.sessionId, [file.id]);
+    changeFiles((files) => files.filter((file) => listed.has(file.sessionId)));
+  }, [state.sessions, state.conversation.id]);
+
+  const attachFiles = useCallback<BackgroundActions["attachFiles"]>((files, source) => {
+    if (!files.length) return;
+    const sessionId = conversationIdRef.current;
+    if (!sessionId) {
+      setState((prev) => ({ ...prev, fileNotice: { sessionId, text: "The chat is still loading. Attach the files again in a moment." } }));
+      return;
+    }
+    const at = new Date();
+    const named = files.map((file) => ({ file, name: attachedFileName(file, source, at) }));
+    const { accepted, errors } = checkFiles(named.map(({ file, name }) => ({ name, size: file.size })), filesRef.current.filter((file) => file.sessionId === sessionId).length);
+    setState((prev) => ({ ...prev, fileNotice: errors.length ? { sessionId, text: errors.join(" ") } : null }));
+    changeFiles((current) => accepted.length ? [...current, ...accepted.map((index): PendingFile => {
+      const { file, name } = named[index]!;
+      return { key: crypto.randomUUID(), sessionId, file, name, mimeType: file.type, bytes: file.size, status: "waiting", id: null, error: null };
+    })] : current);
+    void pumpFiles();
+  }, []);
+  const removeFile = useCallback<BackgroundActions["removeFile"]>((key) => {
+    const item = filesRef.current.find((file) => file.key === key);
+    if (!item) return;
+    const port = portRef.current;
+    if (port && item.status === "ready" && item.id && preparedBy.current.get(key) === port) dismissFileIds(port, item.sessionId, [item.id]);
+    changeFiles((files) => files.filter((file) => file.key !== key));
+  }, []);
+  const clearFileNotice = useCallback(() => setState((prev) => prev.fileNotice ? { ...prev, fileNotice: null } : prev), []);
 
   const requestContent = (request: Extract<SidebarCommand, { type: "mcp.content.list" | "mcp.content.prepare" }>): Promise<McpContentReply> => new Promise((resolve, reject) => {
     if (!portRef.current) { reject(new Error("The sidebar is disconnected.")); return; }
@@ -338,17 +486,23 @@ export function useBackground(): BackgroundState & BackgroundActions {
     setState(prev => ({ ...prev, mcpAttachments: prev.mcpAttachments.filter(item => item.id !== id) }));
   };
 
-  const sendPrompt = useCallback((prompt: string, askId?: string, contentIds?: string[]) => {
-    const command: SidebarCommand = { v: 1, id: crypto.randomUUID(), type: "run.start", prompt, ...(askId ? { askId } : {}), ...(contentIds?.length ? { contentIds, sessionId: conversationIdRef.current } : {}) };
+  /** A send's prepared selections; either needs the session they were prepared for. */
+  const selection = (contentIds?: string[], attachmentIds?: string[]) => ({
+    ...(contentIds?.length ? { contentIds } : {}),
+    ...(attachmentIds?.length ? { attachmentIds } : {}),
+    ...(contentIds?.length || attachmentIds?.length ? { sessionId: conversationIdRef.current } : {}),
+  });
+  const sendPrompt = useCallback((prompt: string, askId?: string, contentIds?: string[], attachmentIds?: string[]) => {
+    const command: SidebarCommand = { v: 1, id: crypto.randomUUID(), type: "run.start", prompt, ...(askId ? { askId } : {}), ...selection(contentIds, attachmentIds) };
     portRef.current?.postMessage(command);
   }, []);
 
-  const steer = useCallback((text: string, askId?: string, contentIds?: string[]) => {
+  const steer = useCallback((text: string, askId?: string, contentIds?: string[], attachmentIds?: string[]) => {
     const runId = openRunIdRef.current;
     // With no run to steer, the background treats the text as a normal prompt.
     portRef.current?.postMessage(runId
-      ? { v: 1, id: crypto.randomUUID(), type: "run.steer", runId, text, ...(askId ? { askId } : {}), ...(contentIds?.length ? { contentIds, sessionId: conversationIdRef.current } : {}) } satisfies SidebarCommand
-      : { v: 1, id: crypto.randomUUID(), type: "run.start", prompt: text, ...(askId ? { askId } : {}), ...(contentIds?.length ? { contentIds, sessionId: conversationIdRef.current } : {}) } satisfies SidebarCommand);
+      ? { v: 1, id: crypto.randomUUID(), type: "run.steer", runId, text, ...(askId ? { askId } : {}), ...selection(contentIds, attachmentIds) } satisfies SidebarCommand
+      : { v: 1, id: crypto.randomUUID(), type: "run.start", prompt: text, ...(askId ? { askId } : {}), ...selection(contentIds, attachmentIds) } satisfies SidebarCommand);
   }, []);
   const removeQueued = useCallback((messageId: string) => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "queue.remove", sessionId: conversationIdRef.current, messageId } satisfies SidebarCommand);
@@ -466,7 +620,7 @@ export function useBackground(): BackgroundState & BackgroundActions {
 
   return {
     ...state, sendPrompt, steer, removeQueued, sendQueued, retryRun, cancelRun, approveAction, denyAction, resolveHelp, newChat, listSessions, openSession, renameSession, pinSession,
-    listMcpContent, prepareMcpContent, dismissMcpContent,
+    listMcpContent, prepareMcpContent, dismissMcpContent, attachFiles, removeFile, clearFileNotice,
     dismissAsk: (askId: string) => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "ask.dismiss", askId } satisfies SidebarCommand),
     deleteSession, downloadContext, rememberSite, saveSiteNote, closeSiteNote, undoMemory, loadWorkspaceImage, listTabs, listSkills: () => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "skills.list" } satisfies SidebarCommand), focusTab, closeAgentTabs, watchTab, unwatchTab, takeOverTab, saveSettings, savePermissionMode,
   };
@@ -587,6 +741,7 @@ function applyEvent(event: SidebarEvent, setState: (updater: (prev: BackgroundSt
         ...(event.payload.ask ? { ask: event.payload.ask } : {}),
         ...(event.payload.scheduled ? { scheduled: event.payload.scheduled } : {}),
         ...(event.payload.content?.length ? { content: event.payload.content } : {}),
+        ...(event.payload.attachments?.length ? { attachments: event.payload.attachments } : {}),
         at: event.at,
       };
       const conversationId = event.conversationId!;

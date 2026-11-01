@@ -35,6 +35,7 @@ import { findMcpServer } from "@/lib/mcp/servers";
 import { mcpServerIcon } from "@/lib/ui/mcp-icons";
 import type { AgentTabSummary, ApprovalRequest, HelpOutcome, HelpRequest } from "@/lib/protocol";
 import { Markdown, type MarkdownImages } from "@/lib/ui/Markdown";
+import { AttachmentRefChips } from "@/lib/ui/AttachmentChip";
 import { McpContentChip } from "@/lib/ui/McpContentChip";
 import { AskChip } from "@/lib/ui/AskChip";
 import { Mascot, type MascotMood } from "@/lib/ui/Mascot";
@@ -412,6 +413,7 @@ export function TurnTrace(props: {
                 {group.text.replace(PROMPT_MENTION_PATTERN, "@$1")}
                 {group.ask && <AskChip ask={group.ask} />}
                 {group.content?.map(item => <McpContentChip key={item.id} item={item} />)}
+                <AttachmentRefChips attachments={group.attachments} images={props.images} />
               </div>
             ) : (
               <div key={group.id} class="trace__message">

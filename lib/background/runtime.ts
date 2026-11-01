@@ -11,7 +11,10 @@
  * checkpointing, persistence) and everything outside a run (credentials, settings).
  */
 
-import { PreparedMcpContent, type ContentAcceptance } from "@/lib/background/mcp-content";
+import { PreparedMcpContent } from "@/lib/background/mcp-content";
+import { AttachmentError, PreparedAttachments, type AttachmentClaim } from "@/lib/background/attachments";
+import type { AttachmentRefV1 } from "@/lib/domain/attachments";
+import type { ImageScaler } from "@/lib/background/image-scale";
 import { hasPreparedMcpPrompt, type McpContentSnapshot } from "@/lib/domain/mcp-content";
 import { McpError, toNormalizedMcpError } from "@/lib/mcp/errors";
 import { AGENT_TOOL_NAMES, AgentLoop } from "@/lib/background/agent-loop";
@@ -30,7 +33,7 @@ import type { RunNotifications } from "@/lib/background/notifications";
 import type { McpConnections } from "@/lib/background/mcp";
 import type { McpToolDefinition } from "@/lib/mcp/tools";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
-import { ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
+import { ScratchFiles, ScratchFilesError, WorkspaceState } from "@/lib/background/browser-program";
 import type { AgentTab } from "@/lib/background/browser-program";
 import type { SidebarHub } from "@/lib/background/sidebar-hub";
 import { FrameAliases, TabController, VisibilityLock } from "@/lib/background/tab-controller";
@@ -59,6 +62,7 @@ import {
   loadWorkspaceFiles,
   saveMessageQueue,
   workspaceStore,
+  removeWorkspaceFiles,
   listSessions,
   migrateConversation,
   pruneSessions,
@@ -197,6 +201,22 @@ interface ActiveRun {
   outcome: "completed" | "cancelled" | "failed" | null;
   /** Set when `#endRun` starts: the run writes no more checkpoints, and it ends only once. */
   ended: boolean;
+  /** Gives up the run's hold on its session's shared scratch files (idempotent); called when its slot is released. */
+  releaseFiles: () => void;
+}
+
+/**
+ * What a send carries besides its text and context-menu chip, claimed for
+ * one session: prepared MCP content, and the files the user attached,
+ * already written to that session's `/workspace/uploads/`. `commit` once the
+ * message (or its queue entry) is persisted; until then a failed send leaves
+ * both pending and the written files are removed again.
+ */
+interface SendSelection {
+  sessionId: string;
+  content: McpContentSnapshot[];
+  attachments: AttachmentRefV1[];
+  commit(): void;
 }
 
 interface AskAcceptance {
@@ -226,7 +246,12 @@ export class BackgroundRuntime {
   #queueClaims = new Map<string, string>();
   #preparedContent = new PreparedMcpContent();
 
-  releaseContentOwner(owner: object): void { this.#preparedContent.releaseOwner(owner); }
+  #preparedAttachments = new PreparedAttachments();
+  /** A sidebar Port closed: drops the MCP content and files it prepared and has not sent. */
+  releaseOwner(owner: object): void {
+    this.#preparedContent.releaseOwner(owner);
+    this.#preparedAttachments.releaseOwner(owner);
+  }
 
   /**
    * Active runs by run id: at most one per session, any number of sessions
@@ -234,6 +259,18 @@ export class BackgroundRuntime {
    * run by id), and `#anyRun`/`#runs` (any or every run).
    */
   #runs = new Map<string, ActiveRun>();
+  /**
+   * Each session's `/workspace`, one `ScratchFiles` shared by the session's
+   * run and every write of the user's attachments, so their changes apply one
+   * at a time and never share a slot, and each sees the other's files. Kept
+   * while held (`#holdScratchFiles`: a run from its claim to its slot's
+   * release, or one `withScratchFiles` call), dropped once the last holder
+   * releases it and its queued changes settle, and closed when the session
+   * is deleted.
+   */
+  #scratch = new Map<string, { files: ScratchFiles; holders: number }>();
+  /** Fits images for the model (attached images on a run's turn and `fs.view`); the background page's canvas if unset. */
+  #scaleImage: ImageScaler | undefined;
   #notice: string | null = null;
   #clock: RuntimeClock;
   #workspace: WorkspaceState;
@@ -337,7 +374,7 @@ export class BackgroundRuntime {
 
   constructor(
     sidebarHub: SidebarHub,
-    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController; sites?: SiteEnv; approvalBadge?: ApprovalBadge; clock?: RuntimeClock; mcp?: McpConnections; alarms?: SchedulerAlarms; notifications?: RunNotifications; workspace?: WorkspaceState } = {},
+    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController; sites?: SiteEnv; approvalBadge?: ApprovalBadge; clock?: RuntimeClock; mcp?: McpConnections; alarms?: SchedulerAlarms; notifications?: RunNotifications; workspace?: WorkspaceState; scaleImage?: ImageScaler } = {},
   ) {
     this.#sidebarHub = sidebarHub;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
@@ -357,6 +394,7 @@ export class BackgroundRuntime {
     this.#approvalBadge = options.approvalBadge ?? null;
     this.#mcp = options.mcp ?? null;
     this.#notifications = options.notifications ?? null;
+    this.#scaleImage = options.scaleImage;
     this.#scheduler = new TaskScheduler({ alarms: options.alarms, now: () => this.#clock.now(),
       dispatch: (task, at, recordStart) => this.#launchScheduled(task, at, recordStart), liveSessions: async () => (await listSessions()).map((s) => s.id) });
     this.#workspace.onOwnershipChange = () => void this.#queueAgentTabSync();
@@ -745,11 +783,69 @@ export class BackgroundRuntime {
     return [...this.#runs.values()].map((run) => run.sessionId);
   }
 
-  /** Releases a run's slot and its leases on the user's tabs, unless another run has already replaced it. */
+  /** Releases a run's slot and its leases on the user's tabs, unless another run has already replaced it, and its hold on its scratch files. */
   #removeRun(run: ActiveRun): void {
+    run.releaseFiles();
     if (this.#runs.get(run.runId) !== run) return;
     this.#runs.delete(run.runId);
     this.#workspace.releaseRunLeases(run.runId);
+  }
+
+  /**
+   * Holds `sessionId`'s shared scratch files, creating them (loaded from
+   * storage on first use) when no one holds them. `release` (idempotent)
+   * gives the hold up; the last release drops the instance once its queued
+   * changes settle, so a later instance never loads under a pending write.
+   */
+  #holdScratchFiles(sessionId: string): { files: ScratchFiles; release: () => void } {
+    let held = this.#scratch.get(sessionId);
+    if (!held) {
+      held = { files: new ScratchFiles(workspaceStore(sessionId)), holders: 0 };
+      this.#scratch.set(sessionId, held);
+    }
+    const entry = held;
+    entry.holders += 1;
+    let released = false;
+    return {
+      files: entry.files,
+      release: () => {
+        if (released) return;
+        released = true;
+        entry.holders -= 1;
+        if (entry.holders > 0) return;
+        void entry.files.settled().then(() => {
+          if (entry.holders === 0 && this.#scratch.get(sessionId) === entry) this.#scratch.delete(sessionId);
+        });
+      },
+    };
+  }
+
+  /**
+   * Runs `use` on `sessionId`'s shared scratch files, held until it settles:
+   * the background's own path to them outside a run (e.g. writing the user's
+   * attachments with `ScratchFiles.attach`, or `discard` to roll them back).
+   * No sidebar, content-script, or program message reaches it directly.
+   */
+  async withScratchFiles<T>(sessionId: string, use: (files: ScratchFiles) => Promise<T>): Promise<T> {
+    const { files, release } = this.#holdScratchFiles(sessionId);
+    try { return await use(files); }
+    finally { release(); }
+  }
+
+  /**
+   * Closes deleted sessions' shared scratch files once their queued changes
+   * settle, so nothing writes their slots afterwards, then removes any slot a
+   * change in flight at the deletion wrote after the session's storage went.
+   */
+  async #closeScratchFiles(ids: readonly string[]): Promise<void> {
+    const closing = ids.filter((id) => this.#scratch.has(id));
+    if (!closing.length) return;
+    await Promise.allSettled(closing.map((id) => {
+      const { files } = this.#scratch.get(id)!;
+      this.#scratch.delete(id);
+      return files.close();
+    }));
+    await removeWorkspaceFiles(closing).catch(() => {});
   }
 
   /** Records `diagnostics` as `sessionId`'s latest run's, dropping the least recently run sessions past the bound. */
@@ -816,6 +912,16 @@ export class BackgroundRuntime {
         return { contentReply: { ok: true, snapshot } };
       } catch (error) { return { contentReply: { ok: false, error: toNormalizedMcpError(error) } }; }
     }
+    if (command.type === "attachment.prepare") {
+      // Only for the open session, like the composer that attaches it; the file stays in memory until a send writes it.
+      if (command.sessionId !== await this.#openSession()) return { attachmentReply: { error: "This chat changed. Attach the file again." } };
+      try { return { attachmentReply: { attachment: this.#preparedAttachments.prepare(command, owner) } }; }
+      catch (error) { return { attachmentReply: { error: error instanceof AttachmentError ? error.message : "The file could not be attached." } }; }
+    }
+    if (command.type === "attachment.dismiss") {
+      this.#preparedAttachments.dismiss(command.attachmentIds, command.sessionId, owner);
+      return;
+    }
     if (command.type === "skills.list") return { skills: sidebarSkillCatalog(await getSkills()) };
     if (command.type === "tabs.list") {
       // As the open session's runs see them: other sessions' agent tabs are left out.
@@ -871,7 +977,8 @@ export class BackgroundRuntime {
       // Only the open session's files, as the sidebar shows them; a read, never a run effect.
       if (command.sessionId !== await this.#openSession()) return { workspaceImage: { ok: false, reason: "session" } };
       const file = (await loadWorkspaceFiles(command.sessionId)).find((entry) => entry.path === command.path);
-      return { workspaceImage: file?.kind === "binary" && VIEWABLE_IMAGE_TYPES.includes(file.mimeType)
+      // A saved image, or an image the user attached; the record's type decides, never the path.
+      return { workspaceImage: file && file.kind !== "text" && VIEWABLE_IMAGE_TYPES.includes(file.mimeType)
         ? { ok: true, mimeType: file.mimeType, data: file.data }
         : { ok: false, reason: "missing" } };
     }
@@ -896,28 +1003,67 @@ export class BackgroundRuntime {
     }
     if (command.type === "run.start" || command.type === "run.steer") {
       let claim: ReturnType<PreparedMcpContent["claim"]> | undefined;
+      let fileClaim: AttachmentClaim | undefined;
+      let files: { files: ScratchFiles; release: () => void } | undefined;
+      let written: string[] = [];
+      let committed = false;
       let askSelection: AskAcceptance | undefined;
       try {
         if (command.askId) askSelection = this.#claimAsk(command.askId);
-        if (command.contentIds?.length) {
-          if (command.sessionId !== await this.#openSession()) throw new McpError("PROTOCOL", "The chat changed. Review the selected attachments before sending.");
-          claim = this.#preparedContent.claim(command.contentIds, command.sessionId, owner, () => this.#sidebarHub.contentAccepted(owner, command.contentIds!));
-          if (!this.#mcp || !(await Promise.all(claim.accepted.content.map(item => this.#mcp!.contentAvailable(item)))).every(Boolean)) throw new McpError("NOT_CONNECTED", "A selected account changed or disconnected. Choose its attachment again.");
+        let selection: SendSelection | undefined;
+        if (command.contentIds?.length || command.attachmentIds?.length) {
+          const sessionId = command.sessionId!;
+          if (sessionId !== await this.#openSession()) throw new McpError("PROTOCOL", "The chat changed. Review the selected attachments before sending.");
+          if (command.contentIds?.length) {
+            claim = this.#preparedContent.claim(command.contentIds, sessionId, owner, () => this.#sidebarHub.contentAccepted(owner, command.contentIds!));
+            if (!this.#mcp || !(await Promise.all(claim.accepted.content.map(item => this.#mcp!.contentAvailable(item)))).every(Boolean)) throw new McpError("NOT_CONNECTED", "A selected account changed or disconnected. Choose its attachment again.");
+          }
+          let attachments: AttachmentRefV1[] = [];
+          if (command.attachmentIds?.length) {
+            // Checked and held together, with no await between: a session
+            // command holds the chat before it switches away from or deletes
+            // it, and one that starts later finds these files held and
+            // removes them with the chat.
+            if (sessionId !== await this.#openSession() || this.#sessionHeld(sessionId)) throw new AttachmentError("The chat changed. Review the attached files before sending.");
+            fileClaim = this.#preparedAttachments.claim(command.attachmentIds, sessionId, owner, () => this.#sidebarHub.attachmentsAccepted(owner, command.attachmentIds!));
+            files = this.#holdScratchFiles(sessionId);
+            const { uploads } = fileClaim;
+            written = await files.files.attach(uploads);
+            attachments = written.map((path, index) => {
+              const { name, mimeType, bytes, text } = uploads[index]!;
+              return { v: 1, path, name, mimeType, bytes, text };
+            });
+          }
+          const accepted = { mcp: claim?.accepted, files: fileClaim };
+          selection = { sessionId, content: accepted.mcp?.content ?? [], attachments, commit: () => {
+            committed = true;
+            accepted.mcp?.commit();
+            accepted.files?.commit();
+          } };
         }
-        if (command.type === "run.start") await this.#submitPrompt(command.prompt, askSelection, claim?.accepted);
-        else await this.#steer(command.runId, command.text, askSelection, claim?.accepted);
+        if (command.type === "run.start") await this.#submitPrompt(command.prompt, askSelection, selection);
+        else await this.#steer(command.runId, command.text, askSelection, selection);
       } catch (error) {
-        this.#notice = toNormalizedMcpError(error).message;
+        this.#notice = error instanceof AttachmentError || error instanceof ScratchFilesError ? error.message : toNormalizedMcpError(error).message;
         await this.#sidebarHub.broadcastSnapshot();
-      } finally { claim?.release(); askSelection?.release(); }
+      } finally {
+        // A send that was refused, or whose message could not be saved, leaves no files behind; its attachments stay pending.
+        if (written.length && !committed) await files!.files.discard(written).catch(() => {});
+        files?.release();
+        claim?.release(); fileClaim?.release(); askSelection?.release();
+      }
       return;
     }
     if (command.type === "queue.remove") {
+      let removed: QueuedMessage | undefined;
       await this.#changeQueue(command.sessionId, queue => {
         // A steer or claimed follow-up is already being delivered.
-        return !this.#queueClaims.has(command.messageId) && queue.some(message => message.id === command.messageId && message.mode === "follow-up")
-          ? queue.filter(message => message.id !== command.messageId) : queue;
+        removed = !this.#queueClaims.has(command.messageId) ? queue.find(message => message.id === command.messageId && message.mode === "follow-up") : undefined;
+        return removed ? queue.filter(message => message !== removed) : queue;
       });
+      // Files attached to a message that will never be sent go with it (outside the queue lock).
+      const paths = removed?.attachments?.map((ref) => ref.path) ?? [];
+      if (paths.length) await this.withScratchFiles(command.sessionId, (files) => files.discard(paths)).catch(() => {});
       return;
     }
     if (command.type === "queue.send") {
@@ -973,8 +1119,9 @@ export class BackgroundRuntime {
       latestRun?.outputs.length ? fence(`[\n${latestRun.outputs.join(",\n")}\n]`) : "No tool output captured for this chat in this background session.",
       "## Conversation log", fence(JSON.stringify(conversation, null, 2)),
       "## Partial response", fence(this.#runFor(sessionId)?.partialAssistantText ?? ""),
-      "## Scratch files", "This chat's /workspace files, kept until the chat is deleted. Binary files (saved screenshots) are listed by type and size, not exported.",
-      files ? fence(JSON.stringify(Object.fromEntries(files.map((file) => [file.path, file.kind === "text" ? file.content : `[binary ${file.mimeType}, ${file.bytes} bytes]`])), null, 2)) : "The scratch files could not be read.",
+      "## Scratch files", "This chat's /workspace files, kept until the chat is deleted. Binary files (saved screenshots and PDFs) are listed by type and size, and files the user attached (/workspace/uploads) by name, type, and size; their contents are not exported.",
+      files ? fence(JSON.stringify(Object.fromEntries(files.map((file) => [file.path, file.kind === "text" ? file.content
+        : file.kind === "upload" ? `[attached ${JSON.stringify(file.name)}, ${file.mimeType}, ${file.bytes} bytes]` : `[binary ${file.mimeType}, ${file.bytes} bytes]`])), null, 2)) : "The scratch files could not be read.",
     ].join("\n\n") };
   }
 
@@ -1107,6 +1254,7 @@ export class BackgroundRuntime {
       this.#retryable.delete(id);
       this.#diagnostics.delete(id);
     }
+    await this.#closeScratchFiles(ids);
     await this.#withQueueLock(async () => {
       for (const id of ids) {
         for (const message of this.#queues.get(id) ?? []) this.#queueClaims.delete(message.id);
@@ -1177,7 +1325,10 @@ export class BackgroundRuntime {
     try {
       await setOpenSessionId(id);
       this.#openSessionId = id;
-      if (previous !== id && !this.#runFor(previous) && await isSessionUntouched(previous)) await deleteSession(previous);
+      if (previous !== id && !this.#runFor(previous) && await isSessionUntouched(previous)) {
+        await deleteSession(previous);
+        await this.#closeScratchFiles([previous]);
+      }
     } finally { release(); }
   }
 
@@ -1466,7 +1617,7 @@ export class BackgroundRuntime {
   }
 
   /** All admissions, removals, delivery, and settlement share the same lock. */
-  async #appendQueued(sessionId: string, message: QueuedMessage, selection?: ContentAcceptance, askSelection?: AskAcceptance): Promise<boolean> {
+  async #appendQueued(sessionId: string, message: QueuedMessage, selection?: SendSelection, askSelection?: AskAcceptance): Promise<boolean> {
     const accepted = await this.#withQueueLock(async () => {
       const current = await this.#readQueue(sessionId);
       if (current.length >= MAX_QUEUED_MESSAGES) return false;
@@ -1489,9 +1640,9 @@ export class BackgroundRuntime {
   }
 
   /** `run.start`: while the open session's run is active, the prompt waits as a follow-up; otherwise a run starts with it. */
-  async #submitPrompt(rawPrompt: string, askSelection?: AskAcceptance, selection?: ContentAcceptance): Promise<void> {
+  async #submitPrompt(rawPrompt: string, askSelection?: AskAcceptance, selection?: SendSelection): Promise<void> {
     const sessionId = await this.#openSession();
-    if (selection?.content.some(item => item.sessionId !== sessionId)) throw new McpError("PROTOCOL", "The chat changed. Choose the attachments again.");
+    if (selection && selection.sessionId !== sessionId) throw new McpError("PROTOCOL", "The chat changed. Choose the attachments again.");
     const queue = await this.#queue(sessionId);
     const prompt = validatePromptText(rawPrompt);
     if (prompt && !hasPreparedMcpPrompt(prompt, selection?.content)) throw new McpError("PROTOCOL", "Choose the MCP prompt from / and prepare its preview before sending.");
@@ -1504,7 +1655,7 @@ export class BackgroundRuntime {
     if (await this.#queueFull(current)) return;
     if (!this.#askIsCurrent(askSelection?.ask.id)) return;
     const ask = this.#snapshotAsk(askSelection, sessionId);
-    await this.#appendQueued(sessionId, { id: crypto.randomUUID(), mode: "follow-up", text: prompt, ...(skill ? { skill } : {}), ...(ask ? { ask } : {}), ...(selection?.content.length ? { content: selection.content } : {}), at: Date.now() }, selection, askSelection);
+    await this.#appendQueued(sessionId, { id: crypto.randomUUID(), mode: "follow-up", text: prompt, ...(skill ? { skill } : {}), ...(ask ? { ask } : {}), ...(selection?.content.length ? { content: selection.content } : {}), ...(selection?.attachments.length ? { attachments: selection.attachments } : {}), at: Date.now() }, selection, askSelection);
   }
 
   async #captureSkill(text: string): Promise<Skill | undefined | null> {
@@ -1517,10 +1668,10 @@ export class BackgroundRuntime {
   }
 
   /** `run.steer`: hands guidance to the active run's agent loop and shows it as pending until delivered. */
-  async #steer(runId: string, rawText: string, askSelection?: AskAcceptance, selection?: ContentAcceptance): Promise<void> {
+  async #steer(runId: string, rawText: string, askSelection?: AskAcceptance, selection?: SendSelection): Promise<void> {
     const run = this.#run(runId);
     if (!run) return this.#submitPrompt(rawText, askSelection, selection);
-    if (selection?.content.some(item => item.sessionId !== run.sessionId)) throw new McpError("PROTOCOL", "Those attachments belong to another chat.");
+    if (selection && selection.sessionId !== run.sessionId) throw new McpError("PROTOCOL", "Those attachments belong to another chat.");
     const queue = await this.#queue(run.sessionId);
     const text = validatePromptText(rawText);
     if (text && !hasPreparedMcpPrompt(text, selection?.content)) throw new McpError("PROTOCOL", "Choose the MCP prompt from / and prepare its preview before sending.");
@@ -1534,7 +1685,7 @@ export class BackgroundRuntime {
     if (await this.#queueFull(current)) return;
     if (!this.#askIsCurrent(askSelection?.ask.id)) return;
     const ask = this.#snapshotAsk(askSelection, run.sessionId);
-    const message: QueuedMessage = { id: crypto.randomUUID(), mode: "steer", text, ...(skill ? { skill } : {}), ...(ask ? { ask } : {}), ...(selection?.content.length ? { content: selection.content } : {}), at: Date.now() };
+    const message: QueuedMessage = { id: crypto.randomUUID(), mode: "steer", text, ...(skill ? { skill } : {}), ...(ask ? { ask } : {}), ...(selection?.content.length ? { content: selection.content } : {}), ...(selection?.attachments.length ? { attachments: selection.attachments } : {}), at: Date.now() };
     if (!await this.#appendQueued(run.sessionId, message, selection, askSelection)) return;
     if (this.#run(runId) === run && !run.controller.signal.aborted) run.agentLoop.steer(message);
     else await this.#settleSteers(run.sessionId);
@@ -1556,7 +1707,7 @@ export class BackgroundRuntime {
       return candidate;
     });
     if (!message) return false;
-    try { await this.#startRun(sessionId, message.text, message.id, { skill: message.skill, ask: message.ask, content: message.content }); }
+    try { await this.#startRun(sessionId, message.text, message.id, { skill: message.skill, ask: message.ask, content: message.content, attachments: message.attachments }); }
     finally { await this.#withQueueLock(async () => { this.#queueClaims.delete(message.id); }); }
     return true;
   }
@@ -1578,7 +1729,7 @@ export class BackgroundRuntime {
    * names the queued follow-up the prompt came from; its user message keeps
    * that id, and it leaves the queue once that message is written.
    */
-  async #startRun(sessionId: string, rawPrompt: string | null, queuedId?: string, accepted?: { skill?: Skill; ask?: AskContextV1; scheduled?: ScheduledSource; runId?: string; content?: McpContentSnapshot[] }, askSelection?: AskAcceptance, selection?: ContentAcceptance): Promise<void> {
+  async #startRun(sessionId: string, rawPrompt: string | null, queuedId?: string, accepted?: { skill?: Skill; ask?: AskContextV1; scheduled?: ScheduledSource; runId?: string; content?: McpContentSnapshot[]; attachments?: AttachmentRefV1[] }, askSelection?: AskAcceptance, selection?: SendSelection): Promise<void> {
     if (this.#disposed) return;
     const retry = rawPrompt === null;
     const retryable = this.#retryable.get(sessionId);
@@ -1607,9 +1758,10 @@ export class BackgroundRuntime {
     const runId = accepted?.runId ?? crypto.randomUUID();
     const controller = new AbortController();
     const tabController = this.#tabControllerFactory();
-    // The session's scratch files load on the first program that uses them; memory is global and read at each use.
-    const scope = { state: this.#workspace, runId, sessionId, files: new ScratchFiles(workspaceStore(sessionId)), skills: new Map<string, Skill>(), sites: this.#sites,
-      memory: runMemory(sessionId, runId) };
+    // The session's shared scratch files load on the first program (or attachment) that uses them; memory is global and read at each use.
+    const files = this.#holdScratchFiles(sessionId);
+    const scope = { state: this.#workspace, runId, sessionId, files: files.files, skills: new Map<string, Skill>(), sites: this.#sites,
+      memory: runMemory(sessionId, runId), ...(this.#scaleImage ? { scaleImage: this.#scaleImage } : {}) };
     const agentLoop = new AgentLoop(this.#provider, tabController, this.#sidebarHub, scope);
     const run: ActiveRun = {
       runId,
@@ -1630,6 +1782,7 @@ export class BackgroundRuntime {
       turnPersisted: retry,
       outcome: null,
       ended: false,
+      releaseFiles: files.release,
     };
     this.#runs.set(runId, run);
 
@@ -1720,6 +1873,7 @@ export class BackgroundRuntime {
           ...(ask ? { ask } : {}),
           ...(run.scheduled ? { scheduled: run.scheduled } : {}),
           ...((selection?.content ?? accepted?.content)?.length ? { content: selection?.content ?? accepted?.content } : {}),
+          ...((selection?.attachments ?? accepted?.attachments)?.length ? { attachments: selection?.attachments ?? accepted?.attachments } : {}),
           ...(sites.length ? { sites } : {}),
           context: artifact ? { artifactId: artifact.artifactId, kind: "page", title: artifact.title, url: artifact.url, capturedAt: artifact.capturedAt } : null,
           at: Date.now(),
@@ -1749,7 +1903,7 @@ export class BackgroundRuntime {
       const userItem = items[userIndex] as UserMessageItem;
       this.#retryable.delete(sessionId);
 
-      this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt: userItem.text, page: userItem.context, ask: userItem.ask ?? null, content: userItem.content, retry, ...(userItem.scheduled ? { scheduled: userItem.scheduled } : {}) });
+      this.#sidebarHub.publishRunEvent(runId, "run.started", { prompt: userItem.text, page: userItem.context, ask: userItem.ask ?? null, content: userItem.content, attachments: userItem.attachments, retry, ...(userItem.scheduled ? { scheduled: userItem.scheduled } : {}) });
       await this.#writeCheckpoint(run, "running", "");
 
       // Pi owns assistant/tool replay during this run. Persisted tool items are

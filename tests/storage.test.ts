@@ -501,6 +501,13 @@ describe("storage: session workspace", () => {
     expect(await loadWorkspaceFiles("a")).toEqual([{ slot: 1, path: "/workspace/shot.png", kind: "binary", mimeType: "image/png", data: PNG, bytes: 8 }]);
   });
 
+  it("round-trips a file the user attached with its original name, type, and text flag", async () => {
+    const file = { kind: "upload", name: "Jane Doe Résumé.pdf", mimeType: "application/pdf", data: "JVBERi0=", bytes: 5, text: false } as const;
+    await workspaceStore("a").write({ slot: 2, path: "/workspace/uploads/Jane-Doe-R-sum-.pdf", ...file });
+    expect((await browser.storage.local.get("workspace:a:2"))["workspace:a:2"]).toEqual({ version: 2, path: "/workspace/uploads/Jane-Doe-R-sum-.pdf", ...file });
+    expect(await loadWorkspaceFiles("a")).toEqual([{ slot: 2, path: "/workspace/uploads/Jane-Doe-R-sum-.pdf", ...file }]);
+  });
+
   it("rewrites a version 1 text record as version 2", async () => {
     await browser.storage.local.set({ "workspace:a:0": { version: 1, path: "/workspace/ok.md", content: "fine" } });
     expect(await loadWorkspaceFiles("a")).toEqual([{ slot: 0, path: "/workspace/ok.md", kind: "text", content: "fine" }]);
@@ -509,6 +516,9 @@ describe("storage: session workspace", () => {
 
   it("revalidates files on read, deleting malformed, oversized, traversing, mistyped, over-budget, and duplicate ones", async () => {
     const big = "A".repeat(1_500_000 / 3 * 4);
+    // 10,000,000 bytes, the most one attached file may hold.
+    const bigUpload = `${"A".repeat(13_333_332)}AA==`;
+    const upload = (path: string, fields: object = {}) => ({ version: 2, path, kind: "upload", name: "Résumé (final).txt", mimeType: "text/plain", data: PNG, bytes: 8, text: true, ...fields });
     await browser.storage.local.set({
       "workspace:a:0": { version: 2, path: "/workspace/ok.md", kind: "text", content: "fine" },
       "workspace:a:1": { version: 3, path: "/workspace/v3.md", kind: "text", content: "unknown version" },
@@ -523,15 +533,29 @@ describe("storage: session workspace", () => {
       "workspace:a:10": { version: 2, path: "/workspace/d.exe", kind: "binary", mimeType: "application/octet-stream", data: PNG, bytes: 8 },
       "workspace:a:11": { version: 2, path: "/workspace/e.png", kind: "text", content: "text under an image name" },
       "workspace:a:12": { version: 2, path: "/workspace/huge.png", kind: "binary", mimeType: "image/png", data: `${big}AAAA`, bytes: 1_500_003 },
-      ...Object.fromEntries([20, 21, 22, 23, 24].map((slot) => [`workspace:a:${slot}`, { version: 2, path: `/workspace/p${slot}.jpg`, kind: "binary", mimeType: "image/jpeg", data: big, bytes: 1_500_000 }])),
+      // Attached files live only in /workspace/uploads, and only they do.
+      "workspace:a:13": upload("/workspace/notes.txt"),
+      "workspace:a:14": { version: 2, path: "/workspace/uploads/shot.png", kind: "binary", mimeType: "image/png", data: PNG, bytes: 8 },
+      "workspace:a:15": { version: 2, path: "/workspace/uploads/notes.md", kind: "text", content: "text" },
+      "workspace:a:16": upload("/workspace/uploads/mismatch.txt", { bytes: 9 }),
+      "workspace:a:17": upload("/workspace/uploads/slash.txt", { name: "a/b.txt" }),
+      "workspace:a:18": upload("/workspace/uploads/type.txt", { mimeType: "not a type" }),
+      "workspace:a:19": upload("/workspace/uploads/huge.bin", { data: "A".repeat(13_333_336), bytes: 10_000_002 }),
+      "workspace:a:27": upload("/workspace/uploads/flag.txt", { text: "yes" }),
+      // Two 10 MB attachments and four 1.5 MB binaries: the 25,000,000-byte budget holds all but the last binary.
+      ...Object.fromEntries([20, 21].map((slot) => [`workspace:a:${slot}`, upload(`/workspace/uploads/u${slot}.bin`, { mimeType: "application/octet-stream", data: bigUpload, bytes: 10_000_000, text: false })])),
+      ...Object.fromEntries([22, 23, 24, 25].map((slot) => [`workspace:a:${slot}`, { version: 2, path: `/workspace/p${slot}.jpg`, kind: "binary", mimeType: "image/jpeg", data: big, bytes: 1_500_000 }])),
+      "workspace:a:26": upload("/workspace/uploads/Resume-final-.txt"),
       "workspace:a:64": { version: 2, path: "/workspace/out-of-range.md", kind: "text", content: "never read" },
     });
-    // The 6,000,000-byte binary budget holds four of the five 1.5 MB files.
-    expect((await loadWorkspaceFiles("a")).map((file) => [file.slot, file.path])).toEqual([
-      [0, "/workspace/ok.md"], [6, "/workspace/max.md"], [20, "/workspace/p20.jpg"], [21, "/workspace/p21.jpg"], [22, "/workspace/p22.jpg"], [23, "/workspace/p23.jpg"],
+    const loaded = await loadWorkspaceFiles("a");
+    expect(loaded.map((file) => [file.slot, file.path])).toEqual([
+      [0, "/workspace/ok.md"], [6, "/workspace/max.md"], [20, "/workspace/uploads/u20.bin"], [21, "/workspace/uploads/u21.bin"],
+      [22, "/workspace/p22.jpg"], [23, "/workspace/p23.jpg"], [24, "/workspace/p24.jpg"], [26, "/workspace/uploads/Resume-final-.txt"],
     ]);
+    expect(loaded.at(-1)).toEqual({ slot: 26, path: "/workspace/uploads/Resume-final-.txt", kind: "upload", name: "Résumé (final).txt", mimeType: "text/plain", data: PNG, bytes: 8, text: true });
     expect(Object.keys(await browser.storage.local.get(null)).sort()).toEqual(
-      ["workspace:a:0", "workspace:a:20", "workspace:a:21", "workspace:a:22", "workspace:a:23", "workspace:a:6", "workspace:a:64"]);
+      ["workspace:a:0", "workspace:a:20", "workspace:a:21", "workspace:a:22", "workspace:a:23", "workspace:a:24", "workspace:a:26", "workspace:a:6", "workspace:a:64"]);
   });
 });
 

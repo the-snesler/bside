@@ -10,6 +10,7 @@
  */
 
 import { isMcpArguments, MCP_CONTENT_LIMITS, type McpContentChoice, type McpContentSnapshot } from "@/lib/domain/mcp-content";
+import { ATTACHMENT_LIMITS, type AttachmentPrepareResult, type AttachmentRefV1 } from "@/lib/domain/attachments";
 import type {
   CaptureGeometry,
   DomAction,
@@ -584,18 +585,35 @@ export type SidebarCommand =
    * session, queues the prompt as a follow-up instead: it starts the next
    * turn once that run completes (not after a failure or cancellation).
    */
-  | { v: 1; id: string; type: "run.start"; prompt: string; askId?: string; contentIds?: string[]; sessionId?: string }
+  | { v: 1; id: string; type: "run.start"; prompt: string; askId?: string; contentIds?: string[]; attachmentIds?: string[]; sessionId?: string }
   /**
    * Guidance for the active run, delivered as a user message at its next tool
    * boundary, within the same turn and budgets. If `runId` is no longer
    * running (finished or cancelling), handled exactly like `run.start`.
    * `askId` (on either) sends the pending context-menu chip with the message;
    * a chip that is no longer pending refuses the send with a notice.
+   * `contentIds` (prepared MCP content) and `attachmentIds` (prepared files,
+   * see `attachment.prepare`) need `sessionId`, the open session they were
+   * prepared for; the send claims them, and a refused send leaves them
+   * pending, with a notice in the next `state.snapshot`.
    */
-  | { v: 1; id: string; type: "run.steer"; runId: string; text: string; askId?: string; contentIds?: string[]; sessionId?: string }
+  | { v: 1; id: string; type: "run.steer"; runId: string; text: string; askId?: string; contentIds?: string[]; attachmentIds?: string[]; sessionId?: string }
   | { v: 1; id: string; type: "mcp.content.list"; sessionId: string; kind: "prompt" | "resource" }
   | { v: 1; id: string; type: "mcp.content.prepare"; sessionId: string; choiceId: string; arguments: Record<string, string> }
   | { v: 1; id: string; type: "mcp.content.dismiss"; sessionId: string; contentIds: string[] }
+  /**
+   * Holds one file the user attached, for the open session, until a message
+   * sends it (`attachmentIds`) or it is dismissed. `name` and `mimeType` are
+   * the file's as the sidebar read them (`mimeType` may be empty); `data` is
+   * its bytes as canonical base64 (1 byte to 10 MB). The background cleans
+   * the name and decides the type from the bytes. Answered privately with
+   * `attachment.prepared` (`requestId` = this `id`). Pending files belong to
+   * this sidebar Port and session; a closed Port or a background restart
+   * drops them.
+   */
+  | { v: 1; id: string; type: "attachment.prepare"; sessionId: string; name: string; mimeType: string; data: string }
+  /** Drops this sidebar's pending files that no send has claimed. */
+  | { v: 1; id: string; type: "attachment.dismiss"; sessionId: string; attachmentIds: string[] }
   /** Removes the pending "Ask bside about…" chip, if it is still the one named. */
   | { v: 1; id: string; type: "ask.dismiss"; askId: string }
   /** Discards a queued follow-up, or a steer not yet delivered, from a session's queue. */
@@ -625,6 +643,11 @@ export type WorkspaceImageReply =
 const isAskId = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 64;
 const isContentIds = (value: unknown): value is string[] => Array.isArray(value) && value.length <= MCP_CONTENT_LIMITS.attachments && value.every(isAskId) && new Set(value).size === value.length;
 const isOptionalAskId = (value: unknown) => value === undefined || isAskId(value);
+const isAttachmentIds = (value: unknown): value is string[] => Array.isArray(value) && value.length <= ATTACHMENT_LIMITS.perMessage && value.every(isAskId) && new Set(value).size === value.length;
+/** Optional `contentIds`/`attachmentIds` on a send; either needs the session they were prepared for. */
+const isSendSelection = (candidate: Record<string, unknown>) =>
+  (candidate.contentIds === undefined || isContentIds(candidate.contentIds)) && (candidate.attachmentIds === undefined || isAttachmentIds(candidate.attachmentIds)) &&
+  (candidate.contentIds === undefined && candidate.attachmentIds === undefined || isSessionId(candidate.sessionId));
 
 /** A `state.subscribe` seq map: a plain object of at most `MAX_SUBSCRIBE_RUNS` run ids (≤64 characters) to non-negative integer seqs. */
 function isRunSeqs(value: unknown): value is Record<string, number> {
@@ -743,7 +766,11 @@ export type SidebarEvent =
   | EventBase<"composer.focus", null>
   | EventBase<"mcp.content.reply", { requestId: string; result: McpContentReply }>
   | EventBase<"mcp.content.accepted", { ids: string[] }>
-  | EventBase<"run.started", { content?: McpContentSnapshot[]; prompt: string; page: PageArtifactSummary | null; ask: AskContextV1 | null; retry: boolean; scheduled?: ScheduledSource }>
+  /** The private answer to `attachment.prepare`, to the sidebar that sent it; `conversationId` is the request's session. */
+  | EventBase<"attachment.prepared", { requestId: string; result: AttachmentPrepareResult }>
+  /** To the sidebar that prepared them: these pending files were sent with a message that is now persisted, so their chips can go. */
+  | EventBase<"attachment.accepted", { ids: string[] }>
+  | EventBase<"run.started", { content?: McpContentSnapshot[]; attachments?: AttachmentRefV1[]; prompt: string; page: PageArtifactSummary | null; ask: AskContextV1 | null; retry: boolean; scheduled?: ScheduledSource }>
   | EventBase<"assistant.delta", { delta: string }>
   | EventBase<"tool.requested", { call: ToolCall; display: string }>
   | EventBase<"action.approval-required", ApprovalRequest>
@@ -804,8 +831,13 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (candidate.type === "state.subscribe") {
     return candidate.lastSeq === null || isRunSeqs(candidate.lastSeq);
   }
-  if (candidate.type === "run.start") return typeof candidate.prompt === "string" && isOptionalAskId(candidate.askId) && (candidate.contentIds === undefined || (isContentIds(candidate.contentIds) && isSessionId(candidate.sessionId)));
-  if (candidate.type === "run.steer") return typeof candidate.runId === "string" && typeof candidate.text === "string" && isOptionalAskId(candidate.askId) && (candidate.contentIds === undefined || (isContentIds(candidate.contentIds) && isSessionId(candidate.sessionId)));
+  if (candidate.type === "run.start") return typeof candidate.prompt === "string" && isOptionalAskId(candidate.askId) && isSendSelection(candidate);
+  if (candidate.type === "run.steer") return typeof candidate.runId === "string" && typeof candidate.text === "string" && isOptionalAskId(candidate.askId) && isSendSelection(candidate);
+  if (candidate.type === "attachment.prepare") {
+    return isSessionId(candidate.sessionId) && typeof candidate.name === "string" && candidate.name.length <= ATTACHMENT_LIMITS.rawName &&
+      typeof candidate.mimeType === "string" && candidate.mimeType.length <= ATTACHMENT_LIMITS.rawMimeType && typeof candidate.data === "string";
+  }
+  if (candidate.type === "attachment.dismiss") return isSessionId(candidate.sessionId) && isAttachmentIds(candidate.attachmentIds);
   if (candidate.type === "ask.dismiss") return isAskId(candidate.askId);
   if (candidate.type === "queue.remove" || candidate.type === "queue.send") {
     return isSessionId(candidate.sessionId) && typeof candidate.messageId === "string";

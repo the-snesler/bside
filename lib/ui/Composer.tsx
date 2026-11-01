@@ -17,8 +17,12 @@ import type { TabMention } from "@/lib/protocol";
 import type { SkillSummary } from "@/lib/domain/skills";
 import { PROMPT_MENTION_PATTERN } from "@/lib/domain/conversation";
 import ArrowUp from "~icons/tabler/arrow-up";
+import X from "~icons/tabler/x";
 import PlayerStop from "~icons/tabler/player-stop";
 import SteeringWheel from "~icons/tabler/steering-wheel";
+import Plus from "~icons/tabler/plus";
+import { filesFromTransfer, type FileSource, type PendingFile } from "@/lib/ui/attachments";
+import { PendingFileChip } from "@/lib/ui/AttachmentChip";
 
 type Mention = {
   type: "mention";
@@ -83,6 +87,13 @@ export function Composer(props: {
   onListMcpContent?: (kind: "prompt" | "resource") => Promise<{ choices: McpContentChoice[]; errors: { message: string }[] }>;
   onPrepareMcpContent?: (id: string, args: Record<string, string>) => Promise<void>;
   onDismissMcpContent?: (id: string) => void;
+  /** This chat's files waiting to go with the next message. */
+  files?: PendingFile[];
+  /** Why the files last picked, pasted, or dropped were not all attached. */
+  fileNotice?: string | null;
+  onAttachFiles?: (files: File[], source: FileSource) => void;
+  onRemoveFile?: (key: string) => void;
+  onClearFileNotice?: () => void;
   disabled: boolean;
   /** This chat's run is active: Stop is shown. */
   running: boolean;
@@ -125,6 +136,12 @@ export function Composer(props: {
   const [selectedPrompt, setSelectedPrompt] = useState<Extract<McpContentChoice, { kind: "prompt" }> | null>(null);
   const [args, setArgs] = useState<Record<string, string>>({});
   const discoveryVersion = useRef(0);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const files = props.files ?? [];
+  // A message waits for its files: every one prepared, none refused (the user removes those).
+  const filesBusy = files.some((file) => file.status === "waiting" || file.status === "uploading");
+  const filesFailed = files.some((file) => file.status === "failed");
+  const filesBlocked = filesBusy || filesFailed;
   const currentSession = useRef(props.sessionId);
   currentSession.current = props.sessionId;
   useEffect(() => {
@@ -207,7 +224,7 @@ export function Composer(props: {
   const selectMatch = () => { if (options[index]) selectOption(options[index]!); };
   const send = (steer = false) => {
     const value = serializeDraft(editor.children);
-    if (!value || value.length > 16000 || props.disabled || preparing || selectedPrompt) return;
+    if (!value || value.length > 16000 || props.disabled || preparing || selectedPrompt || filesBlocked) return;
     if (steer) props.onSteer(value);
     else props.onSend(value);
     Transforms.select(editor, Editor.range(editor, []));
@@ -273,6 +290,17 @@ export function Composer(props: {
           onRemove={() => props.onDismissMcpContent?.(item.id)}
         />
       ))}
+      {files.length > 0 && (
+        <ul class="file-chips file-chips--pending" aria-label="Files to send">
+          {files.map((file) => <PendingFileChip key={file.key} item={file} onRemove={() => props.onRemoveFile?.(file.key)} />)}
+        </ul>
+      )}
+      {props.fileNotice && (
+        <p role="alert" class="composer__file-notice">
+          <span>{props.fileNotice}</span>
+          <button type="button" class="file-chip__remove" aria-label="Dismiss" title="Dismiss" onClick={props.onClearFileNotice}><X /></button>
+        </p>
+      )}
       {selectedPrompt && (
         <form
           class="mcp-prompt-form"
@@ -339,12 +367,45 @@ export function Composer(props: {
         <p role="status">Preparing resource preview…</p>
       )}
       <div class="composer__editor-row">
+        <input
+          ref={fileInput}
+          type="file"
+          multiple
+          hidden
+          tabIndex={-1}
+          aria-hidden="true"
+          onChange={(event) => {
+            const input = event.currentTarget;
+            const picked = Array.from(input.files ?? []);
+            // Cleared so choosing the same file again still fires a change.
+            input.value = "";
+            if (picked.length) props.onAttachFiles?.(picked, "picker");
+            ReactEditor.focus(editor);
+          }}
+        />
+        <button
+          class="composer__attach"
+          type="button"
+          aria-label="Attach files"
+          title="Attach files"
+          disabled={props.disabled || !props.onAttachFiles}
+          onClick={() => fileInput.current?.click()}
+        >
+          <Plus />
+        </button>
         <Editable
           className="composer__editor"
           aria-label="Message"
           readOnly={props.disabled}
           role="textbox"
           aria-multiline="true"
+          onPaste={(event) => {
+            // Files on the clipboard are attached; anything else pastes as plain text (see insertData).
+            const pasted = filesFromTransfer(event.clipboardData);
+            if (!pasted.length || props.disabled || !props.onAttachFiles) return;
+            event.preventDefault();
+            props.onAttachFiles(pasted, "paste");
+          }}
           aria-autocomplete="list"
           aria-expanded={!!target}
           aria-controls={target ? "tab-suggestions" : undefined}
@@ -356,7 +417,9 @@ export function Composer(props: {
           placeholder={
             !props.configured
               ? "Connect OpenAI in settings to start."
-              : props.working
+              : files.length && !text
+                ? "Add a message to send with your files…"
+                : props.working
                 ? "Enter queues, Ctrl/⌘+Enter steers…"
                 : (props.placeholder ??
                   "Type a task, / for prompts or skills, @ for resources or tabs…")
@@ -406,7 +469,7 @@ export function Composer(props: {
             }
           }}
         />
-        {props.working && text && text.length <= 16000 && (
+        {props.working && text && text.length <= 16000 && !filesBlocked && (
           <>
             {props.canSteer && (
               <button
@@ -452,6 +515,7 @@ export function Composer(props: {
               props.disabled ||
               preparing ||
               !!selectedPrompt ||
+              filesBlocked ||
               !text ||
               text.length > 16000
             }
@@ -461,6 +525,11 @@ export function Composer(props: {
           </button>
         )}
       </div>
+      {filesFailed ? (
+        <p class="composer__hint">Remove the files that could not be attached to send.</p>
+      ) : filesBusy ? (
+        <p class="composer__hint" role="status">Attaching files…</p>
+      ) : null}
       {text.length > 16000 && (
         <p class="sidebar__error">
           Message is too long (maximum 16,000 characters).

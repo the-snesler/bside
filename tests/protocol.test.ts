@@ -391,6 +391,9 @@ describe("isPageExecuteRequest: accepts the closed action union only", () => {
       { kind: "press", target: ref, key: "a", modifiers: ["Control", "Shift"] },
       { kind: "upload", target: ref, files: [{ name: "a.txt", mimeType: "text/plain", text: "hi" }] },
       { kind: "upload", target: ref, files: [{ name: "a.png", mimeType: "image/png", base64: "iVBORw0KGgo=" }] },
+      // The user's attachments upload under their own name and type, whatever the extension says.
+      { kind: "upload", target: ref, files: [{ name: "a.png", mimeType: "image/jpeg", base64: "iVBORw0KGgo=" }] },
+      { kind: "upload", target: ref, files: [{ name: "Résumé.docx", mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", base64: "A".repeat(2_000_004) }] },
       { kind: "scroll", target: null, direction: "down", amount: "page" },
     ]) expect(validateDomAction(action), JSON.stringify(action)).not.toBeNull();
     expect(isPageExecuteRequest(execute({ kind: "click", target: ref }))).toBe(true);
@@ -429,10 +432,9 @@ describe("isPageExecuteRequest: accepts the closed action union only", () => {
       { kind: "press", target: ref, key: "A", modifiers: ["Control"] },
       { kind: "upload", target: ref, files: [{ name: "../etc/passwd", mimeType: "text/plain", text: "" }] },
       { kind: "upload", target: ref, files: [] },
-      { kind: "upload", target: ref, files: [{ name: "a.png", mimeType: "image/jpeg", base64: "iVBORw0KGgo=" }] },
-      { kind: "upload", target: ref, files: [{ name: "a.exe", mimeType: "application/octet-stream", base64: "iVBORw0KGgo=" }] },
+      { kind: "upload", target: ref, files: [{ name: "a.exe", mimeType: "application octet-stream", base64: "iVBORw0KGgo=" }] },
       { kind: "upload", target: ref, files: [{ name: "a.png", mimeType: "image/png", base64: "not base64" }] },
-      { kind: "upload", target: ref, files: [{ name: "a.png", mimeType: "image/png", base64: "A".repeat(2_000_004) }] },
+      { kind: "upload", target: ref, files: [{ name: "a.png", mimeType: "image/png", base64: "A".repeat(13_333_340) }] },
       { kind: "upload", target: ref, files: [{ name: "a.png", mimeType: "image/png", base64: "iVBORw0KGgo=", text: "both" }] },
       { kind: "select", target: ref, values: [] },
       { kind: "fill", target: ref, text: "x".repeat(16_001) },

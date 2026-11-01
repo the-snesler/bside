@@ -33,6 +33,9 @@ import { describeAsk } from "@/lib/domain/ask";
 import { QUICK_ACTIONS } from "@/lib/domain/quick-actions";
 import { AskChip } from "@/lib/ui/AskChip";
 import { OtherRunsStrip, runAttention, type OtherRun } from "@/lib/ui/OtherRuns";
+import { AttachmentRefChips } from "@/lib/ui/AttachmentChip";
+import { dragHasFiles, filesFromTransfer } from "@/lib/ui/attachments";
+import FileUpload from "~icons/tabler/file-upload";
 
 const PERMISSION_MODE_OPTIONS: { mode: PermissionMode; label: string; title: string; Icon: typeof ShieldCheck }[] = [
   { mode: "ask", label: "Ask first", title: "Asks before sending, submitting, buying, or deleting", Icon: ShieldCheck },
@@ -96,6 +99,7 @@ export function App() {
     savePermissionMode,
     sendPrompt,
     listMcpContent, prepareMcpContent, dismissMcpContent, mcpAttachments,
+    pendingFiles, fileNotice, attachFiles, removeFile, clearFileNotice,
     steer,
     queue,
     removeQueued,
@@ -181,8 +185,53 @@ export function App() {
   }, [watchedTab?.id]);
   const helpTabId = pendingHelp && chatAgentTabs.some((tab) => tab.id === pendingHelp.tabId) ? pendingHelp.tabId : null;
 
+  // This chat's files waiting for the next message; the composer sends only once every one is prepared.
+  const chatFiles = pendingFiles.filter((file) => file.sessionId === conversation.id);
+  const readyFileIds = () => chatFiles.flatMap((file) => file.status === "ready" && file.id ? [file.id] : []);
+  const chatContentIds = () => mcpAttachments.filter(item => item.sessionId === conversation.id).map(item => item.id);
+
+  // Files dragged from the computer onto any part of the sidebar attach to
+  // this chat. Their dragover and drop are always cancelled, so Firefox never
+  // opens a dropped file in the sidebar; drags without files are left alone.
+  const [dropping, setDropping] = useState(false);
+  useEffect(() => {
+    let depth = 0;
+    const onDrag = (event: DragEvent) => {
+      if (!dragHasFiles(event.dataTransfer)) return;
+      if (event.type === "dragleave") {
+        depth = Math.max(0, depth - 1);
+        if (depth === 0) setDropping(false);
+        return;
+      }
+      event.preventDefault();
+      if (event.type === "dragenter") {
+        depth++;
+        if (!composerDisabled) setDropping(true);
+      } else if (event.type === "dragover") {
+        if (event.dataTransfer) event.dataTransfer.dropEffect = composerDisabled ? "none" : "copy";
+      } else {
+        depth = 0;
+        setDropping(false);
+        if (!composerDisabled) attachFiles(filesFromTransfer(event.dataTransfer), "drop");
+      }
+    };
+    const types = ["dragenter", "dragover", "dragleave", "drop"] as const;
+    for (const type of types) window.addEventListener(type, onDrag);
+    return () => {
+      for (const type of types) window.removeEventListener(type, onDrag);
+      setDropping(false);
+    };
+  }, [composerDisabled, attachFiles]);
+
+
   return (
     <div class="sidebar">
+      {dropping && (
+        <div class="drop-overlay" aria-hidden="true">
+          <FileUpload />
+          <p>Drop files to attach</p>
+        </div>
+      )}
       <header class="sidebar__header">
         <button
           type="button"
@@ -290,6 +339,7 @@ export function App() {
                             </p>
                             {turn.prompt.ask && <AskChip ask={turn.prompt.ask} />}
                             {turn.prompt.content?.map(item => <McpContentChip key={item.id} item={item} />)}
+                            <AttachmentRefChips attachments={turn.prompt.attachments} images={images} />
                           </li>
                         )}
                         {(turn.steps.length > 0 || active) && (
@@ -385,6 +435,7 @@ export function App() {
                       </span>
                       <span class="queue__text" title={text}>{text}</span>
                       {message.content?.map(item => <McpContentChip key={item.id} item={item} />)}
+                      {message.attachments?.length ? <AttachmentRefChips attachments={message.attachments} images={images} compact /> : null}
                       {message.ask && <span class="queue__label" title={describeAsk(message.ask).text}>{describeAsk(message.ask).label}</span>}
                       {message.mode === "follow-up" && !runHere && (
                         <button type="button" class="icon-button" aria-label="Send now" title="Send now" onClick={() => sendQueued(message.id)}>
@@ -450,6 +501,11 @@ export function App() {
                 onListMcpContent={listMcpContent}
                 onPrepareMcpContent={prepareMcpContent}
                 onDismissMcpContent={dismissMcpContent}
+                files={chatFiles}
+                fileNotice={fileNotice?.sessionId === conversation.id ? fileNotice.text : null}
+                onAttachFiles={attachFiles}
+                onRemoveFile={removeFile}
+                onClearFileNotice={clearFileNotice}
                 disabled={composerDisabled}
                 running={runHere}
                 working={runHere}
@@ -465,9 +521,9 @@ export function App() {
                 onListTabs={listTabs}
                 onSend={(text) => {
                   scroll.scrollToBottom();
-                  sendPrompt(text, ask?.id, mcpAttachments.filter(item => item.sessionId === conversation.id).map(item => item.id));
+                  sendPrompt(text, ask?.id, chatContentIds(), readyFileIds());
                 }}
-                onSteer={(text) => steer(text, ask?.id, mcpAttachments.filter(item => item.sessionId === conversation.id).map(item => item.id))}
+                onSteer={(text) => steer(text, ask?.id, chatContentIds(), readyFileIds())}
                 onStop={cancelRun}
               />
             </div>
