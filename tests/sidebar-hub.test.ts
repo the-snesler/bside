@@ -239,7 +239,8 @@ describe("SidebarHub: views", () => {
         asked.push(views.map((view) => view.sessionId));
         return views.map((view) => ({ conversation: { id: view.sessionId }, runs: [] }) as unknown as RuntimeSnapshot);
       },
-      attachView: async (view) => { view.sessionId = sessionFor(view.windowId); },
+      // A pop-out view shows the session its hash names, else a new one.
+      attachView: async (view, requested) => { view.sessionId = view.kind === "sidebar" ? sessionFor(view.windowId) : requested ?? "fresh"; },
       detachView: (view) => { detached.push(view.sessionId); },
       releaseOwner: (owner) => { released.push(owner); },
       handleCommand: async (command, owner) => { commands.push({ type: command.type, owner }); },
@@ -355,5 +356,62 @@ describe("SidebarHub: views", () => {
     expect(released).toEqual([port]);
     expect(hub.views()).toEqual([]);
     expect(hub.viewOf(port)).toBeNull();
+  });
+
+  /** A Port as Firefox sends it from one of this extension's pages (or another sender), optionally in a tab. */
+  const from = (url: string, tab?: number, id = browser.runtime.id) =>
+    Object.assign(fakePort(), { sender: { id, url, ...(tab === undefined ? {} : { tab: { id: tab, windowId: 1 } }) } });
+  const attached = async (hub: SidebarHub, port: FakePort, command: Record<string, unknown>) => {
+    hub.handleConnect(port);
+    await port.send({ v: 1, id: crypto.randomUUID(), type: "view.attach", ...command });
+    return hub.viewOf(port);
+  };
+
+  it("accepts exactly the sidebar and pop-out pages of this extension, and a pop-out only in a tab", async () => {
+    const { hub } = recordingHub();
+    const sidebar = browser.runtime.getURL("/sidepanel.html");
+    const chat = browser.runtime.getURL("/chat.html");
+    expect(await attached(hub, from(sidebar), { windowId: 1 })).toMatchObject({ kind: "sidebar", windowId: 1 });
+    expect(await attached(hub, from(`${chat}#/abc`, 42), { popOut: { sessionId: "abc" } })).toEqual({ kind: "tab", tabId: 42, sessionId: "abc" });
+    expect(await attached(hub, from(chat, 43), { popOut: { sessionId: null } })).toEqual({ kind: "tab", tabId: 43, sessionId: "fresh" });
+
+    // Other pages and senders are never attached: not even their commands are read.
+    for (const port of [
+      from(chat), // a pop-out page outside a tab
+      from(`${chat}?x=1`, 44),
+      from(browser.runtime.getURL("/options.html"), 45),
+      from(browser.runtime.getURL("/onboarding.html")),
+      from(`${chat}x`, 46),
+      from(chat, 47, "another-extension@example"),
+      from("https://example.com/chat.html", 48, "another-extension@example"),
+    ]) {
+      expect(await attached(hub, port, port.sender?.tab ? { popOut: { sessionId: "abc" } } : { windowId: 1 })).toBeNull();
+      expect(port.received).toEqual([]);
+    }
+    expect(hub.views().map((view) => view.kind)).toEqual(["sidebar", "tab", "tab"]);
+  });
+
+  it("attaches a pop-out page only as its own tab's view, with no page, Ask chip, or composer focus", async () => {
+    const query = vi.spyOn(browser.tabs, "query").mockResolvedValue([tab(10, 1)] as never);
+    try {
+      const { hub } = recordingHub();
+      const chat = browser.runtime.getURL("/chat.html");
+      // The page cannot choose its form or tab: a sidebar attach from chat.html, or a pop-out attach from the sidebar, never attaches.
+      expect(await attached(hub, from(chat, 7), { windowId: 1 })).toBeNull();
+      expect(await attached(hub, from(browser.runtime.getURL("/sidepanel.html")), { popOut: { sessionId: "abc" } })).toBeNull();
+      const popOut = from(`${chat}#/abc`, 8);
+      expect(await attached(hub, popOut, { popOut: { sessionId: "abc", tabId: 99 } })).toEqual({ kind: "tab", tabId: 8, sessionId: "abc" });
+
+      const sidebar = await connect(hub, 1);
+      hub.publishAsk(1, null);
+      hub.focusComposer(1);
+      await hub.refreshAttachment();
+      expect(sidebar.received.map((event) => event.type)).toEqual(["ask.changed", "composer.focus"]);
+      expect(popOut.received.map((event) => event.type)).toEqual([]);
+      // It answers like any view, and gets the shared events.
+      await popOut.send({ v: 1, id: "s", type: "state.subscribe", lastSeq: null });
+      hub.publishSessions([]);
+      expect(popOut.received.map((event) => [event.type, event.conversationId])).toEqual([["state.snapshot", "abc"], ["session.listed", null]]);
+    } finally { query.mockRestore(); }
   });
 });

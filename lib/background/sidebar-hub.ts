@@ -1,13 +1,15 @@
 /**
  * Owns the "agent-sidebar:v1" Port: attaches each Port as a view
- * (`view.attach`: the sidebar of one window, showing one session), answers
- * `state.subscribe` with that view's authoritative `state.snapshot` or a gap
- * replay, sends each view `page.attached` whenever its window's active tab's
- * attachability changes, and publishes sequenced run events on behalf of
+ * (`view.attach`: the sidebar of one window, or a pop-out page in a tab of
+ * its own, each showing one session), answers `state.subscribe` with that
+ * view's authoritative `state.snapshot` or a gap replay, sends each sidebar
+ * view `page.attached` whenever its window's active tab's attachability
+ * changes, and publishes sequenced run events on behalf of
  * `BackgroundRuntime` (the `delegate`). A Port that has not attached gets no
  * snapshot, and its other commands wait until it does. Run, queue,
  * session-list, agent-tab, and permission events go to every Port; the Ask
- * chip, composer focus, and page attachment only to their window's views.
+ * chip, composer focus, and page attachment only to their window's sidebar
+ * views (a pop-out view has none of them).
  * Port disconnect is transport loss only — it never cancels anything.
  *
  * Every run has its own sequence numbers (1, 2, …) and replay buffer
@@ -47,7 +49,7 @@ const UNSUPPORTED_HOSTNAME_SUFFIXES = [".mozilla.org", ".mozilla.com"];
  * tab changes, through that view's own session commands, and when the
  * session is deleted; `sessionId` is `""` until the view has attached.
  */
-export interface ChatView {
+export interface SidebarView {
   readonly kind: "sidebar";
   readonly windowId: number;
   sessionId: string;
@@ -55,11 +57,32 @@ export interface ChatView {
   tabId: number | null;
 }
 
+/**
+ * One attached pop-out page (`chat.html`), in a tab of its own: identified
+ * by its Port's sender tab, never by anything the page says. It has no
+ * window page or Ask chip and never follows the active tab; the runtime
+ * picks `sessionId` from the page's hash when it attaches and changes it
+ * through the view's own session commands and when the session is deleted.
+ */
+export interface PopOutView {
+  readonly kind: "tab";
+  /** The pop-out page's own tab. */
+  readonly tabId: number;
+  sessionId: string;
+}
+
+/** An attached Port's view: a window's sidebar, or a pop-out tab. */
+export type ChatView = SidebarView | PopOutView;
+
 export interface SidebarHubDelegate {
   /** One snapshot per view, in order, sharing one read of what views have in common (and one pending notice). */
   getSnapshots(views: readonly ChatView[]): Promise<RuntimeSnapshot[]>;
-  /** A Port's `view.attach`: picks the session the new view shows and sets its `sessionId`. */
-  attachView(view: ChatView): Promise<void>;
+  /**
+   * A Port's `view.attach`: picks the session the new view shows and sets
+   * its `sessionId`; for a pop-out view, `requested` is the session its
+   * page's hash names (`null`: none).
+   */
+  attachView(view: ChatView, requested?: string | null): Promise<void>;
   /** An attached view's Port closed: its session may no longer be shown anywhere. */
   detachView?(view: ChatView): void;
   /** A sidebar Port closed: what it prepared and has not sent (MCP content, attached files) is dropped. */
@@ -87,6 +110,8 @@ interface RunLog {
 
 /** A connected Port and, once it has sent `view.attach`, its view. */
 interface Connection {
+  /** A pop-out page's Port (`chat.html`), with its sender tab; null for a sidebar's. */
+  popOutTab: number | null;
   view: ChatView | null;
   /** Set by the first `view.attach`; later ones are ignored, whether it succeeded or not. */
   attaching: boolean;
@@ -110,7 +135,7 @@ export class SidebarHub {
     return this.#pages.get(windowId) ?? null;
   }
 
-  /** Every attached view (one per connected sidebar that has finished `view.attach`). */
+  /** Every attached view (one per connected sidebar or pop-out page that has finished `view.attach`). */
   views(): ChatView[] {
     return [...this.#ports.values()].flatMap((connection) => connection.view?.sessionId ? [connection.view] : []);
   }
@@ -149,13 +174,28 @@ export class SidebarHub {
     this.#toWindow(windowId, { v: 1, runId: null, conversationId: null, seq: 0, type: "composer.focus", at: Date.now(), payload: null });
   }
 
+  /**
+   * Accepts a Port from this extension's sidebar (`/sidepanel.html`) or a
+   * pop-out page (`/chat.html`, in a tab, whose id names its view); exact
+   * paths, any hash. Anything else (a web page, a content script, another
+   * extension page) is ignored. A Port with no sender is a test's sidebar.
+   */
   handleConnect(port: Browser.runtime.Port): void {
     if (port.name !== SIDEBAR_PORT_NAME) return;
-    // A page/content script cannot impersonate the native sidebar Port.
-    if (port.sender && (port.sender.id !== browser.runtime.id || port.sender.url?.replace(/#.*$/s, "") !== browser.runtime.getURL("/sidepanel.html"))) return;
+    let popOutTab: number | null = null;
+    if (port.sender) {
+      // A page/content script cannot impersonate the native sidebar Port or a pop-out page.
+      if (port.sender.id !== browser.runtime.id) return;
+      const page = port.sender.url?.replace(/#.*$/s, "");
+      if (page === browser.runtime.getURL("/chat.html")) {
+        const tabId = port.sender.tab?.id;
+        if (!Number.isSafeInteger(tabId) || tabId! < 0) return;
+        popOutTab = tabId!;
+      } else if (page !== browser.runtime.getURL("/sidepanel.html")) return;
+    }
     let settle!: (view: ChatView | null) => void;
     const ready = new Promise<ChatView | null>((resolve) => { settle = resolve; });
-    const connection: Connection = { view: null, attaching: false, ready, settle };
+    const connection: Connection = { popOutTab, view: null, attaching: false, ready, settle };
     this.#ports.set(port, connection);
     port.onMessage.addListener((message: unknown) => this.#handleMessage(port, message));
     port.onDisconnect.addListener(() => {
@@ -165,17 +205,17 @@ export class SidebarHub {
       const view = connection.view;
       connection.view = null;
       if (view?.sessionId) this.delegate?.detachView?.(view);
-      for (const windowId of this.#pages.keys()) if (!this.views().some((other) => other.windowId === windowId)) this.#pages.delete(windowId);
+      for (const windowId of this.#pages.keys()) if (!this.#sidebarViews().some((other) => other.windowId === windowId)) this.#pages.delete(windowId);
     });
   }
 
   /**
-   * Re-evaluates the active tab of every window with a view, and sends each
-   * window's views its page when that changed. Windows without a view are
-   * not tracked.
+   * Re-evaluates the active tab of every window with a sidebar view, and
+   * sends each window's views its page when that changed. Windows without
+   * one are not tracked, and pop-out views have no page.
    */
   async refreshAttachment(): Promise<void> {
-    const windows = new Set(this.views().map((view) => view.windowId));
+    const windows = new Set(this.#sidebarViews().map((view) => view.windowId));
     if (windows.size === 0) {
       this.#pages.clear();
       return;
@@ -188,7 +228,7 @@ export class SidebarHub {
       if (this.#pages.has(windowId) && attachmentsEqual(this.#pages.get(windowId)!, next)) continue;
       this.#pages.set(windowId, next);
       for (const [port, connection] of this.#ports) {
-        if (connection.view?.sessionId && connection.view.windowId === windowId) this.#sendAttachment(port, next);
+        if (connection.view?.sessionId && connection.view.kind === "sidebar" && connection.view.windowId === windowId) this.#sendAttachment(port, next);
       }
     }
   }
@@ -275,7 +315,7 @@ export class SidebarHub {
     const connection = this.#ports.get(port);
     if (!connection) return;
     if (message.type === "view.attach") {
-      await this.#attach(port, connection, message.windowId);
+      await this.#attach(port, connection, message);
       return;
     }
     // Commands sent before the Port attached wait for it; a Port that never attaches is never answered.
@@ -319,17 +359,27 @@ export class SidebarHub {
   }
 
   /**
-   * Attaches a Port once, as the sidebar view of `windowId`: the delegate
-   * picks its session, then the view gets its window's page. Repeated
+   * Attaches a Port once: a sidebar's as the view of its window (the
+   * delegate picks its session, then the view gets its window's page), a
+   * pop-out page's as the view of its sender tab, showing the session its
+   * hash names if that still exists. A sidebar's Port sending the pop-out
+   * form, or a pop-out page's the sidebar form, never attaches. Repeated
    * `view.attach` commands are ignored.
    */
-  async #attach(port: Browser.runtime.Port, connection: Connection, windowId: number): Promise<void> {
+  async #attach(port: Browser.runtime.Port, connection: Connection, message: Extract<SidebarCommand, { type: "view.attach" }>): Promise<void> {
     if (connection.attaching || !this.delegate) return;
     connection.attaching = true;
-    const view: ChatView = { kind: "sidebar", windowId, sessionId: "", tabId: null };
+    const popOut = "popOut" in message;
+    if (popOut !== (connection.popOutTab !== null)) {
+      connection.settle(null);
+      return;
+    }
+    const view: ChatView = "popOut" in message
+      ? { kind: "tab", tabId: connection.popOutTab!, sessionId: "" }
+      : { kind: "sidebar", windowId: message.windowId, sessionId: "", tabId: null };
     connection.view = view;
     try {
-      await this.delegate.attachView(view);
+      await this.delegate.attachView(view, "popOut" in message ? message.popOut.sessionId : undefined);
     } catch {
       view.sessionId = "";
     }
@@ -339,6 +389,11 @@ export class SidebarHub {
       connection.settle(null);
       return;
     }
+    if (view.kind === "tab") {
+      connection.settle(view);
+      return;
+    }
+    const windowId = view.windowId;
     const known = this.#pages.has(windowId);
     // A window seen for the first time is sent its page by the refresh.
     await this.refreshAttachment().catch(() => {});
@@ -410,7 +465,12 @@ export class SidebarHub {
 
   #toWindow(windowId: number | null, event: SidebarEvent): void {
     if (windowId === null) return;
-    for (const [port, connection] of this.#ports) if (connection.view?.sessionId && connection.view.windowId === windowId) port.postMessage(event);
+    for (const [port, connection] of this.#ports) if (connection.view?.sessionId && connection.view.kind === "sidebar" && connection.view.windowId === windowId) port.postMessage(event);
+  }
+
+  /** Every attached sidebar view (pop-out views have no window page, Ask chip, or composer focus). */
+  #sidebarViews(): SidebarView[] {
+    return this.views().filter((view): view is SidebarView => view.kind === "sidebar");
   }
 
   #postSnapshot(port: Browser.runtime.Port, snapshot: RuntimeSnapshot): void {

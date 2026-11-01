@@ -229,7 +229,7 @@ export interface Screenshot {
 export interface TabControllerBrowserApi {
   tabs: {
     query(query: { active?: boolean; lastFocusedWindow?: boolean; windowId?: number }): Promise<TabSnapshot[]>;
-    create?(properties: { url: string; active: boolean }): Promise<TabSnapshot>;
+    create?(properties: { url: string; active: boolean; windowId?: number; index?: number }): Promise<TabSnapshot>;
     hide?(tabId: number): Promise<number[]>;
     show?(tabId: number): Promise<void>;
     move?(tabId: number, moveProperties: { windowId: number; index: number }): Promise<unknown>;
@@ -322,6 +322,24 @@ export class TabController {
     if (!validateHttpUrl(url) || !isSupportedUrl(url)) throw new Error("Expected a supported HTTP(S) URL.");
     if (!this.#browserApi.tabs.create) throw new Error("Tab creation is unavailable.");
     const tab = await this.#browserApi.tabs.create({ url, active: false });
+    if (tab.id === undefined) throw new Error("Tab creation failed.");
+    return tab.id;
+  }
+
+  /**
+   * Opens one of this extension's own pages (a pop-out chat) as the active
+   * tab right after the active tab of `windowId` (by default the
+   * last-focused window). Returns the new tab's id.
+   */
+  async openExtensionTab(url: string, windowId?: number): Promise<number> {
+    if (!url.startsWith(browser.runtime.getURL("/"))) throw new Error("Expected one of bside's own pages.");
+    if (!this.#browserApi.tabs.create) throw new Error("Tab creation is unavailable.");
+    const [active] = await this.#browserApi.tabs.query(activeTabIn(windowId)).catch(() => []);
+    const tab = await this.#browserApi.tabs.create({
+      url, active: true,
+      ...(active?.windowId !== undefined ? { windowId: active.windowId } : windowId !== undefined ? { windowId } : {}),
+      ...(active?.index !== undefined ? { index: active.index + 1 } : {}),
+    });
     if (tab.id === undefined) throw new Error("Tab creation failed.");
     return tab.id;
   }

@@ -5060,6 +5060,16 @@ describe("BackgroundRuntime: tab chats", () => {
           .filter((tab) => (query.active === undefined || tab.active === query.active) && (query.windowId === undefined || tab.windowId === query.windowId) && (!query.lastFocusedWindow || tab.windowId === 1))
           .map((tab) => ({ ...tab }))),
         update: vi.fn(async (tabId: number, properties: { url: string } | { active: true }) => { if ("active" in properties) activate(tabId); }),
+        // New tabs (pop-out pages) get ids from 100.
+        create: vi.fn(async (properties: { url: string; active: boolean; windowId?: number; index?: number }) => {
+          const id = 100 + tabs.filter((tab) => tab.id >= 100).length;
+          const windowId = properties.windowId ?? 1;
+          const index = properties.index ?? tabs.filter((tab) => tab.windowId === windowId).length;
+          for (const tab of tabs) if (tab.windowId === windowId && tab.index >= index) tab.index += 1;
+          tabs.push({ id, windowId, index, url: properties.url, title: "bside", hidden: false, active: false });
+          if (properties.active) activate(id);
+          return { id, windowId, index, url: properties.url };
+        }),
         hide: vi.fn(async (tabId: number) => { tabs.find((tab) => tab.id === tabId)!.hidden = true; return [tabId]; }),
         show: vi.fn(async (tabId: number) => { tabs.find((tab) => tab.id === tabId)!.hidden = false; }),
         goBack: vi.fn(async () => {}),
@@ -5093,7 +5103,8 @@ describe("BackgroundRuntime: tab chats", () => {
     const provider = options.provider ?? new FakeProvider();
     if (!options.provider) provider.script = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
     const focus = { window: 1 };
-    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: world.factory, windows: { getLastFocused: async () => ({ id: focus.window }) } });
+    const focusWindow = vi.fn(async (windowId: number, _info: { focused: boolean }) => { focus.window = windowId; });
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: world.factory, windows: { getLastFocused: async () => ({ id: focus.window }), update: focusWindow } });
     hub.delegate = runtime;
     await runtime.initialize();
     const one = fakePort();
@@ -5106,7 +5117,7 @@ describe("BackgroundRuntime: tab chats", () => {
       world.activate(tabId);
       await runtime.handleTabActivated(tabId, world.tabs.find((tab) => tab.id === tabId)!.windowId);
     };
-    return { ...world, hub, runtime, provider, one, two, send, shows, switchTo, focus };
+    return { ...world, hub, runtime, provider, one, two, send, shows, switchTo, focus, focusWindow };
   }
 
   const items = async (sessionId: string) => (await getConversation(sessionId))?.items.flatMap((item) => item.kind === "message" ? [item.text] : []);
@@ -5343,5 +5354,156 @@ describe("BackgroundRuntime: tab chats", () => {
     await vi.waitFor(() => expect(chatValue(21)).toBeUndefined());
     const second = await attachView(hub, fakePort(), 2, false);
     expect(hub.viewOf(second)!.sessionId).not.toBe(results);
+  });
+
+  describe("pop-out chats", () => {
+    const chatPage = (sessionId: string | null) => `${browser.runtime.getURL("/chat.html")}${sessionId === null ? "" : `#/${sessionId}`}`;
+
+    /** A pop-out page (`chat.html#/<hash>`) in tab `tabId` connecting and attaching, as the page does when it loads; `close` is its Port closing. */
+    async function popOutPage(hub: SidebarHub, tabId: number, hash: string | null) {
+      let disconnect = () => {};
+      const port = Object.assign(fakePort(), {
+        sender: { id: browser.runtime.id, url: chatPage(hash), tab: { id: tabId, windowId: 1 } },
+        onDisconnect: { addListener: (listener: () => void) => { disconnect = listener; } },
+      });
+      hub.handleConnect(port);
+      await port.send({ v: 1, id: crypto.randomUUID(), type: "view.attach", popOut: { sessionId: hash } });
+      return { port, close: () => disconnect() };
+    }
+    const lastSnapshot = (port: FakePort) => port.received.findLast((event) => event.type === "state.snapshot")?.payload as RuntimeSnapshot | undefined;
+
+    it("opens a chat in a tab right after the active tab, keeps it in the sidebar, and focuses that tab the next time", async () => {
+      const { hub, runtime, api, tabs, one, send, shows, switchTo, chatValue, focus, focusWindow } = await setup();
+      await send(one, { type: "run.start", prompt: "About A" });
+      const chat = shows(one);
+      await send(one, { type: "session.popOut", sessionId: chat });
+      expect(api.tabs.create).toHaveBeenCalledTimes(1);
+      expect(api.tabs.create).toHaveBeenCalledWith({ url: chatPage(chat), active: true, windowId: 1, index: 1 });
+      // Firefox switches to the new tab before its page connects: the sidebar keeps showing the chat.
+      await runtime.handleTabActivated(100, 1);
+      expect(shows(one)).toBe(chat);
+      const page = await popOutPage(hub, 100, chat);
+      expect(hub.viewOf(page.port)).toEqual({ kind: "tab", tabId: 100, sessionId: chat });
+      expect(shows(one)).toBe(chat);
+      await page.port.send({ v: 1, id: "s", type: "state.subscribe", lastSeq: null });
+      expect(lastSnapshot(page.port)).toMatchObject({ conversation: { id: chat }, page: null, ask: null, viewTabId: 100 });
+
+      // Whenever the pop-out tab is active, the window's sidebar shows its chat; it never gets a tab value.
+      await switchTo(12);
+      expect(shows(one)).not.toBe(chat);
+      await switchTo(100);
+      expect(shows(one)).toBe(chat);
+      await send(one, { type: "run.start", prompt: "From the sidebar" });
+      expect(await items(chat)).toEqual(["About A", "Done.", "From the sidebar", "Done."]);
+      expect(chatValue(100)).toBeUndefined();
+
+      // Popping it out again, from another tab, focuses the tab and its window instead of opening another.
+      await switchTo(11);
+      expect(shows(one)).toBe(chat);
+      focus.window = 2;
+      await send(one, { type: "session.popOut", sessionId: chat });
+      expect(api.tabs.create).toHaveBeenCalledTimes(1);
+      expect(api.tabs.update).toHaveBeenLastCalledWith(100, { active: true });
+      expect(focusWindow).toHaveBeenLastCalledWith(1, { focused: true });
+      expect(tabs.find((tab) => tab.id === 100)!.active).toBe(true);
+    });
+
+    it("refuses to pop out an untouched chat, or a chat the sender's view does not show", async () => {
+      const { api, one, two, send, shows } = await setup();
+      await send(one, { type: "session.popOut", sessionId: shows(one) });
+      expect(lastSnapshot(one)?.notice).toMatch(/Send a message first/);
+      await send(two, { type: "run.start", prompt: "About C" });
+      await send(one, { type: "session.popOut", sessionId: shows(two) });
+      expect(lastSnapshot(one)?.notice).toMatch(/This chat changed/);
+      expect(api.tabs.create).not.toHaveBeenCalled();
+    });
+
+    it("shows a pop-out the chat its hash names, or a new empty chat when that is gone, and changes only its own chat", async () => {
+      const { hub, one, send, shows, chatValue } = await setup();
+      await send(one, { type: "run.start", prompt: "About A" });
+      const chat = shows(one);
+      const page = await popOutPage(hub, 100, "gone-chat");
+      const view = () => hub.viewOf(page.port)!;
+      const fresh = view().sessionId;
+      expect(fresh).not.toBe("gone-chat");
+      expect(await items(fresh)).toEqual([]);
+
+      // Its history drawer opens a chat there alone; the empty chat it left is gone, and no tab is bound.
+      await send(page.port, { type: "session.open", sessionId: chat });
+      expect(view().sessionId).toBe(chat);
+      expect(await getConversation(fresh)).toBeNull();
+      expect(chatValue(100)).toBeUndefined();
+      expect(lastSnapshot(page.port)?.conversation.id).toBe(chat);
+
+      // New chat there leaves the chat it showed, and the sidebar, alone.
+      await send(page.port, { type: "session.create" });
+      expect(view().sessionId).not.toBe(chat);
+      expect(await items(view().sessionId)).toEqual([]);
+      expect(shows(one)).toBe(chat);
+
+      // Deleting its chat elsewhere gives it a new empty chat.
+      await send(page.port, { type: "session.open", sessionId: chat });
+      await send(one, { type: "session.delete", sessionId: chat, closeAgentTabs: true });
+      expect(view().sessionId).not.toBe(chat);
+      expect(await items(view().sessionId)).toEqual([]);
+    });
+
+    it("starts a pop-out's runs with no page and no Ask chip, binding no tab", async () => {
+      const { hub, runtime, provider, one, send, shows, chatValue } = await setup();
+      await send(one, { type: "run.start", prompt: "About A" });
+      const chat = shows(one);
+      const page = await popOutPage(hub, 100, chat);
+      await send(page.port, { type: "run.start", prompt: "Next" });
+      const users = (await getConversation(chat))!.items.flatMap((item) => item.kind === "message" && item.role === "user" ? [item.context?.url ?? null] : []);
+      expect(users).toEqual(["https://a.test/", null]);
+      expect(JSON.stringify(provider.requests.at(-1)!.context.messages.at(-1))).not.toContain("PAGE_11");
+      expect(chatValue(100)).toBeUndefined();
+
+      // Window 1's chip is the sidebar's: a pop-out can neither see nor send it.
+      runtime.setAsk(buildAskContext("selection", { selectionText: "Chip" }, { id: 11, url: "https://a.test/", title: "A" }, "ask-a", 1)!, 1);
+      await page.port.send({ v: 1, id: "s", type: "state.subscribe", lastSeq: null });
+      expect(lastSnapshot(page.port)?.ask).toBeNull();
+      await send(page.port, { type: "run.start", prompt: "With the chip", askId: "ask-a" });
+      expect(await items(chat)).toEqual(["About A", "Done.", "Next", "Done."]);
+      expect(lastSnapshot(one)?.ask?.id).toBe("ask-a");
+    });
+
+    it("has the sidebar follow the pop-out's chat while its tab is active, and drops an untouched pop-out chat once its page closes", async () => {
+      const { hub, runtime, api, tabs, one, send, shows, switchTo } = await setup();
+      await send(one, { type: "run.start", prompt: "About A" });
+      const chat = shows(one);
+      // A pop-out page the user reopened (or reloaded) with no chat in its hash.
+      await api.tabs.create({ url: chatPage(null), active: true, windowId: 1, index: 1 });
+      await runtime.handleTabActivated(100, 1);
+      const unbound = shows(one);
+      expect(unbound).not.toBe(chat);
+      const page = await popOutPage(hub, 100, null);
+      const empty = hub.viewOf(page.port)!.sessionId;
+      expect(shows(one)).toBe(empty);
+      expect(lastSnapshot(one)?.conversation.id).toBe(empty);
+      // The sidebar's own empty chat, which nothing shows now, is gone.
+      expect(await getConversation(unbound)).toBeNull();
+
+      // Opening a chat in the pop-out shows it in the sidebar too; the pop-out's empty chat goes.
+      await send(page.port, { type: "session.open", sessionId: chat });
+      expect(shows(one)).toBe(chat);
+      expect(lastSnapshot(one)?.conversation.id).toBe(chat);
+      expect(await getConversation(empty)).toBeNull();
+
+      // The pop-out page closes: the sidebar follows its tab again, to an empty chat, until the user switches.
+      page.close();
+      runtime.handleTabRemoved(100);
+      await vi.waitFor(() => expect(shows(one)).not.toBe(chat));
+      tabs.splice(tabs.findIndex((tab) => tab.id === 100), 1);
+      await switchTo(11);
+      expect(shows(one)).toBe(chat);
+
+      // An untouched pop-out chat goes once its page closes, like any untouched chat no view shows.
+      const second = await popOutPage(hub, 101, null);
+      const untouched = hub.viewOf(second.port)!.sessionId;
+      second.close();
+      await vi.waitFor(async () => expect(await getConversation(untouched)).toBeNull());
+      expect(await getConversation(chat)).not.toBeNull();
+    });
   });
 });

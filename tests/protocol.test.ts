@@ -47,6 +47,18 @@ describe("isSidebarCommand: accepts every valid variant", () => {
     }
   });
 
+  it("accepts a pop-out's view.attach with its hash's session or none, and session.popOut with a session", () => {
+    expect(isSidebarCommand({ v: 1, id: "1", type: "view.attach", popOut: { sessionId: "s1" } })).toBe(true);
+    expect(isSidebarCommand({ v: 1, id: "1", type: "view.attach", popOut: { sessionId: null } })).toBe(true);
+    for (const popOut of [null, [], "s1", {}, { sessionId: "" }, { sessionId: "../x" }, { sessionId: 3 }]) {
+      expect(isSidebarCommand({ v: 1, id: "1", type: "view.attach", popOut })).toBe(false);
+    }
+    // One form or the other, never both.
+    expect(isSidebarCommand({ v: 1, id: "1", type: "view.attach", windowId: 1, popOut: { sessionId: "s1" } })).toBe(false);
+    expect(isSidebarCommand({ v: 1, id: "1", type: "session.popOut", sessionId: "s1" })).toBe(true);
+    for (const sessionId of [undefined, null, "", "a b", 1]) expect(isSidebarCommand({ v: 1, id: "1", type: "session.popOut", sessionId })).toBe(false);
+  });
+
   it("accepts run.steer and the queue commands only with their fields", () => {
     expect(isSidebarCommand({ v: 1, id: "1", type: "run.steer", runId: "r1", text: "Use tab 2", sessionId: "s1" })).toBe(true);
     expect(isSidebarCommand({ v: 1, id: "1", type: "run.steer", runId: "r1", text: "Use tab 2" })).toBe(false);

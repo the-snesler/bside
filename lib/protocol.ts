@@ -534,6 +534,15 @@ export type SidebarCommand =
    * command that names or implies "the open session" is checked against that view.
    */
   | { v: 1; id: string; type: "view.attach"; windowId: number }
+  /**
+   * A pop-out page's (`chat.html`) first command: attaches its Port as the
+   * view of its own tab (the Port's sender tab), showing `popOut.sessionId`,
+   * the session its URL's hash names (`null` when it names none). A session
+   * that no longer exists is replaced by a new empty chat. The view has no
+   * page or Ask chip, never follows the active tab, and the tab shows its
+   * chat in its window's sidebar while it is the active tab.
+   */
+  | { v: 1; id: string; type: "view.attach"; popOut: { sessionId: string | null } }
   | { v: 1; id: string; type: "skills.list" }
   /** The tabs this view's chat can mention: the user's own, and that chat's agent tabs. */
   | { v: 1; id: string; type: "tabs.list" }
@@ -601,6 +610,13 @@ export type SidebarCommand =
    * The session's scratch files are deleted with it; its agent tabs are closed, or with `closeAgentTabs: false` shown and handed to the user.
    */
   | { v: 1; id: string; type: "session.delete"; sessionId: string; closeAgentTabs: boolean }
+  /**
+   * Opens `sessionId`, the session this view shows, in a tab of its own
+   * (`chat.html#/<sessionId>`): focuses the session's pop-out tab if it has
+   * one, else opens one right after the active tab of this view's window.
+   * Refused for another session than the view's, and for an untouched new chat.
+   */
+  | { v: 1; id: string; type: "session.popOut"; sessionId: string }
   /** Sets a user title, which is never auto-overwritten. */
   | { v: 1; id: string; type: "session.rename"; sessionId: string; title: string }
   | { v: 1; id: string; type: "session.pin"; sessionId: string; pinned: boolean }
@@ -726,13 +742,13 @@ export interface RuntimeSnapshot {
   settings: AppSettingsV1;
   /** The permission mode beside the composer; it applies to the active run at its next gated call. */
   permissionMode: PermissionMode;
-  /** The active tab of this view's window, when it can be attached. */
+  /** The active tab of this view's window, when it can be attached; always null for a pop-out view. */
   page: AttachedPage | null;
   /**
-   * The tab this view shows its chat for (its window's active tab, whatever
-   * page it shows), or null when the window reported none. One empty chat
-   * stands for every tab no chat is bound to, so the sidebar keeps that
-   * chat's unsent text per tab.
+   * The tab this view shows its chat for (a sidebar's window's active tab,
+   * whatever page it shows; a pop-out's own tab), or null when the window
+   * reported none. One empty chat stands for every tab no chat is bound to,
+   * so the sidebar keeps that chat's unsent text per tab.
    */
   viewTabId: number | null;
   agentTabs: AgentTabsState;
@@ -842,7 +858,12 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (candidate.type === "mcp.content.list") return isSessionId(candidate.sessionId) && (candidate.kind === "prompt" || candidate.kind === "resource");
   if (candidate.type === "mcp.content.prepare") return isSessionId(candidate.sessionId) && isAskId(candidate.choiceId) && isMcpArguments(candidate.arguments);
   if (candidate.type === "mcp.content.dismiss") return isSessionId(candidate.sessionId) && isContentIds(candidate.contentIds);
-  if (candidate.type === "view.attach") return isWindowId(candidate.windowId);
+  if (candidate.type === "view.attach") {
+    if (!("popOut" in candidate)) return isWindowId(candidate.windowId);
+    const popOut = candidate.popOut as Record<string, unknown> | null;
+    return candidate.windowId === undefined && typeof popOut === "object" && popOut !== null && !Array.isArray(popOut) &&
+      (popOut.sessionId === null || isSessionId(popOut.sessionId));
+  }
   if (candidate.type === "skills.list") return true;
   if (candidate.type === "tabs.list") return true;
   if (candidate.type === "tabs.focus") return Number.isSafeInteger(candidate.tabId);
@@ -861,7 +882,7 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (candidate.type === "workspace.image") return isSessionId(candidate.sessionId) && isWorkspacePath(candidate.path) && isViewableImagePath(candidate.path);
   if (candidate.type === "context.export") return isSessionId(candidate.sessionId);
   if (candidate.type === "session.create" || candidate.type === "session.list") return true;
-  if (candidate.type === "session.open") return isSessionId(candidate.sessionId);
+  if (candidate.type === "session.open" || candidate.type === "session.popOut") return isSessionId(candidate.sessionId);
   if (candidate.type === "session.delete") return isSessionId(candidate.sessionId) && typeof candidate.closeAgentTabs === "boolean";
   if (candidate.type === "session.rename") {
     return isSessionId(candidate.sessionId) && typeof candidate.title === "string" && candidate.title.length <= MAX_SESSION_TITLE_LEN * 4;
