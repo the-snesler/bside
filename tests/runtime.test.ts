@@ -428,9 +428,14 @@ describe("BackgroundRuntime: memory", () => {
     await store.write({ slot: 0, path: "/workspace/shot.png", kind: "binary", mimeType: "image/png", data: "iVBORw0KGgo=", bytes: 8 });
     await store.write({ slot: 1, path: "/workspace/doc.pdf", kind: "binary", mimeType: "application/pdf", data: "JVBERi0=", bytes: 5 });
     await store.write({ slot: 2, path: "/workspace/notes.png.md", kind: "text", content: "hi" });
+    // An image the user attached is served by its record's type, never its name.
+    await store.write({ slot: 3, path: "/workspace/uploads/photo.png", kind: "upload", name: "photo.png", mimeType: "image/png", data: "iVBORw0KGgo=", bytes: 8, text: false });
+    await store.write({ slot: 4, path: "/workspace/uploads/fake.png", kind: "upload", name: "fake.png", mimeType: "application/octet-stream", data: "iVBORw0KGgo=", bytes: 8, text: false });
     const image = (path: string, session = sessionId) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), type: "workspace.image", sessionId: session, path });
     expect(await image("/workspace/shot.png")).toEqual({ workspaceImage: { ok: true, mimeType: "image/png", data: "iVBORw0KGgo=" } });
     expect(await image("/workspace/gone.png")).toEqual({ workspaceImage: { ok: false, reason: "missing" } });
+    expect(await image("/workspace/uploads/photo.png")).toEqual({ workspaceImage: { ok: true, mimeType: "image/png", data: "iVBORw0KGgo=" } });
+    expect(await image("/workspace/uploads/fake.png")).toEqual({ workspaceImage: { ok: false, reason: "missing" } });
     expect(await image("/workspace/shot.png", "another-session")).toEqual({ workspaceImage: { ok: false, reason: "session" } });
 
     const [asking, other] = [fakePort(), fakePort()];

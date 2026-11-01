@@ -213,9 +213,9 @@ describe("binary /workspace files", () => {
     const { run, files } = setupProgram();
     const big = "A".repeat(WORKSPACE_MAX_BINARY_BYTES / 3 * 4);
     await expect(files.write("/workspace/huge.jpg", { kind: "binary", mimeType: "image/jpeg", data: `${big}AAAA`, bytes: WORKSPACE_MAX_BINARY_BYTES + 3 })).rejects.toThrow("Workspace limits");
-    const fits = WORKSPACE_MAX_BINARY_TOTAL_BYTES / WORKSPACE_MAX_BINARY_BYTES;
+    const fits = Math.floor(WORKSPACE_MAX_BINARY_TOTAL_BYTES / WORKSPACE_MAX_BINARY_BYTES);
     for (let n = 0; n < fits; n++) await files.write(`/workspace/p${n}.jpg`, { kind: "binary", mimeType: "image/jpeg", data: big, bytes: WORKSPACE_MAX_BINARY_BYTES });
-    await expect(files.write("/workspace/over.jpg", { kind: "binary", mimeType: "image/jpeg", data: "AAAA", bytes: 3 })).rejects.toThrow("Workspace limits");
+    await expect(files.write("/workspace/over.jpg", { kind: "binary", mimeType: "image/jpeg", data: big, bytes: WORKSPACE_MAX_BINARY_BYTES })).rejects.toThrow("Workspace limits");
     // Replacing a file counts its new size, not both.
     await files.write("/workspace/p0.jpg", { kind: "binary", mimeType: "image/jpeg", data: "AAAA", bytes: 3 });
     await expect(files.write("/workspace/p0.png", { kind: "binary", mimeType: "image/jpeg", data: "AAAA", bytes: 3 })).rejects.toThrow("matching extension");

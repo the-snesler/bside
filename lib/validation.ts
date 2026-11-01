@@ -115,17 +115,27 @@ export function validateElementTarget(raw: unknown): ElementTarget | null {
   return null;
 }
 
+/**
+ * One file for a file input: a file name, any syntactically valid MIME type,
+ * and either text (≤ `MAX_UPLOAD_FILE_CHARS`) or canonical base64 of 1 to
+ * `WORKSPACE_MAX_UPLOAD_BYTES` bytes (a saved binary or the user's upload,
+ * whose record, not its name, decides the type).
+ */
 function validateUploadFile(raw: unknown): UploadFile | null {
-  if (!isObject(raw)) return null;
-  if (!isBoundedString(raw.name, 255) || /[\\/\x00-\x1f]/.test(raw.name)) return null;
+  if (!isObject(raw) || !isFileName(raw.name) || !isMimeType(raw.mimeType)) return null;
   if (hasExactKeys(raw, ["name", "mimeType", "base64"])) {
-    if (!isBinaryFile(raw.name, raw.mimeType, raw.base64)) return null;
-    return { name: raw.name, mimeType: raw.mimeType as string, base64: raw.base64 as string };
+    const bytes = base64Bytes(raw.base64);
+    if (bytes === null || bytes < 1 || bytes > WORKSPACE_MAX_UPLOAD_BYTES) return null;
+    return { name: raw.name, mimeType: raw.mimeType, base64: raw.base64 as string };
   }
   if (!hasExactKeys(raw, ["name", "mimeType", "text"])) return null;
-  if (typeof raw.mimeType !== "string" || !/^[a-z]+\/[a-z0-9.+-]+$/i.test(raw.mimeType)) return null;
   if (typeof raw.text !== "string" || raw.text.length > MAX_UPLOAD_FILE_CHARS) return null;
   return { name: raw.name, mimeType: raw.mimeType, text: raw.text };
+}
+
+/** Decoded bytes of an upload action's binary files together: at most `WORKSPACE_MAX_BINARY_TOTAL_BYTES`. */
+function uploadBytes(files: readonly UploadFile[]): number {
+  return files.reduce((sum, file) => sum + ("base64" in file ? base64Bytes(file.base64) ?? 0 : 0), 0);
 }
 
 /** Strict, `additionalProperties:false`-equivalent validation of the closed DOM action union. */
@@ -186,7 +196,7 @@ export function validateDomAction(raw: unknown): DomAction | null {
       if (!t || !hasExactKeys(raw, ["kind", "target", "files"])) return null;
       if (!Array.isArray(raw.files) || raw.files.length === 0 || raw.files.length > MAX_UPLOAD_FILES) return null;
       const files = raw.files.map(validateUploadFile);
-      if (files.some((file) => file === null)) return null;
+      if (files.some((file) => file === null) || uploadBytes(files as UploadFile[]) > WORKSPACE_MAX_BINARY_TOTAL_BYTES) return null;
       return { kind: "upload", target: t, files: files as UploadFile[] };
     }
     case "scroll": {
@@ -249,8 +259,15 @@ export const WORKSPACE_MAX_FILES = 64;
 export const WORKSPACE_MAX_FILE_CHARS = 32_000;
 /** Most bytes (decoded) one binary `/workspace` file may hold. */
 export const WORKSPACE_MAX_BINARY_BYTES = 1_500_000;
-/** Most bytes (decoded) all of one session's binary files may hold together. */
-export const WORKSPACE_MAX_BINARY_TOTAL_BYTES = 6_000_000;
+/** Most bytes (decoded) one file the user attached (`/workspace/uploads`) may hold. */
+export const WORKSPACE_MAX_UPLOAD_BYTES = 10_000_000;
+/** Most bytes (decoded) all of one session's binary files and uploads may hold together. */
+export const WORKSPACE_MAX_BINARY_TOTAL_BYTES = 25_000_000;
+/** The directory holding the files the user attached; read-only to programs. */
+export const WORKSPACE_UPLOADS_DIR = "/workspace/uploads";
+/** Longest original file name an upload keeps. */
+export const MAX_FILE_NAME_LEN = 255;
+const MAX_MIME_TYPE_LEN = 100;
 /** The binary file types `/workspace` holds, by extension; the extension decides the type. */
 export const WORKSPACE_BINARY_TYPES: Readonly<Record<string, string>> = {
   png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", pdf: "application/pdf",
@@ -274,6 +291,28 @@ export function binaryTypeFor(name: string): string | null {
 export function base64Bytes(data: unknown): number | null {
   if (typeof data !== "string" || data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(data)) return null;
   return (data.length / 4) * 3 - (data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0);
+}
+
+/** A file name as a user's file has it: 1–255 characters, no '/' or '\\', no control characters. */
+export function isFileName(value: unknown): value is string {
+  return isBoundedString(value, MAX_FILE_NAME_LEN) && !/[\\/\x00-\x1f\x7f]/.test(value);
+}
+
+/** Any syntactically valid MIME type (`type/subtype`, no parameters), at most 100 characters. */
+export function isMimeType(value: unknown): value is string {
+  return isBoundedString(value, MAX_MIME_TYPE_LEN) && /^[a-z]+\/[a-z0-9.+-]+$/i.test(value);
+}
+
+/** A path inside `/workspace/uploads/`, where only the user's attachments live. */
+export function isUploadPath(path: string): boolean {
+  return path.startsWith(`${WORKSPACE_UPLOADS_DIR}/`);
+}
+
+/** The bytes as text when they are valid UTF-8 without NUL bytes; null for anything else (a binary). */
+export function utf8Text(bytes: Uint8Array): string | null {
+  if (bytes.includes(0)) return null;
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  catch { return null; }
 }
 
 /** A binary file: an allowed type its name's extension stands for, and 1 to `WORKSPACE_MAX_BINARY_BYTES` base64 bytes. */

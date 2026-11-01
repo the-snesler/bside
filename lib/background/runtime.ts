@@ -871,7 +871,8 @@ export class BackgroundRuntime {
       // Only the open session's files, as the sidebar shows them; a read, never a run effect.
       if (command.sessionId !== await this.#openSession()) return { workspaceImage: { ok: false, reason: "session" } };
       const file = (await loadWorkspaceFiles(command.sessionId)).find((entry) => entry.path === command.path);
-      return { workspaceImage: file?.kind === "binary" && VIEWABLE_IMAGE_TYPES.includes(file.mimeType)
+      // A saved image, or an image the user attached; the record's type decides, never the path.
+      return { workspaceImage: file && file.kind !== "text" && VIEWABLE_IMAGE_TYPES.includes(file.mimeType)
         ? { ok: true, mimeType: file.mimeType, data: file.data }
         : { ok: false, reason: "missing" } };
     }
@@ -973,8 +974,9 @@ export class BackgroundRuntime {
       latestRun?.outputs.length ? fence(`[\n${latestRun.outputs.join(",\n")}\n]`) : "No tool output captured for this chat in this background session.",
       "## Conversation log", fence(JSON.stringify(conversation, null, 2)),
       "## Partial response", fence(this.#runFor(sessionId)?.partialAssistantText ?? ""),
-      "## Scratch files", "This chat's /workspace files, kept until the chat is deleted. Binary files (saved screenshots) are listed by type and size, not exported.",
-      files ? fence(JSON.stringify(Object.fromEntries(files.map((file) => [file.path, file.kind === "text" ? file.content : `[binary ${file.mimeType}, ${file.bytes} bytes]`])), null, 2)) : "The scratch files could not be read.",
+      "## Scratch files", "This chat's /workspace files, kept until the chat is deleted. Binary files (saved screenshots and PDFs) are listed by type and size, and files the user attached (/workspace/uploads) by name, type, and size; their contents are not exported.",
+      files ? fence(JSON.stringify(Object.fromEntries(files.map((file) => [file.path, file.kind === "text" ? file.content
+        : file.kind === "upload" ? `[attached ${JSON.stringify(file.name)}, ${file.mimeType}, ${file.bytes} bytes]` : `[binary ${file.mimeType}, ${file.bytes} bytes]`])), null, 2)) : "The scratch files could not be read.",
     ].join("\n\n") };
   }
 

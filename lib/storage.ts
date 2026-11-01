@@ -27,7 +27,8 @@ import { addRunUsage, EMPTY_USAGE, hasTokens, isValidRunUsage, isValidUsageTotal
 import { DEFAULT_MODEL_ID, DEFAULT_REASONING_EFFORT } from "@/lib/providers/openai-models";
 import { deviceKey, type DeviceKey } from "@/lib/background/device-key";
 import {
-  base64Bytes, binaryTypeFor, isBinaryFile, isSessionId, isWorkspacePath, validatePromptText, WORKSPACE_MAX_BINARY_TOTAL_BYTES, WORKSPACE_MAX_FILE_CHARS, WORKSPACE_MAX_FILES,
+  base64Bytes, binaryTypeFor, isBinaryFile, isFileName, isMimeType, isSessionId, isUploadPath, isWorkspacePath, validatePromptText, WORKSPACE_MAX_BINARY_TOTAL_BYTES,
+  WORKSPACE_MAX_FILE_CHARS, WORKSPACE_MAX_FILES, WORKSPACE_MAX_UPLOAD_BYTES,
 } from "@/lib/validation";
 import type { ScratchFileEntry, ScratchStore } from "@/lib/background/browser-program";
 
@@ -880,42 +881,59 @@ export async function migrateConversation(): Promise<void> {
 // Workspace — each session's /workspace scratch files, one key per file slot.
 //
 // A session has WORKSPACE_MAX_FILES fixed slots, so writing, removing, or
-// renaming a file touches one key (at most WORKSPACE_MAX_FILE_CHARS of text or
-// WORKSPACE_MAX_BINARY_BYTES of binary), never the whole workspace, and deleting a session removes a known key set without
-// listing storage. The slot record carries its path; there is no separate
-// manifest that could disagree with the files.
+// renaming a file touches one key (at most WORKSPACE_MAX_FILE_CHARS of text,
+// WORKSPACE_MAX_BINARY_BYTES of a program's binary, or WORKSPACE_MAX_UPLOAD_BYTES
+// of a file the user attached), never the whole workspace, and deleting a
+// session removes a known key set without listing storage. The slot record
+// carries its path; there is no separate manifest that could disagree with the
+// files.
 // ---------------------------------------------------------------------------
 
-/** One `/workspace` file: text, or a binary of an allowed type as base64 whose type its path's extension names. */
+/**
+ * One `/workspace` file: text, a binary of an allowed type as base64 whose
+ * type its path's extension names, or (only under `/workspace/uploads/`) a
+ * file the user attached, of any type, with its original name, the type its
+ * record names, and whether its bytes are UTF-8 text.
+ */
 export type WorkspaceFileV2 = { version: 2; path: string } & (
   | { kind: "text"; content: string }
   | { kind: "binary"; mimeType: string; data: string; bytes: number }
+  | { kind: "upload"; name: string; mimeType: string; data: string; bytes: number; text: boolean }
 );
 
 const workspaceKey = (id: string, slot: number) => `local:workspace:${id}:${slot}` as const;
 const workspaceKeys = (id: string) => Array.from({ length: WORKSPACE_MAX_FILES }, (_, slot) => workspaceKey(id, slot));
 
-/** The file a slot record holds, revalidated; null when it is malformed. A pre-binary (version 1) record is a text file. */
+/**
+ * The file a slot record holds, revalidated; null when it is malformed. A
+ * pre-binary (version 1) record is a text file. Uploads live only under
+ * `/workspace/uploads/`, and nothing else does.
+ */
 function readWorkspaceFile(value: unknown): WorkspaceFileV2 | null {
   if (typeof value !== "object" || value === null) return null;
   const v = value as Record<string, unknown>;
   if (!isWorkspacePath(v.path)) return null;
+  const upload = isUploadPath(v.path);
   const textType = binaryTypeFor(v.path) === null;
-  if (v.version === 1 && textType && typeof v.content === "string" && v.content.length <= WORKSPACE_MAX_FILE_CHARS) {
+  if (v.version === 1 && !upload && textType && typeof v.content === "string" && v.content.length <= WORKSPACE_MAX_FILE_CHARS) {
     return { version: 2, path: v.path, kind: "text", content: v.content };
   }
-  if (v.version !== 2) return null;
+  if (v.version !== 2 || upload !== (v.kind === "upload")) return null;
   if (v.kind === "text") return textType && typeof v.content === "string" && v.content.length <= WORKSPACE_MAX_FILE_CHARS ? { version: 2, path: v.path, kind: "text", content: v.content } : null;
   if (v.kind === "binary" && isBinaryFile(v.path, v.mimeType, v.data) && base64Bytes(v.data) === v.bytes) {
     return { version: 2, path: v.path, kind: "binary", mimeType: v.mimeType as string, data: v.data as string, bytes: v.bytes as number };
+  }
+  if (v.kind === "upload" && isFileName(v.name) && isMimeType(v.mimeType) && typeof v.text === "boolean" &&
+    typeof v.bytes === "number" && v.bytes >= 1 && v.bytes <= WORKSPACE_MAX_UPLOAD_BYTES && base64Bytes(v.data) === v.bytes) {
+    return { version: 2, path: v.path, kind: "upload", name: v.name, mimeType: v.mimeType, data: v.data as string, bytes: v.bytes, text: v.text };
   }
   return null;
 }
 
 /**
  * A session's scratch files by slot. Malformed slots, later duplicates of a
- * path, and binaries past the session's binary budget are deleted; version 1
- * text records are rewritten as version 2.
+ * path, and binaries or uploads past the session's byte budget are deleted;
+ * version 1 text records are rewritten as version 2.
  */
 export async function loadWorkspaceFiles(sessionId: string): Promise<ScratchFileEntry[]> {
   const slots = await storage.getItems(workspaceKeys(sessionId));
@@ -927,11 +945,11 @@ export async function loadWorkspaceFiles(sessionId: string): Promise<ScratchFile
     if (value === null || value === undefined) continue;
     const file = readWorkspaceFile(value);
     if (!file || files.some((other) => other.path === file.path) ||
-        (file.kind === "binary" && binaryBytes + file.bytes > WORKSPACE_MAX_BINARY_TOTAL_BYTES)) {
+        (file.kind !== "text" && binaryBytes + file.bytes > WORKSPACE_MAX_BINARY_TOTAL_BYTES)) {
       invalid.push(key);
       continue;
     }
-    if (file.kind === "binary") binaryBytes += file.bytes;
+    if (file.kind !== "text") binaryBytes += file.bytes;
     if ((value as { version?: unknown }).version === 1) upgraded.push({ key, value: file });
     const { version: _version, ...entry } = file;
     files.push({ slot, ...entry });
@@ -948,6 +966,11 @@ export function workspaceStore(sessionId: string): ScratchStore {
     write: ({ slot, ...file }) => storage.setItem(workspaceKey(sessionId, slot), { version: 2, ...file } satisfies WorkspaceFileV2),
     remove: (slot) => storage.removeItem(workspaceKey(sessionId, slot)),
   };
+}
+
+/** Removes every `/workspace` slot of these sessions: a change that was in flight when they were deleted may have landed after. */
+export async function removeWorkspaceFiles(sessionIds: readonly string[]): Promise<void> {
+  if (sessionIds.length > 0) await storage.removeItems(sessionIds.flatMap(workspaceKeys));
 }
 
 // ---------------------------------------------------------------------------
