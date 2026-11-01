@@ -27,6 +27,7 @@ import type { SkillSummary } from "@/lib/domain/skills";
 import type { SiteNote } from "@/lib/domain/instructions";
 import type { AskContextV1 } from "@/lib/domain/ask";
 import type { PermissionMode } from "@/lib/domain/permissions";
+import type { AttachmentPrepareResult } from "@/lib/domain/attachments";
 
 export const MAX_REPLAY_EVENTS_PER_RUN = 512;
 export const MAX_REPLAY_EVENTS_TOTAL = 2_048;
@@ -36,9 +37,11 @@ const UNSUPPORTED_HOSTNAME_SUFFIXES = [".mozilla.org", ".mozilla.com"];
 
 export interface SidebarHubDelegate {
   getSnapshot(): Promise<RuntimeSnapshot>;
-  releaseContentOwner?(owner: object): void;
+  /** A sidebar Port closed: what it prepared and has not sent (MCP content, attached files) is dropped. */
+  releaseOwner?(owner: object): void;
   handleCommand(command: SidebarCommand, owner?: object): Promise<{ markdown: string; filename: string } | { tabs: TabMention[] } | { skills: SkillSummary[] } | { sessions: ConversationSummary[] } |
-    { origin: string | null; note: SiteNote | null } | { note: SiteNote | null; error: string | null } | { undone: string[]; error: string | null } | { contentReply: import("@/lib/protocol").McpContentReply } | { workspaceImage: import("@/lib/protocol").WorkspaceImageReply } | void>;
+    { origin: string | null; note: SiteNote | null } | { note: SiteNote | null; error: string | null } | { undone: string[]; error: string | null } | { contentReply: import("@/lib/protocol").McpContentReply } |
+    { workspaceImage: import("@/lib/protocol").WorkspaceImageReply } | { attachmentReply: AttachmentPrepareResult } | void>;
 }
 
 /** A buffered event and its place among every run's events. */
@@ -85,6 +88,13 @@ export class SidebarHub {
     } satisfies SidebarEvent);
   }
 
+  /** Tells the sidebar that prepared these files that the message they went with is persisted. */
+  attachmentsAccepted(owner: object, ids: string[]): void {
+    for (const port of this.#ports) if (port === owner) port.postMessage({
+      v: 1, type: "attachment.accepted", runId: null, conversationId: null, seq: 0, at: Date.now(), payload: { ids },
+    } satisfies SidebarEvent);
+  }
+
   focusComposer(): void {
     this.#broadcast({ v: 1, runId: null, conversationId: null, seq: 0, type: "composer.focus", at: Date.now(), payload: null });
   }
@@ -97,7 +107,7 @@ export class SidebarHub {
     port.onMessage.addListener((message: unknown) => this.#handleMessage(port, message));
     port.onDisconnect.addListener(() => {
       this.#ports.delete(port);
-      this.delegate?.releaseContentOwner?.(port);
+      this.delegate?.releaseOwner?.(port);
     });
     this.#sendAttachment(port, this.#attachment);
   }
@@ -194,6 +204,9 @@ export class SidebarHub {
     const result = await this.delegate.handleCommand(message, port);
     if (result && "contentReply" in result) port.postMessage({
       v: 1, type: "mcp.content.reply", runId: null, conversationId: "sessionId" in message ? message.sessionId ?? null : null, seq: 0, at: Date.now(), payload: { requestId: message.id, result: result.contentReply },
+    } satisfies SidebarEvent);
+    if (message.type === "attachment.prepare" && result && "attachmentReply" in result) port.postMessage({
+      v: 1, type: "attachment.prepared", runId: null, conversationId: message.sessionId, seq: 0, at: Date.now(), payload: { requestId: message.id, result: result.attachmentReply },
     } satisfies SidebarEvent);
     if (message.type === "skills.list" && result && "skills" in result) port.postMessage({
       v: 1, type: "skills.listed", runId: null, conversationId: null, seq: 0, at: Date.now(), payload: result,

@@ -788,6 +788,18 @@ export class BrowserProgram {
     return this.#images.splice(0);
   }
 
+  /**
+   * Counts one image shown to the model outside a program (an image the user
+   * attached to the current turn) against the run's image budget, and taints
+   * the run; false, counting nothing, once the budget is spent.
+   */
+  showImage(): boolean {
+    if (this.#imagesUsed >= this.maxImages) return false;
+    this.#imagesUsed += 1;
+    this.#tainted = true;
+    return true;
+  }
+
   /** Records that the model has seen refs from this document and its frames (e.g. the initial page artifact). */
   observe(tabId: number, documentId: string, frames: Record<string, string> = {}): void {
     this.state.observed.set(tabId, { documentId, frames });

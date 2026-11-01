@@ -240,3 +240,234 @@ describe("PreparedAttachments", () => {
     expect(() => prepared.prepare(file(), owner)).toThrow("disconnected");
   });
 });
+
+describe("BackgroundRuntime: attached files", () => {
+  it("answers prepare privately and refuses another chat", async () => {
+    const f = await fixture({ credential: false });
+    const other = fakePort();
+    f.hub.handleConnect(other);
+    const result = await f.prepare("photo", "image/png", PNG);
+    expect(result).toEqual({ attachment: { id: expect.any(String), name: "photo", mimeType: "image/png", bytes: PNG.length, text: false } });
+    expect(other.received.some((event) => event.type === "attachment.prepared")).toBe(false);
+    expect(f.port.received.find((event) => event.type === "attachment.prepared")).toMatchObject({ conversationId: f.sessionId });
+    expect(await f.prepare("a.txt", "", text("x"), f.port, "another-chat")).toEqual({ error: "This chat changed. Attach the file again." });
+    expect(await f.prepare("a.txt", "", new Uint8Array())).toEqual({ error: "a.txt is empty." });
+  });
+
+  it("writes the files on send, keeps references on the message, and shows images on the current turn only", async () => {
+    const f = await fixture();
+    const photo = await f.prepared("photo.png", "image/png", PNG);
+    const notes = await f.prepared("My notes.md", "text/markdown", text("# Notes"));
+    const archive = await f.prepared("data.zip", "application/zip", ZIP);
+    const ids = [photo.id, notes.id, archive.id];
+    await f.port.send({ v: 1, id: "start", type: "run.start", prompt: "Look at these", sessionId: f.sessionId, attachmentIds: ids });
+
+    const refs: AttachmentRefV1[] = [
+      { v: 1, path: "/workspace/uploads/photo.png", name: "photo.png", mimeType: "image/png", bytes: PNG.length, text: false },
+      { v: 1, path: "/workspace/uploads/My-notes.md", name: "My notes.md", mimeType: "text/markdown", bytes: 7, text: true },
+      { v: 1, path: "/workspace/uploads/data.zip", name: "data.zip", mimeType: "application/zip", bytes: ZIP.length, text: false },
+    ];
+    expect((await f.userItems())[0]).toMatchObject({ text: "Look at these", attachments: refs });
+    expect((await f.uploads()).map((file) => [file.path, file.kind === "upload" && file.name])).toEqual(refs.map((ref) => [ref.path, ref.name]));
+    expect(f.port.received.filter((event) => event.type === "attachment.accepted")).toEqual([expect.objectContaining({ payload: { ids } })]);
+    expect(f.port.received.find((event) => event.type === "run.started")).toMatchObject({ payload: { attachments: refs } });
+
+    const first = parts(f.provider.requests[0]!.context.messages[0]);
+    expect(first[0]!.text).toBe(`Look at these\n\n${renderAttachments(refs)}`);
+    expect(first.filter((part) => part.type === "image")).toEqual([{ type: "image", mimeType: "image/jpeg", data: b64(text("scaled")) }]);
+    expect(first.some((part) => part.text === "Attached image /workspace/uploads/photo.png:")).toBe(true);
+    expect(f.provider.requests[0]!.context.systemPrompt).not.toContain("photo.png");
+
+    // Sent once: the ids are spent.
+    await f.port.send({ v: 1, id: "again", type: "run.start", prompt: "Again", sessionId: f.sessionId, attachmentIds: [photo.id] });
+    expect(await f.notice()).toContain("no longer available");
+    expect(await f.userItems()).toHaveLength(1);
+
+    // Later turns replay the list as text, byte-identically, without the image.
+    await f.port.send({ v: 1, id: "next", type: "run.start", prompt: "And now?" });
+    await f.port.send({ v: 1, id: "third", type: "run.start", prompt: "Once more" });
+    const replayed = f.provider.requests[1]!.context.messages[0];
+    expect(parts(replayed)).toEqual([{ type: "text", text: first[0]!.text }]);
+    expect(JSON.stringify(f.provider.requests[2]!.context.messages[0])).toBe(JSON.stringify(replayed));
+  });
+
+  it("counts images against the run's budget, taints the run, and leaves an untainted run for names alone", async () => {
+    const f = await fixture();
+    let round = 0;
+    f.provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      if (round++ % 2 === 0) {
+        yield { type: "tool.call", call: { id: `save-${round}`, name: "browser_program", arguments: { source: `fs.write("/memory/note-${round}.md", "A note\\nDurable detail");` } } } as ScriptedProviderEvent;
+        yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+      } else yield* answer;
+    } });
+    const notes = await f.prepared("notes.txt", "text/plain", text("names only"));
+    await f.port.send({ v: 1, id: "a", type: "run.start", prompt: "Remember", sessionId: f.sessionId, attachmentIds: [notes.id] });
+    const photo = await f.prepared("photo.png", "image/png", PNG);
+    await f.port.send({ v: 1, id: "b", type: "run.start", prompt: "Remember this too", sessionId: f.sessionId, attachmentIds: [photo.id] });
+    const memories = await listMemories();
+    expect(memories.find((memory) => memory.name === "note-1")?.provenance).toMatchObject({ tainted: false });
+    expect(memories.find((memory) => memory.name === "note-3")?.provenance).toMatchObject({ tainted: true });
+  });
+
+  it("notes instead of images for a model without image input", async () => {
+    const f = await fixture({ provider: new FakeProvider({ ...TEST_MODEL, input: ["text"] }) });
+    const photo = await f.prepared("photo.png", "image/png", PNG);
+    await f.port.send({ v: 1, id: "a", type: "run.start", prompt: "See", sessionId: f.sessionId, attachmentIds: [photo.id] });
+    const sent = parts(f.provider.requests[0]!.context.messages[0]);
+    expect(sent.some((part) => part.type === "image")).toBe(false);
+    expect(sent.at(-1)!.text).toContain("does not accept images");
+  });
+
+  it("refuses a send when the chat's files are full, writing nothing and keeping the files pending", async () => {
+    const f = await fixture();
+    const store = workspaceStore(f.sessionId);
+    for (let slot = 0; slot < 64; slot++) await store.write({ slot, path: `/workspace/n${slot}.txt`, kind: "text", content: "x" });
+    const photo = await f.prepared("photo.png", "image/png", PNG);
+    const command = { v: 1, id: "a", type: "run.start", prompt: "See", sessionId: f.sessionId, attachmentIds: [photo.id] };
+    await f.port.send(command);
+    expect(await f.notice()).toContain("files are full");
+    expect(await f.userItems()).toEqual([]);
+    expect(await f.uploads()).toEqual([]);
+    expect(f.provider.requests).toHaveLength(0);
+    await store.remove(0);
+    await f.port.send(command);
+    expect((await f.userItems())[0]?.attachments).toHaveLength(1);
+  });
+
+  it("removes the written files when the message cannot be saved, and the files stay pending", async () => {
+    const f = await fixture();
+    const photo = await f.prepared("photo.png", "image/png", PNG);
+    const originalSet = browser.storage.local.set.bind(browser.storage.local);
+    const fail = vi.spyOn(browser.storage.local, "set").mockImplementation(async (items) => {
+      const chunk = (items as Record<string, unknown>)[`conversation:${f.sessionId}:items:0`] as { items?: ConversationItem[] } | undefined;
+      if (chunk?.items?.some((item) => item.kind === "message" && item.role === "user")) throw new Error("private storage error");
+      await originalSet(items);
+    });
+    const command = { v: 1, id: "a", type: "run.start", prompt: "See", sessionId: f.sessionId, attachmentIds: [photo.id] };
+    await f.port.send(command);
+    fail.mockRestore();
+    expect(await f.notice()).toContain("Could not save this message");
+    expect(await f.uploads()).toEqual([]);
+    expect(f.port.received.some((event) => event.type === "attachment.accepted")).toBe(false);
+    await f.port.send(command);
+    // The same name: the first write was removed, not left to collide.
+    expect((await f.userItems())[0]?.attachments?.map((ref) => ref.path)).toEqual(["/workspace/uploads/photo.png"]);
+  });
+
+  it("refuses another sidebar's ids and a closed sidebar's", async () => {
+    const f = await fixture();
+    const photo = await f.prepared("photo.png", "image/png", PNG);
+    const other = fakePort();
+    f.hub.handleConnect(other);
+    await other.send({ v: 1, id: "a", type: "run.start", prompt: "See", sessionId: f.sessionId, attachmentIds: [photo.id] });
+    expect(await f.notice()).toContain("no longer available");
+    expect(await f.uploads()).toEqual([]);
+    f.runtime.releaseOwner(f.port);
+    await f.port.send({ v: 1, id: "b", type: "run.start", prompt: "See", sessionId: f.sessionId, attachmentIds: [photo.id] });
+    expect(await f.notice()).toContain("no longer available");
+    expect(await f.userItems()).toEqual([]);
+  });
+
+  it("dismisses pending files", async () => {
+    const f = await fixture();
+    const photo = await f.prepared("photo.png", "image/png", PNG);
+    await f.port.send({ v: 1, id: "d", type: "attachment.dismiss", sessionId: f.sessionId, attachmentIds: [photo.id] });
+    await f.port.send({ v: 1, id: "a", type: "run.start", prompt: "See", sessionId: f.sessionId, attachmentIds: [photo.id] });
+    expect(await f.notice()).toContain("no longer available");
+  });
+
+  it.each(["follow-up", "steer"] as const)("keeps references on a queued %s through delivery, without images on a steer", async (mode) => {
+    const f = await fixture();
+    const gate = Promise.withResolvers<void>();
+    let round = 0;
+    f.provider.script = () => ({ [Symbol.asyncIterator]: async function* () {
+      if (round++ === 0) {
+        await gate.promise;
+        yield { type: "tool.call", call: { id: "wait", name: "current_time", arguments: {} } } as ScriptedProviderEvent;
+        yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+      } else yield* answer;
+    } });
+    const running = f.port.send({ v: 1, id: "start", type: "run.start", prompt: "Start" });
+    await vi.waitFor(() => expect(f.provider.requests).toHaveLength(1));
+    const runId = (await f.runtime.getSnapshot()).runs[0]!.runId;
+    const photo = await f.prepared("photo.png", "image/png", PNG);
+    await f.port.send(mode === "steer"
+      ? { v: 1, id: "s", type: "run.steer", runId, text: "Use this", sessionId: f.sessionId, attachmentIds: [photo.id] }
+      : { v: 1, id: "s", type: "run.start", prompt: "Use this", sessionId: f.sessionId, attachmentIds: [photo.id] });
+    const ref = { v: 1, path: "/workspace/uploads/photo.png", name: "photo.png", mimeType: "image/png", bytes: PNG.length, text: false };
+    expect(await loadMessageQueue(f.sessionId)).toEqual([expect.objectContaining({ mode, text: "Use this", attachments: [ref] })]);
+    expect(f.port.received.filter((event) => event.type === "attachment.accepted")).toHaveLength(1);
+    expect((await f.uploads()).map((file) => file.path)).toEqual([ref.path]);
+    gate.resolve();
+    await running;
+    await vi.waitFor(async () => expect((await f.runtime.getSnapshot()).runs).toEqual([]));
+    const item = (await f.userItems()).find((message) => message.text === "Use this");
+    expect(item).toMatchObject({ attachments: [ref], ...(mode === "steer" ? { delivery: "steer" } : {}) });
+    const request = f.provider.requests.at(-1)!;
+    const message = request.context.messages.find((entry) => entry.role === "user" && parts(entry)[0]!.text?.startsWith("Use this"))!;
+    expect(parts(message)[0]!.text).toContain(renderAttachments([ref as AttachmentRefV1]));
+    // A follow-up is its own turn and shows the image; a steer lists it for fs.view.
+    expect(parts(message).some((part) => part.type === "image")).toBe(mode === "follow-up");
+    expect(isTurnStart(item!)).toBe(mode === "follow-up");
+  });
+
+  it("removes a removed follow-up's files", async () => {
+    const f = await fixture();
+    const gate = Promise.withResolvers<void>();
+    f.provider.script = () => ({ [Symbol.asyncIterator]: async function* () { await gate.promise; yield* answer; } });
+    const running = f.port.send({ v: 1, id: "start", type: "run.start", prompt: "Start" });
+    await vi.waitFor(() => expect(f.provider.requests).toHaveLength(1));
+    const photo = await f.prepared("photo.png", "image/png", PNG);
+    await f.port.send({ v: 1, id: "q", type: "run.start", prompt: "Later", sessionId: f.sessionId, attachmentIds: [photo.id] });
+    const [queued] = await loadMessageQueue(f.sessionId);
+    expect(await f.uploads()).toHaveLength(1);
+    await f.port.send({ v: 1, id: "rm", type: "queue.remove", sessionId: f.sessionId, messageId: queued!.id });
+    expect(await f.uploads()).toEqual([]);
+    gate.resolve();
+    await running;
+  });
+
+  it("retries a failed turn with its files and shows its images again", async () => {
+    const f = await fixture();
+    f.provider.script = () => ({ [Symbol.asyncIterator]: async function* () { throw new ProviderStreamError("Try again", "NETWORK"); } });
+    const photo = await f.prepared("photo.png", "image/png", PNG);
+    await f.port.send({ v: 1, id: "a", type: "run.start", prompt: "See", sessionId: f.sessionId, attachmentIds: [photo.id] });
+    f.provider.script = answer;
+    await f.port.send({ v: 1, id: "retry", type: "run.retry" });
+    expect(await f.userItems()).toHaveLength(1);
+    expect(JSON.stringify(f.provider.requests.at(-1)!.context.messages[0])).toBe(JSON.stringify(f.provider.requests[0]!.context.messages[0]));
+    expect(parts(f.provider.requests.at(-1)!.context.messages[0]).some((part) => part.type === "image")).toBe(true);
+  });
+
+  it("revalidates stored references", async () => {
+    const f = await fixture({ credential: false });
+    const ref = { v: 1, path: "/workspace/uploads/a.txt", name: "a.txt", mimeType: "text/plain", bytes: 1, text: true } as const;
+    await expect(saveMessageQueue(f.sessionId, [{ id: "q", mode: "follow-up", text: "x", attachments: [{ ...ref, path: "/workspace/a.txt" }], at: 1 }])).rejects.toThrow();
+    await browser.storage.local.set({ [`queue:${f.sessionId}`]: { version: 1, messages: [{ id: "q", mode: "follow-up", text: "x", attachments: [{ ...ref, bytes: -1 }], at: 1 }] } });
+    expect(await loadMessageQueue(f.sessionId)).toEqual([]);
+    await saveMessageQueue(f.sessionId, [{ id: "q", mode: "follow-up", text: "x", attachments: [ref], at: 1 }]);
+    expect(await loadMessageQueue(f.sessionId)).toEqual([{ id: "q", mode: "follow-up", text: "x", attachments: [ref], at: 1 }]);
+  });
+
+  it("leaves no files behind when the chat is deleted while a send writes them", async () => {
+    const f = await fixture();
+    const photo = await f.prepared("photo.png", "image/png", PNG);
+    const writing = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    const originalSet = browser.storage.local.set.bind(browser.storage.local);
+    const hold = vi.spyOn(browser.storage.local, "set").mockImplementation(async (items) => {
+      if (Object.keys(items as object).some((key) => key.startsWith(`workspace:${f.sessionId}:`))) { writing.resolve(); await resume.promise; }
+      await originalSet(items);
+    });
+    const sending = f.port.send({ v: 1, id: "a", type: "run.start", prompt: "See", sessionId: f.sessionId, attachmentIds: [photo.id] });
+    await writing.promise;
+    const deleting = f.port.send({ v: 1, id: "del", type: "session.delete", sessionId: f.sessionId, closeAgentTabs: true });
+    resume.resolve();
+    await Promise.all([sending, deleting]);
+    hold.mockRestore();
+    const keys = Object.keys(await browser.storage.local.get(null));
+    expect(keys.filter((key) => key.startsWith(`workspace:${f.sessionId}:`))).toEqual([]);
+    expect(await getConversation(f.sessionId)).toBeNull();
+    expect(f.provider.requests).toHaveLength(0);
+  });
+});
