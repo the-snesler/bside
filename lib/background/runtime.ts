@@ -59,6 +59,7 @@ import {
   loadWorkspaceFiles,
   saveMessageQueue,
   workspaceStore,
+  removeWorkspaceFiles,
   listSessions,
   migrateConversation,
   pruneSessions,
@@ -197,6 +198,8 @@ interface ActiveRun {
   outcome: "completed" | "cancelled" | "failed" | null;
   /** Set when `#endRun` starts: the run writes no more checkpoints, and it ends only once. */
   ended: boolean;
+  /** Gives up the run's hold on its session's shared scratch files (idempotent); called when its slot is released. */
+  releaseFiles: () => void;
 }
 
 interface AskAcceptance {
@@ -234,6 +237,16 @@ export class BackgroundRuntime {
    * run by id), and `#anyRun`/`#runs` (any or every run).
    */
   #runs = new Map<string, ActiveRun>();
+  /**
+   * Each session's `/workspace`, one `ScratchFiles` shared by the session's
+   * run and every write of the user's attachments, so their changes apply one
+   * at a time and never share a slot, and each sees the other's files. Kept
+   * while held (`#holdScratchFiles`: a run from its claim to its slot's
+   * release, or one `withScratchFiles` call), dropped once the last holder
+   * releases it and its queued changes settle, and closed when the session
+   * is deleted.
+   */
+  #scratch = new Map<string, { files: ScratchFiles; holders: number }>();
   #notice: string | null = null;
   #clock: RuntimeClock;
   #workspace: WorkspaceState;
@@ -745,11 +758,69 @@ export class BackgroundRuntime {
     return [...this.#runs.values()].map((run) => run.sessionId);
   }
 
-  /** Releases a run's slot and its leases on the user's tabs, unless another run has already replaced it. */
+  /** Releases a run's slot and its leases on the user's tabs, unless another run has already replaced it, and its hold on its scratch files. */
   #removeRun(run: ActiveRun): void {
+    run.releaseFiles();
     if (this.#runs.get(run.runId) !== run) return;
     this.#runs.delete(run.runId);
     this.#workspace.releaseRunLeases(run.runId);
+  }
+
+  /**
+   * Holds `sessionId`'s shared scratch files, creating them (loaded from
+   * storage on first use) when no one holds them. `release` (idempotent)
+   * gives the hold up; the last release drops the instance once its queued
+   * changes settle, so a later instance never loads under a pending write.
+   */
+  #holdScratchFiles(sessionId: string): { files: ScratchFiles; release: () => void } {
+    let held = this.#scratch.get(sessionId);
+    if (!held) {
+      held = { files: new ScratchFiles(workspaceStore(sessionId)), holders: 0 };
+      this.#scratch.set(sessionId, held);
+    }
+    const entry = held;
+    entry.holders += 1;
+    let released = false;
+    return {
+      files: entry.files,
+      release: () => {
+        if (released) return;
+        released = true;
+        entry.holders -= 1;
+        if (entry.holders > 0) return;
+        void entry.files.settled().then(() => {
+          if (entry.holders === 0 && this.#scratch.get(sessionId) === entry) this.#scratch.delete(sessionId);
+        });
+      },
+    };
+  }
+
+  /**
+   * Runs `use` on `sessionId`'s shared scratch files, held until it settles:
+   * the background's own path to them outside a run (e.g. writing the user's
+   * attachments with `ScratchFiles.attach`, or `discard` to roll them back).
+   * No sidebar, content-script, or program message reaches it directly.
+   */
+  async withScratchFiles<T>(sessionId: string, use: (files: ScratchFiles) => Promise<T>): Promise<T> {
+    const { files, release } = this.#holdScratchFiles(sessionId);
+    try { return await use(files); }
+    finally { release(); }
+  }
+
+  /**
+   * Closes deleted sessions' shared scratch files once their queued changes
+   * settle, so nothing writes their slots afterwards, then removes any slot a
+   * change in flight at the deletion wrote after the session's storage went.
+   */
+  async #closeScratchFiles(ids: readonly string[]): Promise<void> {
+    const closing = ids.filter((id) => this.#scratch.has(id));
+    if (!closing.length) return;
+    await Promise.allSettled(closing.map((id) => {
+      const { files } = this.#scratch.get(id)!;
+      this.#scratch.delete(id);
+      return files.close();
+    }));
+    await removeWorkspaceFiles(closing).catch(() => {});
   }
 
   /** Records `diagnostics` as `sessionId`'s latest run's, dropping the least recently run sessions past the bound. */
@@ -1109,6 +1180,7 @@ export class BackgroundRuntime {
       this.#retryable.delete(id);
       this.#diagnostics.delete(id);
     }
+    await this.#closeScratchFiles(ids);
     await this.#withQueueLock(async () => {
       for (const id of ids) {
         for (const message of this.#queues.get(id) ?? []) this.#queueClaims.delete(message.id);
@@ -1179,7 +1251,10 @@ export class BackgroundRuntime {
     try {
       await setOpenSessionId(id);
       this.#openSessionId = id;
-      if (previous !== id && !this.#runFor(previous) && await isSessionUntouched(previous)) await deleteSession(previous);
+      if (previous !== id && !this.#runFor(previous) && await isSessionUntouched(previous)) {
+        await deleteSession(previous);
+        await this.#closeScratchFiles([previous]);
+      }
     } finally { release(); }
   }
 
@@ -1609,8 +1684,9 @@ export class BackgroundRuntime {
     const runId = accepted?.runId ?? crypto.randomUUID();
     const controller = new AbortController();
     const tabController = this.#tabControllerFactory();
-    // The session's scratch files load on the first program that uses them; memory is global and read at each use.
-    const scope = { state: this.#workspace, runId, sessionId, files: new ScratchFiles(workspaceStore(sessionId)), skills: new Map<string, Skill>(), sites: this.#sites,
+    // The session's shared scratch files load on the first program (or attachment) that uses them; memory is global and read at each use.
+    const files = this.#holdScratchFiles(sessionId);
+    const scope = { state: this.#workspace, runId, sessionId, files: files.files, skills: new Map<string, Skill>(), sites: this.#sites,
       memory: runMemory(sessionId, runId) };
     const agentLoop = new AgentLoop(this.#provider, tabController, this.#sidebarHub, scope);
     const run: ActiveRun = {
@@ -1632,6 +1708,7 @@ export class BackgroundRuntime {
       turnPersisted: retry,
       outcome: null,
       ended: false,
+      releaseFiles: files.release,
     };
     this.#runs.set(runId, run);
 

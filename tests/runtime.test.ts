@@ -19,7 +19,7 @@ import {
   saveOpenAICredential, appendConversationItem, createSession, ensureOpenSession, getConversation, getOpenAICredential, getOpenSessionId,
   listSessions, loadMessageQueue, saveHistorySettings, saveMessageQueue, saveRunCheckpoint, setOpenSessionId, updateSession,
   getAppSettings, saveAppSettings, getSiteNotes, getRunCheckpoint, listRunCheckpoints,
-  getScheduledTasks, getNotificationSettings, saveNotificationSettings, workspaceStore,
+  getScheduledTasks, getNotificationSettings, saveNotificationSettings, workspaceStore, loadWorkspaceFiles,
 } from "@/lib/storage";
 import type { ConversationItem, ConversationSummary } from "@/lib/domain/conversation";
 import { isTurnStart } from "@/lib/domain/conversation";
@@ -2198,6 +2198,63 @@ describe("BackgroundRuntime: session-scoped workspace and agent tabs", () => {
     await restarted.handleCommand({ v: 1, id: "delete", type: "session.delete", sessionId: alpha, closeAgentTabs: true });
     expect(await workspaceKeys(alpha)).toEqual([]);
     expect(await workspaceKeys(beta)).toHaveLength(1);
+  });
+
+  const attachment = (name: string, text = name) => ({ name, mimeType: "text/plain", data: btoa(text), bytes: text.length, text: true });
+
+  it("shares one /workspace per chat between its run and the user's attachments, then loads it afresh once neither holds it", async () => {
+    const { runtime, provider, send, exported } = await setup();
+    const attached = Promise.withResolvers<void>();
+    const waiting = Promise.withResolvers<void>();
+    let round = 0;
+    provider.script = () => {
+      const current = round++;
+      return { [Symbol.asyncIterator]: async function* () {
+        if (current === 0) {
+          // Loads the run's view of the workspace before anything is attached.
+          yield { type: "tool.call", call: { id: "list", name: "browser_program", arguments: { source: 'return fs.list("/workspace");' } } } as ScriptedProviderEvent;
+        } else if (current === 1) {
+          waiting.resolve();
+          await attached.promise;
+          yield { type: "tool.call", call: { id: "write", name: "browser_program", arguments: { source: 'await fs.write("/workspace/notes.md", "n"); return fs.list("/workspace");' } } } as ScriptedProviderEvent;
+        } else {
+          yield { type: "text.delta", delta: "Done." } as ScriptedProviderEvent;
+        }
+        yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
+      } };
+    };
+    const started = send({ type: "run.start", prompt: "Work" });
+    await waiting.promise;
+    expect(await runtime.withScratchFiles(owner, (files) => files.attach([attachment("cv.txt", "cv")]))).toEqual(["/workspace/uploads/cv.txt"]);
+    attached.resolve();
+    await started;
+    // The run saw the attachment, and its own write took the next slot instead of overwriting it.
+    expect(modelInput(provider)).toContain("/workspace/uploads/cv.txt");
+    expect((await loadWorkspaceFiles(owner)).map((file) => [file.slot, file.path])).toEqual([[0, "/workspace/uploads/cv.txt"], [1, "/workspace/notes.md"]]);
+    // Exported by name, type, and size only.
+    expect(await exported(owner)).toContain('"/workspace/uploads/cv.txt": "[attached \\"cv.txt\\", text/plain, 2 bytes]"');
+    expect(await exported(owner)).not.toContain(btoa("cv"));
+
+    // Nobody holds it now, so the next holder reads storage again.
+    await workspaceStore(owner).write({ slot: 5, path: "/workspace/uploads/late.txt", kind: "upload", ...attachment("late.txt") });
+    await tick();
+    expect(await runtime.withScratchFiles(owner, (files) => files.attach([attachment("late.txt")]))).toEqual(["/workspace/uploads/late-2.txt"]);
+  });
+
+  it("closes a deleted chat's /workspace so an attachment in progress writes nothing after the deletion", async () => {
+    const { runtime, send } = await setup();
+    const doomed = (await createSession()).id;
+    const deleted = Promise.withResolvers<void>();
+    const pending = runtime.withScratchFiles(doomed, async (files) => {
+      await files.attach([attachment("first.txt")]);
+      await deleted.promise;
+      return files.attach([attachment("second.txt")]);
+    });
+    await vi.waitFor(async () => expect(await workspaceKeys(doomed)).toHaveLength(1));
+    await send({ type: "session.delete", sessionId: doomed, closeAgentTabs: true });
+    deleted.resolve();
+    await expect(pending).rejects.toMatchObject({ code: "CLOSED" });
+    expect(await workspaceKeys(doomed)).toEqual([]);
   });
 
   it("tags tabs with their chat; other chats neither list nor reach them, and switching chats leaves them alone", async () => {
