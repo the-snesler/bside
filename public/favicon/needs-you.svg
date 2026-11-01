@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -11 64 64" width="64" height="64">
+  <!-- The pop-out tab's favicon (needs-you): bside's face from lib/ui/Mascot.tsx in the icon's colors. -->
+  <rect width="64" height="42" rx="11" fill="#6b82db"/>
+  <circle cx="18.4" cy="18.6" r="11.2" fill="#011773"/>
+  <circle cx="45.6" cy="18.6" r="11.2" fill="#011773"/>
+  <path d="M15.1 13.3L21.7 19.9M21.7 13.3L15.1 19.9" stroke="#6b82db" stroke-width="2.4" stroke-linecap="round"/><circle cx="18.4" cy="16.6" r="2.8" fill="#6b82db"/><circle cx="15.1" cy="13.3" r="2.1" fill="#6b82db"/><circle cx="21.7" cy="13.3" r="2.1" fill="#6b82db"/><circle cx="21.7" cy="19.9" r="2.1" fill="#6b82db"/><circle cx="15.1" cy="19.9" r="2.1" fill="#6b82db"/>
+  <path d="M42.3 13.3L48.9 19.9M48.9 13.3L42.3 19.9" stroke="#6b82db" stroke-width="2.4" stroke-linecap="round"/><circle cx="45.6" cy="16.6" r="2.8" fill="#6b82db"/><circle cx="42.3" cy="13.3" r="2.1" fill="#6b82db"/><circle cx="48.9" cy="13.3" r="2.1" fill="#6b82db"/><circle cx="48.9" cy="19.9" r="2.1" fill="#6b82db"/><circle cx="42.3" cy="19.9" r="2.1" fill="#6b82db"/>
+  <ellipse cx="32" cy="34.2" rx="2.6" ry="2.9" fill="#011773"/>
+  <circle cx="53" cy="-0.5" r="9.5" fill="#fafcda" stroke="#011773" stroke-width="2"/>
+  <rect x="51.4" y="-7" width="3.2" height="8" rx="1.6" fill="#011773"/>
+  <circle cx="53" cy="4.2" r="1.8" fill="#011773"/>
+</svg>

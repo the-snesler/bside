@@ -4,6 +4,23 @@
   height: 100dvh;
   min-width: 240px;
 }
+/* A chat popped out into a tab of its own (entrypoints/chat): one wider, centered column. */
+.sidebar--tab {
+  max-width: 880px;
+  margin: 0 auto;
+}
+.sidebar--tab .sidebar__header {
+  padding: 14px 16px 8px;
+}
+.sidebar--tab .sidebar__title {
+  font-size: 16px;
+}
+.sidebar--tab .sidebar__body {
+  padding: 20px 24px;
+}
+.sidebar--tab .sidebar__composer {
+  padding-bottom: 16px;
+}
 .sidebar__header {
   display: flex;
   align-items: center;

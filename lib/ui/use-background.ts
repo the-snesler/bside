@@ -1,8 +1,10 @@
 /**
  * Preact hook connecting a UI surface to the background's
  * "agent-sidebar:v1" Port. It first attaches the Port as its window's sidebar
- * view (`view.attach`, with the id from `windows.getCurrent()`); the
- * background then answers with that view's chat, page, and Ask chip, and
+ * view (`view.attach`, with the id from `windows.getCurrent()`), or, in a
+ * pop-out page (`mode: "tab"`), as the view of its own tab showing the
+ * session its hash names; the background then answers with that view's
+ * chat, page, and Ask chip (a pop-out has neither), and
  * checks every command naming "the open session" (sent as `sessionId`)
  * against it. The sidebar renders this state; it never owns an
  * inference request, tool loop, transcript authority, or credential read.
@@ -34,6 +36,7 @@ import type { PermissionMode } from "@/lib/domain/permissions";
 import type { TabMention } from "@/lib/protocol";
 import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
 import { EMPTY_USAGE } from "@/lib/domain/usage";
+import { parseChatHash } from "@/lib/ui/chat-tab";
 import type { SiteNote } from "@/lib/domain/instructions";
 
 /** The sidebar's "Remember something about this site" editor, for one page's site. */
@@ -109,6 +112,8 @@ export interface BackgroundActions {
   /** Answers the run's pending help request; `note` is optional (empty for none). */
   resolveHelp(callId: string, outcome: HelpOutcome, note: string): void;
   newChat(): void;
+  /** Opens the open chat in a tab of its own (or focuses the tab it already has). */
+  popOut(): void;
   listSessions(): void;
   openSession(sessionId: string): void;
   renameSession(sessionId: string, title: string): void;
@@ -221,7 +226,10 @@ const INITIAL_STATE: BackgroundState = {
 
 type Port = Browser.runtime.Port;
 
-export function useBackground(): BackgroundState & BackgroundActions {
+/** Where the hook runs: the native sidebar, or a chat popped out into a tab (`chat.html`). */
+export type SurfaceMode = "sidebar" | "tab";
+
+export function useBackground(mode: SurfaceMode = "sidebar"): BackgroundState & BackgroundActions {
   const [state, setState] = useState<BackgroundState>(INITIAL_STATE);
   const portRef = useRef<Port | null>(null);
   const seqsRef = useRef(new RunSeqTracker());
@@ -396,7 +404,9 @@ export function useBackground(): BackgroundState & BackgroundActions {
     port.onMessage.addListener(onMessage);
 
     // The background holds every other command until the Port attaches, so they may be sent at once.
-    void sidebarWindowId().then((windowId) => {
+    // A pop-out page attaches as its own tab's view, showing the chat its hash names.
+    if (mode === "tab") port.postMessage({ v: 1, id: crypto.randomUUID(), type: "view.attach", popOut: { sessionId: parseChatHash(location.hash) } } satisfies SidebarCommand);
+    else void sidebarWindowId().then((windowId) => {
       if (portRef.current !== port || windowId === null) return;
       port.postMessage({ v: 1, id: crypto.randomUUID(), type: "view.attach", windowId } satisfies SidebarCommand);
     });
@@ -560,6 +570,9 @@ export function useBackground(): BackgroundState & BackgroundActions {
   const newChat = useCallback(() => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.create" } satisfies SidebarCommand);
   }, []);
+  const popOut = useCallback(() => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.popOut", sessionId: conversationIdRef.current } satisfies SidebarCommand);
+  }, []);
   const listSessions = useCallback(() => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.list" } satisfies SidebarCommand);
   }, []);
@@ -634,7 +647,7 @@ export function useBackground(): BackgroundState & BackgroundActions {
   }, []);
 
   return {
-    ...state, sendPrompt, steer, removeQueued, sendQueued, retryRun, cancelRun, approveAction, denyAction, resolveHelp, newChat, listSessions, openSession, renameSession, pinSession,
+    ...state, sendPrompt, steer, removeQueued, sendQueued, retryRun, cancelRun, approveAction, denyAction, resolveHelp, newChat, popOut, listSessions, openSession, renameSession, pinSession,
     listMcpContent, prepareMcpContent, dismissMcpContent, attachFiles, removeFile, clearFileNotice,
     dismissAsk: (askId: string) => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "ask.dismiss", askId } satisfies SidebarCommand),
     deleteSession, downloadContext, rememberSite, saveSiteNote, closeSiteNote, undoMemory, loadWorkspaceImage, listTabs, listSkills: () => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "skills.list" } satisfies SidebarCommand), focusTab, closeAgentTabs, watchTab, unwatchTab, takeOverTab, saveSettings, savePermissionMode,
