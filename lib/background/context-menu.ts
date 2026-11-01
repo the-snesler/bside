@@ -10,12 +10,15 @@ export interface EntryPointsApi {
   sidebarAction: { open(): Promise<void> };
 }
 
-/** Listener registration is synchronous; opening stays in the original gesture, before any await. */
+/**
+ * Listener registration is synchronous; opening stays in the original gesture, before any await.
+ * `setAsk` holds the chip for the clicked tab's window, whose sidebar alone shows it; `newChat`
+ * opens a new chat in the last-focused window's sidebar and focuses its composer.
+ */
 export function registerEntryPoints(api: EntryPointsApi, actions: {
-  setAsk(ask: AskContextV1): void;
+  setAsk(ask: AskContextV1, windowId: number): void;
   updateAskAlt(id: string, alt: string | null): void;
   newChat(): Promise<void>;
-  focusComposer(): void;
 }): void {
   void api.menus.removeAll().then(() => {
     for (const kind of ASK_KINDS) api.menus.create({
@@ -32,8 +35,9 @@ export function registerEntryPoints(api: EntryPointsApi, actions: {
     // Firefox requires this call on the gesture's stack, even if validation or initialization takes time.
     void api.sidebarAction.open().catch(() => {});
     const ask = buildAskContext(kind, info, tab ?? {}, crypto.randomUUID(), Date.now());
-    if (!ask) return;
-    actions.setAsk(ask);
+    // A chip belongs to the window it was clicked in; one Firefox names no window for has no sidebar to show it.
+    if (!ask || !Number.isSafeInteger(tab?.windowId) || tab!.windowId! < 0) return;
+    actions.setAsk(ask, tab!.windowId!);
     if (kind !== "image" || !Number.isSafeInteger(info.targetElementId)) return;
     const frameId = info.frameId ?? 0;
     const request: PageMenuTargetRequest = { v: 1, id: crypto.randomUUID(), type: "page.menu-target", frameId, tabId: ask.tabId, targetElementId: info.targetElementId! };
@@ -50,6 +54,6 @@ export function registerEntryPoints(api: EntryPointsApi, actions: {
     // _execute_sidebar_action is handled by Firefox and never fires onCommand.
     if (command !== "new-chat") return;
     void api.sidebarAction.open().catch(() => {});
-    void actions.newChat().then(() => actions.focusComposer());
+    void actions.newChat().catch(() => {});
   });
 }

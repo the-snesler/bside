@@ -215,7 +215,7 @@ export interface Screenshot {
 
 export interface TabControllerBrowserApi {
   tabs: {
-    query(query: { active?: boolean; lastFocusedWindow?: boolean }): Promise<TabSnapshot[]>;
+    query(query: { active?: boolean; lastFocusedWindow?: boolean; windowId?: number }): Promise<TabSnapshot[]>;
     create?(properties: { url: string; active: boolean }): Promise<TabSnapshot>;
     hide?(tabId: number): Promise<number[]>;
     show?(tabId: number): Promise<void>;
@@ -344,12 +344,13 @@ export class TabController {
   }
 
   /**
-   * Moves a hidden tab next to the last-focused window's active tab, shows
-   * it, and switches to it. Returns the tab that was active before, unless it
-   * is the revealed tab itself. A failed move only leaves the tab where it was.
+   * Moves a hidden tab next to the active tab of `windowId` (by default the
+   * last-focused window), shows it, and switches to it. Returns the tab that
+   * was active before, unless it is the revealed tab itself. A failed move
+   * only leaves the tab where it was.
    */
-  async revealTab(tabId: number): Promise<number | null> {
-    const [active] = await this.#browserApi.tabs.query({ active: true, lastFocusedWindow: true });
+  async revealTab(tabId: number, windowId?: number): Promise<number | null> {
+    const [active] = await this.#browserApi.tabs.query(activeTabIn(windowId));
     const previous = active?.id !== undefined && active.id !== tabId ? active.id : null;
     if (previous !== null && active!.windowId !== undefined && this.#browserApi.tabs.move) {
       await this.#browserApi.tabs.move(tabId, { windowId: active!.windowId, index: (active!.index ?? -2) + 1 }).catch(() => {});
@@ -427,9 +428,12 @@ export class TabController {
     };
   }
 
-  /** Binds this controller to the active HTTP(S) tab and captures the head of its outline. */
-  async captureActivePage(): Promise<PageOutcome<{ artifact: PageArtifactSummary; snapshot: PageSnapshot }>> {
-    const tabs = await this.#browserApi.tabs.query({ active: true, lastFocusedWindow: true });
+  /**
+   * Binds this controller to the active HTTP(S) tab of `windowId` (by default
+   * the last-focused window) and captures the head of its outline.
+   */
+  async captureActivePage(windowId?: number): Promise<PageOutcome<{ artifact: PageArtifactSummary; snapshot: PageSnapshot }>> {
+    const tabs = await this.#browserApi.tabs.query(activeTabIn(windowId));
     const tab = tabs[0];
     if (!tab || tab.id === undefined || !isSupportedUrl(tab.url)) {
       return pageError("UNSUPPORTED_PAGE", "This page cannot be attached.");
@@ -1100,4 +1104,9 @@ function sleep(ms: number): Promise<void> {
   const { promise, resolve } = Promise.withResolvers<void>();
   setTimeout(resolve, ms);
   return promise;
+}
+
+/** The query for a window's active tab; the last-focused window's when none is named. */
+function activeTabIn(windowId: number | undefined): { active: true; windowId: number } | { active: true; lastFocusedWindow: true } {
+  return windowId === undefined ? { active: true, lastFocusedWindow: true } : { active: true, windowId };
 }

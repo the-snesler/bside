@@ -420,7 +420,7 @@ describe("sidebar UI contracts", () => {
     expect(background!.lastError?.retryable).toBe(true);
 
     await act(() => background!.retryRun());
-    expect(posted.at(-1)).toMatchObject({ v: 1, type: "run.retry" });
+    expect(posted.at(-1)).toMatchObject({ v: 1, type: "run.retry", sessionId: "s1" });
     expect(isSidebarCommand(posted.at(-1))).toBe(true);
 
     await emit({ runId: "r2", type: "run.started", payload: { prompt: "Find it", page: null, ask: null, retry: true } });
@@ -487,8 +487,31 @@ describe("sidebar UI contracts", () => {
       await act(() => view.current!.cancelRun());
       await act(() => view.current!.approveAction("call-1"));
       await act(() => view.current!.steer("Go on"));
-      expect(posted.slice(-3)).toMatchObject([{ type: "run.cancel", runId: "ra" }, { type: "action.approve", runId: "ra" }, { type: "run.steer", runId: "ra" }]);
+      expect(posted.slice(-3)).toMatchObject([{ type: "run.cancel", runId: "ra" }, { type: "action.approve", runId: "ra" }, { type: "run.steer", runId: "ra", sessionId: "a" }]);
       await unmount();
+    });
+
+    it("attaches its Port as its window's view and names the chat it shows on every send", async () => {
+      const current = vi.spyOn(browser.windows, "getCurrent").mockResolvedValue({ id: 7 } as never);
+      try {
+        const { view, posted, deliver, unmount } = await harness();
+        await vi.waitFor(() => expect(posted.some((message) => message.type === "view.attach")).toBe(true));
+        expect(posted.find((message) => message.type === "view.attach")).toMatchObject({ windowId: 7 });
+        expect(posted.filter((message) => message.type === "view.attach")).toHaveLength(1);
+        for (const message of posted) expect(isSidebarCommand(message)).toBe(true);
+
+        await deliver({ runId: null, conversationId: "b", seq: 0, type: "state.snapshot", payload: snapshotFor("b") });
+        await act(() => view.current!.sendPrompt("Hello"));
+        await act(() => view.current!.steer("Also this"));
+        await act(() => view.current!.retryRun());
+        expect(posted.slice(-3)).toMatchObject([
+          { type: "run.start", prompt: "Hello", sessionId: "b" },
+          { type: "run.start", prompt: "Also this", sessionId: "b" },
+          { type: "run.retry", sessionId: "b" },
+        ]);
+        for (const message of posted.slice(-3)) expect(isSidebarCommand(message)).toBe(true);
+        await unmount();
+      } finally { current.mockRestore(); }
     });
 
     it("skips duplicates, and on a gap skips the event and asks once for every run's missed events", async () => {

@@ -1,6 +1,10 @@
 /**
  * Preact hook connecting a UI surface to the background's
- * "agent-sidebar:v1" Port. The sidebar renders this state; it never owns an
+ * "agent-sidebar:v1" Port. It first attaches the Port as its window's sidebar
+ * view (`view.attach`, with the id from `windows.getCurrent()`); the
+ * background then answers with that view's chat, page, and Ask chip, and
+ * checks every command naming "the open session" (sent as `sessionId`)
+ * against it. The sidebar renders this state; it never owns an
  * inference request, tool loop, transcript authority, or credential read.
  * Between full `state.snapshot` syncs, run-lifecycle events are applied
  * incrementally so the composer/timeline update live without re-fetching.
@@ -387,6 +391,11 @@ export function useBackground(): BackgroundState & BackgroundActions {
     };
     port.onMessage.addListener(onMessage);
 
+    // The background holds every other command until the Port attaches, so they may be sent at once.
+    void sidebarWindowId().then((windowId) => {
+      if (portRef.current !== port || windowId === null) return;
+      port.postMessage({ v: 1, id: crypto.randomUUID(), type: "view.attach", windowId } satisfies SidebarCommand);
+    });
     const subscribe: SidebarCommand = { v: 1, id: crypto.randomUUID(), type: "state.subscribe", lastSeq: null };
     port.postMessage(subscribe);
     port.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.list" } satisfies SidebarCommand);
@@ -409,7 +418,7 @@ export function useBackground(): BackgroundState & BackgroundActions {
 
   // A chat that opens again prepares its waiting files.
   useEffect(() => { void pumpFiles(); }, [state.conversation.id]);
-  // Files of a chat that no longer exists (an untouched chat is deleted when the user leaves it) are dropped.
+  // Files of a chat that no longer exists (an untouched chat is deleted once no sidebar shows it) are dropped.
   useEffect(() => {
     const listed = new Set(state.sessions.map((session) => session.id));
     if (!listed.has(state.conversation.id)) return;
@@ -486,11 +495,11 @@ export function useBackground(): BackgroundState & BackgroundActions {
     setState(prev => ({ ...prev, mcpAttachments: prev.mcpAttachments.filter(item => item.id !== id) }));
   };
 
-  /** A send's prepared selections; either needs the session they were prepared for. */
+  /** A send's session (the open chat, which the background checks against this view) and its prepared selections. */
   const selection = (contentIds?: string[], attachmentIds?: string[]) => ({
+    sessionId: conversationIdRef.current,
     ...(contentIds?.length ? { contentIds } : {}),
     ...(attachmentIds?.length ? { attachmentIds } : {}),
-    ...(contentIds?.length || attachmentIds?.length ? { sessionId: conversationIdRef.current } : {}),
   });
   const sendPrompt = useCallback((prompt: string, askId?: string, contentIds?: string[], attachmentIds?: string[]) => {
     const command: SidebarCommand = { v: 1, id: crypto.randomUUID(), type: "run.start", prompt, ...(askId ? { askId } : {}), ...selection(contentIds, attachmentIds) };
@@ -512,7 +521,7 @@ export function useBackground(): BackgroundState & BackgroundActions {
   }, []);
 
   const retryRun = useCallback(() => {
-    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "run.retry" } satisfies SidebarCommand);
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "run.retry", sessionId: conversationIdRef.current } satisfies SidebarCommand);
   }, []);
 
   const cancelRun = useCallback(() => {
@@ -624,6 +633,14 @@ export function useBackground(): BackgroundState & BackgroundActions {
     dismissAsk: (askId: string) => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "ask.dismiss", askId } satisfies SidebarCommand),
     deleteSession, downloadContext, rememberSite, saveSiteNote, closeSiteNote, undoMemory, loadWorkspaceImage, listTabs, listSkills: () => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "skills.list" } satisfies SidebarCommand), focusTab, closeAgentTabs, watchTab, unwatchTab, takeOverTab, saveSettings, savePermissionMode,
   };
+}
+
+/** This sidebar's window, for `view.attach`; `null` when Firefox names none. */
+async function sidebarWindowId(): Promise<number | null> {
+  try {
+    const id = (await browser.windows.getCurrent())?.id;
+    return Number.isSafeInteger(id) && id! >= 0 ? id! : null;
+  } catch { return null; }
 }
 
 /** Appends a run item to the timeline only when the run belongs to the open session. */

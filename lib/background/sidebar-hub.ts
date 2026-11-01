@@ -1,14 +1,19 @@
 /**
- * Owns the "agent-sidebar:v1" Port: answers `state.subscribe` with the
- * authoritative `state.snapshot` or a gap replay, broadcasts `page.attached`
- * whenever the active tab's attachability changes, and publishes sequenced
- * run events on behalf of `BackgroundRuntime` (the `delegate`). Port
- * disconnect is transport loss only — it never cancels anything.
+ * Owns the "agent-sidebar:v1" Port: attaches each Port as a view
+ * (`view.attach`: the sidebar of one window, showing one session), answers
+ * `state.subscribe` with that view's authoritative `state.snapshot` or a gap
+ * replay, sends each view `page.attached` whenever its window's active tab's
+ * attachability changes, and publishes sequenced run events on behalf of
+ * `BackgroundRuntime` (the `delegate`). A Port that has not attached gets no
+ * snapshot, and its other commands wait until it does. Run, queue,
+ * session-list, agent-tab, and permission events go to every Port; the Ask
+ * chip, composer focus, and page attachment only to their window's views.
+ * Port disconnect is transport loss only — it never cancels anything.
  *
  * Every run has its own sequence numbers (1, 2, …) and replay buffer
  * (`MAX_REPLAY_EVENTS_PER_RUN` events), registered by `startRun` with the
  * run's session, which every event of the run carries and which may differ
- * from the session the sidebar has open. All buffers together keep at most
+ * from the session a sidebar has open. All buffers together keep at most
  * `MAX_REPLAY_EVENTS_TOTAL` events, dropping the oldest first. A run's buffer
  * outlives its terminal event by `ENDED_RUN_GRACE_MS` (at most
  * `MAX_ENDED_RUNS` such runs), so a reconnecting sidebar can still replay its
@@ -35,8 +40,25 @@ export const ENDED_RUN_GRACE_MS = 60_000;
 export const MAX_ENDED_RUNS = 16;
 const UNSUPPORTED_HOSTNAME_SUFFIXES = [".mozilla.org", ".mozilla.com"];
 
+/**
+ * One attached sidebar: the window it belongs to and the session it shows.
+ * The runtime picks `sessionId` when the view attaches and changes it only
+ * through that view's session commands (and when the session is deleted);
+ * it is `""` until the view has attached.
+ */
+export interface ChatView {
+  readonly kind: "sidebar";
+  readonly windowId: number;
+  sessionId: string;
+}
+
 export interface SidebarHubDelegate {
-  getSnapshot(): Promise<RuntimeSnapshot>;
+  /** One snapshot per view, in order, sharing one read of what views have in common (and one pending notice). */
+  getSnapshots(views: readonly ChatView[]): Promise<RuntimeSnapshot[]>;
+  /** A Port's `view.attach`: picks the session the new view shows and sets its `sessionId`. */
+  attachView(view: ChatView): Promise<void>;
+  /** An attached view's Port closed: its session may no longer be shown anywhere. */
+  detachView?(view: ChatView): void;
   /** A sidebar Port closed: what it prepared and has not sent (MCP content, attached files) is dropped. */
   releaseOwner?(owner: object): void;
   handleCommand(command: SidebarCommand, owner?: object): Promise<{ markdown: string; filename: string } | { tabs: TabMention[] } | { skills: SkillSummary[] } | { sessions: ConversationSummary[] } |
@@ -60,17 +82,40 @@ interface RunLog {
   endedAt: number | null;
 }
 
+/** A connected Port and, once it has sent `view.attach`, its view. */
+interface Connection {
+  view: ChatView | null;
+  /** Set by the first `view.attach`; later ones are ignored, whether it succeeded or not. */
+  attaching: boolean;
+  /** Settles with the attached view, or `null` once the Port closes or attaching fails; every command but `view.attach` waits on it. */
+  ready: Promise<ChatView | null>;
+  settle(view: ChatView | null): void;
+}
+
 export class SidebarHub {
   delegate: SidebarHubDelegate | null = null;
 
-  #ports = new Set<Browser.runtime.Port>();
-  #attachment: AttachedPage | null = null;
+  #ports = new Map<Browser.runtime.Port, Connection>();
+  /** The attachable active tab of each window that has a view, as last sent to its views. */
+  #pages = new Map<number, AttachedPage | null>();
   #runs = new Map<string, RunLog>();
   #buffered = 0;
   #order = 0;
 
-  currentAttachment(): AttachedPage | null {
-    return this.#attachment;
+  /** The attachable active tab of a window with a view, as its views were last told. */
+  currentAttachment(windowId: number): AttachedPage | null {
+    return this.#pages.get(windowId) ?? null;
+  }
+
+  /** Every attached view (one per connected sidebar that has finished `view.attach`). */
+  views(): ChatView[] {
+    return [...this.#ports.values()].flatMap((connection) => connection.view?.sessionId ? [connection.view] : []);
+  }
+
+  /** The attached view of a Port, or `null` for a Port that is not connected or has not attached. */
+  viewOf(owner: object): ChatView | null {
+    const view = this.#ports.get(owner as Browser.runtime.Port)?.view;
+    return view?.sessionId ? view : null;
   }
 
   /** The seq of a run's last published event; 0 for a run that has published none or is not registered. */
@@ -78,50 +123,70 @@ export class SidebarHub {
     return this.#runs.get(runId)?.seq ?? 0;
   }
 
-  publishAsk(ask: AskContextV1 | null): void {
-    this.#broadcast({ v: 1, runId: null, conversationId: null, seq: 0, type: "ask.changed", at: Date.now(), payload: { ask } });
+  /** Sends a window's Ask chip to that window's views only; `null` (no window) reaches none. */
+  publishAsk(windowId: number | null, ask: AskContextV1 | null): void {
+    this.#toWindow(windowId, { v: 1, runId: null, conversationId: null, seq: 0, type: "ask.changed", at: Date.now(), payload: { ask } });
   }
 
   contentAccepted(owner: object, ids: string[]): void {
-    for (const port of this.#ports) if (port === owner) port.postMessage({
+    for (const port of this.#ports.keys()) if (port === owner) port.postMessage({
       v: 1, type: "mcp.content.accepted", runId: null, conversationId: null, seq: 0, at: Date.now(), payload: { ids },
     } satisfies SidebarEvent);
   }
 
   /** Tells the sidebar that prepared these files that the message they went with is persisted. */
   attachmentsAccepted(owner: object, ids: string[]): void {
-    for (const port of this.#ports) if (port === owner) port.postMessage({
+    for (const port of this.#ports.keys()) if (port === owner) port.postMessage({
       v: 1, type: "attachment.accepted", runId: null, conversationId: null, seq: 0, at: Date.now(), payload: { ids },
     } satisfies SidebarEvent);
   }
 
-  focusComposer(): void {
-    this.#broadcast({ v: 1, runId: null, conversationId: null, seq: 0, type: "composer.focus", at: Date.now(), payload: null });
+  /** Focuses the composer of a window's views only; `null` (no window) reaches none. */
+  focusComposer(windowId: number | null): void {
+    this.#toWindow(windowId, { v: 1, runId: null, conversationId: null, seq: 0, type: "composer.focus", at: Date.now(), payload: null });
   }
 
   handleConnect(port: Browser.runtime.Port): void {
     if (port.name !== SIDEBAR_PORT_NAME) return;
     // A page/content script cannot impersonate the native sidebar Port.
     if (port.sender && (port.sender.id !== browser.runtime.id || port.sender.url?.replace(/#.*$/s, "") !== browser.runtime.getURL("/sidepanel.html"))) return;
-    this.#ports.add(port);
+    let settle!: (view: ChatView | null) => void;
+    const ready = new Promise<ChatView | null>((resolve) => { settle = resolve; });
+    const connection: Connection = { view: null, attaching: false, ready, settle };
+    this.#ports.set(port, connection);
     port.onMessage.addListener((message: unknown) => this.#handleMessage(port, message));
     port.onDisconnect.addListener(() => {
       this.#ports.delete(port);
+      connection.settle(null);
       this.delegate?.releaseOwner?.(port);
+      const view = connection.view;
+      connection.view = null;
+      if (view?.sessionId) this.delegate?.detachView?.(view);
+      for (const windowId of this.#pages.keys()) if (!this.views().some((other) => other.windowId === windowId)) this.#pages.delete(windowId);
     });
-    this.#sendAttachment(port, this.#attachment);
   }
 
-  /** Re-evaluates the active tab's attachability and broadcasts if it changed. */
+  /**
+   * Re-evaluates the active tab of every window with a view, and sends each
+   * window's views its page when that changed. Windows without a view are
+   * not tracked.
+   */
   async refreshAttachment(): Promise<void> {
-    const tabs = await browser.tabs.query({ active: true, lastFocusedWindow: true });
-    const tab = tabs[0];
-    const next = tab && isSupportedUrl(tab.url) && tab.id !== undefined ? toAttachment(tab) : null;
-
-    if (attachmentsEqual(this.#attachment, next)) return;
-    this.#attachment = next;
-    for (const port of this.#ports) {
-      this.#sendAttachment(port, next);
+    const windows = new Set(this.views().map((view) => view.windowId));
+    if (windows.size === 0) {
+      this.#pages.clear();
+      return;
+    }
+    const tabs = await browser.tabs.query({ active: true });
+    for (const windowId of [...this.#pages.keys()]) if (!windows.has(windowId)) this.#pages.delete(windowId);
+    for (const windowId of windows) {
+      const tab = tabs.find((candidate) => candidate.windowId === windowId);
+      const next = tab && isSupportedUrl(tab.url) && tab.id !== undefined ? toAttachment(tab) : null;
+      if (this.#pages.has(windowId) && attachmentsEqual(this.#pages.get(windowId)!, next)) continue;
+      this.#pages.set(windowId, next);
+      for (const [port, connection] of this.#ports) {
+        if (connection.view?.sessionId && connection.view.windowId === windowId) this.#sendAttachment(port, next);
+      }
     }
   }
 
@@ -188,17 +253,29 @@ export class SidebarHub {
     this.#prune();
   }
 
-  /** Broadcasts the current full snapshot to every connected port (e.g. after a dropped run.start). */
+  /** Sends every attached view its own current full snapshot (e.g. after a dropped run.start). */
   async broadcastSnapshot(): Promise<void> {
     if (!this.delegate) return;
-    const snapshot = await this.delegate.getSnapshot();
-    for (const port of this.#ports) this.#postSnapshot(port, snapshot);
+    const targets = [...this.#ports].filter(([, connection]) => connection.view?.sessionId);
+    if (targets.length === 0) return;
+    const snapshots = await this.delegate.getSnapshots(targets.map(([, connection]) => connection.view!));
+    targets.forEach(([port, connection], index) => {
+      if (this.#ports.get(port) === connection) this.#postSnapshot(port, snapshots[index]!);
+    });
   }
 
   async #handleMessage(port: Browser.runtime.Port, message: unknown): Promise<void> {
     if (!isSidebarCommand(message) || !this.delegate) return;
+    const connection = this.#ports.get(port);
+    if (!connection) return;
+    if (message.type === "view.attach") {
+      await this.#attach(port, connection, message.windowId);
+      return;
+    }
+    // Commands sent before the Port attached wait for it; a Port that never attaches is never answered.
+    if (!(await connection.ready) || this.#ports.get(port) !== connection) return;
     if (message.type === "state.subscribe") {
-      await this.#handleSubscribe(port, message.lastSeq);
+      await this.#handleSubscribe(port, connection, message.lastSeq);
       return;
     }
     const result = await this.delegate.handleCommand(message, port);
@@ -235,15 +312,43 @@ export class SidebarHub {
     } satisfies SidebarEvent);
   }
 
-  async #handleSubscribe(port: Browser.runtime.Port, known: Record<string, number> | null): Promise<void> {
-    if (!this.delegate) return;
+  /**
+   * Attaches a Port once, as the sidebar view of `windowId`: the delegate
+   * picks its session, then the view gets its window's page. Repeated
+   * `view.attach` commands are ignored.
+   */
+  async #attach(port: Browser.runtime.Port, connection: Connection, windowId: number): Promise<void> {
+    if (connection.attaching || !this.delegate) return;
+    connection.attaching = true;
+    const view: ChatView = { kind: "sidebar", windowId, sessionId: "" };
+    connection.view = view;
+    try {
+      await this.delegate.attachView(view);
+    } catch {
+      view.sessionId = "";
+    }
+    if (this.#ports.get(port) !== connection) return;
+    if (!view.sessionId) {
+      connection.view = null;
+      connection.settle(null);
+      return;
+    }
+    const known = this.#pages.has(windowId);
+    // A window seen for the first time is sent its page by the refresh.
+    await this.refreshAttachment().catch(() => {});
+    if (known || !this.#pages.has(windowId)) this.#sendAttachment(port, this.#pages.get(windowId) ?? null);
+    connection.settle(view);
+  }
+
+  async #handleSubscribe(port: Browser.runtime.Port, connection: Connection, known: Record<string, number> | null): Promise<void> {
+    if (!this.delegate || !connection.view) return;
     const replay = known ? this.#missedEvents(known) : null;
     if (replay) {
       for (const event of replay) port.postMessage(event);
       return;
     }
-    const snapshot = await this.delegate.getSnapshot();
-    this.#postSnapshot(port, snapshot);
+    const [snapshot] = await this.delegate.getSnapshots([connection.view]);
+    if (snapshot && this.#ports.get(port) === connection) this.#postSnapshot(port, snapshot);
   }
 
   /**
@@ -294,7 +399,12 @@ export class SidebarHub {
   }
 
   #broadcast(event: SidebarEvent): void {
-    for (const port of this.#ports) port.postMessage(event);
+    for (const port of this.#ports.keys()) port.postMessage(event);
+  }
+
+  #toWindow(windowId: number | null, event: SidebarEvent): void {
+    if (windowId === null) return;
+    for (const [port, connection] of this.#ports) if (connection.view?.sessionId && connection.view.windowId === windowId) port.postMessage(event);
   }
 
   #postSnapshot(port: Browser.runtime.Port, snapshot: RuntimeSnapshot): void {

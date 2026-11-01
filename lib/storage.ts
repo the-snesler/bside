@@ -858,7 +858,11 @@ export async function setOpenSessionId(id: string): Promise<void> {
   await openConversationItem.setValue({ version: 1, id });
 }
 
-/** Returns the open session, else opens the most recently updated one, else creates and opens an empty one. */
+/**
+ * The fallback session, `local:openConversation`: the session last shown in
+ * any sidebar view, which a newly attached view shows. Returns it, else makes
+ * the most recently updated one the fallback, else creates an empty one.
+ */
 export function ensureOpenSession(): Promise<string> {
   return withConversationLock(async () => {
     const sessions = await readIndex();

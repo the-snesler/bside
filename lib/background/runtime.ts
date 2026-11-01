@@ -1,6 +1,6 @@
 /**
- * BackgroundRuntime tracks the open session, owns each active run's
- * AbortController (a run may belong to a session other than the open one),
+ * BackgroundRuntime tracks the session each sidebar view shows, owns each
+ * active run's AbortController (a run may belong to a session no view shows),
  * and is the only place that calls the provider or writes
  * conversation/checkpoint storage. Sidebar and options pages never
  * own an inference request, tool loop, transcript authority, or credential
@@ -35,7 +35,7 @@ import type { McpToolDefinition } from "@/lib/mcp/tools";
 import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { ScratchFiles, ScratchFilesError, WorkspaceState } from "@/lib/background/browser-program";
 import type { AgentTab } from "@/lib/background/browser-program";
-import type { SidebarHub } from "@/lib/background/sidebar-hub";
+import type { ChatView, SidebarHub } from "@/lib/background/sidebar-hub";
 import { FrameAliases, TabController, VisibilityLock } from "@/lib/background/tab-controller";
 import { PdfReader, workerPdfExtractor } from "@/lib/background/pdf";
 import { browserSiteEnv } from "@/lib/sites";
@@ -221,8 +221,24 @@ interface SendSelection {
 
 interface AskAcceptance {
   ask: AskContextV1;
+  /** The window whose chip it is. */
+  windowId: number | null;
   commit(): void;
   release(): void;
+}
+
+/**
+ * Where a command came from: an attached sidebar view, or `null` for the
+ * fallback view, which commands from no Port act on (the background's own
+ * callers and tests). The fallback view shows the fallback session,
+ * `local:openConversation`, the session a newly attached view shows; it has
+ * no window, so no page of its own and no Ask chip but one set for no window.
+ */
+type ViewRef = ChatView | null;
+
+/** `windows.getLastFocused`, for clicks that open a chat in the window the user is in. */
+export interface RuntimeWindowsApi {
+  getLastFocused(): Promise<{ id?: number } | undefined>;
 }
 
 export class BackgroundRuntime {
@@ -274,8 +290,13 @@ export class BackgroundRuntime {
   #notice: string | null = null;
   #clock: RuntimeClock;
   #workspace: WorkspaceState;
-  /** Cached `local:openConversation`; resolved lazily so every path sees a real session. */
-  #openSessionId: string | null = null;
+  /**
+   * Cached `local:openConversation`, the fallback session: the session last
+   * shown in any view, which a newly attached view shows and commands from no
+   * Port act on. Resolved lazily so every path sees a real session.
+   */
+  #fallbackId: string | null = null;
+  #windows: RuntimeWindowsApi | null;
   #sessionOps: Promise<void> = Promise.resolve();
   /**
    * Sessions a pending session command may switch away from or delete, with
@@ -320,38 +341,49 @@ export class BackgroundRuntime {
   #shieldSent: { tabId: number; shield: PageShieldState } | null = null;
   /** Each session's message queue once loaded; this cache is authoritative and written through to storage. */
   #queues = new Map<string, QueuedMessage[]>();
-  /** The last menu gesture, held only in the background until sent or removed. */
-  #ask: AskContextV1 | null = null;
+  /**
+   * Each window's last menu gesture, held only in the background until sent
+   * or removed; only that window's views see it or can send it. `null` is the
+   * fallback view's (no window).
+   */
+  #asks = new Map<number | null, AskContextV1>();
   /** An in-flight send reserves its snapshot without removing the visible chip. */
   #askClaims = new Set<string>();
 
-  setAsk(ask: AskContextV1): void {
+  /** A context-menu gesture in window `windowId`: its chip replaces that window's, and the window's composer is focused. */
+  setAsk(ask: AskContextV1, windowId: number | null = null): void {
     if (!isAskContext(ask) || ask.path !== null) return;
-    this.#ask = structuredClone(ask);
-    this.#sidebarHub.publishAsk(this.#ask);
-    this.#sidebarHub.focusComposer();
+    const held = structuredClone(ask);
+    this.#asks.set(windowId, held);
+    this.#sidebarHub.publishAsk(windowId, held);
+    this.#sidebarHub.focusComposer(windowId);
   }
 
   updateAskAlt(id: string, alt: string | null): void {
-    if (this.#ask?.id !== id || this.#ask.kind !== "image" || !alt) return;
-    const next = { ...this.#ask, alt };
-    if (!isAskContext(next)) return;
-    this.#ask = next;
-    this.#sidebarHub.publishAsk(next);
+    for (const [windowId, ask] of this.#asks) {
+      if (ask.id !== id || ask.kind !== "image" || !alt) continue;
+      const next = { ...ask, alt };
+      if (!isAskContext(next)) return;
+      this.#asks.set(windowId, next);
+      this.#sidebarHub.publishAsk(windowId, next);
+      return;
+    }
   }
 
-  #claimAsk(id: string): AskAcceptance {
-    if (this.#ask?.id !== id || this.#askClaims.has(id)) throw new McpError("PROTOCOL", "That page context is no longer available or is already being sent. Review the current chip before sending again.");
-    const ask = { ...this.#ask };
+  #claimAsk(id: string, windowId: number | null): AskAcceptance {
+    const held = this.#asks.get(windowId);
+    if (held?.id !== id || this.#askClaims.has(id)) throw new McpError("PROTOCOL", "That page context is no longer available or is already being sent. Review the current chip before sending again.");
+    const ask = { ...held };
     this.#askClaims.add(id);
     return {
       ask,
+      windowId,
       commit: () => {
         this.#askClaims.delete(id);
         // A newer menu gesture or an explicit dismissal wins over this send.
-        if (this.#ask?.id !== id) return;
-        this.#ask = null;
-        this.#sidebarHub.publishAsk(null);
+        if (this.#asks.get(windowId)?.id !== id) return;
+        this.#asks.delete(windowId);
+        this.#sidebarHub.publishAsk(windowId, null);
       },
       release: () => { this.#askClaims.delete(id); },
     };
@@ -365,8 +397,8 @@ export class BackgroundRuntime {
     return { ...ask, path };
   }
 
-  #askIsCurrent(id: string | undefined): boolean {
-    if (!id || this.#ask?.id === id) return true;
+  #askIsCurrent(selection: AskAcceptance | undefined): boolean {
+    if (!selection || this.#asks.get(selection.windowId)?.id === selection.ask.id) return true;
     this.#notice = "That page context was replaced or removed. Review the current chip before sending again.";
     void this.#sidebarHub.broadcastSnapshot();
     return false;
@@ -374,9 +406,10 @@ export class BackgroundRuntime {
 
   constructor(
     sidebarHub: SidebarHub,
-    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController; sites?: SiteEnv; approvalBadge?: ApprovalBadge; clock?: RuntimeClock; mcp?: McpConnections; alarms?: SchedulerAlarms; notifications?: RunNotifications; workspace?: WorkspaceState; scaleImage?: ImageScaler } = {},
+    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController; sites?: SiteEnv; approvalBadge?: ApprovalBadge; clock?: RuntimeClock; mcp?: McpConnections; alarms?: SchedulerAlarms; notifications?: RunNotifications; workspace?: WorkspaceState; scaleImage?: ImageScaler; windows?: RuntimeWindowsApi } = {},
   ) {
     this.#sidebarHub = sidebarHub;
+    this.#windows = options.windows ?? (typeof browser !== "undefined" ? browser.windows ?? null : null);
     this.#clock = options.clock ?? SYSTEM_CLOCK;
     this.#workspace = options.workspace ?? new WorkspaceState(() => this.#clock.now());
     this.#chatgpt = options.chatgpt ?? new ChatGPTAuth();
@@ -424,7 +457,7 @@ export class BackgroundRuntime {
             if (items) this.#retryable.set(sessionId, { hadPageEffect: lastTurnMayHaveCommitted(items) });
           }
         })
-        .finally(() => this.#openSession())
+        .finally(() => this.#fallbackSession())
         .finally(() => restored.catch(() => {}))
         .then(() => this.#applyRetention()),
       restored,
@@ -497,14 +530,14 @@ export class BackgroundRuntime {
   }
 
   /**
-   * Shows one of the open session's agent tabs next to the active tab and
-   * switches to it. The tab stays bside's, and runs keep using it;
+   * Shows one of the view's session's agent tabs next to its window's active
+   * tab and switches to it. The tab stays bside's, and runs keep using it;
    * `handleTabActivated` hides it again once the user switches away. Watching
    * another tab hides the previous one and keeps the tab to go back to.
    */
-  async #watchAgentTab(tabId: number): Promise<void> {
+  async #watchAgentTab(tabId: number, view: ViewRef): Promise<void> {
     const tab = this.#workspace.agentTabs.get(tabId);
-    if (!tab || tab.sessionId !== await this.#openSession()) return;
+    if (!tab || tab.sessionId !== await this.#sessionOf(view)) return;
     const tabController = this.#tabControllerFactory();
     const previous = this.#watching;
     if (previous?.tabId === tabId) {
@@ -515,7 +548,7 @@ export class BackgroundRuntime {
     const watching = { tabId, returnTabId: previous?.returnTabId ?? null, takenOver: false };
     this.#watching = watching;
     try {
-      const before = await tabController.revealTab(tabId);
+      const before = await tabController.revealTab(tabId, view?.windowId);
       if (!previous) watching.returnTabId = before;
     } catch {
       if (this.#watching === watching) this.#watching = previous;
@@ -748,18 +781,37 @@ export class BackgroundRuntime {
     }
   }
 
-  /** The open session's id, resolved once and kept in step with `local:openConversation`. */
-  async #openSession(): Promise<string> {
-    this.#openSessionId ??= await ensureOpenSession();
-    return this.#openSessionId;
+  /** The fallback session's id, resolved once and kept in step with `local:openConversation`. */
+  async #fallbackSession(): Promise<string> {
+    this.#fallbackId ??= await ensureOpenSession();
+    return this.#fallbackId;
   }
 
-  /** The open session materialized; if it vanished from storage, the most recent (or a new) session is opened instead. */
-  async #openConversation(): Promise<Conversation> {
-    const conversation = await getConversation(await this.#openSession());
+  /** The view a command came from: the sender Port's attached view, `null` (the fallback view) for no Port, `undefined` for a Port that has not attached. */
+  #viewOf(owner: object): ViewRef | undefined {
+    if (owner === this) return null;
+    return this.#sidebarHub.viewOf(owner) ?? undefined;
+  }
+
+  /** The session a view shows ("the open session" of that sidebar). */
+  async #sessionOf(view: ViewRef): Promise<string> {
+    return view ? view.sessionId : this.#fallbackSession();
+  }
+
+  /** Every session a view shows, the fallback included: retention and untouched-chat cleanup spare them. */
+  async #shownSessions(): Promise<Set<string>> {
+    return new Set([await this.#fallbackSession(), ...this.#sidebarHub.views().map((view) => view.sessionId)]);
+  }
+
+  /** The view's session materialized; if it vanished from storage, the view shows the fallback (the most recent, or a new, session) instead. */
+  async #conversationOf(view: ViewRef): Promise<Conversation> {
+    const id = await this.#sessionOf(view);
+    const conversation = await getConversation(id);
     if (conversation) return conversation;
-    this.#openSessionId = null;
-    return (await getConversation(await this.#openSession()))!;
+    if (this.#fallbackId === id) this.#fallbackId = null;
+    const fallback = await this.#fallbackSession();
+    if (view && view.sessionId === id) view.sessionId = fallback;
+    return (await getConversation(fallback))!;
   }
 
   /** The session's active run, if any: the one run that writes to that session. */
@@ -859,62 +911,108 @@ export class BackgroundRuntime {
     }
   }
 
-  async getSnapshot(): Promise<RuntimeSnapshot> {
+  /** One view's snapshot; by default the fallback view's (see `ViewRef`). */
+  async getSnapshot(view: ViewRef = null): Promise<RuntimeSnapshot> {
+    return (await this.getSnapshots([view]))[0]!;
+  }
+
+  /**
+   * Each view's snapshot: its own session, that session's queue, its
+   * window's page and Ask chip; everything else (and the pending notice, read
+   * once) is shared.
+   */
+  async getSnapshots(views: readonly ViewRef[]): Promise<RuntimeSnapshot[]> {
     await this.#ready;
-    const [conversation, credential, settings, provider] = await Promise.all([
-      this.#openConversation(),
+    const [shown, credential, settings, provider] = await Promise.all([
+      Promise.all(views.map(async (view) => {
+        const conversation = await this.#conversationOf(view);
+        return { conversation, queue: [...await this.#queue(conversation.id)] };
+      })),
       this.#getCredentialStatus(),
       this.#getValidatedSettings(),
       this.#getProviderDefinition(),
     ]);
+    const skills = sidebarSkillCatalog(await getSkills());
     const notice = this.#notice;
     this.#notice = null;
-    return {
-      conversation,
+    // Read together with each run's seq, so its next event is exactly lastSeq + 1.
+    const runs = [...this.#runs.values()].map((run) => ({
+      runId: run.runId,
+      conversationId: run.sessionId,
+      status: run.status,
+      partialAssistantText: run.partialAssistantText,
+      pendingApproval: run.pendingApproval,
+      pendingHelp: run.pendingHelp,
+      usage: run.usage,
+      lastSeq: this.#sidebarHub.lastSeq(run.runId),
+    }));
+    return views.map((view, index) => ({
+      conversation: shown[index]!.conversation,
       credential: { ...credential, configured: credential.chatgpt.connected || credential.configured },
       provider,
       settings,
       permissionMode: this.#permissionMode,
-      skills: sidebarSkillCatalog(await getSkills()),
-      page: this.#sidebarHub.currentAttachment(),
+      skills,
+      page: view ? this.#sidebarHub.currentAttachment(view.windowId) : null,
       agentTabs: this.#agentTabsState,
-      queue: [...await this.#queue(conversation.id)],
-      ask: this.#ask,
-      // Read together with each run's seq, so its next event is exactly lastSeq + 1.
-      runs: [...this.#runs.values()].map((run) => ({
-        runId: run.runId,
-        conversationId: run.sessionId,
-        status: run.status,
-        partialAssistantText: run.partialAssistantText,
-        pendingApproval: run.pendingApproval,
-        pendingHelp: run.pendingHelp,
-        usage: run.usage,
-        lastSeq: this.#sidebarHub.lastSeq(run.runId),
-      })),
+      queue: shown[index]!.queue,
+      ask: this.#asks.get(view?.windowId ?? null) ?? null,
+      runs: runs.map((run) => ({ ...run })),
       notice,
-    };
+    }));
   }
 
+  /**
+   * `view.attach`: a new sidebar view shows the fallback session, the one
+   * last shown anywhere (or the one a click chose while no view of the
+   * window had attached; see `#inFocusedWindow`).
+   */
+  async attachView(view: ChatView): Promise<void> {
+    await this.#ready;
+    await this.#queueSessionOp(async () => { view.sessionId = await this.#fallbackSession(); });
+  }
+
+  /** A view's sidebar closed: an untouched new chat it showed goes, unless another view shows it. */
+  detachView(view: ChatView): void {
+    const id = view.sessionId;
+    void this.#ready.then(() => this.#queueSessionOp(() => this.#dropIfUntouched(id))).catch(() => {});
+  }
+
+  /** The keyboard's "New chat" command: a new chat in the last-focused window's sidebar, its composer focused. */
+  async newChat(): Promise<void> {
+    await this.#ready;
+    const windowId = await this.#inFocusedWindow({ v: 1, id: crypto.randomUUID(), type: "session.create" });
+    this.#sidebarHub.focusComposer(windowId);
+  }
+
+  /**
+   * Handles one sidebar command from `owner`, the sender's Port (whose
+   * attached view it acts on), or, called without one, as the fallback view
+   * (see `ViewRef`). A Port that has not attached is ignored.
+   */
   handleCommand(command: Extract<SidebarCommand, { type: "context.export" }>): Promise<{ markdown: string; filename: string } | undefined>;
   handleCommand(command: { v: 1; id: string; type: "session.list" }): Promise<{ sessions: ConversationSummary[] }>;
   handleCommand(command: SidebarCommand, owner?: object): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]>;
   async handleCommand(command: SidebarCommand, owner: object = this): ReturnType<import("./sidebar-hub").SidebarHubDelegate["handleCommand"]> {
     await this.#ready;
+    const view = this.#viewOf(owner);
+    // The hub attaches Ports itself; one that has not attached has no view to act on.
+    if (view === undefined || command.type === "view.attach") return;
     if (command.type === "mcp.content.list" || command.type === "mcp.content.prepare" || command.type === "mcp.content.dismiss") {
       try {
-        if (command.sessionId !== await this.#openSession()) throw new McpError("PROTOCOL", "This chat changed. Open the picker again.");
+        if (command.sessionId !== await this.#sessionOf(view)) throw new McpError("PROTOCOL", "This chat changed. Open the picker again.");
         if (command.type === "mcp.content.dismiss") { this.#preparedContent.dismiss(command.contentIds, owner); return; }
         if (!this.#mcp) throw new McpError("NOT_CONNECTED", "Connect an account in settings first.");
         if (command.type === "mcp.content.list") return { contentReply: { ok: true, ...await this.#mcp.contentCatalog(command.kind) } };
         const snapshot = await this.#mcp.prepareContent(command.choiceId, command.arguments, command.sessionId);
-        if (command.sessionId !== await this.#openSession()) throw new McpError("PROTOCOL", "This chat changed while preparing content. Choose it again.");
+        if (command.sessionId !== await this.#sessionOf(view)) throw new McpError("PROTOCOL", "This chat changed while preparing content. Choose it again.");
         this.#preparedContent.add(snapshot, owner);
         return { contentReply: { ok: true, snapshot } };
       } catch (error) { return { contentReply: { ok: false, error: toNormalizedMcpError(error) } }; }
     }
     if (command.type === "attachment.prepare") {
-      // Only for the open session, like the composer that attaches it; the file stays in memory until a send writes it.
-      if (command.sessionId !== await this.#openSession()) return { attachmentReply: { error: "This chat changed. Attach the file again." } };
+      // Only for the session this view shows, like the composer that attaches it; the file stays in memory until a send writes it.
+      if (command.sessionId !== await this.#sessionOf(view)) return { attachmentReply: { error: "This chat changed. Attach the file again." } };
       try { return { attachmentReply: { attachment: this.#preparedAttachments.prepare(command, owner) } }; }
       catch (error) { return { attachmentReply: { error: error instanceof AttachmentError ? error.message : "The file could not be attached." } }; }
     }
@@ -924,8 +1022,8 @@ export class BackgroundRuntime {
     }
     if (command.type === "skills.list") return { skills: sidebarSkillCatalog(await getSkills()) };
     if (command.type === "tabs.list") {
-      // As the open session's runs see them: other sessions' agent tabs are left out.
-      const openId = await this.#openSession();
+      // As this view's session's runs see them: other sessions' agent tabs are left out.
+      const openId = await this.#sessionOf(view);
       const owner = (id: number) => this.#workspace.agentTabs.get(id)?.sessionId;
       const tabs = (await this.#tabControllerFactory().listTabs()).filter((tab) => owner(tab.id!) === undefined || owner(tab.id!) === openId);
       return { tabs: tabs.map((tab) => ({ id: tab.id!, title: tab.title ?? "", url: tab.url!, path: `/${owner(tab.id!) ? "agent-tabs" : "tabs"}/${tab.id}/page.md` })) };
@@ -936,7 +1034,7 @@ export class BackgroundRuntime {
       return;
     }
     if (command.type === "tabs.watch") {
-      await this.#watchAgentTab(command.tabId);
+      await this.#watchAgentTab(command.tabId, view);
       return;
     }
     if (command.type === "tabs.unwatch") {
@@ -974,8 +1072,8 @@ export class BackgroundRuntime {
     if (command.type === "siteNote.save") return saveSiteNoteFromSidebar(command.note);
     if (command.type === "memory.undo") return undoMemoryChanges(command.changeIds);
     if (command.type === "workspace.image") {
-      // Only the open session's files, as the sidebar shows them; a read, never a run effect.
-      if (command.sessionId !== await this.#openSession()) return { workspaceImage: { ok: false, reason: "session" } };
+      // Only the files of the session this view shows; a read, never a run effect.
+      if (command.sessionId !== await this.#sessionOf(view)) return { workspaceImage: { ok: false, reason: "session" } };
       const file = (await loadWorkspaceFiles(command.sessionId)).find((entry) => entry.path === command.path);
       // A saved image, or an image the user attached; the record's type decides, never the path.
       return { workspaceImage: file && file.kind !== "text" && VIEWABLE_IMAGE_TYPES.includes(file.mimeType)
@@ -985,18 +1083,25 @@ export class BackgroundRuntime {
     if (command.type === "session.list") return { sessions: await listSessions() };
     if (command.type === "session.create" || command.type === "session.open" || command.type === "session.delete" ||
       command.type === "session.rename" || command.type === "session.pin") {
-      await this.#runSessionCommand(command);
+      await this.#runSessionCommand(command, () => [view]);
       return;
     }
     if (command.type === "context.export") return this.#exportSession(command.sessionId);
+    const windowId = view?.windowId ?? null;
     if (command.type === "ask.dismiss") {
-      if (this.#ask?.id === command.askId) {
-        this.#ask = null;
-        this.#sidebarHub.publishAsk(null);
+      if (this.#asks.get(windowId)?.id === command.askId) {
+        this.#asks.delete(windowId);
+        this.#sidebarHub.publishAsk(windowId, null);
       }
       return;
     }
-    if ((command.type === "run.start" || command.type === "run.steer") && command.askId && this.#ask?.id !== command.askId) {
+    if ((command.type === "run.start" || command.type === "run.steer" || command.type === "run.retry") && command.sessionId !== await this.#sessionOf(view)) {
+      // The sidebar showed another chat than this view now does (it switched meanwhile).
+      this.#notice = "This chat changed before your message was sent. Review it and send again.";
+      await this.#sidebarHub.broadcastSnapshot();
+      return;
+    }
+    if ((command.type === "run.start" || command.type === "run.steer") && command.askId && this.#asks.get(windowId)?.id !== command.askId) {
       this.#notice = "That page context was replaced or removed. Review the current chip before sending again.";
       await this.#sidebarHub.broadcastSnapshot();
       return;
@@ -1009,11 +1114,11 @@ export class BackgroundRuntime {
       let committed = false;
       let askSelection: AskAcceptance | undefined;
       try {
-        if (command.askId) askSelection = this.#claimAsk(command.askId);
+        if (command.askId) askSelection = this.#claimAsk(command.askId, windowId);
         let selection: SendSelection | undefined;
+        const sessionId = command.sessionId;
         if (command.contentIds?.length || command.attachmentIds?.length) {
-          const sessionId = command.sessionId!;
-          if (sessionId !== await this.#openSession()) throw new McpError("PROTOCOL", "The chat changed. Review the selected attachments before sending.");
+          if (sessionId !== await this.#sessionOf(view)) throw new McpError("PROTOCOL", "The chat changed. Review the selected attachments before sending.");
           if (command.contentIds?.length) {
             claim = this.#preparedContent.claim(command.contentIds, sessionId, owner, () => this.#sidebarHub.contentAccepted(owner, command.contentIds!));
             if (!this.#mcp || !(await Promise.all(claim.accepted.content.map(item => this.#mcp!.contentAvailable(item)))).every(Boolean)) throw new McpError("NOT_CONNECTED", "A selected account changed or disconnected. Choose its attachment again.");
@@ -1024,7 +1129,7 @@ export class BackgroundRuntime {
             // command holds the chat before it switches away from or deletes
             // it, and one that starts later finds these files held and
             // removes them with the chat.
-            if (sessionId !== await this.#openSession() || this.#sessionHeld(sessionId)) throw new AttachmentError("The chat changed. Review the attached files before sending.");
+            if (sessionId !== await this.#sessionOf(view) || this.#sessionHeld(sessionId)) throw new AttachmentError("The chat changed. Review the attached files before sending.");
             fileClaim = this.#preparedAttachments.claim(command.attachmentIds, sessionId, owner, () => this.#sidebarHub.attachmentsAccepted(owner, command.attachmentIds!));
             files = this.#holdScratchFiles(sessionId);
             const { uploads } = fileClaim;
@@ -1041,8 +1146,8 @@ export class BackgroundRuntime {
             accepted.files?.commit();
           } };
         }
-        if (command.type === "run.start") await this.#submitPrompt(command.prompt, askSelection, selection);
-        else await this.#steer(command.runId, command.text, askSelection, selection);
+        if (command.type === "run.start") await this.#submitPrompt(sessionId, windowId, command.prompt, askSelection, selection);
+        else await this.#steer(command.runId, sessionId, windowId, command.text, askSelection, selection);
       } catch (error) {
         this.#notice = error instanceof AttachmentError || error instanceof ScratchFilesError ? error.message : toNormalizedMcpError(error).message;
         await this.#sidebarHub.broadcastSnapshot();
@@ -1067,11 +1172,11 @@ export class BackgroundRuntime {
       return;
     }
     if (command.type === "queue.send") {
-      await this.#sendQueued(command.sessionId, command.messageId);
+      await this.#sendQueued(command.sessionId, command.messageId, view);
       return;
     }
     if (command.type === "run.retry") {
-      await this.#startRun(await this.#openSession(), null);
+      await this.#startRun(command.sessionId, null, undefined, undefined, undefined, undefined, windowId);
       return;
     }
     if (command.type === "run.cancel") {
@@ -1159,27 +1264,59 @@ export class BackgroundRuntime {
   }
 
   /**
-   * The sessions a session command holds: the open one (it may be switched
-   * away from, and deleted if untouched) and, for a delete, the deleted one.
-   * Renaming and pinning hold none.
+   * The sessions a session command from `view` holds: the one it shows (it
+   * may be switched away from, and deleted if untouched) and, for a delete,
+   * the deleted one. Renaming and pinning hold none.
    */
-  #sessionsHeldBy(command: SessionCommand): string[] {
+  #sessionsHeldBy(command: SessionCommand, view: ViewRef): string[] {
     if (command.type === "session.rename" || command.type === "session.pin") return [];
-    // Resolved during startup, before any sidebar command runs; held in full otherwise.
-    const open = this.#openSessionId === null ? ["*"] : [this.#openSessionId];
+    // The fallback is resolved during startup, before any sidebar command runs; held in full otherwise.
+    const open = view ? [view.sessionId] : this.#fallbackId === null ? ["*"] : [this.#fallbackId];
     return command.type === "session.delete" ? [...open, command.sessionId] : open;
   }
 
-  /** Applies a session command, then republishes the snapshot and the session list. */
-  async #runSessionCommand(command: SessionCommand): Promise<void> {
-    try { await this.#queueSessionOp(() => this.#applySessionCommand(command), this.#sessionsHeldBy(command)); }
-    catch { this.#notice = "Could not update chats. Try again."; }
+  /**
+   * Applies a session command to each of the views `targets` names (read
+   * under the session lock, so a view attaching meanwhile is either counted
+   * or picks up the result as the fallback), then republishes the snapshots
+   * and the session list.
+   */
+  async #runSessionCommand(command: SessionCommand, targets: () => ViewRef[]): Promise<void> {
+    const holds = targets().flatMap((view) => this.#sessionsHeldBy(command, view));
+    try {
+      await this.#queueSessionOp(async () => {
+        for (const view of targets()) await this.#applySessionCommand(command, view);
+      }, holds);
+    } catch { this.#notice = "Could not update chats. Try again."; }
     if (command.type === "session.open") {
-      await this.#scheduler.markRead(await this.#openSession()).catch(() => {});
+      await this.#scheduler.markRead(command.sessionId).catch(() => {});
       await this.#syncScheduleBadge();
     }
     await this.#sidebarHub.broadcastSnapshot();
     await this.#publishSessions();
+  }
+
+  /**
+   * A deliberate click outside a sidebar (a notification, the toolbar's
+   * attention badge, scheduled results in options, the new-chat command)
+   * applies to the last-focused window's sidebar views; when none has
+   * attached there yet (the click is opening the sidebar), to the fallback
+   * view, so the sidebar shows it once it attaches. Returns that window.
+   */
+  async #inFocusedWindow(command: SessionCommand): Promise<number | null> {
+    const windowId = await this.#lastFocusedWindow();
+    await this.#runSessionCommand(command, () => {
+      const views = windowId === null ? [] : this.#sidebarHub.views().filter((view) => view.windowId === windowId);
+      return views.length > 0 ? views : [null];
+    });
+    return windowId;
+  }
+
+  async #lastFocusedWindow(): Promise<number | null> {
+    try {
+      const id = (await this.#windows?.getLastFocused())?.id;
+      return Number.isSafeInteger(id) && id! >= 0 ? id! : null;
+    } catch { return null; }
   }
 
   /** Pushes the session index to every sidebar. A failed read is skipped; the next change republishes. */
@@ -1189,20 +1326,21 @@ export class BackgroundRuntime {
   }
 
   /**
-   * Deletes unpinned sessions not updated within the retention period. The
-   * open session and every active run's session are never pruned. Also closes
+   * Deletes unpinned sessions not updated within the retention period. A
+   * session a view shows (the fallback included) and every active run's
+   * session are never pruned. Also closes
    * agent tabs whose session no longer exists (one deleted while its tabs
    * could not be closed, or restored from an older profile). Returns the
    * number of sessions deleted.
    */
   async #applyRetention(): Promise<number> {
     this.#lastRetentionAt = this.#clock.now();
-    // Holds no session: a run only starts in the open session, which is kept,
-    // as a follow-up in the session whose run just completed, which was just
-    // updated, or as a scheduled run, which starts under this same lock.
+    // Holds no session: a run only starts in a session a view shows, which is
+    // kept, as a follow-up in the session whose run just completed, which was
+    // just updated, or as a scheduled run, which starts under this same lock.
     const deleted = await this.#queueSessionOp(async () => {
       const cutoff = retentionCutoff((await getHistorySettings()).retention, this.#clock.now());
-      const keep = [await this.#openSession(), ...this.#runSessions()];
+      const keep = [...await this.#shownSessions(), ...this.#runSessions()];
       const ids = cutoff === null ? [] : await pruneSessions(cutoff, keep);
       await this.#forgetSessions(ids, true);
       const live = new Set((await listSessions()).map((session) => session.id));
@@ -1216,18 +1354,25 @@ export class BackgroundRuntime {
 
   /**
    * "Delete all history": every session except active runs', pinned ones
-   * included, with their scratch files and agent tabs. A deleted open session
-   * is replaced by a new empty one.
+   * included, with their scratch files and agent tabs. Each view that showed
+   * a deleted session gets a new empty one, and so does the fallback.
    */
   async #deleteAllHistory(): Promise<string> {
     const { deleted, kept } = await this.#queueSessionOp(async () => {
       const kept = this.#runSessions();
-      const openId = await this.#openSession();
+      const fallback = await this.#fallbackSession();
       const deleted = await deleteAllSessions(kept);
-      if (deleted.includes(openId)) {
-        const { id } = await createSession();
+      const gone = new Set(deleted);
+      let fresh: string | null = null;
+      for (const view of this.#sidebarHub.views()) {
+        if (!gone.has(view.sessionId)) continue;
+        view.sessionId = (await createSession()).id;
+        fresh ??= view.sessionId;
+      }
+      if (gone.has(fallback)) {
+        const id = fresh ?? (await createSession()).id;
         await setOpenSessionId(id);
-        this.#openSessionId = id;
+        this.#fallbackId = id;
       }
       await this.#forgetSessions(deleted, true);
       return { deleted, kept };
@@ -1276,17 +1421,18 @@ export class BackgroundRuntime {
     await this.#closeAgentTabs(owned, false);
   }
 
-  async #applySessionCommand(command: SessionCommand): Promise<void> {
-    const openId = await this.#openSession();
+  /** Applies a session command for one view; called under the session lock. */
+  async #applySessionCommand(command: SessionCommand, view: ViewRef): Promise<void> {
+    const openId = await this.#sessionOf(view);
     if (command.type === "session.create") {
-      // An untouched open session already is a new chat. A session with an
-      // active run counts as touched even before its user message is written.
-      if (this.#runFor(openId) || !(await isSessionUntouched(openId))) await this.#switchSession((await createSession()).id);
+      // An untouched session in this view already is a new chat. A session with
+      // an active run counts as touched even before its user message is written.
+      if (this.#runFor(openId) || !(await isSessionUntouched(openId))) await this.#showSession(view, (await createSession()).id);
       return;
     }
     if (command.type === "session.open") {
       if (command.sessionId === openId) return;
-      if ((await listSessions()).some((session) => session.id === command.sessionId)) await this.#switchSession(command.sessionId);
+      if ((await listSessions()).some((session) => session.id === command.sessionId)) await this.#showSession(view, command.sessionId);
       else this.#notice = "That chat no longer exists.";
       return;
     }
@@ -1307,29 +1453,41 @@ export class BackgroundRuntime {
     }
     await deleteSession(command.sessionId);
     await this.#forgetSessions([command.sessionId], command.closeAgentTabs);
-    if (command.sessionId === openId) {
-      // Opens the most recently updated remaining session, or a new empty one.
-      this.#openSessionId = null;
-      await this.#openSession();
-    }
+    // Every view that showed it (any window's, not only this one) shows the
+    // most recently updated remaining session, or a new empty one, instead.
+    if (this.#fallbackId === command.sessionId) this.#fallbackId = null;
+    const fallback = await this.#fallbackSession();
+    for (const other of this.#sidebarHub.views()) if (other.sessionId === command.sessionId) other.sessionId = fallback;
   }
 
   /**
-   * Opens `id`. The previous session is deleted if it is untouched, so
-   * abandoned new chats do not pile up. It is held until then: a run started
-   * there after the check below would lose its session.
+   * Shows `id` in `view` and makes it the fallback, the session the next view
+   * to attach shows. The session the view showed before is deleted if it is
+   * an untouched new chat no view shows any more, so abandoned new chats do
+   * not pile up. It is held until then: a run started there after the check
+   * would lose its session.
    */
-  async #switchSession(id: string): Promise<void> {
-    const previous = await this.#openSession();
+  async #showSession(view: ViewRef, id: string): Promise<void> {
+    const previous = await this.#sessionOf(view);
     const release = this.#holdSessions([previous]);
     try {
+      if (view) view.sessionId = id;
       await setOpenSessionId(id);
-      this.#openSessionId = id;
-      if (previous !== id && !this.#runFor(previous) && await isSessionUntouched(previous)) {
-        await deleteSession(previous);
-        await this.#closeScratchFiles([previous]);
-      }
+      this.#fallbackId = id;
+      if (previous !== id) await this.#dropIfUntouched(previous);
     } finally { release(); }
+  }
+
+  /**
+   * Deletes `id` if it is an untouched new chat that no view shows (the
+   * fallback counts as shown) and no run writes to. Called under the session
+   * lock. Never listed, so the session list is not republished.
+   */
+  async #dropIfUntouched(id: string): Promise<void> {
+    if (!id || this.#runFor(id) || (await this.#shownSessions()).has(id) || !(await isSessionUntouched(id))) return;
+    if (this.#runFor(id) || (await this.#shownSessions()).has(id)) return;
+    await deleteSession(id);
+    await this.#closeScratchFiles([id]);
   }
 
   async handleCredentialRequest(request: CredentialRequest): Promise<CredentialResponse> {
@@ -1438,10 +1596,13 @@ export class BackgroundRuntime {
     await this.#scheduler.handleAlarm(name).catch(() => {});
   }
 
-  /** A deliberate UI/notification click, never called by automatic dispatch. */
+  /**
+   * A deliberate UI/notification click, never called by automatic dispatch:
+   * opens the chat in the last-focused window's sidebar (see `#inFocusedWindow`).
+   */
   async openResultsSession(sessionId: string): Promise<void> {
     await this.#ready;
-    await this.#runSessionCommand({ v: 1, id: crypto.randomUUID(), type: "session.open", sessionId });
+    await this.#inFocusedWindow({ v: 1, id: crypto.randomUUID(), type: "session.open", sessionId });
   }
 
   /**
@@ -1639,21 +1800,24 @@ export class BackgroundRuntime {
     return true;
   }
 
-  /** `run.start`: while the open session's run is active, the prompt waits as a follow-up; otherwise a run starts with it. */
-  async #submitPrompt(rawPrompt: string, askSelection?: AskAcceptance, selection?: SendSelection): Promise<void> {
-    const sessionId = await this.#openSession();
+  /**
+   * `run.start` in `sessionId` (the sender view's session) from window
+   * `windowId`: while that session's run is active, the prompt waits as a
+   * follow-up; otherwise a run starts with it, attaching that window's page.
+   */
+  async #submitPrompt(sessionId: string, windowId: number | null, rawPrompt: string, askSelection?: AskAcceptance, selection?: SendSelection): Promise<void> {
     if (selection && selection.sessionId !== sessionId) throw new McpError("PROTOCOL", "The chat changed. Choose the attachments again.");
     const queue = await this.#queue(sessionId);
     const prompt = validatePromptText(rawPrompt);
     if (prompt && !hasPreparedMcpPrompt(prompt, selection?.content)) throw new McpError("PROTOCOL", "Choose the MCP prompt from / and prepare its preview before sending.");
-    if (!prompt || !this.#runFor(sessionId)) return this.#startRun(sessionId, rawPrompt, undefined, undefined, askSelection, selection);
+    if (!prompt || !this.#runFor(sessionId)) return this.#startRun(sessionId, rawPrompt, undefined, undefined, askSelection, selection, windowId);
     if (await this.#queueFull(queue)) return;
     const skill = await this.#captureSkill(prompt);
     if (skill === null) return;
-    if (!this.#runFor(sessionId)) return this.#startRun(sessionId, prompt, undefined, { skill }, askSelection, selection);
+    if (!this.#runFor(sessionId)) return this.#startRun(sessionId, prompt, undefined, { skill }, askSelection, selection, windowId);
     const current = await this.#queue(sessionId);
     if (await this.#queueFull(current)) return;
-    if (!this.#askIsCurrent(askSelection?.ask.id)) return;
+    if (!this.#askIsCurrent(askSelection)) return;
     const ask = this.#snapshotAsk(askSelection, sessionId);
     await this.#appendQueued(sessionId, { id: crypto.randomUUID(), mode: "follow-up", text: prompt, ...(skill ? { skill } : {}), ...(ask ? { ask } : {}), ...(selection?.content.length ? { content: selection.content } : {}), ...(selection?.attachments.length ? { attachments: selection.attachments } : {}), at: Date.now() }, selection, askSelection);
   }
@@ -1667,23 +1831,27 @@ export class BackgroundRuntime {
     }
   }
 
-  /** `run.steer`: hands guidance to the active run's agent loop and shows it as pending until delivered. */
-  async #steer(runId: string, rawText: string, askSelection?: AskAcceptance, selection?: SendSelection): Promise<void> {
+  /**
+   * `run.steer` from a view showing `sessionId`: hands guidance to that
+   * session's active run's agent loop and shows it as pending until delivered.
+   */
+  async #steer(runId: string, sessionId: string, windowId: number | null, rawText: string, askSelection?: AskAcceptance, selection?: SendSelection): Promise<void> {
     const run = this.#run(runId);
-    if (!run) return this.#submitPrompt(rawText, askSelection, selection);
+    if (!run) return this.#submitPrompt(sessionId, windowId, rawText, askSelection, selection);
+    if (run.sessionId !== sessionId) throw new McpError("PROTOCOL", "That run belongs to another chat. Review your message and send it again.");
     if (selection && selection.sessionId !== run.sessionId) throw new McpError("PROTOCOL", "Those attachments belong to another chat.");
     const queue = await this.#queue(run.sessionId);
     const text = validatePromptText(rawText);
     if (text && !hasPreparedMcpPrompt(text, selection?.content)) throw new McpError("PROTOCOL", "Choose the MCP prompt from / and prepare its preview before sending.");
     // Re-checked after loading: once a run ends or is cancelling, a steer could never be delivered.
-    if (!text || this.#run(runId) !== run || run.status === "cancelling") return this.#submitPrompt(rawText, askSelection, selection);
+    if (!text || this.#run(runId) !== run || run.status === "cancelling") return this.#submitPrompt(sessionId, windowId, rawText, askSelection, selection);
     if (await this.#queueFull(queue)) return;
     const skill = await this.#captureSkill(text);
     if (skill === null) return;
-    if (this.#run(runId) !== run || run.controller.signal.aborted) return this.#submitPrompt(rawText, askSelection, selection);
+    if (this.#run(runId) !== run || run.controller.signal.aborted) return this.#submitPrompt(sessionId, windowId, rawText, askSelection, selection);
     const current = await this.#queue(run.sessionId);
     if (await this.#queueFull(current)) return;
-    if (!this.#askIsCurrent(askSelection?.ask.id)) return;
+    if (!this.#askIsCurrent(askSelection)) return;
     const ask = this.#snapshotAsk(askSelection, run.sessionId);
     const message: QueuedMessage = { id: crypto.randomUUID(), mode: "steer", text, ...(skill ? { skill } : {}), ...(ask ? { ask } : {}), ...(selection?.content.length ? { content: selection.content } : {}), ...(selection?.attachments.length ? { attachments: selection.attachments } : {}), at: Date.now() };
     if (!await this.#appendQueued(run.sessionId, message, selection, askSelection)) return;
@@ -1697,8 +1865,12 @@ export class BackgroundRuntime {
       ? queue.map(message => ({ ...message, mode: "follow-up" })) : queue);
   }
 
-  /** Claim under the queue lock, then start outside it: a run itself delivers/removes queue entries. */
-  async #runQueued(sessionId: string, messageId?: string): Promise<boolean> {
+  /**
+   * Claim under the queue lock, then start outside it: a run itself
+   * delivers/removes queue entries. The run attaches the active page of
+   * `windowId` (by default the last-focused window).
+   */
+  async #runQueued(sessionId: string, messageId?: string, windowId?: number | null): Promise<boolean> {
     const message = await this.#withQueueLock(async () => {
       // One claim per session at a time: a claimed follow-up is already starting this session's run.
       if (this.#runFor(sessionId) || [...this.#queueClaims.values()].includes(sessionId) || this.#sessionHeld(sessionId)) return undefined;
@@ -1707,29 +1879,32 @@ export class BackgroundRuntime {
       return candidate;
     });
     if (!message) return false;
-    try { await this.#startRun(sessionId, message.text, message.id, { skill: message.skill, ask: message.ask, content: message.content, attachments: message.attachments }); }
+    try { await this.#startRun(sessionId, message.text, message.id, { skill: message.skill, ask: message.ask, content: message.content, attachments: message.attachments }, undefined, undefined, windowId); }
     finally { await this.#withQueueLock(async () => { this.#queueClaims.delete(message.id); }); }
     return true;
   }
 
-  /** `queue.send`: only an unclaimed follow-up of the open session can start. */
-  async #sendQueued(sessionId: string, messageId: string): Promise<void> {
-    if (sessionId !== await this.#openSession() || !await this.#runQueued(sessionId, messageId)) await this.#sidebarHub.broadcastSnapshot();
+  /** `queue.send`: only an unclaimed follow-up of the session the sender view shows can start. */
+  async #sendQueued(sessionId: string, messageId: string, view: ViewRef): Promise<void> {
+    if (sessionId !== await this.#sessionOf(view) || !await this.#runQueued(sessionId, messageId, view?.windowId ?? null)) await this.#sidebarHub.broadcastSnapshot();
   }
 
   /** Completed runs dispatch oldest first; failed/cancelled runs leave follow-ups pending. */
   async #dispatchFollowUp(sessionId: string): Promise<void> {
-    await this.#runQueued(sessionId);
+    // Its turn attaches the active page of a window whose sidebar shows the chat, else of the last-focused window.
+    await this.#runQueued(sessionId, undefined, this.#sidebarHub.views().find((view) => view.sessionId === sessionId)?.windowId);
   }
 
   /**
-   * Starts a run in `sessionId` (the open session, or a completed run's
+   * Starts a run in `sessionId` (a view's session, or a completed run's
    * session for a follow-up). A `null` prompt is a retry: it re-runs the last
    * turn's existing user message instead of appending a new one. `queuedId`
    * names the queued follow-up the prompt came from; its user message keeps
-   * that id, and it leaves the queue once that message is written.
+   * that id, and it leaves the queue once that message is written. Without a
+   * chip, the run attaches the active page of `windowId`, the sender view's
+   * window (`null`/absent: the last-focused window).
    */
-  async #startRun(sessionId: string, rawPrompt: string | null, queuedId?: string, accepted?: { skill?: Skill; ask?: AskContextV1; scheduled?: ScheduledSource; runId?: string; content?: McpContentSnapshot[]; attachments?: AttachmentRefV1[] }, askSelection?: AskAcceptance, selection?: SendSelection): Promise<void> {
+  async #startRun(sessionId: string, rawPrompt: string | null, queuedId?: string, accepted?: { skill?: Skill; ask?: AskContextV1; scheduled?: ScheduledSource; runId?: string; content?: McpContentSnapshot[]; attachments?: AttachmentRefV1[] }, askSelection?: AskAcceptance, selection?: SendSelection, windowId?: number | null): Promise<void> {
     if (this.#disposed) return;
     const retry = rawPrompt === null;
     const retryable = this.#retryable.get(sessionId);
@@ -1810,7 +1985,7 @@ export class BackgroundRuntime {
       conversation = await getConversation(sessionId);
       if (!conversation) throw new ProviderStreamError("This chat no longer exists.", "INVALID_REQUEST");
       if (retry && !conversation.items.some(isTurnStart)) throw new ProviderStreamError("There is no turn to retry.", "INVALID_REQUEST");
-      if (!this.#askIsCurrent(askSelection?.ask.id)) throw new ProviderStreamError(this.#notice!, "INVALID_REQUEST");
+      if (!this.#askIsCurrent(askSelection)) throw new ProviderStreamError(this.#notice!, "INVALID_REQUEST");
       ask = retry ? conversation.items.findLast(isTurnStart)?.ask : accepted?.ask ?? this.#snapshotAsk(askSelection, sessionId);
       if (retry) run.scheduled = conversation.items.findLast(isTurnStart)?.scheduled;
       controller.signal.throwIfAborted();
@@ -1849,7 +2024,7 @@ export class BackgroundRuntime {
       const askOwner = ask ? this.#workspace.agentTabs.get(ask.tabId)?.sessionId : undefined;
       const captureOutcome = run.scheduled ? await this.#captureScheduledPage(tabController, run) : ask
         ? askOwner && askOwner !== sessionId ? null : await tabController.capturePage(ask.tabId)
-        : await tabController.captureActivePage();
+        : await tabController.captureActivePage(windowId ?? undefined);
       const captured = captureOutcome?.ok ? captureOutcome.value : null;
       const capturedOwner = captured ? this.#workspace.agentTabs.get(captured.snapshot.tabId)?.sessionId : undefined;
       // Attaching a user's tab is the run's first use of it, so it takes the

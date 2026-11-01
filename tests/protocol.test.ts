@@ -33,14 +33,25 @@ describe("isSidebarCommand: accepts every valid variant", () => {
     expect(isSidebarCommand({ v: 1, id: "1", type: "state.subscribe", lastSeq: max })).toBe(true);
   });
 
-  it("accepts run.start", () => {
-    expect(isSidebarCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi" })).toBe(true);
+  it("accepts run.start only for a named session", () => {
+    expect(isSidebarCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi", sessionId: "s1" })).toBe(true);
+    expect(isSidebarCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi" })).toBe(false);
+    expect(isSidebarCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi", sessionId: "../s1" })).toBe(false);
+  });
+
+  it("accepts view.attach only for a real window id", () => {
+    expect(isSidebarCommand({ v: 1, id: "1", type: "view.attach", windowId: 0 })).toBe(true);
+    expect(isSidebarCommand({ v: 1, id: "1", type: "view.attach", windowId: 42 })).toBe(true);
+    for (const windowId of [undefined, -1, -2, 1.5, "3", Number.NaN, null]) {
+      expect(isSidebarCommand({ v: 1, id: "1", type: "view.attach", windowId })).toBe(false);
+    }
   });
 
   it("accepts run.steer and the queue commands only with their fields", () => {
-    expect(isSidebarCommand({ v: 1, id: "1", type: "run.steer", runId: "r1", text: "Use tab 2" })).toBe(true);
-    expect(isSidebarCommand({ v: 1, id: "1", type: "run.steer", text: "Use tab 2" })).toBe(false);
-    expect(isSidebarCommand({ v: 1, id: "1", type: "run.steer", runId: "r1", text: 5 })).toBe(false);
+    expect(isSidebarCommand({ v: 1, id: "1", type: "run.steer", runId: "r1", text: "Use tab 2", sessionId: "s1" })).toBe(true);
+    expect(isSidebarCommand({ v: 1, id: "1", type: "run.steer", runId: "r1", text: "Use tab 2" })).toBe(false);
+    expect(isSidebarCommand({ v: 1, id: "1", type: "run.steer", text: "Use tab 2", sessionId: "s1" })).toBe(false);
+    expect(isSidebarCommand({ v: 1, id: "1", type: "run.steer", runId: "r1", text: 5, sessionId: "s1" })).toBe(false);
     for (const type of ["queue.remove", "queue.send"]) {
       expect(isSidebarCommand({ v: 1, id: "1", type, sessionId: "s1", messageId: "m1" })).toBe(true);
       expect(isSidebarCommand({ v: 1, id: "1", type, sessionId: "../s1", messageId: "m1" })).toBe(false);
@@ -48,8 +59,9 @@ describe("isSidebarCommand: accepts every valid variant", () => {
     }
   });
 
-  it("accepts run.retry, which carries no prompt", () => {
-    expect(isSidebarCommand({ v: 1, id: "1", type: "run.retry" })).toBe(true);
+  it("accepts run.retry, which carries no prompt, only for a named session", () => {
+    expect(isSidebarCommand({ v: 1, id: "1", type: "run.retry", sessionId: "s1" })).toBe(true);
+    expect(isSidebarCommand({ v: 1, id: "1", type: "run.retry" })).toBe(false);
   });
 
   it("accepts run.cancel", () => {

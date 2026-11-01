@@ -473,6 +473,11 @@ function isRefPrefix(frameId: unknown, value: unknown): boolean {
   return frameId === 0 ? value === "" : typeof value === "string" && /^f[1-9]\d{0,5}:$/.test(value);
 }
 
+/** A Firefox window id: a non-negative integer (never `WINDOW_ID_NONE` or `WINDOW_ID_CURRENT`). */
+function isWindowId(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
 function isTabId(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 0;
 }
@@ -519,13 +524,23 @@ export interface NormalizedError {
 export const SIDEBAR_PORT_NAME = "agent-sidebar:v1";
 
 export type SidebarCommand =
+  /**
+   * The Port's first command: attaches it as the sidebar view of window
+   * `windowId` (the sidebar reads it from `windows.getCurrent()`). The
+   * background answers nothing to a Port before it attaches; commands sent
+   * earlier wait for it. The view shows one session, the chat the background
+   * picks for it (see `RuntimeSnapshot.conversation`), and every command that
+   * names or implies "the open session" is checked against that view.
+   */
+  | { v: 1; id: string; type: "view.attach"; windowId: number }
   | { v: 1; id: string; type: "skills.list" }
+  /** The tabs this view's chat can mention: the user's own, and that chat's agent tabs. */
   | { v: 1; id: string; type: "tabs.list" }
   | { v: 1; id: string; type: "tabs.focus"; tabId: number }
   /** Closes one session's hidden agent tabs (the sidebar sends the open session's); refused while that session has an active run. */
   | { v: 1; id: string; type: "tabs.closeAgentTabs"; sessionId: string }
   /**
-   * Shows one of the open session's agent tabs next to the active tab and switches to it, so the user can watch it.
+   * Shows one of this view's session's agent tabs next to its window's active tab and switches to it, so the user can watch it.
    * bside keeps the tab: switching to any other tab hides it again. Watching another tab replaces this one.
    */
   | { v: 1; id: string; type: "tabs.watch"; tabId: number }
@@ -552,7 +567,7 @@ export type SidebarCommand =
    */
   | { v: 1; id: string; type: "memory.undo"; changeIds: string[] }
   /**
-   * Reads one of the open session's `/workspace` images so the sidebar can show
+   * Reads one of this view's session's `/workspace` images so the sidebar can show
    * it where model Markdown references it. Not a run effect and never sent to
    * the model. Answered with `workspace.image.loaded` to the requesting sidebar only.
    */
@@ -566,14 +581,17 @@ export type SidebarCommand =
    * when each run's buffer still covers them, else sends a full snapshot.
    */
   | { v: 1; id: string; type: "state.subscribe"; lastSeq: Record<string, number> | null }
-  /** "New chat": opens an empty session (reusing the open one if it is an untouched new chat), which starts with an empty /workspace. */
+  /** "New chat": shows an empty session in this view (reusing its own if it is an untouched new chat), which starts with an empty /workspace. */
   | { v: 1; id: string; type: "session.create" }
   /** Answered with `session.listed` to the requesting sidebar; every sidebar also gets `session.listed` whenever the index changes. */
   | { v: 1; id: string; type: "session.list" }
-  /** Allowed while a run is active elsewhere; the run keeps its own session. Leaving an untouched new chat (no items, pin, or user title) deletes it. */
+  /**
+   * Shows a session in this view. Allowed while a run is active elsewhere; the run keeps its own session. An untouched
+   * new chat (no items, pin, or user title) that no view shows any more and that has no run is deleted.
+   */
   | { v: 1; id: string; type: "session.open"; sessionId: string }
   /**
-   * Refused for the active run's session. Deleting the open session opens the most recent remaining one, or a new empty one.
+   * Refused for the active run's session. Every view showing it then shows the most recent remaining one, or a new empty one.
    * The session's scratch files are deleted with it; its agent tabs are closed, or with `closeAgentTabs: false` shown and handed to the user.
    */
   | { v: 1; id: string; type: "session.delete"; sessionId: string; closeAgentTabs: boolean }
@@ -581,28 +599,30 @@ export type SidebarCommand =
   | { v: 1; id: string; type: "session.rename"; sessionId: string; title: string }
   | { v: 1; id: string; type: "session.pin"; sessionId: string; pinned: boolean }
   /**
-   * Starts a run in the open session. While the active run is in the open
-   * session, queues the prompt as a follow-up instead: it starts the next
-   * turn once that run completes (not after a failure or cancellation).
+   * Starts a run in `sessionId`, which must be the session this view shows
+   * (else refused with a notice). While that session has a run, queues the
+   * prompt as a follow-up instead: it starts the next turn once that run
+   * completes (not after a failure or cancellation).
    */
-  | { v: 1; id: string; type: "run.start"; prompt: string; askId?: string; contentIds?: string[]; attachmentIds?: string[]; sessionId?: string }
+  | { v: 1; id: string; type: "run.start"; prompt: string; askId?: string; contentIds?: string[]; attachmentIds?: string[]; sessionId: string }
   /**
    * Guidance for the active run, delivered as a user message at its next tool
    * boundary, within the same turn and budgets. If `runId` is no longer
    * running (finished or cancelling), handled exactly like `run.start`.
-   * `askId` (on either) sends the pending context-menu chip with the message;
-   * a chip that is no longer pending refuses the send with a notice.
-   * `contentIds` (prepared MCP content) and `attachmentIds` (prepared files,
-   * see `attachment.prepare`) need `sessionId`, the open session they were
-   * prepared for; the send claims them, and a refused send leaves them
-   * pending, with a notice in the next `state.snapshot`.
+   * `sessionId` (on either) is the session this view shows, and the run's.
+   * `askId` (on either) sends this window's pending context-menu chip with
+   * the message; a chip that is no longer pending refuses the send with a
+   * notice. `contentIds` (prepared MCP content) and `attachmentIds` (prepared
+   * files, see `attachment.prepare`) must have been prepared for `sessionId`;
+   * the send claims them, and a refused send leaves them pending, with a
+   * notice in the next `state.snapshot`.
    */
-  | { v: 1; id: string; type: "run.steer"; runId: string; text: string; askId?: string; contentIds?: string[]; attachmentIds?: string[]; sessionId?: string }
+  | { v: 1; id: string; type: "run.steer"; runId: string; text: string; askId?: string; contentIds?: string[]; attachmentIds?: string[]; sessionId: string }
   | { v: 1; id: string; type: "mcp.content.list"; sessionId: string; kind: "prompt" | "resource" }
   | { v: 1; id: string; type: "mcp.content.prepare"; sessionId: string; choiceId: string; arguments: Record<string, string> }
   | { v: 1; id: string; type: "mcp.content.dismiss"; sessionId: string; contentIds: string[] }
   /**
-   * Holds one file the user attached, for the open session, until a message
+   * Holds one file the user attached, for the session this view shows, until a message
    * sends it (`attachmentIds`) or it is dismissed. `name` and `mimeType` are
    * the file's as the sidebar read them (`mimeType` may be empty); `data` is
    * its bytes as canonical base64 (1 byte to 10 MB). The background cleans
@@ -614,14 +634,17 @@ export type SidebarCommand =
   | { v: 1; id: string; type: "attachment.prepare"; sessionId: string; name: string; mimeType: string; data: string }
   /** Drops this sidebar's pending files that no send has claimed. */
   | { v: 1; id: string; type: "attachment.dismiss"; sessionId: string; attachmentIds: string[] }
-  /** Removes the pending "Ask bside about…" chip, if it is still the one named. */
+  /** Removes this window's pending "Ask bside about…" chip, if it is still the one named. */
   | { v: 1; id: string; type: "ask.dismiss"; askId: string }
   /** Discards a queued follow-up, or a steer not yet delivered, from a session's queue. */
   | { v: 1; id: string; type: "queue.remove"; sessionId: string; messageId: string }
-  /** Starts a run with a queued follow-up of the open session now; refused while any run is active. */
+  /** Starts a run with a queued follow-up of this view's session now; refused while that session has a run. */
   | { v: 1; id: string; type: "queue.send"; sessionId: string; messageId: string }
-  /** Re-runs the open session's last turn's existing user message; accepted only when no run is active and that turn ended failed, cancelled, or interrupted without a committed page effect. */
-  | { v: 1; id: string; type: "run.retry" }
+  /**
+   * Re-runs the last turn's existing user message of `sessionId`, the session this view shows; accepted only when that
+   * session has no run and that turn ended failed, cancelled, or interrupted without a committed page effect.
+   */
+  | { v: 1; id: string; type: "run.retry"; sessionId: string }
   | { v: 1; id: string; type: "run.cancel"; runId: string }
   | { v: 1; id: string; type: "action.approve"; runId: string; callId: string }
   | { v: 1; id: string; type: "action.deny"; runId: string; callId: string }
@@ -644,10 +667,9 @@ const isAskId = (value: unknown): value is string => typeof value === "string" &
 const isContentIds = (value: unknown): value is string[] => Array.isArray(value) && value.length <= MCP_CONTENT_LIMITS.attachments && value.every(isAskId) && new Set(value).size === value.length;
 const isOptionalAskId = (value: unknown) => value === undefined || isAskId(value);
 const isAttachmentIds = (value: unknown): value is string[] => Array.isArray(value) && value.length <= ATTACHMENT_LIMITS.perMessage && value.every(isAskId) && new Set(value).size === value.length;
-/** Optional `contentIds`/`attachmentIds` on a send; either needs the session they were prepared for. */
+/** A send's session and its optional `contentIds`/`attachmentIds`, prepared for that session. */
 const isSendSelection = (candidate: Record<string, unknown>) =>
-  (candidate.contentIds === undefined || isContentIds(candidate.contentIds)) && (candidate.attachmentIds === undefined || isAttachmentIds(candidate.attachmentIds)) &&
-  (candidate.contentIds === undefined && candidate.attachmentIds === undefined || isSessionId(candidate.sessionId));
+  isSessionId(candidate.sessionId) && (candidate.contentIds === undefined || isContentIds(candidate.contentIds)) && (candidate.attachmentIds === undefined || isAttachmentIds(candidate.attachmentIds));
 
 /** A `state.subscribe` seq map: a plain object of at most `MAX_SUBSCRIBE_RUNS` run ids (≤64 characters) to non-negative integer seqs. */
 function isRunSeqs(value: unknown): value is Record<string, number> {
@@ -691,18 +713,19 @@ export interface HelpRequest {
 
 export interface RuntimeSnapshot {
   skills?: SkillSummary[];
-  /** The open session. */
+  /** The session this view shows ("the open session" of this sidebar). */
   conversation: Conversation;
   credential: { configured: boolean; maskedSuffix: string | null; chatgpt: ChatGPTStatus };
   provider: ProviderDefinition;
   settings: AppSettingsV1;
   /** The permission mode beside the composer; it applies to the active run at its next gated call. */
   permissionMode: PermissionMode;
+  /** The active tab of this view's window, when it can be attached. */
   page: AttachedPage | null;
   agentTabs: AgentTabsState;
-  /** The open session's queued follow-ups and undelivered steers, oldest first. */
+  /** The view's session's queued follow-ups and undelivered steers, oldest first. */
   queue: QueuedMessage[];
-  /** The pending "Ask bside about…" chip from the page's context menu, shown beside the composer of any chat. */
+  /** This window's pending "Ask bside about…" chip from the page's context menu, shown beside the composer of whichever chat the window shows. */
   ask: AskContextV1 | null;
   /** Every run in progress, at most one per session; each may belong to a session other than the open one. */
   runs: RunState[];
@@ -755,14 +778,16 @@ export type SidebarEvent =
   | EventBase<"workspace.image.loaded", { requestId: string; result: WorkspaceImageReply }>
   | EventBase<"state.snapshot", RuntimeSnapshot>
   | EventBase<"session.listed", { sessions: ConversationSummary[] }>
+  /** The active tab of this view's window, whenever its attachability changes; sent only to that window's views. */
   | EventBase<"page.attached", AttachedPage | null>
   | EventBase<"agent-tabs.changed", AgentTabsState>
   /** The permission mode changed (from any sidebar). Not run-sequenced. */
   | EventBase<"permissions.changed", { mode: PermissionMode }>
   /** A session's queue after it changed; `conversationId` is that session. Not run-sequenced. */
   | EventBase<"queue.changed", { messages: QueuedMessage[] }>
-  /** The pending context-menu chip changed: a new click, alt text the page reported, sent, or removed. Not run-sequenced. */
+  /** This window's pending context-menu chip changed: a new click, alt text the page reported, sent, or removed. Sent only to that window's views. Not run-sequenced. */
   | EventBase<"ask.changed", { ask: AskContextV1 | null }>
+  /** Focus the composer (a context-menu click or the new-chat command in this window). Sent only to that window's views. */
   | EventBase<"composer.focus", null>
   | EventBase<"mcp.content.reply", { requestId: string; result: McpContentReply }>
   | EventBase<"mcp.content.accepted", { ids: string[] }>
@@ -804,6 +829,7 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (candidate.type === "mcp.content.list") return isSessionId(candidate.sessionId) && (candidate.kind === "prompt" || candidate.kind === "resource");
   if (candidate.type === "mcp.content.prepare") return isSessionId(candidate.sessionId) && isAskId(candidate.choiceId) && isMcpArguments(candidate.arguments);
   if (candidate.type === "mcp.content.dismiss") return isSessionId(candidate.sessionId) && isContentIds(candidate.contentIds);
+  if (candidate.type === "view.attach") return isWindowId(candidate.windowId);
   if (candidate.type === "skills.list") return true;
   if (candidate.type === "tabs.list") return true;
   if (candidate.type === "tabs.focus") return Number.isSafeInteger(candidate.tabId);
@@ -842,7 +868,7 @@ export function isSidebarCommand(value: unknown): value is SidebarCommand {
   if (candidate.type === "queue.remove" || candidate.type === "queue.send") {
     return isSessionId(candidate.sessionId) && typeof candidate.messageId === "string";
   }
-  if (candidate.type === "run.retry") return true;
+  if (candidate.type === "run.retry") return isSessionId(candidate.sessionId);
   if (candidate.type === "run.cancel") return typeof candidate.runId === "string";
   if (candidate.type === "action.approve" || candidate.type === "action.deny") {
     return typeof candidate.runId === "string" && typeof candidate.callId === "string";
