@@ -1518,3 +1518,199 @@ summary.trace__line:focus-visible .trace__chevron,
 .mcp-prompt-form { display: grid; gap: 8px; padding: 12px; border: 1px solid var(--hairline); border-radius: 8px; overflow-wrap: anywhere; }
 .mcp-prompt-form label { display: grid; gap: 4px; }
 .mcp-prompt-form input { width: 100%; min-width: 0; box-sizing: border-box; }
+
+/* File attachments: chips in the composer (pending), on user messages, steers, and queued messages. */
+.composer__attach {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  margin: 0 -4px 0 -2px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.composer__attach:hover:not(:disabled) {
+  background: var(--raised);
+  color: var(--ink);
+}
+.composer__hint {
+  margin: 6px 4px 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+.composer__file-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0 0 6px;
+  padding: 6px 8px;
+  border-radius: var(--radius-control);
+  background: color-mix(in srgb, var(--error) 10%, transparent);
+  color: var(--error);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.composer__file-notice span {
+  flex: 1;
+  min-width: 0;
+}
+.file-chips {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 0;
+  padding: 0;
+  min-width: 0;
+  max-width: 100%;
+}
+.file-chips--pending {
+  margin: 0 0 6px;
+}
+.timeline__item--user .file-chips {
+  justify-content: flex-end;
+  max-width: 88%;
+}
+/* A queued message's files go on their own line below its text. */
+.queue__item:has(> .file-chips) {
+  flex-wrap: wrap;
+}
+.queue__item > .file-chips {
+  order: 1;
+  flex-basis: 100%;
+  margin: 0 0 4px;
+}
+.file-chip {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  max-width: min(100%, 220px);
+  padding: 4px 4px 4px 4px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-control);
+  background: var(--raised);
+  font-size: 12px;
+  line-height: 1.3;
+}
+.file-chips--compact .file-chip {
+  max-width: min(100%, 180px);
+  padding: 2px 6px 2px 2px;
+}
+.file-chip--failed {
+  border-color: color-mix(in srgb, var(--error) 45%, transparent);
+}
+.file-chip__thumb {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  overflow: hidden;
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--muted);
+}
+.file-chips--compact .file-chip__thumb {
+  width: 24px;
+  height: 24px;
+}
+.file-chip--failed .file-chip__thumb {
+  color: var(--error);
+}
+.file-chip__thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.file-chip__thumb svg {
+  width: 16px;
+  height: 16px;
+}
+.file-chip__text {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  padding-right: 2px;
+}
+.file-chip__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+.file-chip__meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--muted);
+}
+.file-chip--failed .file-chip__meta {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  color: var(--error);
+}
+.file-chip--busy .file-chip__thumb {
+  animation: pulse 0.9s ease-in-out infinite alternate;
+}
+.file-chip__remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  align-self: flex-start;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  opacity: 0.75;
+  cursor: pointer;
+}
+.file-chip__remove:hover {
+  opacity: 1;
+  background: var(--surface);
+}
+.file-chip__remove svg {
+  width: 14px;
+  height: 14px;
+}
+.drop-overlay {
+  position: fixed;
+  inset: 6px;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 2px dashed color-mix(in srgb, var(--accent) 70%, transparent);
+  border-radius: var(--radius-panel);
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  color: var(--ink);
+  pointer-events: none;
+}
+.drop-overlay svg {
+  width: 32px;
+  height: 32px;
+  color: var(--accent);
+}
+.drop-overlay p {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 500;
+}
+@media (prefers-reduced-motion: reduce) {
+  .file-chip--busy .file-chip__thumb { animation: none; }
+}
