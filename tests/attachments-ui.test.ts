@@ -282,6 +282,16 @@ describe("sidebar attachments UI", () => {
     return { ...port, root, unmount: () => act(() => render(null, root)) };
   }
 
+  it("keeps the composer's text per tab only while the chat is empty, and per chat once it has messages", async () => {
+    const f = await mountApp();
+    await f.emit({ runId: null, conversationId: "s1", type: "state.snapshot", payload: { ...snapshotFor("s1"), viewTabId: 12 } });
+    expect(composer.props).toMatchObject({ sessionId: "s1", draftTabId: 12 });
+    const item: ConversationItem = { id: "u1", kind: "message", role: "user", text: "Hi", context: null, at: 1 };
+    await f.emit({ runId: null, conversationId: "s1", type: "state.snapshot", payload: { ...snapshotFor("s1", [item]), viewTabId: 12 } });
+    expect(composer.props).toMatchObject({ sessionId: "s1", draftTabId: null });
+    f.unmount();
+  });
+
   it("shows a drop overlay only for drags carrying files, cancels their default, and attaches dropped files", async () => {
     const f = await mountApp();
     const sidebar = f.root.querySelector(".sidebar")!;

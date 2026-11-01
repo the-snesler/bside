@@ -97,6 +97,7 @@ export function App() {
     saveSettings,
     permissionMode,
     savePermissionMode,
+    viewTabId,
     sendPrompt,
     listMcpContent, prepareMcpContent, dismissMcpContent, mcpAttachments,
     pendingFiles, fileNotice, attachFiles, removeFile, clearFileNotice,
@@ -497,6 +498,7 @@ export function App() {
               )}
               <Composer
                 sessionId={conversation.id}
+                draftTabId={conversation.items.length === 0 && !runHere ? viewTabId : null}
                 attachments={mcpAttachments.filter(item => item.sessionId === conversation.id)}
                 onListMcpContent={listMcpContent}
                 onPrepareMcpContent={prepareMcpContent}
