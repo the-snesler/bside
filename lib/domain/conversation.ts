@@ -5,6 +5,7 @@
  */
 
 import type { McpContentSnapshot } from "@/lib/domain/mcp-content";
+import type { AttachmentRefV1 } from "@/lib/domain/attachments";
 import type { HelpKind, PageArtifactSummary, ToolCall, ToolResult } from "@/lib/domain/tools";
 import type { RunUsageV1, UsageTotals } from "@/lib/domain/usage";
 import type { Skill } from "@/lib/domain/skills";
@@ -34,6 +35,8 @@ export type ConversationItem =
       scheduled?: ScheduledSource;
       /** Immutable user-selected remote data, never elevated messages. */
       content?: McpContentSnapshot[];
+      /** Files the user attached, written to the session's `/workspace/uploads/` when the message was accepted; references only, never bytes. */
+      attachments?: AttachmentRefV1[];
       /**
        * `"steer"`: guidance sent while the turn's run was working, persisted
        * where the model received it (after a tool round). It belongs to the
@@ -87,6 +90,8 @@ export interface QueuedMessage {
   /** The context-menu chip sent with the message, taken when it was accepted. */
   ask?: AskContextV1;
   content?: McpContentSnapshot[];
+  /** Files the user attached, already in the session's `/workspace/uploads/`; the message keeps them when it is sent or delivered. */
+  attachments?: AttachmentRefV1[];
   at: number;
 }
 

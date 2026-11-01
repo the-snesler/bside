@@ -11,6 +11,7 @@
  */
 
 import { isMcpContentSnapshots } from "@/lib/domain/mcp-content";
+import { isAttachmentRefs } from "@/lib/domain/attachments";
 import { storage } from "wxt/utils/storage";
 import { isScheduledTask, isScheduledSource, MAX_SCHEDULED_TASKS, taskDraft, type ScheduledTask, type ScheduledTasksV1, type NotificationSettingsV1 } from "@/lib/domain/automation";
 import { isSkill } from "@/lib/domain/skills";
@@ -168,7 +169,8 @@ function isValidConversationItem(value: unknown): value is ConversationItem {
     if (typeof v.text !== "string") return false;
     if (v.role === "user") return (v.context === null || typeof v.context === "object") && (v.delivery === undefined || v.delivery === "steer") && (v.skill === undefined || isSkill(v.skill)) &&
       (v.scheduled === undefined || isScheduledSource(v.scheduled)) &&
-      (v.sites === undefined || (Array.isArray(v.sites) && v.sites.length <= MAX_SITE_NOTES && v.sites.every(isSiteNote))) && (v.ask === undefined || isAskContext(v.ask)) && (v.content === undefined || isMcpContentSnapshots(v.content));
+      (v.sites === undefined || (Array.isArray(v.sites) && v.sites.length <= MAX_SITE_NOTES && v.sites.every(isSiteNote))) && (v.ask === undefined || isAskContext(v.ask)) && (v.content === undefined || isMcpContentSnapshots(v.content)) &&
+      (v.attachments === undefined || isAttachmentRefs(v.attachments));
     return v.role === "assistant";
   }
   if (v.kind === "tool-call") return typeof v.call === "object" && v.call !== null;
@@ -698,6 +700,7 @@ export function isSessionUntouched(id: string): Promise<boolean> {
 export function appendConversationItem(id: string, item: ConversationItem): Promise<void> {
   return withConversationLock(async () => {
     if (item.kind === "message" && item.role === "user" && item.content !== undefined && !isMcpContentSnapshots(item.content, id)) throw new Error("Invalid MCP attachment snapshot.");
+    if (item.kind === "message" && item.role === "user" && item.attachments !== undefined && !isAttachmentRefs(item.attachments)) throw new Error("Invalid attached files.");
     let record = await readRecord(id);
     if (!record) {
       const summary = (await readIndex()).find((session) => session.id === id);
@@ -1120,7 +1123,8 @@ function isValidQueuedMessage(value: unknown): value is QueuedMessage {
   const v = value as Record<string, unknown>;
   return typeof v.id === "string" && v.id.length > 0 && v.id.length <= 64 && (v.mode === "follow-up" || v.mode === "steer") &&
     typeof v.text === "string" && validatePromptText(v.text) === v.text && Number.isFinite(v.at) && (v.skill === undefined || isSkill(v.skill)) &&
-    (v.ask === undefined || isAskContext(v.ask)) && (v.content === undefined || isMcpContentSnapshots(v.content));
+    (v.ask === undefined || isAskContext(v.ask)) && (v.content === undefined || isMcpContentSnapshots(v.content)) &&
+    (v.attachments === undefined || isAttachmentRefs(v.attachments));
 }
 
 /** A session's queued messages, oldest first. A malformed record is deleted and reads as empty. */
@@ -1137,6 +1141,7 @@ export async function loadMessageQueue(sessionId: string): Promise<QueuedMessage
 /** Replaces a session's queue; an empty queue removes the record. */
 export async function saveMessageQueue(sessionId: string, messages: readonly QueuedMessage[]): Promise<void> {
   if (messages.some(message => message.content !== undefined && !isMcpContentSnapshots(message.content, sessionId))) throw new Error("Invalid queued MCP attachment snapshot.");
+  if (messages.some(message => message.attachments !== undefined && !isAttachmentRefs(message.attachments))) throw new Error("Invalid queued attached files.");
   if (messages.length === 0) await storage.removeItem(queueKey(sessionId));
   else await storage.setItem(queueKey(sessionId), { version: 1, messages: [...messages] } satisfies MessageQueueV1);
 }
