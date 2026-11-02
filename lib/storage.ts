@@ -22,7 +22,7 @@ import { DEFAULT_PERMISSION_SETTINGS, isPermissionMode, type PermissionSettingsV
 import { DEFAULT_MEMORY_SETTINGS, isMemoryChange, isMemoryEntry, MAX_MEMORIES, MEMORY_WRITE_POLICIES, type MemoryEntry, type MemoryEntryV1, type MemorySettingsV1 } from "@/lib/domain/memory";
 import { REASONING_EFFORTS, type AppSettingsV1, type ModelListing, type ReasoningEffort } from "@/lib/domain/provider";
 import type { Conversation, ConversationIndexV1, ConversationItem, ConversationSummary, HistorySettingsV1, MessageQueueV1, QueuedMessage } from "@/lib/domain/conversation";
-import { COMPACTION_SUMMARY_MAX_CHARS, HISTORY_RETENTIONS, isTurnStart, MAX_QUEUED_MESSAGES, titleFromPrompt } from "@/lib/domain/conversation";
+import { COMPACTION_SUMMARY_MAX_CHARS, HISTORY_RETENTIONS, isTurnStart, isUntouchedSummary, MAX_QUEUED_MESSAGES, titleFromPrompt } from "@/lib/domain/conversation";
 import { digestFromItems, isValidRunDigest } from "@/lib/domain/run-digest";
 import { addRunUsage, EMPTY_USAGE, hasTokens, isValidRunUsage, isValidUsageTotals, type RunUsageV1 } from "@/lib/domain/usage";
 import { DEFAULT_MODEL_ID, DEFAULT_REASONING_EFFORT } from "@/lib/providers/openai-models";
@@ -693,6 +693,43 @@ export function isSessionUntouched(id: string): Promise<boolean> {
   });
 }
 
+/** Whether an index entry is an untouched new chat by its record's item count; called only while holding the conversation lock. */
+async function isUntouchedEntry(session: ConversationSummary): Promise<boolean> {
+  return isUntouchedSummary({ ...session, itemCount: (await readRecord(session.id))?.itemCount ?? 0 });
+}
+
+/**
+ * The index as `listSessions` sorts it, without untouched new chats (see
+ * `isSessionUntouched`) other than `keep`: what the history drawer lists.
+ * Only entries whose index count is 0 read their record.
+ */
+export function listTouchedSessions(keep: readonly string[] = []): Promise<ConversationSummary[]> {
+  return withConversationLock(async () => {
+    const listed: ConversationSummary[] = [];
+    for (const session of await readIndex()) {
+      if (keep.includes(session.id) || !isUntouchedSummary(session) || !(await isUntouchedEntry(session))) listed.push(session);
+    }
+    return sortSessions(listed);
+  });
+}
+
+/**
+ * Deletes every untouched new chat (see `isSessionUntouched`) except `keep`,
+ * in one index write, and clears the open pointer if it named one. Returns
+ * the deleted ids.
+ */
+export function deleteUntouchedSessions(keep: readonly string[]): Promise<string[]> {
+  return withConversationLock(async () => {
+    const sessions = await readIndex();
+    const doomed: ConversationSummary[] = [];
+    for (const session of sessions) {
+      if (!keep.includes(session.id) && isUntouchedSummary(session) && await isUntouchedEntry(session)) doomed.push(session);
+    }
+    await removeSessions(sessions, doomed);
+    return doomed.map((session) => session.id);
+  });
+}
+
 /**
  * Appends one item, writing only the tail chunk and the record. Throws for a
  * session missing from the index. A corrupt tail chunk loses only its own items.
@@ -821,7 +858,11 @@ export async function setOpenSessionId(id: string): Promise<void> {
   await openConversationItem.setValue({ version: 1, id });
 }
 
-/** Returns the open session, else opens the most recently updated one, else creates and opens an empty one. */
+/**
+ * The fallback session, `local:openConversation`: the session last shown in
+ * any sidebar view, which a newly attached view shows. Returns it, else makes
+ * the most recently updated one the fallback, else creates an empty one.
+ */
 export function ensureOpenSession(): Promise<string> {
   return withConversationLock(async () => {
     const sessions = await readIndex();

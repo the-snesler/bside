@@ -61,6 +61,13 @@ function fakePort(): FakePort {
   } as unknown as FakePort;
 }
 
+/** Connects a sidebar Port and attaches it as the view of `windowId`, as the sidebar does when it loads. */
+async function attachView(hub: SidebarHub, port: FakePort, windowId = 1): Promise<FakePort> {
+  hub.handleConnect(port);
+  await port.send({ v: 1, id: crypto.randomUUID(), type: "view.attach", windowId });
+  return port;
+}
+
 function noPageTabs(): TabController {
   const api: TabControllerBrowserApi = {
     tabs: {
@@ -84,9 +91,10 @@ async function fixture(options: { provider?: FakeProvider; credential?: boolean 
   const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: noPageTabs, scaleImage });
   hub.delegate = runtime;
   const port = fakePort();
-  hub.handleConnect(port);
+  await attachView(hub, port);
   await port.send({ v: 1, id: "subscribe", type: "state.subscribe", lastSeq: null });
-  const sessionId = (await runtime.getSnapshot()).conversation.id;
+  // The chat the sidebar shows: its window has no active tab, so an empty one.
+  const sessionId = hub.viewOf(port)!.sessionId;
   const prepare = async (name: string, mimeType: string, bytes: Uint8Array, sender = port, session = sessionId) => {
     const id = crypto.randomUUID();
     await sender.send({ v: 1, id, type: "attachment.prepare", sessionId: session, name, mimeType, data: b64(bytes) });
@@ -245,7 +253,7 @@ describe("BackgroundRuntime: attached files", () => {
   it("answers prepare privately and refuses another chat", async () => {
     const f = await fixture({ credential: false });
     const other = fakePort();
-    f.hub.handleConnect(other);
+    await attachView(f.hub, other);
     const result = await f.prepare("photo", "image/png", PNG);
     expect(result).toEqual({ attachment: { id: expect.any(String), name: "photo", mimeType: "image/png", bytes: PNG.length, text: false } });
     expect(other.received.some((event) => event.type === "attachment.prepared")).toBe(false);
@@ -284,8 +292,8 @@ describe("BackgroundRuntime: attached files", () => {
     expect(await f.userItems()).toHaveLength(1);
 
     // Later turns replay the list as text, byte-identically, without the image.
-    await f.port.send({ v: 1, id: "next", type: "run.start", prompt: "And now?" });
-    await f.port.send({ v: 1, id: "third", type: "run.start", prompt: "Once more" });
+    await f.port.send({ v: 1, id: "next", type: "run.start", sessionId: f.sessionId, prompt: "And now?" });
+    await f.port.send({ v: 1, id: "third", type: "run.start", sessionId: f.sessionId, prompt: "Once more" });
     const replayed = f.provider.requests[1]!.context.messages[0];
     expect(parts(replayed)).toEqual([{ type: "text", text: first[0]!.text }]);
     expect(JSON.stringify(f.provider.requests[2]!.context.messages[0])).toBe(JSON.stringify(replayed));
@@ -358,7 +366,8 @@ describe("BackgroundRuntime: attached files", () => {
     const f = await fixture();
     const photo = await f.prepared("photo.png", "image/png", PNG);
     const other = fakePort();
-    f.hub.handleConnect(other);
+    await attachView(f.hub, other);
+    await other.send({ v: 1, id: "open", type: "session.open", sessionId: f.sessionId });
     await other.send({ v: 1, id: "a", type: "run.start", prompt: "See", sessionId: f.sessionId, attachmentIds: [photo.id] });
     expect(await f.notice()).toContain("no longer available");
     expect(await f.uploads()).toEqual([]);
@@ -387,7 +396,7 @@ describe("BackgroundRuntime: attached files", () => {
         yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
       } else yield* answer;
     } });
-    const running = f.port.send({ v: 1, id: "start", type: "run.start", prompt: "Start" });
+    const running = f.port.send({ v: 1, id: "start", type: "run.start", sessionId: f.sessionId, prompt: "Start" });
     await vi.waitFor(() => expect(f.provider.requests).toHaveLength(1));
     const runId = (await f.runtime.getSnapshot()).runs[0]!.runId;
     const photo = await f.prepared("photo.png", "image/png", PNG);
@@ -415,7 +424,7 @@ describe("BackgroundRuntime: attached files", () => {
     const f = await fixture();
     const gate = Promise.withResolvers<void>();
     f.provider.script = () => ({ [Symbol.asyncIterator]: async function* () { await gate.promise; yield* answer; } });
-    const running = f.port.send({ v: 1, id: "start", type: "run.start", prompt: "Start" });
+    const running = f.port.send({ v: 1, id: "start", type: "run.start", sessionId: f.sessionId, prompt: "Start" });
     await vi.waitFor(() => expect(f.provider.requests).toHaveLength(1));
     const photo = await f.prepared("photo.png", "image/png", PNG);
     await f.port.send({ v: 1, id: "q", type: "run.start", prompt: "Later", sessionId: f.sessionId, attachmentIds: [photo.id] });
@@ -433,7 +442,7 @@ describe("BackgroundRuntime: attached files", () => {
     const photo = await f.prepared("photo.png", "image/png", PNG);
     await f.port.send({ v: 1, id: "a", type: "run.start", prompt: "See", sessionId: f.sessionId, attachmentIds: [photo.id] });
     f.provider.script = answer;
-    await f.port.send({ v: 1, id: "retry", type: "run.retry" });
+    await f.port.send({ v: 1, id: "retry", type: "run.retry", sessionId: f.sessionId });
     expect(await f.userItems()).toHaveLength(1);
     expect(JSON.stringify(f.provider.requests.at(-1)!.context.messages[0])).toBe(JSON.stringify(f.provider.requests[0]!.context.messages[0]));
     expect(parts(f.provider.requests.at(-1)!.context.messages[0]).some((part) => part.type === "image")).toBe(true);

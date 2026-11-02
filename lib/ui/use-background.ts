@@ -1,6 +1,12 @@
 /**
  * Preact hook connecting a UI surface to the background's
- * "agent-sidebar:v1" Port. The sidebar renders this state; it never owns an
+ * "agent-sidebar:v1" Port. It first attaches the Port as its window's sidebar
+ * view (`view.attach`, with the id from `windows.getCurrent()`), or, in a
+ * pop-out page (`mode: "tab"`), as the view of its own tab showing the
+ * session its hash names; the background then answers with that view's
+ * chat, page, and Ask chip (a pop-out has neither), and
+ * checks every command naming "the open session" (sent as `sessionId`)
+ * against it. The sidebar renders this state; it never owns an
  * inference request, tool loop, transcript authority, or credential read.
  * Between full `state.snapshot` syncs, run-lifecycle events are applied
  * incrementally so the composer/timeline update live without re-fetching.
@@ -30,6 +36,7 @@ import type { PermissionMode } from "@/lib/domain/permissions";
 import type { TabMention } from "@/lib/protocol";
 import { OPENAI_PROVIDER } from "@/lib/providers/openai-models";
 import { EMPTY_USAGE } from "@/lib/domain/usage";
+import { parseChatHash } from "@/lib/ui/chat-tab";
 import type { SiteNote } from "@/lib/domain/instructions";
 
 /** The sidebar's "Remember something about this site" editor, for one page's site. */
@@ -105,6 +112,8 @@ export interface BackgroundActions {
   /** Answers the run's pending help request; `note` is optional (empty for none). */
   resolveHelp(callId: string, outcome: HelpOutcome, note: string): void;
   newChat(): void;
+  /** Opens the open chat in a tab of its own (or focuses the tab it already has). */
+  popOut(): void;
   listSessions(): void;
   openSession(sessionId: string): void;
   renameSession(sessionId: string, title: string): void;
@@ -205,6 +214,7 @@ const INITIAL_STATE: BackgroundState = {
   settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
   permissionMode: "ask",
   page: null,
+  viewTabId: null,
   agentTabs: { bySession: {}, watching: null, takenOver: false },
   queue: [],
   runs: [],
@@ -216,7 +226,10 @@ const INITIAL_STATE: BackgroundState = {
 
 type Port = Browser.runtime.Port;
 
-export function useBackground(): BackgroundState & BackgroundActions {
+/** Where the hook runs: the native sidebar, or a chat popped out into a tab (`chat.html`). */
+export type SurfaceMode = "sidebar" | "tab";
+
+export function useBackground(mode: SurfaceMode = "sidebar"): BackgroundState & BackgroundActions {
   const [state, setState] = useState<BackgroundState>(INITIAL_STATE);
   const portRef = useRef<Port | null>(null);
   const seqsRef = useRef(new RunSeqTracker());
@@ -229,6 +242,8 @@ export function useBackground(): BackgroundState & BackgroundActions {
   const imageRequests = useRef(new Map<string, (reply: WorkspaceImageLoad) => void>());
   const imageCache = useRef(new Map<string, Promise<WorkspaceImageLoad>>());
   const conversationIdRef = useRef("");
+  /** Whether a `session.listed` has come, so `sessions` is the background's list rather than the initial empty one. */
+  const sessionsListedRef = useRef(false);
   conversationIdRef.current = state.conversation.id;
   /** The open session's run, which run commands (cancel, approve, deny, help, steer) address. */
   const openRunIdRef = useRef<string | null>(null);
@@ -378,6 +393,7 @@ export function useBackground(): BackgroundState & BackgroundActions {
         return;
       }
       if (event.type === "state.snapshot") seqsRef.current.reset(event.payload.runs);
+      if (event.type === "session.listed") sessionsListedRef.current = true;
       if (isRunEvent(event)) {
         const verdict = seqsRef.current.accept(event);
         if (verdict === "gap") port.postMessage({ v: 1, id: crypto.randomUUID(), type: "state.subscribe", lastSeq: seqsRef.current.known() } satisfies SidebarCommand);
@@ -387,6 +403,13 @@ export function useBackground(): BackgroundState & BackgroundActions {
     };
     port.onMessage.addListener(onMessage);
 
+    // The background holds every other command until the Port attaches, so they may be sent at once.
+    // A pop-out page attaches as its own tab's view, showing the chat its hash names.
+    if (mode === "tab") port.postMessage({ v: 1, id: crypto.randomUUID(), type: "view.attach", popOut: { sessionId: parseChatHash(location.hash) } } satisfies SidebarCommand);
+    else void sidebarWindowId().then((windowId) => {
+      if (portRef.current !== port || windowId === null) return;
+      port.postMessage({ v: 1, id: crypto.randomUUID(), type: "view.attach", windowId } satisfies SidebarCommand);
+    });
     const subscribe: SidebarCommand = { v: 1, id: crypto.randomUUID(), type: "state.subscribe", lastSeq: null };
     port.postMessage(subscribe);
     port.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.list" } satisfies SidebarCommand);
@@ -409,10 +432,12 @@ export function useBackground(): BackgroundState & BackgroundActions {
 
   // A chat that opens again prepares its waiting files.
   useEffect(() => { void pumpFiles(); }, [state.conversation.id]);
-  // Files of a chat that no longer exists (an untouched chat is deleted when the user leaves it) are dropped.
+  // Files of a chat that no longer exists are dropped: once the session list
+  // has come, one left out of it other than the open chat (history never
+  // lists untouched new chats, and one is deleted once no sidebar shows it).
   useEffect(() => {
-    const listed = new Set(state.sessions.map((session) => session.id));
-    if (!listed.has(state.conversation.id)) return;
+    if (!state.conversation.id || !sessionsListedRef.current) return;
+    const listed = new Set([...state.sessions.map((session) => session.id), state.conversation.id]);
     const gone = filesRef.current.filter((file) => !listed.has(file.sessionId));
     if (!gone.length) return;
     const port = portRef.current;
@@ -486,11 +511,11 @@ export function useBackground(): BackgroundState & BackgroundActions {
     setState(prev => ({ ...prev, mcpAttachments: prev.mcpAttachments.filter(item => item.id !== id) }));
   };
 
-  /** A send's prepared selections; either needs the session they were prepared for. */
+  /** A send's session (the open chat, which the background checks against this view) and its prepared selections. */
   const selection = (contentIds?: string[], attachmentIds?: string[]) => ({
+    sessionId: conversationIdRef.current,
     ...(contentIds?.length ? { contentIds } : {}),
     ...(attachmentIds?.length ? { attachmentIds } : {}),
-    ...(contentIds?.length || attachmentIds?.length ? { sessionId: conversationIdRef.current } : {}),
   });
   const sendPrompt = useCallback((prompt: string, askId?: string, contentIds?: string[], attachmentIds?: string[]) => {
     const command: SidebarCommand = { v: 1, id: crypto.randomUUID(), type: "run.start", prompt, ...(askId ? { askId } : {}), ...selection(contentIds, attachmentIds) };
@@ -512,7 +537,7 @@ export function useBackground(): BackgroundState & BackgroundActions {
   }, []);
 
   const retryRun = useCallback(() => {
-    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "run.retry" } satisfies SidebarCommand);
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "run.retry", sessionId: conversationIdRef.current } satisfies SidebarCommand);
   }, []);
 
   const cancelRun = useCallback(() => {
@@ -544,6 +569,9 @@ export function useBackground(): BackgroundState & BackgroundActions {
 
   const newChat = useCallback(() => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.create" } satisfies SidebarCommand);
+  }, []);
+  const popOut = useCallback(() => {
+    portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.popOut", sessionId: conversationIdRef.current } satisfies SidebarCommand);
   }, []);
   const listSessions = useCallback(() => {
     portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "session.list" } satisfies SidebarCommand);
@@ -619,11 +647,19 @@ export function useBackground(): BackgroundState & BackgroundActions {
   }, []);
 
   return {
-    ...state, sendPrompt, steer, removeQueued, sendQueued, retryRun, cancelRun, approveAction, denyAction, resolveHelp, newChat, listSessions, openSession, renameSession, pinSession,
+    ...state, sendPrompt, steer, removeQueued, sendQueued, retryRun, cancelRun, approveAction, denyAction, resolveHelp, newChat, popOut, listSessions, openSession, renameSession, pinSession,
     listMcpContent, prepareMcpContent, dismissMcpContent, attachFiles, removeFile, clearFileNotice,
     dismissAsk: (askId: string) => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "ask.dismiss", askId } satisfies SidebarCommand),
     deleteSession, downloadContext, rememberSite, saveSiteNote, closeSiteNote, undoMemory, loadWorkspaceImage, listTabs, listSkills: () => portRef.current?.postMessage({ v: 1, id: crypto.randomUUID(), type: "skills.list" } satisfies SidebarCommand), focusTab, closeAgentTabs, watchTab, unwatchTab, takeOverTab, saveSettings, savePermissionMode,
   };
+}
+
+/** This sidebar's window, for `view.attach`; `null` when Firefox names none. */
+async function sidebarWindowId(): Promise<number | null> {
+  try {
+    const id = (await browser.windows.getCurrent())?.id;
+    return Number.isSafeInteger(id) && id! >= 0 ? id! : null;
+  } catch { return null; }
 }
 
 /** Appends a run item to the timeline only when the run belongs to the open session. */

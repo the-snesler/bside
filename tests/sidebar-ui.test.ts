@@ -35,7 +35,7 @@ function snapshotFor(id: string): RuntimeSnapshot {
     provider: OPENAI_API_KEY_PROVIDER,
     settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
     permissionMode: "ask",
-    page: null, ask: null, agentTabs: { bySession: {}, watching: null, takenOver: false }, queue: [], runs: [], notice: null,
+    page: null, viewTabId: null, ask: null, agentTabs: { bySession: {}, watching: null, takenOver: false }, queue: [], runs: [], notice: null,
   };
 }
 
@@ -420,7 +420,7 @@ describe("sidebar UI contracts", () => {
     expect(background!.lastError?.retryable).toBe(true);
 
     await act(() => background!.retryRun());
-    expect(posted.at(-1)).toMatchObject({ v: 1, type: "run.retry" });
+    expect(posted.at(-1)).toMatchObject({ v: 1, type: "run.retry", sessionId: "s1" });
     expect(isSidebarCommand(posted.at(-1))).toBe(true);
 
     await emit({ runId: "r2", type: "run.started", payload: { prompt: "Find it", page: null, ask: null, retry: true } });
@@ -487,8 +487,31 @@ describe("sidebar UI contracts", () => {
       await act(() => view.current!.cancelRun());
       await act(() => view.current!.approveAction("call-1"));
       await act(() => view.current!.steer("Go on"));
-      expect(posted.slice(-3)).toMatchObject([{ type: "run.cancel", runId: "ra" }, { type: "action.approve", runId: "ra" }, { type: "run.steer", runId: "ra" }]);
+      expect(posted.slice(-3)).toMatchObject([{ type: "run.cancel", runId: "ra" }, { type: "action.approve", runId: "ra" }, { type: "run.steer", runId: "ra", sessionId: "a" }]);
       await unmount();
+    });
+
+    it("attaches its Port as its window's view and names the chat it shows on every send", async () => {
+      const current = vi.spyOn(browser.windows, "getCurrent").mockResolvedValue({ id: 7 } as never);
+      try {
+        const { view, posted, deliver, unmount } = await harness();
+        await vi.waitFor(() => expect(posted.some((message) => message.type === "view.attach")).toBe(true));
+        expect(posted.find((message) => message.type === "view.attach")).toMatchObject({ windowId: 7 });
+        expect(posted.filter((message) => message.type === "view.attach")).toHaveLength(1);
+        for (const message of posted) expect(isSidebarCommand(message)).toBe(true);
+
+        await deliver({ runId: null, conversationId: "b", seq: 0, type: "state.snapshot", payload: snapshotFor("b") });
+        await act(() => view.current!.sendPrompt("Hello"));
+        await act(() => view.current!.steer("Also this"));
+        await act(() => view.current!.retryRun());
+        expect(posted.slice(-3)).toMatchObject([
+          { type: "run.start", prompt: "Hello", sessionId: "b" },
+          { type: "run.start", prompt: "Also this", sessionId: "b" },
+          { type: "run.retry", sessionId: "b" },
+        ]);
+        for (const message of posted.slice(-3)) expect(isSidebarCommand(message)).toBe(true);
+        await unmount();
+      } finally { current.mockRestore(); }
     });
 
     it("skips duplicates, and on a gap skips the event and asks once for every run's missed events", async () => {
@@ -1287,5 +1310,107 @@ describe("entry-point drafts", () => {
     await emit("ask.changed", { ask: null });
     expect(root.querySelector(".ask-chip")).toBeNull();
     render(null, root);
+  });
+});
+
+describe("pop-out chat page", () => {
+  /** Renders the chat surface in `mode` at `hash`, returning an event emitter and the commands it posts. */
+  async function mountChat(mode: "sidebar" | "tab", hash = "") {
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    for (const link of document.head.querySelectorAll('link[rel="icon"]')) link.remove();
+    location.hash = hash;
+    const posted: Array<Record<string, unknown> & { type: string }> = [];
+    const listeners: Array<(message: unknown) => void> = [];
+    vi.spyOn(browser.runtime, "connect").mockReturnValue({
+      postMessage: (message: { type: string }) => posted.push(message),
+      onMessage: { addListener: (listener: (message: unknown) => void) => listeners.push(listener), removeListener: () => {} },
+      disconnect: () => {},
+    } as never);
+    const root = document.createElement("div");
+    document.body.append(root);
+    await act(() => render(h(App, { mode }), root));
+    const emit = (event: Omit<SidebarEvent, "v" | "seq" | "at">) => act(() => listeners.forEach((listener) => listener({ v: 1, at: 1, ...event, seq: stamp(event) })));
+    return { root, posted, emit };
+  }
+  const titled = (id: string, title: string, items: ConversationItem[] = []): RuntimeSnapshot => {
+    const snapshot = snapshotFor(id);
+    return { ...snapshot, conversation: { ...snapshot.conversation, title, titleSource: "prompt", itemCount: items.length, items } };
+  };
+  const icon = () => [...document.head.querySelectorAll<HTMLLinkElement>('link[rel="icon"]')].map((link) => link.getAttribute("href"));
+  const popOutButton = (root: HTMLElement) => root.querySelector<HTMLButtonElement>('[aria-label="Open in a tab"]');
+  const sent: ConversationItem[] = [{ id: "u1", kind: "message", role: "user", text: "Plan a trip", context: null, at: 0 }];
+
+  it("attaches as its tab's view of the hash's chat, shows no page or chip, and keeps the hash on the chat it shows", async () => {
+    const { root, posted, emit } = await mountChat("tab", "#/a");
+    expect(posted[0]).toMatchObject({ type: "view.attach", popOut: { sessionId: "a" } });
+    expect(isSidebarCommand(posted[0])).toBe(true);
+    const snapshot = titled("a", "Trip plan", sent);
+    snapshot.page = { tabId: 1, artifactId: "page1", kind: "page", title: "Active tab", url: "https://example.com/", capturedAt: 1 };
+    snapshot.ask = { version: 1, id: "ask-1", kind: "selection", tabId: 1, path: null, pageUrl: "https://example.com/", pageTitle: "Active tab", text: "x", at: 1 } as RuntimeSnapshot["ask"];
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: snapshot });
+    expect(root.querySelector(".sidebar--tab")).not.toBeNull();
+    expect(root.querySelector(".context-chip")).toBeNull();
+    expect(root.querySelector(".ask-chip")).toBeNull();
+    expect(popOutButton(root)).toBeNull();
+
+    // The history drawer opened another chat here: the hash follows it, without a new history entry.
+    const entries = history.length;
+    await emit({ runId: null, conversationId: "b", type: "state.snapshot", payload: titled("b", "Other") });
+    expect(location.hash).toBe("#/b");
+    expect(history.length).toBe(entries);
+    await act(() => root.querySelector<HTMLButtonElement>('[aria-label="New chat"]')!.click());
+    expect(posted.at(-1)).toMatchObject({ type: "session.create" });
+  });
+
+  it("attaches with no session when the hash names none", async () => {
+    const { posted } = await mountChat("tab", "#/not a chat");
+    expect(posted[0]).toMatchObject({ type: "view.attach", popOut: { sessionId: null } });
+  });
+
+  it("shows the chat's status in its favicon and title, and a run finished while hidden until the tab is seen", async () => {
+    let hidden = false;
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => hidden });
+    try {
+      const { root, emit } = await mountChat("tab", "#/a");
+      await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: titled("a", "Trip <b>plan</b>", sent) });
+      expect(document.title).toBe("Trip <b>plan</b> — bside");
+      expect(icon()).toEqual(["/favicon/idle.svg"]);
+      // The untrusted title stays text in the page.
+      expect(root.querySelector("h1 b")).toBeNull();
+
+      await emit({ runId: "r1", conversationId: "a", type: "run.started", payload: { prompt: "Go", page: null, ask: null, retry: false } });
+      expect([document.title, ...icon()]).toEqual(["◌ Trip <b>plan</b>", "/favicon/working.svg"]);
+      const call = { id: "c1", name: "request_action_confirmation" as const, arguments: { title: "Book", message: "Book it?", artifact: "" } };
+      await emit({ runId: "r1", conversationId: "a", type: "action.approval-required", payload: { call, origin: "", display: "Book", target: {} } as never });
+      expect([document.title, ...icon()]).toEqual(["(!) Trip <b>plan</b>", "/favicon/needs-you.svg"]);
+      await emit({ runId: "r1", conversationId: "a", type: "run.failed", payload: { code: "RATE_LIMIT", message: "Rate limited.", retryable: true, phase: "provider" } });
+      expect([document.title, ...icon()]).toEqual(["✕ Trip <b>plan</b>", "/favicon/failed.svg"]);
+
+      // A run that completes while the tab is hidden marks it until the user looks.
+      await emit({ runId: "r2", conversationId: "a", type: "run.started", payload: { prompt: "Again", page: null, ask: null, retry: false } });
+      hidden = true;
+      await emit({ runId: "r2", conversationId: "a", type: "run.completed", payload: { messageId: "m2" } });
+      expect([document.title, ...icon()]).toEqual(["• Trip <b>plan</b>", "/favicon/finished.svg"]);
+      hidden = false;
+      await act(() => { document.dispatchEvent(new Event("visibilitychange")); });
+      expect([document.title, ...icon()]).toEqual(["Trip <b>plan</b> — bside", "/favicon/idle.svg"]);
+    } finally {
+      delete (document as unknown as Record<string, unknown>).hidden;
+    }
+  });
+
+  it("offers the sidebar's pop-out only for a chat with messages, and leaves the sidebar's title and favicon alone", async () => {
+    const { root, posted, emit } = await mountChat("sidebar");
+    document.title = "bside";
+    await emit({ runId: null, conversationId: "a", type: "state.snapshot", payload: titled("a", "") });
+    expect(popOutButton(root)).toBeNull();
+    await emit({ runId: null, conversationId: "b", type: "state.snapshot", payload: titled("b", "Trip plan", sent) });
+    await act(() => popOutButton(root)!.click());
+    expect(posted.at(-1)).toMatchObject({ type: "session.popOut", sessionId: "b" });
+    expect(isSidebarCommand(posted.at(-1))).toBe(true);
+    expect(posted.some((command) => command.type === "view.attach" && "popOut" in command)).toBe(false);
+    expect(document.title).toBe("bside");
+    expect(icon()).toEqual([]);
+    expect(root.querySelector(".sidebar--tab")).toBeNull();
   });
 });

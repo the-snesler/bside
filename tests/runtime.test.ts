@@ -11,7 +11,7 @@ import { ChatGPTAuth } from "@/lib/background/chatgpt-auth";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { WorkspaceState } from "@/lib/background/browser-program";
 import { TabController } from "@/lib/background/tab-controller";
-import { AGENT_TAB_TAG_KEY } from "@/lib/background/tab-controller";
+import { AGENT_TAB_TAG_KEY, CHAT_TAB_KEY } from "@/lib/background/tab-controller";
 import type { TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import type { RuntimeClock } from "@/lib/background/runtime";
 import { ProviderStreamError } from "@/lib/providers/openai";
@@ -25,7 +25,7 @@ import type { ConversationItem, ConversationSummary } from "@/lib/domain/convers
 import { isTurnStart } from "@/lib/domain/conversation";
 import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
 import type { PageSnapshot } from "@/lib/domain/tools";
-import type { AgentTabsState, SidebarCommand, SidebarEvent } from "@/lib/protocol";
+import type { AgentTabsState, RuntimeSnapshot, SidebarCommand, SidebarEvent } from "@/lib/protocol";
 import { splitSystemMessage, TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
 import { buildTurns } from "@/lib/ui/turns";
 import { handleSkillsRequest } from "@/lib/background/skills";
@@ -34,6 +34,21 @@ import { listMemories, writeMemory } from "@/lib/background/memory";
 import { buildAskContext } from "@/lib/domain/ask";
 
 type ProviderUsage = NonNullable<Extract<ScriptedProviderEvent, { type: "turn.completed" }>["usage"]>;
+
+/** The fallback session, which commands without a sidebar Port act on and run commands must name. */
+const fallbackId = () => ensureOpenSession();
+
+/** A run command naming the fallback session when it names none, as a sidebar showing that session would send it. */
+async function inOpenChat(command: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const named = command.type === "run.start" || command.type === "run.steer" || command.type === "run.retry";
+  return named && command.sessionId === undefined ? { ...command, sessionId: await fallbackId() } : command;
+}
+
+/** A run command naming the chat a sidebar's view shows when it names none, as that sidebar would send it. */
+function inView(hub: SidebarHub, port: object, command: Record<string, unknown>): Record<string, unknown> {
+  const named = command.type === "run.start" || command.type === "run.steer" || command.type === "run.retry";
+  return named && command.sessionId === undefined ? { ...command, sessionId: hub.viewOf(port)!.sessionId } : command;
+}
 
 /** The open session, as the sidebar shows it; empty before any session exists. */
 async function openConversation(): Promise<{ items: ConversationItem[] }> {
@@ -136,7 +151,7 @@ describe("context controls", () => {
     } });
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: supportedPageTabControllerFactory });
     hub.delegate = runtime;
-    await runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Read the fixture" });
+    await runtime.handleCommand({ v: 1, id: "run", type: "run.start", sessionId: await fallbackId(), prompt: "Read the fixture" });
     const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export", sessionId: (await getOpenSessionId())! });
     const outputs = exported?.markdown.split("## Full tool output — latest run")[1]?.split("## Conversation log")[0];
     expect(outputs).toContain("Orchid launch moved to Friday.");
@@ -168,7 +183,7 @@ describe("context controls", () => {
     provider.script = [{ type: "text.delta", delta: "Hello." }, { type: "turn.completed", replayState: null }];
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
-    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Context export test" });
+    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", sessionId: await fallbackId(), prompt: "Context export test" });
     const exported = await runtime.handleCommand({ v: 1, id: "export", type: "context.export", sessionId: (await getOpenSessionId())! });
     expect(exported?.filename).toMatch(/\.md$/);
     expect(exported?.markdown).toContain("Context export test");
@@ -189,7 +204,7 @@ describe("context controls", () => {
     hub.delegate = new BackgroundRuntime(hub, { provider: new FakeProvider() });
     const first = fakePort();
     const second = fakePort();
-    hub.handleConnect(first); hub.handleConnect(second);
+    await attachView(hub, first); await attachView(hub, second);
     await first.send({ v: 1, id: "download", type: "context.export", sessionId: (await getOpenSessionId())! });
     expect(first.received.find((event) => event.type === "context.exported")?.payload).toMatchObject({ requestId: "download", markdown: expect.stringContaining("Saved context") });
     expect(second.received.some((event) => event.type === "context.exported")).toBe(false);
@@ -201,7 +216,7 @@ describe("BackgroundRuntime: saved skills", () => {
   const save = (body = skill.body) => handleSkillsRequest({ v: 1, id: "save", type: "skills.save", skill: { ...skill, body } });
   const read: ScriptedProviderEvent[] = [{ type: "tool.call", call: { id: "read-skill", name: "browser_program", arguments: { source: 'return fs.read("/skills/brief.md");' } } }, { type: "turn.completed", replayState: null }];
   const answer: ScriptedProviderEvent[] = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
-  const send = (runtime: BackgroundRuntime, command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+  const send = async (runtime: BackgroundRuntime, command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...await inOpenChat(command) } as SidebarCommand);
 
   it("keeps bodies out of prompts, reads on demand, and pins retry/history despite edits", async () => {
     await saveOpenAICredential("sk-test");
@@ -295,7 +310,7 @@ describe("BackgroundRuntime: custom instructions and site notes", () => {
   const github = { origin: "https://github.com", includeSubdomains: true, text: "GITHUB_NOTE" };
   const unrelated = { origin: "https://unrelated.example", includeSubdomains: false, text: "UNRELATED_NOTE" };
   const answer: ScriptedProviderEvent[] = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
-  const send = (runtime: BackgroundRuntime, command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+  const send = async (runtime: BackgroundRuntime, command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...await inOpenChat(command) } as SidebarCommand);
 
   it("snapshots instructions at run start and notes for the attached page and mentioned tabs onto the user message", async () => {
     await saveOpenAICredential("sk-test");
@@ -348,8 +363,8 @@ describe("BackgroundRuntime: custom instructions and site notes", () => {
     const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
     const [asking, other] = [fakePort(), fakePort()];
-    hub.handleConnect(asking);
-    hub.handleConnect(other);
+    await attachView(hub, asking);
+    await attachView(hub, other);
     await asking.send({ v: 1, id: "get", type: "siteNote.get", url: "https://example.com/a" });
     await asking.send({ v: 1, id: "save", type: "siteNote.save", note: { origin: "https://example.com", includeSubdomains: true, text: "Hi" } });
     await asking.send({ v: 1, id: "bad", type: "siteNote.save", note: { origin: "https://example.com/", includeSubdomains: true, text: "Hi" } });
@@ -363,7 +378,7 @@ describe("BackgroundRuntime: custom instructions and site notes", () => {
 });
 
 describe("BackgroundRuntime: memory", () => {
-  const send = (runtime: BackgroundRuntime, command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+  const send = async (runtime: BackgroundRuntime, command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...await inOpenChat(command) } as SidebarCommand);
 
   it("lists the run-start memory index on the current turn only, keeping it for the run and out of the system prompt and earlier turns", async () => {
     await saveOpenAICredential("sk-test");
@@ -409,8 +424,8 @@ describe("BackgroundRuntime: memory", () => {
     const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
     const [asking, other] = [fakePort(), fakePort()];
-    hub.handleConnect(asking);
-    hub.handleConnect(other);
+    await attachView(hub, asking);
+    await attachView(hub, other);
     await asking.send({ v: 1, id: "undo", type: "memory.undo", changeIds: [change.id] });
     await asking.send({ v: 1, id: "bad", type: "memory.undo", changeIds: [] });
     await vi.waitFor(() => expect(asking.received.filter((event) => event.type === "memory.undone")).toHaveLength(1));
@@ -439,8 +454,8 @@ describe("BackgroundRuntime: memory", () => {
     expect(await image("/workspace/shot.png", "another-session")).toEqual({ workspaceImage: { ok: false, reason: "session" } });
 
     const [asking, other] = [fakePort(), fakePort()];
-    hub.handleConnect(asking);
-    hub.handleConnect(other);
+    await attachView(hub, asking);
+    await attachView(hub, other);
     await asking.send({ v: 1, id: "img", type: "workspace.image", sessionId, path: "/workspace/shot.png" });
     for (const path of ["/workspace/doc.pdf", "/workspace/notes.png.md", "/workspace/../shot.png", "https://example.com/a.png"]) {
       await asking.send({ v: 1, id: path, type: "workspace.image", sessionId, path });
@@ -493,6 +508,25 @@ function fakePort(): FakePort {
   } as unknown as FakePort;
 }
 
+/**
+ * Connects a sidebar Port and attaches it as the view of `windowId`, as the
+ * sidebar does when it loads. Unless `fallback` is false, the view then opens
+ * the fallback chat (the one commands without a Port act on), as a sidebar
+ * would whose window's active tab is bound to it; most suites test one chat
+ * seen from both sides.
+ */
+async function attachView<P extends FakePort>(hub: SidebarHub, port: P, windowId = 1, fallback = true): Promise<P> {
+  hub.handleConnect(port);
+  await port.send({ v: 1, id: crypto.randomUUID(), type: "view.attach", windowId });
+  if (fallback) {
+    // What opening it pushed (a snapshot, the session list) is not what a test observes.
+    const before = port.received.length;
+    await port.send({ v: 1, id: crypto.randomUUID(), type: "session.open", sessionId: await ensureOpenSession() });
+    port.received.splice(before);
+  }
+  return port;
+}
+
 /** Yields to the microtask queue repeatedly; no real timer, no macrotask. */
 async function tick(times = 20): Promise<void> {
   for (let i = 0; i < times; i += 1) {
@@ -532,12 +566,12 @@ describe("BackgroundRuntime: one run per session", () => {
     hub.delegate = runtime;
 
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
 
-    void port.send({ v: 1, id: "1", type: "run.start", prompt: "Hello" });
+    void port.send({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Hello" });
     // Wait for the first run to reach the provider, not a fixed tick count.
     await vi.waitFor(() => expect(provider.requests).toHaveLength(1));
-    await port.send({ v: 1, id: "2", type: "run.start", prompt: "Second" });
+    await port.send({ v: 1, id: "2", type: "run.start", sessionId: await fallbackId(), prompt: "Second" });
     await vi.waitFor(() => expect(port.received.some((e) => e.type === "queue.changed")).toBe(true));
 
     const snapshot = await runtime.getSnapshot();
@@ -559,11 +593,11 @@ describe("BackgroundRuntime: one run per session", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
 
     // Fire both before yielding to the event loop at all.
-    const first = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "A" });
-    const second = runtime.handleCommand({ v: 1, id: "2", type: "run.start", prompt: "B" });
+    const first = runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "A" });
+    const second = runtime.handleCommand({ v: 1, id: "2", type: "run.start", sessionId: await fallbackId(), prompt: "B" });
     await Promise.all([first, second]);
 
     const snapshot = await runtime.getSnapshot();
@@ -587,9 +621,9 @@ describe("BackgroundRuntime: event sequencing", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
 
-    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi" });
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Hi" });
 
     const runEvents = port.received.filter((e) => e.type !== "state.snapshot" && e.type !== "page.attached" && e.type !== "session.listed");
     const seqs = runEvents.map((e) => e.seq);
@@ -619,9 +653,9 @@ describe("BackgroundRuntime: cancellation", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
 
-    const runCommand = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi" });
+    const runCommand = runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Hi" });
     await untilRequested(provider);
 
     const runningSnapshot = await runtime.getSnapshot();
@@ -653,9 +687,9 @@ describe("BackgroundRuntime: cancellation", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
 
-    const runCommand = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi" });
+    const runCommand = runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Hi" });
     await untilPartial(runtime, "The page says");
     const runId = (await runtime.getSnapshot()).runs[0]?.runId as string;
 
@@ -696,9 +730,9 @@ describe("BackgroundRuntime: cancellation", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
 
-    const runCommand = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi" });
+    const runCommand = runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Hi" });
     await untilPartial(runtime, "partial");
     const runId = (await runtime.getSnapshot()).runs[0]?.runId as string;
 
@@ -731,7 +765,7 @@ describe("BackgroundRuntime: credential and settings changes from the options pa
     provider.script = [{ type: "text.delta", delta: "Hello." }, { type: "turn.completed", replayState: null }];
     const runtime = new BackgroundRuntime(hub, { provider, chatgpt: subscription(), tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
-    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Hello" });
+    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", sessionId: await fallbackId(), prompt: "Hello" });
     expect(stream.mock.calls[0]?.[1]).toMatchObject({ method: "chatgpt", secret: "test-subscription-token" });
     const snapshot = await runtime.getSnapshot();
     expect(snapshot.settings).toMatchObject({ modelId: "account-model", reasoningEffort: "none" });
@@ -766,9 +800,9 @@ describe("BackgroundRuntime: credential and settings changes from the options pa
     const runtime = new BackgroundRuntime(hub, { provider, chatgpt: subscription(true), tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
     await port.send({ v: 1, id: "sub", type: "state.subscribe", lastSeq: null });
-    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Hello" });
+    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", sessionId: await fallbackId(), prompt: "Hello" });
     expect(provider.requests).toEqual([]);
     expect((await openConversation()).items).toEqual([]);
     expect(port.received.some((event) => event.type === "state.snapshot" && event.payload.notice?.includes("Reconnect in settings"))).toBe(true);
@@ -800,7 +834,7 @@ describe("BackgroundRuntime: credential and settings changes from the options pa
     const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
     await port.send({ v: 1, id: "sub", type: "state.subscribe", lastSeq: null });
     const credentialStates = () => port.received.flatMap((event) => event.type === "state.snapshot" ? [event.payload.credential.configured] : []);
     expect(credentialStates()).toEqual([false]);
@@ -866,7 +900,7 @@ describe("BackgroundRuntime: credential and settings changes from the options pa
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
     expect(await runtime.handleCredentialRequest({ v: 1, id: "save", type: "credentials.openai.save", apiKey: "sk-bad" })).toMatchObject({ ok: false });
     expect(port.received.some((event) => event.type === "state.snapshot")).toBe(false);
   });
@@ -876,7 +910,7 @@ describe("BackgroundRuntime: credential and settings changes from the options pa
     const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
     const settings = { version: 1 as const, providerId: "openai" as const, modelId: "gpt-5.6-sol", reasoningEffort: "high" as const };
     await runtime.handleSettingsRequest({ v: 1, id: "s", type: "settings.save", settings });
     const latest = port.received.at(-1);
@@ -891,9 +925,9 @@ describe("BackgroundRuntime: missing credential", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
 
-    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi" });
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Hi" });
 
     const snapshot = await runtime.getSnapshot();
     expect(snapshot.runs).toEqual([]);
@@ -936,14 +970,14 @@ describe("BackgroundRuntime: cross-run transcript (regression)", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
 
-    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Show the guestbook" });
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Show the guestbook" });
     const firstRunConversation = (await runtime.getSnapshot()).conversation;
     expect(firstRunConversation.items.some((item) => item.kind === "tool-call")).toBe(true);
     expect(firstRunConversation.items.some((item) => item.kind === "tool-result")).toBe(true);
 
-    await runtime.handleCommand({ v: 1, id: "2", type: "run.start", prompt: "Try again" });
+    await runtime.handleCommand({ v: 1, id: "2", type: "run.start", sessionId: await fallbackId(), prompt: "Try again" });
 
     const secondRunRequest = provider.requests[2];
     expect(secondRunRequest).toBeDefined();
@@ -967,7 +1001,7 @@ describe("BackgroundRuntime: prompt-cache usage", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
 
-    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hello" });
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Hello" });
 
     const sessionId = (await runtime.getSnapshot()).conversation.id;
     expect(sessionId).toMatch(/^[\da-f-]{36}$/);
@@ -990,9 +1024,9 @@ describe("BackgroundRuntime: unsupported page permits ordinary chat (regression)
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
 
-    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hi, no page needed" });
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Hi, no page needed" });
 
     const snapshot = await runtime.getSnapshot();
     expect(snapshot.runs).toEqual([]);
@@ -1017,13 +1051,13 @@ describe("BackgroundRuntime: reconnect during approval (regression)", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: supportedPageTabControllerFactory });
     hub.delegate = runtime;
     const firstPort = fakePort();
-    hub.handleConnect(firstPort);
+    await attachView(hub, firstPort);
 
-    void runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Click submit" });
+    void runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Click submit" });
     await tick(200);
 
     const reconnectedPort = fakePort();
-    hub.handleConnect(reconnectedPort);
+    await attachView(hub, reconnectedPort);
     await reconnectedPort.send({ v: 1, id: "2", type: "state.subscribe", lastSeq: null });
 
     const snapshotEvent = reconnectedPort.received.find((e) => e.type === "state.snapshot");
@@ -1050,10 +1084,10 @@ describe("BackgroundRuntime: permission mode", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: supportedPageTabControllerFactory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
     expect((await runtime.getSnapshot()).permissionMode).toBe("ask");
 
-    const running = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Submit it" });
+    const running = runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Submit it" });
     await tick(200);
     const runId = (await runtime.getSnapshot()).runs[0]!.runId;
     expect((await runtime.getSnapshot()).runs[0]?.pendingApproval?.call.id).toBe("call_1");
@@ -1098,9 +1132,9 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: supportedPageTabControllerFactory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
 
-    const runCommand = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Click submit" });
+    const runCommand = runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Click submit" });
     await runCommand;
 
     const failed = port.received.find((e) => e.type === "run.failed");
@@ -1122,12 +1156,12 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
     expect(snapshot.payload.notice).toContain("already changed a page or a connected account");
   }
 
-  function setup(provider: FakeProvider) {
+  async function setup(provider: FakeProvider) {
     const hub = new SidebarHub();
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: supportedPageTabControllerFactory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
     return { runtime, port };
   }
 
@@ -1140,11 +1174,11 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
       yield { type: "tool.call", call: { id: "call_1", name: "browser_program", arguments: { source: click } } } as ScriptedProviderEvent;
       yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
     } });
-    const { runtime, port } = setup(provider);
-    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Click submit" });
+    const { runtime, port } = await setup(provider);
+    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", sessionId: await fallbackId(), prompt: "Click submit" });
     expect(port.received.some((event) => event.type === "run.failed")).toBe(true);
 
-    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry", sessionId: await fallbackId() });
     refusedRetry(provider, port, 2);
   });
 
@@ -1166,14 +1200,14 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
       signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
       await promise;
     } });
-    const { runtime, port } = setup(provider);
-    const run = runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Click submit" });
+    const { runtime, port } = await setup(provider);
+    const run = runtime.handleCommand({ v: 1, id: "start", type: "run.start", sessionId: await fallbackId(), prompt: "Click submit" });
     await vi.waitFor(() => expect(provider.requests).toHaveLength(2));
     await runtime.handleCommand({ v: 1, id: "cancel", type: "run.cancel", runId: (await runtime.getSnapshot()).runs[0]!.runId });
     await run;
     expect(port.received.some((event) => event.type === "run.cancelled")).toBe(true);
 
-    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry", sessionId: await fallbackId() });
     refusedRetry(provider, port, 2);
   });
 
@@ -1184,10 +1218,10 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
     await seed({ id: "c1", kind: "tool-call", call: { id: "call_1", name: "browser_program", arguments: { source: click } }, at: 2 });
     await saveRunCheckpoint({ version: 3, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
     const provider = new FakeProvider();
-    const { runtime, port } = setup(provider);
+    const { runtime, port } = await setup(provider);
     await runtime.initialize();
 
-    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry", sessionId: await fallbackId() });
     refusedRetry(provider, port, 0);
   });
 
@@ -1208,13 +1242,13 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: supportedPageTabControllerFactory, mcp });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
-    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Add a Notion page" });
+    await attachView(hub, port);
+    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", sessionId: await fallbackId(), prompt: "Add a Notion page" });
     expect(provider.requests[0]!.context.tools!.map((tool) => tool.name)).toContain("mcp__notion__notion-create-pages");
     expect(fake.requests.some((request) => request.body.includes('"tools/call"') && request.body.includes("notion-create-pages"))).toBe(true);
     expect(port.received.find((event) => event.type === "run.failed")?.payload).toMatchObject({ code: "RATE_LIMIT", retryable: false });
 
-    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry", sessionId: await fallbackId() });
     refusedRetry(provider, port, 2);
   });
 
@@ -1224,9 +1258,9 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
     await seed({ id: "c1", kind: "tool-call", call: { id: "call_1", name: "mcp__todoist__add-tasks", arguments: {}, mcp: { server: "todoist", tool: "add-tasks", readOnly: false } }, at: 2 });
     await saveRunCheckpoint({ version: 3, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
     const provider = new FakeProvider();
-    const { runtime, port } = setup(provider);
+    const { runtime, port } = await setup(provider);
     await runtime.initialize();
-    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry", sessionId: await fallbackId() });
     refusedRetry(provider, port, 0);
   });
 
@@ -1236,9 +1270,9 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
     await seed({ id: "c1", kind: "tool-call", call: { id: "call_1", name: "mcp__todoist__find-tasks", arguments: {}, mcp: { server: "todoist", tool: "find-tasks", readOnly: true } }, at: 2 });
     await saveRunCheckpoint({ version: 3, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
     const provider = new FakeProvider();
-    const { runtime } = setup(provider);
+    const { runtime } = await setup(provider);
     await runtime.initialize();
-    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry", sessionId: await fallbackId() });
     expect(provider.requests).toHaveLength(1);
   });
 
@@ -1253,11 +1287,11 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
       yield { type: "text.delta", delta: "Done." } as ScriptedProviderEvent;
       yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
     } });
-    const { runtime } = setup(provider);
+    const { runtime } = await setup(provider);
     await runtime.initialize();
 
-    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
-    await runtime.handleCommand({ v: 1, id: "retry-again", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry", sessionId: await fallbackId() });
+    await runtime.handleCommand({ v: 1, id: "retry-again", type: "run.retry", sessionId: await fallbackId() });
     expect(provider.requests).toHaveLength(2);
     expect((await openConversation()).items.at(-1)).toMatchObject({ role: "assistant", text: "Done." });
   });
@@ -1273,7 +1307,7 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
     await saveRunCheckpoint({ version: 3, runId: "r1", sessionId: clicked, status: "running", partialAssistantText: "Clicking", usage: null, lastSeq: 2, updatedAt: 1 });
     await saveRunCheckpoint({ version: 3, runId: "r2", sessionId: read, status: "awaiting-help", partialAssistantText: "", usage, lastSeq: 3, updatedAt: 1 });
     const provider = new FakeProvider();
-    const { runtime, port } = setup(provider);
+    const { runtime, port } = await setup(provider);
     await runtime.initialize();
 
     expect((await getConversation(clicked))?.items.map((item) => item.id)).toEqual(["u1", "c1", "interrupted-r1", "digest-r1"]);
@@ -1282,10 +1316,10 @@ describe("BackgroundRuntime: retry gating on committed page effects (regression)
     expect(await listRunCheckpoints()).toEqual([]);
 
     // The open session's attempt may have clicked, so it is not retried; the other only read, so it is.
-    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry", sessionId: await fallbackId() });
     refusedRetry(provider, port, 0);
     await runtime.handleCommand({ v: 1, id: "open", type: "session.open", sessionId: read });
-    await runtime.handleCommand({ v: 1, id: "retry-read", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "retry-read", type: "run.retry", sessionId: await fallbackId() });
     expect(provider.requests).toHaveLength(1);
   });
 });
@@ -1299,7 +1333,7 @@ describe("BackgroundRuntime: a run that throws outside its agent loop", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
     await runtime.initialize();
 
     // The run's settings read (in #runAgentLoop, after the user message and checkpoint) fails once.
@@ -1313,7 +1347,7 @@ describe("BackgroundRuntime: a run that throws outside its agent loop", () => {
       }
       return get(keys as never);
     });
-    await runtime.handleCommand({ v: 1, id: "first", type: "run.start", prompt: "First" });
+    await runtime.handleCommand({ v: 1, id: "first", type: "run.start", sessionId: await fallbackId(), prompt: "First" });
     await vi.waitFor(() => expect(failed).toBe(true));
     spy.mockRestore();
 
@@ -1325,7 +1359,7 @@ describe("BackgroundRuntime: a run that throws outside its agent loop", () => {
     expect((await openConversation()).items.map((item) => item.kind === "run-digest" ? `digest:${item.digest.status}` : item.id).at(-1)).toBe("digest:failed");
 
     // The session is free again.
-    await runtime.handleCommand({ v: 1, id: "second", type: "run.start", prompt: "Second" });
+    await runtime.handleCommand({ v: 1, id: "second", type: "run.start", sessionId: await fallbackId(), prompt: "Second" });
     expect(provider.requests).toHaveLength(1);
     expect((await openConversation()).items.at(-1)).toMatchObject({ role: "assistant", text: "Done." });
   });
@@ -1337,14 +1371,14 @@ describe("BackgroundRuntime: a run that throws outside its agent loop", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
     await runtime.initialize();
 
     // The run's slot is claimed, but announcing it to the hub throws: #abandonRun must register it before publishing.
     const startRun = hub.startRun.bind(hub);
     const spy = vi.spyOn(hub, "startRun").mockImplementationOnce(() => { throw new Error("hub unavailable"); });
     spy.mockImplementation(startRun);
-    await runtime.handleCommand({ v: 1, id: "first", type: "run.start", prompt: "First" });
+    await runtime.handleCommand({ v: 1, id: "first", type: "run.start", sessionId: await fallbackId(), prompt: "First" });
     await vi.waitFor(async () => expect((await runtime.getSnapshot()).runs).toEqual([]));
 
     const runEvents = port.received.filter((event) => event.runId !== null);
@@ -1383,13 +1417,14 @@ describe("BackgroundRuntime: approval badge", () => {
   async function startAwaitingApproval(badge: ApprovalBadge) {
     await saveOpenAICredential("sk-test");
     const hub = new SidebarHub();
-    const runtime = new BackgroundRuntime(hub, { provider: confirmationProvider(), tabControllerFactory: supportedPageTabControllerFactory, approvalBadge: badge });
+    const runtime = new BackgroundRuntime(hub, { provider: confirmationProvider(), tabControllerFactory: supportedPageTabControllerFactory, approvalBadge: badge,
+      windows: { getLastFocused: async () => ({ id: 1 }) } });
     hub.delegate = runtime;
-    const run = runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Submit it" });
+    const run = runtime.handleCommand({ v: 1, id: "start", type: "run.start", sessionId: await fallbackId(), prompt: "Submit it" });
     await tick(200);
     const snapshot = await runtime.getSnapshot();
     expect(snapshot.runs[0]?.status).toBe("awaiting-approval");
-    return { runtime, run, runId: snapshot.runs[0]!.runId };
+    return { runtime, hub, run, runId: snapshot.runs[0]!.runId };
   }
 
   it("sets the badge while awaiting approval and clears it when approved and the run completes", async () => {
@@ -1434,7 +1469,7 @@ describe("BackgroundRuntime: approval badge", () => {
     const hub = new SidebarHub();
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory, approvalBadge: badge });
     hub.delegate = runtime;
-    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Hi" });
+    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", sessionId: await fallbackId(), prompt: "Hi" });
     await tick();
     expect(texts).toEqual([""]);
   });
@@ -1455,29 +1490,30 @@ describe("BackgroundRuntime: approval badge", () => {
     expect(items.find((item) => item.id === "interrupted-r1")).toMatchObject({ role: "assistant" });
     expect(items.find((item) => item.id === "digest-r1")).toMatchObject({ digest: { status: "interrupted", entries: [{ type: "help", kind: "login", reason: "Sign in.", outcome: null }] } });
     // Asking for help is not a page effect, so the turn can be retried.
-    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry", sessionId: await fallbackId() });
     expect(provider.requests).toHaveLength(1);
   });
 
   it("routes the toolbar click to the waiting run's chat from another chat, and to nothing once it ends", async () => {
     const { badge } = fakeBadge();
-    const { runtime, run, runId } = await startAwaitingApproval(badge);
+    const { runtime, hub, run, runId } = await startAwaitingApproval(badge);
     const waitingSession = (await getOpenSessionId())!;
-    await runtime.handleCommand({ v: 1, id: "new", type: "session.create" });
-    const other = (await getOpenSessionId())!;
+    // The focused window's sidebar shows another chat.
+    const port = await attachView(hub, fakePort(), 1, false);
+    const other = hub.viewOf(port)!.sessionId;
     expect(other).not.toBe(waitingSession);
     // Named, so leaving it does not delete it as an untouched new chat.
     await runtime.handleCommand({ v: 1, id: "name", type: "session.rename", sessionId: other, title: "Other" });
     expect(badge.waitingRuns()).toEqual([runId]);
     await runtime.openAttentionSession();
-    expect(await getOpenSessionId()).toBe(waitingSession);
+    expect(hub.viewOf(port)!.sessionId).toBe(waitingSession);
 
     await runtime.handleCommand({ v: 1, id: "approve", type: "action.approve", runId, callId: "call_1" });
     await run;
     expect(badge.attention).toBe(false);
-    await runtime.handleCommand({ v: 1, id: "open", type: "session.open", sessionId: other });
+    await port.send({ v: 1, id: "open", type: "session.open", sessionId: other });
     await runtime.openAttentionSession();
-    expect(await getOpenSessionId()).toBe(other);
+    expect(hub.viewOf(port)!.sessionId).toBe(other);
   });
 
   it("saves model settings while a run waits, but refuses credential changes", async () => {
@@ -1525,12 +1561,12 @@ describe("BackgroundRuntime: run.retry", () => {
     };
   }
 
-  function setup(provider: FakeProvider) {
+  async function setup(provider: FakeProvider) {
     const hub = new SidebarHub();
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
     return { runtime, port };
   }
 
@@ -1544,12 +1580,12 @@ describe("BackgroundRuntime: run.retry", () => {
       new ProviderStreamError("Rate limited.", "RATE_LIMIT"),
       answer("Found it."),
     ]);
-    const { runtime, port } = setup(provider);
+    const { runtime, port } = await setup(provider);
 
-    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Find it" });
+    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", sessionId: await fallbackId(), prompt: "Find it" });
     expect(port.received.find((event) => event.type === "run.failed")?.payload).toMatchObject({ code: "RATE_LIMIT", retryable: true });
 
-    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry", sessionId: await fallbackId() });
     const started = port.received.filter((event) => event.type === "run.started").at(-1);
     expect(started?.payload).toMatchObject({ prompt: "Find it", retry: true });
     expect(port.received.filter((event) => event.type !== "session.listed").at(-1)?.type).toBe("run.completed");
@@ -1569,14 +1605,14 @@ describe("BackgroundRuntime: run.retry", () => {
     await saveOpenAICredential("sk-test");
     const provider = new FakeProvider();
     scriptedRounds(provider, [[{ type: "text.delta", delta: "The page says" }], answer("Done.")]);
-    const { runtime } = setup(provider);
+    const { runtime } = await setup(provider);
 
-    const run = runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Read it" });
+    const run = runtime.handleCommand({ v: 1, id: "start", type: "run.start", sessionId: await fallbackId(), prompt: "Read it" });
     await untilPartial(runtime, "The page says");
     await runtime.handleCommand({ v: 1, id: "cancel", type: "run.cancel", runId: (await runtime.getSnapshot()).runs[0]!.runId });
     await run;
 
-    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry", sessionId: await fallbackId() });
     expect(await userTexts()).toEqual(["Read it"]);
     expect(provider.requests[1]?.context.messages.map((message) => message.role)).toEqual(["user"]);
     const texts = (await openConversation()).items.flatMap((item) => item.kind === "message" && item.role === "assistant" ? [item.text] : []);
@@ -1589,10 +1625,10 @@ describe("BackgroundRuntime: run.retry", () => {
     await saveRunCheckpoint({ version: 3, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "Half", usage: null, lastSeq: 2, updatedAt: 1 });
     const provider = new FakeProvider();
     scriptedRounds(provider, [answer("After restart.")]);
-    const { runtime } = setup(provider);
+    const { runtime } = await setup(provider);
     await runtime.initialize();
 
-    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry", sessionId: await fallbackId() });
     expect(await userTexts()).toEqual(["Before restart"]);
     expect(provider.requests[0]?.context.messages.map((message) => message.role)).toEqual(["user"]);
     expect((await openConversation()).items.at(-1)).toMatchObject({ role: "assistant", text: "After restart." });
@@ -1602,26 +1638,26 @@ describe("BackgroundRuntime: run.retry", () => {
     await saveOpenAICredential("sk-test");
     const provider = new FakeProvider();
     scriptedRounds(provider, [answer("One."), new ProviderStreamError("Rate limited.", "RATE_LIMIT"), answer("Two.")]);
-    const { runtime, port } = setup(provider);
+    const { runtime, port } = await setup(provider);
 
-    await runtime.handleCommand({ v: 1, id: "none", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "none", type: "run.retry", sessionId: await fallbackId() });
     expect(provider.requests).toHaveLength(0);
     expect(port.received.at(-1)?.type).toBe("state.snapshot");
 
-    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "First" });
-    await runtime.handleCommand({ v: 1, id: "after-complete", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", sessionId: await fallbackId(), prompt: "First" });
+    await runtime.handleCommand({ v: 1, id: "after-complete", type: "run.retry", sessionId: await fallbackId() });
     expect(provider.requests).toHaveLength(1);
 
-    await runtime.handleCommand({ v: 1, id: "start2", type: "run.start", prompt: "Second" });
-    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
-    await runtime.handleCommand({ v: 1, id: "retry-again", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "start2", type: "run.start", sessionId: await fallbackId(), prompt: "Second" });
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry", sessionId: await fallbackId() });
+    await runtime.handleCommand({ v: 1, id: "retry-again", type: "run.retry", sessionId: await fallbackId() });
     expect(provider.requests).toHaveLength(3);
     expect(await userTexts()).toEqual(["First", "Second"]);
 
     scriptedRounds(provider, [new ProviderStreamError("Rate limited.", "RATE_LIMIT")]);
-    await runtime.handleCommand({ v: 1, id: "start3", type: "run.start", prompt: "Third" });
+    await runtime.handleCommand({ v: 1, id: "start3", type: "run.start", sessionId: await fallbackId(), prompt: "Third" });
     await runtime.handleCommand({ v: 1, id: "reset", type: "session.create" });
-    await runtime.handleCommand({ v: 1, id: "after-reset", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "after-reset", type: "run.retry", sessionId: await fallbackId() });
     expect(provider.requests).toHaveLength(4);
     expect((await openConversation()).items).toEqual([]);
   });
@@ -1630,12 +1666,12 @@ describe("BackgroundRuntime: run.retry", () => {
     await saveOpenAICredential("sk-test");
     const provider = new FakeProvider();
     scriptedRounds(provider, [new ProviderStreamError("Rate limited.", "RATE_LIMIT"), [{ type: "text.delta", delta: "Working" }]]);
-    const { runtime } = setup(provider);
-    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", prompt: "Go" });
+    const { runtime } = await setup(provider);
+    await runtime.handleCommand({ v: 1, id: "start", type: "run.start", sessionId: await fallbackId(), prompt: "Go" });
 
-    const retry = runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    const retry = runtime.handleCommand({ v: 1, id: "retry", type: "run.retry", sessionId: await fallbackId() });
     await untilPartial(runtime, "Working");
-    await runtime.handleCommand({ v: 1, id: "retry-again", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "retry-again", type: "run.retry", sessionId: await fallbackId() });
     expect(provider.requests).toHaveLength(2);
     await runtime.handleCommand({ v: 1, id: "cancel", type: "run.cancel", runId: (await runtime.getSnapshot()).runs[0]!.runId });
     await retry;
@@ -1738,11 +1774,11 @@ describe("BackgroundRuntime: agent-tab ownership across restarts", () => {
     hub.delegate = runtime;
     await runtime.initialize();
 
-    await runtime.handleCommand({ v: 1, id: "open", type: "run.start", prompt: "Open example" });
+    await runtime.handleCommand({ v: 1, id: "open", type: "run.start", sessionId: await fallbackId(), prompt: "Open example" });
     await vi.waitFor(() => expect([...tags]).toEqual([[100, tag(clock.now())]]));
 
     scripted(provider, programRound('return fs.remove("/agent-tabs/100/page.md");'));
-    await runtime.handleCommand({ v: 1, id: "close", type: "run.start", prompt: "Close it" });
+    await runtime.handleCommand({ v: 1, id: "close", type: "run.start", sessionId: await fallbackId(), prompt: "Close it" });
     expect(tabs.map((tab) => tab.id)).toEqual([1]);
     expect(api.sessions.removeTabValue).toHaveBeenCalledWith(100, AGENT_TAB_TAG_KEY);
     expect(api.sessions.removeTabValue.mock.invocationCallOrder[0]).toBeLessThan(api.tabs.remove.mock.invocationCallOrder[0]!);
@@ -1761,7 +1797,7 @@ describe("BackgroundRuntime: agent-tab ownership across restarts", () => {
     hub.delegate = runtime;
     await runtime.initialize();
 
-    await runtime.handleCommand({ v: 1, id: "move", type: "run.start", prompt: "Swap tabs" });
+    await runtime.handleCommand({ v: 1, id: "move", type: "run.start", sessionId: await fallbackId(), prompt: "Swap tabs" });
     await vi.waitFor(() => expect([...tags]).toEqual([[1, tag(clock.now())]]));
     expect(tabs.map((tab) => [tab.id, tab.hidden])).toEqual([[1, true], [5, false]]);
     expect(await tabPaths(runtime)).toEqual({ 1: "/agent-tabs/1/page.md", 5: "/tabs/5/page.md" });
@@ -1778,7 +1814,7 @@ describe("BackgroundRuntime: agent-tab ownership across restarts", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: first.factory, clock });
     hub.delegate = runtime;
     await runtime.initialize();
-    await runtime.handleCommand({ v: 1, id: "open", type: "run.start", prompt: "Open two tabs" });
+    await runtime.handleCommand({ v: 1, id: "open", type: "run.start", sessionId: await fallbackId(), prompt: "Open two tabs" });
     await vi.waitFor(() => expect([...first.tags.keys()]).toEqual([100, 101]));
 
     // Firefox restarts: the session values follow the tabs to new IDs, and the
@@ -1813,7 +1849,7 @@ describe("BackgroundRuntime: agent-tab ownership across restarts", () => {
     await runtime.initialize();
 
     // Releasing tab 6 resyncs ownership; a lost search role would rewrite tab 5's tag.
-    await runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Close tab 6" });
+    await runtime.handleCommand({ v: 1, id: "run", type: "run.start", sessionId: await fallbackId(), prompt: "Close tab 6" });
     await vi.waitFor(() => expect([...tags]).toEqual([[5, tag(1, "search")]]));
     expect(api.sessions.setTabValue).not.toHaveBeenCalled();
   });
@@ -1838,7 +1874,7 @@ describe("BackgroundRuntime: agent-tab ownership across restarts", () => {
     const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: factory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
     await runtime.initialize();
 
     tabs.push(
@@ -1873,7 +1909,7 @@ describe("BackgroundRuntime: agent-tab ownership across restarts", () => {
       return tab;
     });
 
-    await runtime.handleCommand({ v: 1, id: "open", type: "run.start", prompt: "Open example" });
+    await runtime.handleCommand({ v: 1, id: "open", type: "run.start", sessionId: await fallbackId(), prompt: "Open example" });
     await Promise.all(created);
     await vi.waitFor(() => expect([...tags.keys()]).toEqual([100]));
     expect(await tabPaths(runtime)).toMatchObject({ 100: "/agent-tabs/100/page.md" });
@@ -1938,7 +1974,7 @@ describe("BackgroundRuntime: closing agent tabs", () => {
     const runtime = new BackgroundRuntime(hub, { provider: new FakeProvider(), tabControllerFactory: factory, clock });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
     await runtime.initialize();
     expect(tabCounts((await runtime.getSnapshot()).agentTabs)).toEqual({ [owner]: 2 });
 
@@ -1961,7 +1997,7 @@ describe("BackgroundRuntime: closing agent tabs", () => {
     hub.delegate = runtime;
     await runtime.initialize();
 
-    const run = runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Wait" });
+    const run = runtime.handleCommand({ v: 1, id: "run", type: "run.start", sessionId: await fallbackId(), prompt: "Wait" });
     await untilRequested(provider);
     expect((await runtime.getSnapshot()).runs).toHaveLength(1);
     await runtime.handleCommand({ v: 1, id: "close", type: "tabs.closeAgentTabs", sessionId: owner });
@@ -1984,7 +2020,7 @@ describe("BackgroundRuntime: closing agent tabs", () => {
     hub.delegate = runtime;
     await runtime.initialize();
 
-    const run = runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Wait" });
+    const run = runtime.handleCommand({ v: 1, id: "run", type: "run.start", sessionId: await fallbackId(), prompt: "Wait" });
     await untilRequested(provider);
     await runtime.handleCommand({ v: 1, id: "close", type: "tabs.closeAgentTabs", sessionId: owner });
     expect(tabs.map((tab) => tab.id)).toEqual([1, 5, 6]);
@@ -2007,7 +2043,7 @@ describe("BackgroundRuntime: closing agent tabs", () => {
     hub.delegate = runtime;
     await runtime.initialize();
 
-    const run = runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Wait" });
+    const run = runtime.handleCommand({ v: 1, id: "run", type: "run.start", sessionId: await fallbackId(), prompt: "Wait" });
     await untilRequested(provider);
     advance(AGENT_TAB_IDLE_MS + minute);
     await sweep();
@@ -2057,7 +2093,7 @@ describe("BackgroundRuntime: closing agent tabs", () => {
     hub.delegate = runtime;
     await runtime.initialize();
 
-    const run = runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Open example and think for a long time" });
+    const run = runtime.handleCommand({ v: 1, id: "run", type: "run.start", sessionId: await fallbackId(), prompt: "Open example and think for a long time" });
     await vi.waitFor(() => expect(tabs.map((tab) => tab.id)).toEqual([1, 5, 100]));
     advance(AGENT_TAB_IDLE_MS + 10 * minute);
     await sweep();
@@ -2095,7 +2131,7 @@ describe("BackgroundRuntime: Phase 0 integration (regression)", () => {
 
     await runtime.initialize();
     await sweep();
-    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "retry", type: "run.retry", sessionId: await fallbackId() });
     expect(provider.requests).toHaveLength(1);
     expect((await openConversation()).items.at(-1)).toMatchObject({ role: "assistant", text: "After restart." });
   });
@@ -2124,7 +2160,7 @@ describe("BackgroundRuntime: Phase 0 integration (regression)", () => {
     hub.delegate = runtime;
     await runtime.initialize();
 
-    await runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Swap tabs" });
+    await runtime.handleCommand({ v: 1, id: "run", type: "run.start", sessionId: await fallbackId(), prompt: "Swap tabs" });
     expect(modelInput(provider)).toContain("/agent-tabs/100/page.md");
     await vi.waitFor(() => expect([...tags.keys()]).toEqual([100]));
     expect(tabCounts((await runtime.getSnapshot()).agentTabs)).toEqual({ [owner]: 1 });
@@ -2142,12 +2178,12 @@ describe("BackgroundRuntime: Phase 0 integration (regression)", () => {
     await runtime.initialize();
     api.sessions.removeTabValue.mockRejectedValue(new Error("Session store busy."));
 
-    await runtime.handleCommand({ v: 1, id: "move", type: "run.start", prompt: "Show tab 5" });
+    await runtime.handleCommand({ v: 1, id: "move", type: "run.start", sessionId: await fallbackId(), prompt: "Show tab 5" });
     await tick();
     expect([...tags.keys()]).toEqual([5, 6]);
     api.sessions.removeTabValue.mockReset();
     scripted(provider, programRound('return fs.remove("/agent-tabs/6/page.md");'));
-    await runtime.handleCommand({ v: 1, id: "close", type: "run.start", prompt: "Close tab 6" });
+    await runtime.handleCommand({ v: 1, id: "close", type: "run.start", sessionId: await fallbackId(), prompt: "Close tab 6" });
     await vi.waitFor(() => expect(tags.size).toBe(0));
     expect(tabs.map((tab) => [tab.id, tab.hidden])).toEqual([[1, false], [5, false]]);
   });
@@ -2166,7 +2202,7 @@ describe("BackgroundRuntime: session-scoped workspace and agent tabs", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: fake.factory, clock });
     hub.delegate = runtime;
     await runtime.initialize();
-    const send = (command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+    const send = async (command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...await inOpenChat(command) } as SidebarCommand);
     const program = (source: string, prompt = "Run a program") => { scripted(provider, programRound(source)); return send({ type: "run.start", prompt }); };
     const exported = async (sessionId: string) => (await send({ type: "context.export", sessionId }) as { markdown: string }).markdown.split("## Scratch files")[1];
     return { ...fake, tabs, hub, provider, runtime, send, program, exported };
@@ -2191,7 +2227,7 @@ describe("BackgroundRuntime: session-scoped workspace and agent tabs", () => {
     await restarted.initialize();
     await restarted.handleCommand({ v: 1, id: "open", type: "session.open", sessionId: alpha });
     scripted(restartedProvider, programRound('return fs.read("/workspace/notes.md");'));
-    await restarted.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Read my notes" });
+    await restarted.handleCommand({ v: 1, id: "run", type: "run.start", sessionId: await fallbackId(), prompt: "Read my notes" });
     expect(modelInput(restartedProvider)).toContain("Alpha notes");
 
     expect(await workspaceKeys(alpha)).toHaveLength(1);
@@ -2310,7 +2346,9 @@ describe("BackgroundRuntime: session-scoped workspace and agent tabs", () => {
     await updateSession(other, { pinned: true });
     const { runtime } = await setup(tabs, tags, clock);
     expect(await getConversation(old)).toBeNull();
-    expect(tabs.map((tab) => tab.id)).toEqual([1, 7, 8]);
+    // No sidebar shows the owner chat yet, so retention pruned it too.
+    expect(await getConversation(owner)).toBeNull();
+    expect(tabs.map((tab) => tab.id)).toEqual([1, 7]);
 
     await runtime.handleHistoryRequest({ v: 1, id: "all", type: "history.deleteAll" });
     expect(tabs.map((tab) => tab.id)).toEqual([1]);
@@ -2379,17 +2417,17 @@ describe("BackgroundRuntime: watching an agent tab", () => {
     await saveOpenAICredential("sk-test");
     const hub = new SidebarHub();
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
     const provider = new FakeProvider();
-    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: fake.factory, clock, approvalBadge });
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: fake.factory, clock, approvalBadge, windows: { getLastFocused: async () => ({ id: 1 }) } });
     hub.delegate = runtime;
     await runtime.initialize();
-    const send = (command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+    const send = async (command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...await inOpenChat(command) } as SidebarCommand);
     /** The user clicks a tab in the tab strip. */
     const switchTo = async (tabId: number) => { activate(tabId); await runtime.handleTabActivated(tabId); };
     const state = (id: number) => { const tab = tabs.find((candidate) => candidate.id === id)!; return { hidden: tab.hidden, active: tab.active }; };
     const watching = async () => (await runtime.getSnapshot()).agentTabs.watching;
-    return { ...fake, api, tabs, port, provider, runtime, send, switchTo, state, watching };
+    return { ...fake, api, tabs, hub, port, provider, runtime, send, switchTo, state, watching };
   }
 
   it("shows the chat's agent tab beside the active tab, switches to it, and hides it again once the user switches away", async () => {
@@ -2645,7 +2683,10 @@ describe("BackgroundRuntime: watching an agent tab", () => {
 
   it("keeps ! on while two overlapping runs wait, routing the toolbar to the longest-waiting one until both resolve", async () => {
     const { badge, texts } = helpBadge();
-    const { send, runtime, provider } = await setup([], [], undefined, badge);
+    const { send, runtime, provider, hub } = await setup([], [], undefined, badge);
+    // Window 1's sidebar, where the toolbar click opens chats.
+    const sidebar = await attachView(hub, fakePort(), 1, false);
+    const shown = () => hub.viewOf(sidebar)!.sessionId;
     // Rounds in request order: A asks for help, B asks for confirmation, then A and B answer.
     scripted(provider, [
       [{ type: "tool.call", call: { id: "help_1", name: "request_user_help", arguments: { tab: "/agent-tabs/5/page.md", kind: "login", reason: "Sign in to Grocer." } } }, { type: "turn.completed", replayState: null }],
@@ -2668,7 +2709,7 @@ describe("BackgroundRuntime: watching an agent tab", () => {
 
     // The toolbar opens the chat that has waited longest: A's, though B's chat is on screen.
     await runtime.openAttentionSession();
-    expect(await getOpenSessionId()).toBe(owner);
+    expect(shown()).toBe(owner);
 
     // Resolving A leaves B waiting: ! stays, and the toolbar now routes to B.
     await send({ type: "help.resolve", runId: a, callId: "help_1", outcome: "done", note: "" });
@@ -2678,7 +2719,7 @@ describe("BackgroundRuntime: watching an agent tab", () => {
     expect(badge.pending).toBe(true);
     expect(texts.at(-1)).toBe("!");
     await runtime.openAttentionSession();
-    expect(await getOpenSessionId()).toBe(other);
+    expect(shown()).toBe(other);
 
     // Resolving B as well clears it.
     await send({ type: "action.approve", runId: b, callId: "confirm" });
@@ -2751,16 +2792,18 @@ describe("BackgroundRuntime: sessions", () => {
     };
   }
 
-  async function setup(rounds: Array<string | null | Error> = []) {
+  /** `initialize`: start the runtime (as the background does before any sidebar connects) before the sidebar attaches. */
+  async function setup(rounds: Array<string | null | Error> = [], { initialize = false } = {}) {
     await saveOpenAICredential("sk-test");
     const hub = new SidebarHub();
     const provider = new FakeProvider();
     scripted(provider, rounds);
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
+    if (initialize) await runtime.initialize();
     const port = fakePort();
-    hub.handleConnect(port);
-    const send = (command: Record<string, unknown>): Promise<unknown> => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+    await attachView(hub, port);
+    const send = async (command: Record<string, unknown>): Promise<unknown> => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...await inOpenChat(command) } as SidebarCommand);
     const snapshot = () => runtime.getSnapshot();
     /** Notices are one-shot, so read the one the command's own snapshot broadcast carried. */
     const notice = () => port.received.findLast((event) => event.type === "state.snapshot")?.payload.notice;
@@ -2780,11 +2823,13 @@ describe("BackgroundRuntime: sessions", () => {
     const fresh = (await snapshot()).conversation;
     expect(fresh.id).not.toBe(empty);
     expect(fresh.items).toEqual([]);
+    // History never lists the untouched new chat, though the sidebar shows it.
     const { sessions } = await send({ type: "session.list" }) as { sessions: ConversationSummary[] };
     expect(sessions.map((session) => [session.id, session.title, session.itemCount])).toEqual([
-      [fresh.id, "", 0], [empty, "First question", 2],
+      [empty, "First question", 2],
     ]);
-    expect(sessions[1]?.lastModelId).toBe("gpt-5.6-terra");
+    expect(sessions[0]?.lastModelId).toBe("gpt-5.6-terra");
+    expect((await listSessions()).map((session) => session.id)).toContain(fresh.id);
   });
 
   it("New chat leaves the previous chat's run diagnostics in its export and starts without them", async () => {
@@ -2979,9 +3024,10 @@ describe("BackgroundRuntime: sessions", () => {
 
   it("migrates the pre-sessions conversation at startup and keeps its prompt-cache key", async () => {
     await browser.storage.local.set({ conversation: { version: 1, id: "default", items: [prompt("u1", "Legacy question")], updatedAt: 5 } });
-    const { runtime, send, snapshot, provider } = await setup(["Continued."]);
-    await runtime.initialize();
+    const { port, send, snapshot, provider } = await setup(["Continued."], { initialize: true });
     expect((await snapshot()).conversation).toMatchObject({ id: "default", title: "Legacy question" });
+    await port.send({ v: 1, id: "subscribe", type: "state.subscribe", lastSeq: null });
+    expect(port.received.findLast((event) => event.type === "state.snapshot")?.conversationId).toBe("default");
     await send({ type: "run.start", prompt: "Follow-up" });
     expect(provider.requests[0]?.sessionId).toBe("default");
     expect((await browser.storage.local.get("conversation")).conversation).toBeUndefined();
@@ -3010,11 +3056,14 @@ describe("BackgroundRuntime: history drawer support", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory, clock });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
-    const send = (command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+    await attachView(hub, port);
+    // From the sidebar; a run command names the chat its view shows.
+    const send = async (command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...inView(hub, port, command) } as SidebarCommand, port);
     const history = (request: Record<string, unknown>) => runtime.handleHistoryRequest({ v: 1, id: crypto.randomUUID(), ...request } as never);
     const listed = () => port.received.flatMap((event) => event.type === "session.listed" ? [event.payload.sessions] : []);
-    return { hub, runtime, port, send, history, listed, sweep };
+    /** The sidebar's own snapshot: the chat its view shows. */
+    const snapshot = () => runtime.getSnapshot(hub.viewOf(port));
+    return { hub, runtime, port, send, history, listed, sweep, snapshot };
   }
 
   it("prunes unpinned chats past retention at startup, keeping pinned, open, and recent ones", async () => {
@@ -3035,30 +3084,32 @@ describe("BackgroundRuntime: history drawer support", () => {
 
   it("keeps everything by default, and applies a shorter retention from the options page at once, sparing the active run's chat", async () => {
     const { provider, release } = blockingProvider();
-    const { runtime, send, history, listed } = await setup(provider);
+    const { runtime, send, history, listed, snapshot } = await setup(provider);
     await runtime.initialize();
     const old = await createSessionWith(prompt("u1", "Old"));
-    const running = (await runtime.getSnapshot()).conversation.id;
+    const running = (await snapshot()).conversation.id;
     const run = send({ type: "run.start", prompt: "Long task" });
     await untilRequested(provider);
     await send({ type: "session.create" });
-    const open = (await runtime.getSnapshot()).conversation.id;
+    const open = (await snapshot()).conversation.id;
     vi.setSystemTime(Date.now() + 40 * DAY);
 
     expect(await history({ type: "history.retention.save", retention: "forever" })).toMatchObject({ ok: true, sessionCount: 3, notice: null });
     const saved = await history({ type: "history.retention.save", retention: "30d" });
     expect(saved).toMatchObject({ ok: true, settings: { version: 1, retention: "30d" }, sessionCount: 2, notice: expect.stringContaining("Deleted 1 chat") });
     expect(await getConversation(old)).toBeNull();
-    expect(listed().at(-1)?.map((session) => session.id).sort()).toEqual([running, open].sort());
+    // The untouched new chat the sidebar shows is kept, but never listed.
+    expect(listed().at(-1)?.map((session) => session.id)).toEqual([running]);
+    expect(await getConversation(open)).not.toBeNull();
     release();
     await run;
   });
 
   it("re-applies retention on the first sweep an hour after the last pass", async () => {
-    const { runtime, send, sweep } = await setup();
+    const { runtime, send, sweep, snapshot } = await setup();
     await runtime.initialize();
     await saveHistorySettings({ version: 1, retention: "7d" });
-    const stale = (await runtime.getSnapshot()).conversation.id;
+    const stale = (await snapshot()).conversation.id;
     await send({ type: "session.rename", sessionId: stale, title: "Kept until left" });
     await send({ type: "session.create" });
     vi.setSystemTime(Date.now() + 30 * 60_000);
@@ -3067,27 +3118,29 @@ describe("BackgroundRuntime: history drawer support", () => {
     vi.setSystemTime(Date.now() + 8 * DAY);
     await sweep();
     expect(await getConversation(stale)).toBeNull();
-    expect(await listSessionIds()).toEqual([(await runtime.getSnapshot()).conversation.id]);
+    expect(await listSessionIds()).toEqual([(await snapshot()).conversation.id]);
   });
 
   it("deletes all history except the active run's chat and opens a fresh empty chat", async () => {
     const { provider, release } = blockingProvider();
-    const { runtime, send, history, listed, port } = await setup(provider);
+    const { runtime, send, history, listed, port, hub, snapshot } = await setup(provider);
     await runtime.initialize();
     const pinned = await createSessionWith(prompt("u1", "Pinned"));
     await updateSession(pinned, { pinned: true });
-    const running = (await runtime.getSnapshot()).conversation.id;
+    const running = (await snapshot()).conversation.id;
     const run = send({ type: "run.start", prompt: "Long task" });
     await untilRequested(provider);
     await send({ type: "session.create" });
-    const viewing = (await runtime.getSnapshot()).conversation.id;
+    const viewing = (await snapshot()).conversation.id;
 
     const response = await history({ type: "history.deleteAll" });
     expect(response).toMatchObject({ ok: true, sessionCount: 2, notice: expect.stringContaining("active run was kept") });
     const fresh = port.received.findLast((event) => event.type === "state.snapshot")!;
     expect(fresh.type === "state.snapshot" && fresh.payload.conversation).toMatchObject({ items: [] });
     expect([pinned, viewing, running]).not.toContain(fresh.conversationId);
-    expect(listed().at(-1)?.map((session) => session.id).sort()).toEqual([running, fresh.conversationId].sort());
+    // The sidebar shows the fresh chat, which history lists once it has a message.
+    expect(listed().at(-1)?.map((session) => session.id)).toEqual([running]);
+    expect(hub.viewOf(port)!.sessionId).toBe(fresh.conversationId);
     release();
     await run;
     expect((await getConversation(running))?.items[0]).toMatchObject({ role: "user", text: "Long task" });
@@ -3098,12 +3151,12 @@ describe("BackgroundRuntime: history drawer support", () => {
   it("exports any chat by id, each with its own latest run's diagnostics", async () => {
     const provider = new FakeProvider();
     provider.script = [{ type: "text.delta", delta: "Answer." }, { type: "turn.completed", replayState: null }];
-    const { runtime, send, port } = await setup(provider);
+    const { send, port, snapshot } = await setup(provider);
     await send({ type: "run.start", prompt: "Alpha question" });
-    const alpha = (await runtime.getSnapshot()).conversation.id;
+    const alpha = (await snapshot()).conversation.id;
     await send({ type: "session.create" });
     await send({ type: "run.start", prompt: "Beta question" });
-    const beta = (await runtime.getSnapshot()).conversation.id;
+    const beta = (await snapshot()).conversation.id;
     await send({ type: "session.open", sessionId: alpha });
 
     const exportOf = async (sessionId: string) => (await send({ type: "context.export", sessionId }) as { markdown: string } | undefined)?.markdown;
@@ -3127,11 +3180,11 @@ describe("BackgroundRuntime: history drawer support", () => {
   it("pushes the session list to every sidebar when a run titles a chat, when it ends, and on session commands", async () => {
     const provider = new FakeProvider();
     provider.script = [{ type: "text.delta", delta: "Answer." }, { type: "turn.completed", replayState: null }];
-    const { hub, runtime, send, listed, port } = await setup(provider);
+    const { hub, send, listed, port, snapshot } = await setup(provider);
     const other = fakePort();
-    hub.handleConnect(other);
+    await attachView(hub, other, 2, false);
     await send({ type: "run.start", prompt: "Plan a @Trip (tab 4, /tabs/4/page.md, https://example.com/) today" });
-    const id = (await runtime.getSnapshot()).conversation.id;
+    const id = (await snapshot()).conversation.id;
     const lists = listed();
     expect(lists[0]).toEqual([expect.objectContaining({ id, title: "Plan a @Trip today", itemCount: 1 })]);
     expect(lists.at(-1)).toEqual([expect.objectContaining({ id, itemCount: 2 })]);
@@ -3160,7 +3213,7 @@ describe("BackgroundRuntime: run digests and context continuity", () => {
   const programCall = (id: string, source = "return 1;"): ScriptedProviderEvent => ({ type: "tool.call", call: { id, name: "browser_program", arguments: { source } } });
   const done: ScriptedProviderEvent = { type: "turn.completed", replayState: null };
 
-  function setup(rounds: Array<ScriptedProviderEvent[] | Error | "hang" | "loop">, tabControllerFactory = unsupportedPageTabControllerFactory) {
+  async function setup(rounds: Array<ScriptedProviderEvent[] | Error | "hang" | "loop">, tabControllerFactory = unsupportedPageTabControllerFactory) {
     const hub = new SidebarHub();
     const provider = new FakeProvider();
     let round = 0;
@@ -3180,26 +3233,26 @@ describe("BackgroundRuntime: run digests and context continuity", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
     return { runtime, provider, port };
   }
   const digests = async () => (await openConversation()).items.flatMap((item) => item.kind === "run-digest" ? [item.digest] : []);
 
   it("persists a digest after a completed run's answer and replays it as a note on the next run", async () => {
     await saveOpenAICredential("sk-test");
-    const { runtime, provider } = setup([
+    const { runtime, provider } = await setup([
       [programCall("read", 'return fs.read("/tabs/1/page.md");'), done],
       [{ type: "text.delta", delta: "It moved to Friday." }, done],
       [{ type: "text.delta", delta: "Friday." }, done],
     ], supportedPageTabControllerFactory);
-    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "When is the launch?" });
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "When is the launch?" });
     const items = (await openConversation()).items;
     expect(items.map((item) => item.kind)).toEqual(["message", "tool-call", "tool-result", "message", "run-digest"]);
     expect(await digests()).toEqual([{ version: 1, status: "completed", error: null, omittedEntries: 0, entries: [
       { type: "program", source: 'return fs.read("/tabs/1/page.md");', ok: true, code: null, urls: ["http://127.0.0.1:4173/agent-page.html"], excerpt: expect.stringContaining("Orchid launch moved to Friday.") },
     ] }]);
 
-    await runtime.handleCommand({ v: 1, id: "2", type: "run.start", prompt: "Which day again?" });
+    await runtime.handleCommand({ v: 1, id: "2", type: "run.start", sessionId: await fallbackId(), prompt: "Which day again?" });
     const messages = provider.requests[2]!.context.messages;
     expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "user", "user"]);
     expect(messages[2]!.content).toEqual(expect.stringContaining("Orchid launch moved to Friday."));
@@ -3211,17 +3264,17 @@ describe("BackgroundRuntime: run digests and context continuity", () => {
 
   it("persists a digest for a failed run with its safe error, and leaves it out of the retried request", async () => {
     await saveOpenAICredential("sk-test");
-    const { runtime, provider } = setup([[programCall("p1"), done], new ProviderStreamError("Rate limited.", "RATE_LIMIT"), [{ type: "text.delta", delta: "Ok." }, done]]);
-    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Try" });
+    const { runtime, provider } = await setup([[programCall("p1"), done], new ProviderStreamError("Rate limited.", "RATE_LIMIT"), [{ type: "text.delta", delta: "Ok." }, done]]);
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Try" });
     expect(await digests()).toEqual([expect.objectContaining({ status: "failed", error: "Rate limited.", entries: [expect.objectContaining({ source: "return 1;", ok: true })] })]);
-    await runtime.handleCommand({ v: 1, id: "2", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "2", type: "run.retry", sessionId: await fallbackId() });
     expect(provider.requests[2]!.context.messages.map((message) => message.role)).toEqual(["user"]);
   });
 
   it("persists a digest for a run stopped by a budget (LIMIT_EXCEEDED), bounded to the newest calls", async () => {
     await saveOpenAICredential("sk-test");
-    const { runtime, port } = setup(["loop"]);
-    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Loop" });
+    const { runtime, port } = await setup(["loop"]);
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Loop" });
     expect(port.received.find((event) => event.type === "run.failed")?.payload).toMatchObject({ code: "LIMIT_EXCEEDED" });
     const [digest] = await digests();
     expect(digest).toMatchObject({ status: "failed", error: expect.stringContaining("Stopped after 40 steps"), omittedEntries: 24 });
@@ -3230,8 +3283,8 @@ describe("BackgroundRuntime: run digests and context continuity", () => {
 
   it("persists a digest for a cancelled run", async () => {
     await saveOpenAICredential("sk-test");
-    const { runtime, provider } = setup([[programCall("p1"), done], "hang"]);
-    const run = runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Go" });
+    const { runtime, provider } = await setup([[programCall("p1"), done], "hang"]);
+    const run = runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Go" });
     await untilRequested(provider, 2);
     await runtime.handleCommand({ v: 1, id: "2", type: "run.cancel", runId: (await runtime.getSnapshot()).runs[0]!.runId });
     await run;
@@ -3240,8 +3293,8 @@ describe("BackgroundRuntime: run digests and context continuity", () => {
 
   it("writes no digest for a run that used no tools", async () => {
     await saveOpenAICredential("sk-test");
-    const { runtime } = setup([[{ type: "text.delta", delta: "Hi." }, done]]);
-    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hello" });
+    const { runtime } = await setup([[{ type: "text.delta", delta: "Hi." }, done]]);
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Hello" });
     expect(await digests()).toEqual([]);
   });
 
@@ -3249,7 +3302,7 @@ describe("BackgroundRuntime: run digests and context continuity", () => {
     await seed({ id: "u1", kind: "message", role: "user", text: "Before restart", context: null, at: 1 });
     await seed({ id: "t1", kind: "tool-call", call: { id: "call_1", name: "browser_program", arguments: { source: 'return await web.search("orchids");' } }, at: 2 });
     await saveRunCheckpoint({ version: 3, runId: "r1", sessionId: await ensureOpenSession(), status: "running", partialAssistantText: "", usage: null, lastSeq: 2, updatedAt: 1 });
-    const { runtime } = setup([[{ type: "text.delta", delta: "Ok." }, done]]);
+    const { runtime } = await setup([[{ type: "text.delta", delta: "Ok." }, done]]);
     await runtime.initialize();
     const items = (await openConversation()).items;
     expect(items.at(-2)).toMatchObject({ id: "interrupted-r1" });
@@ -3262,9 +3315,9 @@ describe("BackgroundRuntime: run digests and context continuity", () => {
       await seed({ id: `u${i}`, kind: "message", role: "user", text: `Question ${i} ${"q".repeat(16_000)}`, context: null, at: i });
       await seed({ id: `a${i}`, kind: "message", role: "assistant", text: `Answer ${i}`, at: i });
     }
-    const { runtime, provider, port } = setup([[{ type: "text.delta", delta: "Summary of orchids." }, done], [{ type: "text.delta", delta: "Answered." }, done]]);
+    const { runtime, provider, port } = await setup([[{ type: "text.delta", delta: "Summary of orchids." }, done], [{ type: "text.delta", delta: "Answered." }, done]]);
     provider.getModel = () => ({ ...TEST_MODEL, contextWindow: 30_000 });
-    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Latest?" });
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Latest?" });
     const items = (await openConversation()).items;
     const compaction = items.find((item) => item.kind === "compaction");
     expect(compaction).toMatchObject({ summary: "Summary of orchids.", firstKeptItemId: expect.any(String) });
@@ -3301,16 +3354,16 @@ describe("BackgroundRuntime: talk while it works", () => {
       } };
     };
   }
-  function setup(provider = new FakeProvider()) {
+  async function setup(provider = new FakeProvider()) {
     const hub = new SidebarHub();
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
     return { runtime, port, provider };
   }
-  const send = (runtime: BackgroundRuntime, command: Record<string, unknown>) =>
-    runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+  const send = async (runtime: BackgroundRuntime, command: Record<string, unknown>) =>
+    runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...await inOpenChat(command) } as SidebarCommand);
   const userTexts = (items: ConversationItem[]) => items.flatMap((item) => item.kind === "message" && item.role === "user" ? [item.text] : []);
   const queueOf = async (runtime: BackgroundRuntime) => (await runtime.getSnapshot()).queue.map((message) => `${message.mode}:${message.text}`);
 
@@ -3319,7 +3372,7 @@ describe("BackgroundRuntime: talk while it works", () => {
   });
 
   it("steers the running turn at its next tool boundary, showing the steer as pending until it is delivered", async () => {
-    const { runtime, port, provider } = setup();
+    const { runtime, port, provider } = await setup();
     const gate = Promise.withResolvers<void>();
     scripted(provider, [{ events: program, gate: gate.promise }, { events: answer("Used tab 2.") }]);
     const run = send(runtime, { type: "run.start", prompt: "Compare prices" });
@@ -3345,7 +3398,7 @@ describe("BackgroundRuntime: talk while it works", () => {
   });
 
   it("starts a queued follow-up as the next turn once the run completes, in the run's chat even after switching chats", async () => {
-    const { runtime, port, provider } = setup();
+    const { runtime, port, provider } = await setup();
     const gate = Promise.withResolvers<void>();
     scripted(provider, [{ events: answer("A done."), gate: gate.promise }, { events: answer("C done.") }, { events: answer("B done.") }]);
     const run = send(runtime, { type: "run.start", prompt: "A" });
@@ -3374,7 +3427,7 @@ describe("BackgroundRuntime: talk while it works", () => {
   });
 
   it("keeps follow-ups waiting after a failed run until the user sends or removes them", async () => {
-    const { runtime, provider } = setup();
+    const { runtime, provider } = await setup();
     const gate = Promise.withResolvers<void>();
     scripted(provider, [{ gate: gate.promise, error: new ProviderStreamError("Rate limited.", "RATE_LIMIT") }, { events: answer("B done.") }]);
     const run = send(runtime, { type: "run.start", prompt: "A" });
@@ -3395,7 +3448,7 @@ describe("BackgroundRuntime: talk while it works", () => {
   });
 
   it("turns steers still pending at cancellation into waiting follow-ups and sends nothing", async () => {
-    const { runtime, provider } = setup();
+    const { runtime, provider } = await setup();
     scripted(provider, [{ events: answer("Never."), gate: new Promise(() => {}) }]);
     const run = send(runtime, { type: "run.start", prompt: "A" });
     await untilRequested(provider);
@@ -3410,7 +3463,7 @@ describe("BackgroundRuntime: talk while it works", () => {
   });
 
   it("treats a steer for a run that already ended as a new prompt", async () => {
-    const { runtime, provider } = setup();
+    const { runtime, provider } = await setup();
     scripted(provider, [{ events: answer("One.") }, { events: answer("Two.") }]);
     await send(runtime, { type: "run.start", prompt: "A" });
     await send(runtime, { type: "run.steer", runId: "finished-run", text: "More" });
@@ -3420,14 +3473,14 @@ describe("BackgroundRuntime: talk while it works", () => {
   });
 
   it("keeps queued messages across a background restart; the interrupted run's steers come back as follow-ups, unsent", async () => {
-    const before = setup();
+    const before = await setup();
     scripted(before.provider, [{ events: answer("Never."), gate: new Promise(() => {}) }]);
     void send(before.runtime, { type: "run.start", prompt: "A" });
     await untilRequested(before.provider);
     await send(before.runtime, { type: "run.steer", runId: (await before.runtime.getSnapshot()).runs[0]!.runId, text: "S" });
     await send(before.runtime, { type: "run.start", prompt: "F" });
 
-    const after = setup();
+    const after = await setup();
     await after.runtime.initialize();
     expect(await queueOf(after.runtime)).toEqual(["follow-up:S", "follow-up:F"]);
     expect(after.provider.requests).toHaveLength(0);
@@ -3438,13 +3491,13 @@ describe("BackgroundRuntime: talk while it works", () => {
     const id = await ensureOpenSession();
     await saveMessageQueue(id, [{ id: "q1", mode: "steer", text: "S", at: 1 }, { id: "q2", mode: "follow-up", text: "F", at: 2 }]);
     await appendConversationItem(id, { id: "q1", kind: "message", role: "user", text: "S", context: null, delivery: "steer", at: 3 });
-    const { runtime } = setup();
+    const { runtime } = await setup();
     await runtime.initialize();
     expect(await queueOf(runtime)).toEqual(["follow-up:F"]);
   });
 
   it("gives a dispatched follow-up's user message its queued id", async () => {
-    const { runtime, provider } = setup();
+    const { runtime, provider } = await setup();
     const gate = Promise.withResolvers<void>();
     scripted(provider, [{ events: answer("A done."), gate: gate.promise }, { events: answer("B done.") }]);
     const run = send(runtime, { type: "run.start", prompt: "A" });
@@ -3457,7 +3510,7 @@ describe("BackgroundRuntime: talk while it works", () => {
   });
 
   it("retries a failed turn with the steers it received, without adding user items", async () => {
-    const { runtime, provider } = setup();
+    const { runtime, provider } = await setup();
     const gate = Promise.withResolvers<void>();
     scripted(provider, [{ events: program, gate: gate.promise }, { error: new ProviderStreamError("Rate limited.", "RATE_LIMIT") }, { events: answer("Done.") }]);
     const run = send(runtime, { type: "run.start", prompt: "A" });
@@ -3480,7 +3533,7 @@ describe("BackgroundRuntime: usage visibility", () => {
   const toolCall: ScriptedProviderEvent = { type: "tool.call", call: { id: "call_1", name: "browser_program", arguments: { source: "return 1;" } } };
   const text = (delta: string): ScriptedProviderEvent => ({ type: "text.delta", delta });
 
-  function setup(rounds: Array<ScriptedProviderEvent[] | Error | "hang">, options: { chatgpt?: ChatGPTAuth } = {}) {
+  async function setup(rounds: Array<ScriptedProviderEvent[] | Error | "hang">, options: { chatgpt?: ChatGPTAuth } = {}) {
     const hub = new SidebarHub();
     const provider = new FakeProvider();
     provider.getModel = () => PRICED_MODEL;
@@ -3500,19 +3553,19 @@ describe("BackgroundRuntime: usage visibility", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: unsupportedPageTabControllerFactory, ...options });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
+    await attachView(hub, port);
     return { runtime, provider, port };
   }
   const usageItems = async () => (await openConversation()).items.flatMap((item) => item.kind === "run-usage" ? [item] : []);
 
   it("persists a completed run's tokens and estimated cost after its digest, publishes it live, and totals it on the session", async () => {
     await saveOpenAICredential("sk-test");
-    const { runtime, provider, port } = setup([
+    const { runtime, provider, port } = await setup([
       round([toolCall], { input: 900, cacheRead: 0, cacheWrite: 100, output: 100, reasoning: 40, cost: cost(0.003) }),
       round([text("Done.")], { input: 100, cacheRead: 896, output: 50, cost: cost(0.001) }),
       round([text("Again.")], { input: 10, output: 5, cost: cost(0.0001) }),
     ]);
-    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hello" });
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Hello" });
     const items = (await openConversation()).items;
     expect(items.map((item) => item.kind)).toEqual(["message", "tool-call", "tool-result", "message", "run-digest", "run-usage"]);
     const runId = port.received.find((event) => event.type === "run.started")!.runId!;
@@ -3529,7 +3582,7 @@ describe("BackgroundRuntime: usage visibility", () => {
     });
 
     // Usage items never reach the model, so later requests replay history unchanged.
-    await runtime.handleCommand({ v: 1, id: "2", type: "run.start", prompt: "Again" });
+    await runtime.handleCommand({ v: 1, id: "2", type: "run.start", sessionId: await fallbackId(), prompt: "Again" });
     expect(JSON.stringify(provider.requests[2]!.context.messages)).not.toMatch(/run-usage|costUsd|usage-/);
     expect(provider.requests[2]!.context.messages.map((message) => message.role)).toEqual(["user", "assistant", "user", "user"]);
     // Totals keep accumulating, and a restarted background lists them from storage.
@@ -3545,38 +3598,38 @@ describe("BackgroundRuntime: usage visibility", () => {
     vi.spyOn(chatgpt, "status").mockResolvedValue({ connected: true, email: "user@example.test", signInAgain: false });
     vi.spyOn(chatgpt, "models").mockResolvedValue(null);
     vi.spyOn(chatgpt, "getAuth").mockResolvedValue({ providerId: "openai", method: "chatgpt", secret: "token" });
-    const plan = setup([round([text("Hi.")], { input: 500, output: 20, cost: cost(0.5) })], { chatgpt });
-    await plan.runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hello" });
+    const plan = await setup([round([text("Hi.")], { input: 500, output: 20, cost: cost(0.5) })], { chatgpt });
+    await plan.runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Hello" });
     expect((await usageItems())[0]?.usage).toMatchObject({ billing: "chatgpt", input: 500, output: 20, costUsd: null });
     expect((await listSessions())[0]?.usage).toMatchObject({ planRuns: 1, pricedRuns: 0, costUsd: 0 });
 
     fakeBrowser.reset();
     await saveOpenAICredential("sk-test");
-    const unpriced = setup([round([text("Hi.")], { input: 500, output: 20 })]);
+    const unpriced = await setup([round([text("Hi.")], { input: 500, output: 20 })]);
     unpriced.provider.getModel = () => TEST_MODEL;
-    await unpriced.runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Hello" });
+    await unpriced.runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Hello" });
     expect((await usageItems())[0]?.usage).toMatchObject({ billing: "api-key", input: 500, costUsd: null });
     expect((await listSessions())[0]?.usage).toMatchObject({ unpricedRuns: 1, pricedRuns: 0 });
   });
 
   it("persists usage for failed and cancelled runs, sums a retried turn's runs, and records nothing for a run without tokens", async () => {
     await saveOpenAICredential("sk-test");
-    const { runtime, port, provider } = setup([
+    const { runtime, port, provider } = await setup([
       round([toolCall], { input: 300, output: 30, cost: cost(0.001) }),
       new ProviderStreamError("Rate limited.", "RATE_LIMIT"),
       round([text("Done.")], { input: 200, output: 20, cost: cost(0.002) }),
       round([toolCall], { input: 50, output: 5, cost: cost(0.0005) }),
       "hang",
     ]);
-    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Try" });
+    await runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Try" });
     expect(port.received.some((event) => event.type === "run.failed")).toBe(true);
-    await runtime.handleCommand({ v: 1, id: "2", type: "run.retry" });
+    await runtime.handleCommand({ v: 1, id: "2", type: "run.retry", sessionId: await fallbackId() });
     expect((await usageItems()).map((item) => [item.usage.input, item.usage.costUsd])).toEqual([[300, 0.001], [200, 0.002]]);
     const turns = buildTurns((await openConversation()).items, false);
     expect(turns).toHaveLength(1);
     expect(turns[0]!.usage).toMatchObject({ input: 500, output: 50, costUsd: expect.closeTo(0.003, 10), pricedRuns: 2 });
 
-    const run = runtime.handleCommand({ v: 1, id: "3", type: "run.start", prompt: "Go" });
+    const run = runtime.handleCommand({ v: 1, id: "3", type: "run.start", sessionId: await fallbackId(), prompt: "Go" });
     await untilRequested(provider, 5);
     await runtime.handleCommand({ v: 1, id: "4", type: "run.cancel", runId: (await runtime.getSnapshot()).runs[0]!.runId });
     await run;
@@ -3584,15 +3637,15 @@ describe("BackgroundRuntime: usage visibility", () => {
     expect((await listSessions())[0]?.usage).toMatchObject({ input: 550, pricedRuns: 3 });
 
     await saveOpenAICredential("sk-test");
-    const silent = setup([[text("Hi.")]]);
-    await silent.runtime.handleCommand({ v: 1, id: "5", type: "run.start", prompt: "Quiet" });
+    const silent = await setup([[text("Hi.")]]);
+    await silent.runtime.handleCommand({ v: 1, id: "5", type: "run.start", sessionId: await fallbackId(), prompt: "Quiet" });
     expect(await usageItems()).toHaveLength(3);
   });
 
   it("checkpoints usage during a run, so a restart persists what the interrupted run had used", async () => {
     await saveOpenAICredential("sk-test");
-    const { runtime } = setup([round([toolCall], { input: 700, output: 70, cost: cost(0.002) }), "hang"]);
-    void runtime.handleCommand({ v: 1, id: "1", type: "run.start", prompt: "Long" });
+    const { runtime } = await setup([round([toolCall], { input: 700, output: 70, cost: cost(0.002) }), "hang"]);
+    void runtime.handleCommand({ v: 1, id: "1", type: "run.start", sessionId: await fallbackId(), prompt: "Long" });
     // Wait for the checkpoint itself, not a fixed number of ticks: on a slow
     // machine the first round's usage lands after `tick()` returns.
     await vi.waitFor(async () => {
@@ -3614,7 +3667,7 @@ describe("BackgroundRuntime: usage visibility", () => {
 
 describe("BackgroundRuntime: context-menu drafts", () => {
   const ask = (id = "ask-1", text = "Selected source text") => buildAskContext("selection", { selectionText: text }, { id: 1, url: "http://127.0.0.1:4173/agent-page.html", title: "Source page" }, id, 1)!;
-  const send = (runtime: BackgroundRuntime, command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+  const send = async (runtime: BackgroundRuntime, command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...await inOpenChat(command) } as SidebarCommand);
   const answer: ScriptedProviderEvent[] = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
 
   it("keeps a removable draft without sending, ignores stale removals/labels, and preserves it on setup failure", async () => {
@@ -3726,13 +3779,16 @@ describe("BackgroundRuntime: scheduled automation", () => {
     const badge = new ApprovalBadge({ setBadgeText: ({ text }) => { texts.push(text); }, setBadgeBackgroundColor: () => {} });
     const hub = new SidebarHub();
     const alarms = { create: vi.fn(), clear: vi.fn(async () => true) };
-    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory, clock, alarms, approvalBadge: badge, notifications, mcp });
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: factory, clock, alarms, approvalBadge: badge, notifications, mcp, windows: { getLastFocused: async () => ({ id: 1 }) } });
     runtimes.push(runtime); hub.delegate = runtime;
     await runtime.initialize();
+    // The focused window's sidebar, showing the open chat: where results and attention clicks open chats.
+    const sidebar = await attachView(hub, fakePort());
+    const shown = () => hub.viewOf(sidebar)!.sessionId;
     const saved = await runtime.handleAutomationRequest({ v: 1, id: "save", type: "automation.save", taskId: null, task: draft });
     if (!saved.ok) throw new Error(saved.error.message);
     const taskId = saved.tasks[0]!.id;
-    return { runtime, provider, advance, api, tags, taskId, openId, badge, texts, alarms, hub };
+    return { runtime, provider, advance, api, tags, taskId, openId, badge, texts, alarms, hub, sidebar, shown };
   }
   const ended = async (taskId: string) => {
     await vi.waitFor(async () => expect((await getScheduledTasks()).find((t) => t.id === taskId)?.lastRun?.endedAt).toBeTypeOf("number"));
@@ -3742,7 +3798,7 @@ describe("BackgroundRuntime: scheduled automation", () => {
   it("runs in a dedicated owned agent tab/session, preserves open chat, and reuses the results session", async () => {
     const provider = new FakeProvider();
     provider.script = [{ type: "text.delta", delta: "Checked." }, { type: "turn.completed", replayState: null }];
-    const { runtime, advance, api, tags, taskId, openId, texts } = await setup(provider);
+    const { runtime, advance, api, tags, taskId, openId, texts, shown } = await setup(provider);
     advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
     const first = await ended(taskId);
     expect(first.sessionId).not.toBe(openId);
@@ -3760,8 +3816,9 @@ describe("BackgroundRuntime: scheduled automation", () => {
     advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM); await ended(taskId);
     expect((await getScheduledTasks())[0]!.sessionId).toBe(first.sessionId);
     expect((await getConversation(first.sessionId!))!.items.filter(isTurnStart)).toHaveLength(2);
+    expect(shown()).toBe(openId);
     await runtime.openAttentionSession();
-    expect(await getOpenSessionId()).toBe(first.sessionId);
+    expect(shown()).toBe(first.sessionId);
     expect((await getScheduledTasks())[0]!.unread).toBe(false);
     expect(texts.at(-1)).toBe("");
   });
@@ -3771,7 +3828,7 @@ describe("BackgroundRuntime: scheduled automation", () => {
   it("runs a tick while an unrelated chat runs, leaving that run and the open chat alone", async () => {
     const { provider, release } = blockingProvider();
     const { runtime, advance, taskId, openId } = await setup(provider);
-    const userRun = runtime.handleCommand({ v: 1, id: "user", type: "run.start", prompt: "User work" });
+    const userRun = runtime.handleCommand({ v: 1, id: "user", type: "run.start", sessionId: await fallbackId(), prompt: "User work" });
     await untilRequested(provider);
     const activeId = (await runtime.getSnapshot()).runs[0]!.runId;
     advance(300_000);
@@ -3797,12 +3854,13 @@ describe("BackgroundRuntime: scheduled automation", () => {
       if (round++ === 1) await gate.promise;
       yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent;
     } });
-    const { runtime, advance, taskId } = await setup(provider);
+    const { runtime, advance, taskId, sidebar, shown } = await setup(provider);
     advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
     const results = (await ended(taskId)).sessionId!;
     // The user opens the results and asks a follow-up there, which keeps running.
     await runtime.openResultsSession(results);
-    const userRun = runtime.handleCommand({ v: 1, id: "user", type: "run.start", prompt: "User work" });
+    expect(shown()).toBe(results);
+    const userRun = runtime.handleCommand({ v: 1, id: "user", type: "run.start", sessionId: results, prompt: "User work" }, sidebar);
     await untilRequested(provider, 2);
     const activeId = (await runtime.getSnapshot()).runs[0]!.runId;
     advance(300_000);
@@ -3834,8 +3892,8 @@ describe("BackgroundRuntime: scheduled automation", () => {
     const mcp = new McpConnections({ fetcher: fake.fetcher, popup: approvingPopup() });
     await mcp.connect("notion");
     const provider = new FakeProvider(); provider.script = [{ type: "turn.completed", replayState: null }];
-    const { runtime, advance, taskId, openId } = await setup(provider, undefined, mcp);
-    const owner = {};
+    const { runtime, advance, taskId, openId, hub } = await setup(provider, undefined, mcp);
+    const owner = await attachView(hub, fakePort());
     const catalog = await runtime.handleCommand({ v: 1, id: "catalog", type: "mcp.content.list", sessionId: openId, kind: "resource" }, owner);
     if (!catalog || !("contentReply" in catalog) || !catalog.contentReply.ok || !("choices" in catalog.contentReply)) throw new Error("Missing resource catalog");
     const prepared = await runtime.handleCommand({ v: 1, id: "prepare", type: "mcp.content.prepare", sessionId: openId, choiceId: catalog.contentReply.choices[0]!.id, arguments: {} }, owner);
@@ -3861,7 +3919,7 @@ describe("BackgroundRuntime: scheduled automation", () => {
     await mcp.connect("notion");
     const provider = new FakeProvider();
     provider.script = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
-    const { runtime, advance, api, taskId, hub } = await setup(provider, undefined, mcp);
+    const { runtime, advance, api, taskId, hub, sidebar } = await setup(provider, undefined, mcp);
     const capturing = Promise.withResolvers<void>();
     const resume = Promise.withResolvers<void>();
     const sendMessage = api.tabs.sendMessage.getMockImplementation()!;
@@ -3886,7 +3944,7 @@ describe("BackgroundRuntime: scheduled automation", () => {
       await capturing.promise;
       const sessionId = (await getScheduledTasks()).find(task => task.id === taskId)!.sessionId!;
       await runtime.openResultsSession(sessionId);
-      const port = fakePort(); hub.handleConnect(port);
+      const port = sidebar;
       await port.send({ v: 1, id: "subscribe", type: "state.subscribe", lastSeq: null });
       const runId = (await runtime.getSnapshot()).runs[0]!.runId;
       const catalog = await runtime.handleCommand({ v: 1, id: "catalog", type: "mcp.content.list", sessionId, kind: "resource" }, port);
@@ -3895,14 +3953,14 @@ describe("BackgroundRuntime: scheduled automation", () => {
       if (!result || !("contentReply" in result) || !result.contentReply.ok || !("snapshot" in result.contentReply)) throw new Error("Missing resource preview");
       const prepared = result.contentReply.snapshot;
       await port.send({ v: 1, id: "steer", type: "run.steer", runId, text: "Explain the attachment", sessionId, contentIds: [prepared.id] });
-      await port.send({ v: 1, id: "remove-later", type: "run.steer", runId, text: "Remove this guidance later" });
+      await port.send({ v: 1, id: "remove-later", type: "run.steer", sessionId, runId, text: "Remove this guidance later" });
       const pending = await loadMessageQueue(sessionId);
       expect(pending).toMatchObject([{ mode: "steer", content: [prepared] }, { mode: "steer" }]);
       resume.resolve();
       expect((await ended(taskId)).lastRun?.status).toBe("failed");
       await vi.waitFor(async () => expect((await runtime.getSnapshot()).runs).toEqual([]));
       const queue = pending.map(message => ({ ...message, mode: "follow-up" }));
-      expect((await runtime.getSnapshot()).queue).toEqual(queue);
+      expect((await runtime.getSnapshot(hub.viewOf(port))).queue).toEqual(queue);
       expect(await loadMessageQueue(sessionId)).toEqual(queue);
       expect(provider.requests).toHaveLength(0);
       expect(port.received.findLast(event => event.type === "state.snapshot")?.payload).toMatchObject({ runs: [], queue });
@@ -3965,7 +4023,7 @@ describe("BackgroundRuntime: scheduled automation", () => {
       { type: "tool.call", call: { id: "after", name: "browser_program", arguments: { source: 'return fs.write("/workspace/approved.txt", "approved");' } } },
       { type: "turn.completed", replayState: null },
     ], [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }]]);
-    const { runtime, advance, taskId, openId, badge, texts } = await setup(provider);
+    const { runtime, advance, taskId, openId, badge, texts, shown } = await setup(provider);
     advance(300_000); await runtime.handleAlarm(SCHEDULE_ALARM);
     await vi.waitFor(async () => expect((await runtime.getSnapshot()).runs[0]?.status).toBe("awaiting-approval"));
     const active = (await runtime.getSnapshot()).runs[0]!;
@@ -3973,7 +4031,8 @@ describe("BackgroundRuntime: scheduled automation", () => {
     expect(await getOpenSessionId()).toBe(openId);
     expect(provider.requests).toHaveLength(1);
     badge.setResults(true); await tick(); expect(texts.at(-1)).toBe("!");
-    await runtime.openAttentionSession(); expect(await getOpenSessionId()).toBe(active.conversationId);
+    expect(shown()).toBe(openId);
+    await runtime.openAttentionSession(); expect(shown()).toBe(active.conversationId);
     await runtime.handleCommand({ v: 1, id: "approve", type: "action.approve", runId: active.runId, callId: "confirm" });
     const task = await ended(taskId);
     expect((await getConversation(task.sessionId!))!.items.some((item) => item.kind === "tool-result" && item.callId === "after" && item.result.ok)).toBe(true);
@@ -4051,7 +4110,7 @@ describe("BackgroundRuntime: scheduled automation", () => {
     await vi.waitFor(() => expect(create).toHaveBeenCalledOnce());
     const wire = JSON.stringify(create.mock.calls); expect(wire).not.toContain("PRIVATE"); expect(wire).not.toContain("example.test"); expect(wire).not.toContain(draft.prompt);
     clicked!(create.mock.calls[0]![0]); expect(openSidebar).toHaveBeenCalledOnce();
-    await vi.waitFor(async () => expect(await getOpenSessionId()).toBe(task.sessionId));
+    await vi.waitFor(() => expect(setupResult.shown()).toBe(task.sessionId));
     await runtime.handleAutomationRequest({ v: 1, id: "disable", type: "automation.notifications.save", enabled: false });
     expect(await getNotificationSettings()).toEqual({ version: 1, enabled: false });
   });
@@ -4090,9 +4149,11 @@ describe("BackgroundRuntime: selected MCP content", () => {
     await mcp.connect("notion");
     const hub = new SidebarHub();
     const runtime = new BackgroundRuntime(hub, { provider, mcp, tabControllerFactory });
-    const owner = {};
+    hub.delegate = runtime;
+    // The sidebar of window 1, showing the fallback chat.
+    const owner = await attachView(hub, fakePort());
     const sessionId = (await runtime.getSnapshot()).conversation.id;
-    const send = (command: Record<string, unknown>, sender = owner) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand, sender);
+    const send = async (command: Record<string, unknown>, sender: object = owner) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...await inOpenChat(command) } as SidebarCommand, sender);
     const prepare = async (kind: "prompt" | "resource" = "prompt", sender = owner) => {
       const list = await send({ type: "mcp.content.list", kind, sessionId }, sender);
       if (!list || !("contentReply" in list) || !list.contentReply.ok || !("choices" in list.contentReply)) throw new Error("Missing catalog");
@@ -4100,7 +4161,11 @@ describe("BackgroundRuntime: selected MCP content", () => {
       if (!result || !("contentReply" in result) || !result.contentReply.ok || !("snapshot" in result.contentReply)) throw new Error("Missing snapshot");
       return result.contentReply.snapshot;
     };
-    return { runtime, mcp, hub, provider, remote, sessionId, send, prepare, owner };
+    /** What window 1's sidebar is shown: the chat, and that window's Ask chip. */
+    const snapshot = () => runtime.getSnapshot(hub.viewOf(owner));
+    /** The one-shot notice of the last snapshot window 1's sidebar was sent. */
+    const notice = () => owner.received.findLast((event) => event.type === "state.snapshot")?.payload.notice;
+    return { runtime, mcp, hub, provider, remote, sessionId, send, prepare, owner, snapshot, notice };
   }
 
   it("settles an accepted second-sidebar steer when the initial message cannot be saved after capture", async () => {
@@ -4116,25 +4181,25 @@ describe("BackgroundRuntime: selected MCP content", () => {
     const f = await fixture(undefined, () => controller);
     f.hub.delegate = f.runtime;
     f.provider.script = answer;
-    const first = fakePort(); f.hub.handleConnect(first);
+    const first = fakePort(); await attachView(f.hub, first);
     const originalSet = browser.storage.local.set.bind(browser.storage.local);
     const fail = vi.spyOn(browser.storage.local, "set").mockImplementation(async items => {
       const chunk = (items as Record<string, unknown>)[`conversation:${f.sessionId}:items:0`] as { items?: ConversationItem[] } | undefined;
       if (chunk?.items?.some(item => item.kind === "message" && item.role === "user" && item.text === "Start")) throw new Error("private storage error");
       await originalSet(items);
     });
-    const starting = first.send({ v: 1, id: "start", type: "run.start", prompt: "Start" });
+    const starting = first.send({ v: 1, id: "start", type: "run.start", sessionId: await fallbackId(), prompt: "Start" });
     try {
       await capturing.promise;
-      const second = fakePort(); f.hub.handleConnect(second);
+      const second = fakePort(); await attachView(f.hub, second);
       await second.send({ v: 1, id: "subscribe", type: "state.subscribe", lastSeq: null });
-      const runId = (await f.runtime.getSnapshot()).runs[0]!.runId;
+      const runId = (await f.snapshot()).runs[0]!.runId;
       const prepared = await f.prepare("resource", second);
       await second.send({ v: 1, id: "steer", type: "run.steer", runId, text: "Explain", sessionId: f.sessionId, contentIds: [prepared.id] });
       const [pending] = await loadMessageQueue(f.sessionId);
       expect(pending).toMatchObject({ mode: "steer", content: [prepared] });
       resumeCapture.resolve(); await starting;
-      const snapshot = await f.runtime.getSnapshot();
+      const snapshot = await f.snapshot();
       expect(snapshot.runs).toEqual([]);
       expect(snapshot.queue).toEqual([{ ...pending, mode: "follow-up" }]);
       expect(await loadMessageQueue(f.sessionId)).toEqual(snapshot.queue);
@@ -4155,11 +4220,12 @@ describe("BackgroundRuntime: selected MCP content", () => {
   it("keeps failed-send chips available, refuses other sidebars/session and duplicate sends, and replays exact bytes after disconnect", async () => {
     const f = await fixture();
     await f.send({ type: "run.start", prompt: "/mcp:notion:summarize" });
-    expect((await f.runtime.getSnapshot()).notice).toContain("prepare its preview");
+    expect(f.notice()).toContain("prepare its preview");
     const prepared = await f.prepare();
     const command = { type: "run.start", prompt: "/mcp:notion:summarize", sessionId: f.sessionId, contentIds: [prepared.id] };
-    await f.send(command, {});
-    expect((await f.runtime.getSnapshot()).notice).toContain("no longer available");
+    // Another window's sidebar showing the same chat.
+    await f.send(command, await attachView(f.hub, fakePort(), 2));
+    expect(f.notice()).toContain("no longer available");
     await f.send(command);
     expect(f.provider.requests).toHaveLength(0); // No provider credential; preparation survives.
     await saveOpenAICredential("sk-test");
@@ -4219,7 +4285,7 @@ describe("BackgroundRuntime: selected MCP content", () => {
     const running = f.send({ type: "run.start", prompt: "Start" });
     await untilRequested(f.provider);
     const prepared = await f.prepare();
-    const runId = (await f.runtime.getSnapshot()).runs[0]!.runId;
+    const runId = (await f.snapshot()).runs[0]!.runId;
     const command = { type: mode === "steer" ? "run.steer" : "run.start", runId, prompt: "Explain", text: "Explain", sessionId: f.sessionId, contentIds: [prepared.id] };
     await Promise.all([f.send(command), f.send(command)]);
     expect((await loadMessageQueue(f.sessionId))).toHaveLength(1);
@@ -4228,7 +4294,7 @@ describe("BackgroundRuntime: selected MCP content", () => {
     await f.mcp.refresh("notion");
     gate.resolve();
     await running;
-    await vi.waitFor(async () => expect((await f.runtime.getSnapshot()).runs).toEqual([]));
+    await vi.waitFor(async () => expect((await f.snapshot()).runs).toEqual([]));
     expect(f.provider.requests).toHaveLength(3);
     expect(JSON.stringify(f.provider.requests[1]!.context.messages)).toContain("Original remote snapshot");
     expect(JSON.stringify(f.provider.requests[1]!.context.messages)).not.toContain("Remote replacement");
@@ -4239,7 +4305,7 @@ describe("BackgroundRuntime: selected MCP content", () => {
   it.each(["removal", "delivery", "settlement"] as const)("serializes %s while attachment acceptance is persisting without resurrecting queued messages", async mode => {
     await saveOpenAICredential("sk-test");
     const f = await fixture();
-    const observer = fakePort(); f.hub.handleConnect(observer);
+    const observer = fakePort(); await attachView(f.hub, observer);
     const firstRound = Promise.withResolvers<void>();
     const secondRound = Promise.withResolvers<void>();
     let round = 0;
@@ -4251,7 +4317,7 @@ describe("BackgroundRuntime: selected MCP content", () => {
     } });
     const running = f.send({ type: "run.start", prompt: "Start" });
     await untilRequested(f.provider);
-    const runId = (await f.runtime.getSnapshot()).runs[0]!.runId;
+    const runId = (await f.snapshot()).runs[0]!.runId;
     await f.send(mode === "removal" ? { type: "run.start", prompt: "A" } : { type: "run.steer", runId, text: "A" });
     const a = (await loadMessageQueue(f.sessionId))[0]!;
     const prepared = await f.prepare("resource");
@@ -4270,14 +4336,14 @@ describe("BackgroundRuntime: selected MCP content", () => {
     try {
       await writing.promise;
       let removing: Promise<unknown> | undefined;
-      if (mode === "removal") removing = f.send({ type: "queue.remove", sessionId: f.sessionId, messageId: a.id }, {});
+      if (mode === "removal") removing = f.send({ type: "queue.remove", sessionId: f.sessionId, messageId: a.id }, await attachView(f.hub, fakePort(), 2));
       else if (mode === "delivery") {
         firstRound.resolve();
         await vi.waitFor(async () => expect((await getConversation(f.sessionId))!.items.some(item => item.id === a.id && item.kind === "message" && item.role === "user" && item.delivery === "steer")).toBe(true));
       } else {
         await f.send({ type: "run.cancel", runId });
         firstRound.resolve();
-        await vi.waitFor(async () => expect((await f.runtime.getSnapshot()).runs).toEqual([]));
+        await vi.waitFor(async () => expect((await f.snapshot()).runs).toEqual([]));
       }
       // Let the competing command/delivery reach the held acceptance boundary.
       await tick();
@@ -4286,7 +4352,7 @@ describe("BackgroundRuntime: selected MCP content", () => {
       await removing;
       if (mode === "settlement") await running;
       const expected = mode === "settlement" ? ["A", "B"] : ["B"];
-      await vi.waitFor(async () => expect((await f.runtime.getSnapshot()).queue.map(message => message.text)).toEqual(expected));
+      await vi.waitFor(async () => expect((await f.snapshot()).queue.map(message => message.text)).toEqual(expected));
       await vi.waitFor(async () => expect((await loadMessageQueue(f.sessionId)).map(message => message.text)).toEqual(expected));
       if (mode === "delivery") {
         await vi.waitFor(() => expect(observer.received.some(event => event.type === "steer.delivered" && event.payload.item.id === a.id)).toBe(true));
@@ -4298,7 +4364,7 @@ describe("BackgroundRuntime: selected MCP content", () => {
       firstRound.resolve(); secondRound.resolve();
       await running;
       if (mode === "settlement") await f.send({ type: "queue.send", sessionId: f.sessionId, messageId: a.id });
-      await vi.waitFor(async () => expect((await f.runtime.getSnapshot()).runs).toEqual([]));
+      await vi.waitFor(async () => expect((await f.snapshot()).runs).toEqual([]));
       const users = (await getConversation(f.sessionId))!.items.filter(item => item.kind === "message" && item.role === "user");
       expect(users.filter(item => item.text === "A")).toHaveLength(mode === "removal" ? 0 : 1);
       expect(users.filter(item => item.text === "B")).toHaveLength(1);
@@ -4318,7 +4384,7 @@ describe("BackgroundRuntime: selected MCP content", () => {
     await saveOpenAICredential("sk-test");
     const f = await fixture();
     const first = fakePort(); const second = fakePort();
-    f.hub.handleConnect(first); f.hub.handleConnect(second);
+    await attachView(f.hub, first); await attachView(f.hub, second);
     const gate = Promise.withResolvers<void>();
     let round = 0;
     f.provider.script = () => ({ [Symbol.asyncIterator]: async function* () { if (mode !== "initial" && round++ === 0) await gate.promise; yield* answer; } });
@@ -4326,8 +4392,8 @@ describe("BackgroundRuntime: selected MCP content", () => {
     if (mode !== "initial") await untilRequested(f.provider);
     const prepared = withContent ? await f.prepare("prompt", first) : undefined;
     const competing = withContent ? await f.prepare("resource", second) : undefined;
-    const source = ask(); f.runtime.setAsk(source);
-    const runId = (await f.runtime.getSnapshot()).runs[0]?.runId;
+    const source = ask(); f.runtime.setAsk(source, 1);
+    const runId = (await f.snapshot()).runs[0]?.runId;
     const command = { type: mode === "steer" ? "run.steer" : "run.start", runId, prompt: "Explain", text: "Explain", askId: source.id, sessionId: f.sessionId, contentIds: prepared ? [prepared.id] : undefined };
     const competingCommand = { ...command, contentIds: competing ? [competing.id] : undefined };
     const expected = { ask: { ...source, path: "/tabs/1/page.md" }, ...(prepared ? { content: [prepared] } : {}) };
@@ -4341,19 +4407,19 @@ describe("BackgroundRuntime: selected MCP content", () => {
       await tick();
       held.resume(); await Promise.all([sending, competingSend]);
       expect(visibleWhileSaving).toEqual({ ask: source });
-      expect((await f.runtime.getSnapshot()).ask).toEqual(source);
-      expect((await f.runtime.getSnapshot()).queue).toEqual([]);
+      expect((await f.snapshot()).ask).toEqual(source);
+      expect((await f.snapshot()).queue).toEqual([]);
       expect(await loadMessageQueue(f.sessionId)).toEqual([]);
       expect(first.received.some(event => event.type === "mcp.content.accepted")).toBe(false);
       expect(f.provider.requests).toHaveLength(mode === "initial" ? 0 : 1);
       held.restore();
       await Promise.all([f.send(command, first), f.send(command, first)]);
       await f.send(competingCommand, second);
-      expect((await f.runtime.getSnapshot()).ask).toBeNull();
+      expect((await f.snapshot()).ask).toBeNull();
       if (mode !== "initial") expect((await loadMessageQueue(f.sessionId))).toMatchObject([expected]);
       gate.resolve(); await running;
       await vi.waitFor(async () => {
-        const snapshot = await f.runtime.getSnapshot();
+        const snapshot = await f.snapshot();
         expect(snapshot.runs).toEqual([]); expect(snapshot.queue).toEqual([]);
       });
       const users = (await getConversation(f.sessionId))!.items.filter(item => item.kind === "message" && item.role === "user" && item.text === "Explain");
@@ -4380,16 +4446,16 @@ describe("BackgroundRuntime: selected MCP content", () => {
     const running = mode === "initial" ? Promise.resolve() : f.send({ type: "run.start", prompt: "Start" });
     if (mode !== "initial") await untilRequested(f.provider);
     const prepared = await f.prepare();
-    f.runtime.setAsk(ask());
-    const runId = (await f.runtime.getSnapshot()).runs[0]?.runId;
+    f.runtime.setAsk(ask(), 1);
+    const runId = (await f.snapshot()).runs[0]?.runId;
     const held = holdAdmission(f.sessionId, "Explain", reject);
     const sending = f.send({ type: mode === "steer" ? "run.steer" : "run.start", runId, prompt: "Explain", text: "Explain", askId: "ask-1", sessionId: f.sessionId, contentIds: [prepared.id] });
     try {
       await held.writing;
-      if (change === "replace") f.runtime.setAsk(ask("newer", "New menu gesture"));
+      if (change === "replace") f.runtime.setAsk(ask("newer", "New menu gesture"), 1);
       else await f.send({ type: "ask.dismiss", askId: "ask-1" });
       held.resume(); await sending;
-      expect((await f.runtime.getSnapshot()).ask).toEqual(change === "replace" ? ask("newer", "New menu gesture") : null);
+      expect((await f.snapshot()).ask).toEqual(change === "replace" ? ask("newer", "New menu gesture") : null);
       const users = (await getConversation(f.sessionId))!.items.filter(item => item.kind === "message" && item.role === "user" && item.text === "Explain");
       expect(users).toMatchObject(reject ? [] : [{ ask: { ...ask(), path: "/tabs/1/page.md" }, content: [prepared] }]);
     } finally {
@@ -4403,13 +4469,13 @@ describe("BackgroundRuntime: selected MCP content", () => {
     const prepared = await f.prepare();
     await f.mcp.refresh("notion");
     await f.send({ type: "run.start", prompt: "Explain", sessionId: f.sessionId, contentIds: [prepared.id] });
-    expect((await f.runtime.getSnapshot()).notice).toContain("disconnected");
+    expect(f.notice()).toContain("disconnected");
     await f.send({ type: "session.open", sessionId: (await createSession()).id });
     await f.send({ type: "run.start", prompt: "Explain", sessionId: f.sessionId, contentIds: [prepared.id] });
-    expect((await f.runtime.getSnapshot()).notice).toContain("chat changed");
+    expect(f.notice()).toContain("chat changed");
     const port = fakePort();
     Object.assign(port, { sender: { id: browser.runtime.id, url: "https://example.com/" } });
-    f.hub.handleConnect(port);
+    await attachView(f.hub, port);
     await port.send({ v: 1, id: "read", type: "mcp.content.list", kind: "resource", sessionId: f.sessionId });
     expect(port.received).toHaveLength(0);
     expect(f.provider.requests).toHaveLength(0);
@@ -4427,7 +4493,7 @@ describe("user-tab leases", () => {
     hub.delegate = runtime;
 
     scripted(provider, programRound('return fs.read("/tabs/1/page.md");'));
-    await runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "What is this?" });
+    await runtime.handleCommand({ v: 1, id: "run", type: "run.start", sessionId: await fallbackId(), prompt: "What is this?" });
     const first = JSON.stringify(provider.requests[0]?.context.messages);
     expect(first).toContain("The user is looking at tab /tabs/1/page.md, but another bside chat is using it");
     expect(first).not.toContain("Orchid launch");
@@ -4441,7 +4507,7 @@ describe("user-tab leases", () => {
     workspace.releaseRunLeases("other-run");
     scripted(provider, programRound('return fs.read("/tabs/1/page.md");'));
     const before = provider.requests.length;
-    await runtime.handleCommand({ v: 1, id: "run2", type: "run.start", prompt: "And now?" });
+    await runtime.handleCommand({ v: 1, id: "run2", type: "run.start", sessionId: await fallbackId(), prompt: "And now?" });
     expect(JSON.stringify(provider.requests[before]?.context.messages)).toContain("The user is looking at tab /tabs/1/page.md (list mounts");
     expect(modelInput(provider)).toContain("Orchid launch");
     // Attaching and reading took the lease; the run's end released it.
@@ -4484,8 +4550,8 @@ describe("BackgroundRuntime: concurrent runs", () => {
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: options.tabControllerFactory ?? unsupportedPageTabControllerFactory, workspace: options.workspace });
     hub.delegate = runtime;
     const port = fakePort();
-    hub.handleConnect(port);
-    const send = (command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...command } as SidebarCommand);
+    await attachView(hub, port);
+    const send = async (command: Record<string, unknown>) => runtime.handleCommand({ v: 1, id: crypto.randomUUID(), ...await inOpenChat(command) } as SidebarCommand);
     const open = async () => (await runtime.getSnapshot()).conversation.id;
     const runIn = async (sessionId: string) => (await runtime.getSnapshot()).runs.find((run) => run.conversationId === sessionId);
     /** Starts a run in a new chat (or the empty open one) with these rounds; returns once the run reached the provider. */
@@ -4680,10 +4746,764 @@ describe("BackgroundRuntime: concurrent runs", () => {
     for (const { sessionId, runId } of [a, b]) expect((await itemsOf(sessionId)).map((item) => item.id)).toContain(`interrupted-${runId}`);
     // Each chat may retry its own turn.
     await restarted.handleCommand({ v: 1, id: "open-a", type: "session.open", sessionId: a.sessionId });
-    await restarted.handleCommand({ v: 1, id: "retry-a", type: "run.retry" });
+    await restarted.handleCommand({ v: 1, id: "retry-a", type: "run.retry", sessionId: await fallbackId() });
     await restarted.handleCommand({ v: 1, id: "open-b", type: "session.open", sessionId: b.sessionId });
-    await restarted.handleCommand({ v: 1, id: "retry-b", type: "run.retry" });
+    await restarted.handleCommand({ v: 1, id: "retry-b", type: "run.retry", sessionId: await fallbackId() });
     expect(provider.requests.map((request) => request.sessionId)).toEqual([a.sessionId, b.sessionId]);
     restarted.dispose();
+  });
+});
+
+describe("BackgroundRuntime: sidebar views", () => {
+  /** Two windows' active tabs, each a readable page whose outline names its own window. */
+  function twoWindowsTabControllerFactory(): TabController {
+    const tabs = [{ id: 11, windowId: 1, url: "https://one.test/", title: "Window one", active: true }, { id: 22, windowId: 2, url: "https://two.test/", title: "Window two", active: true }];
+    const api: TabControllerBrowserApi = {
+      tabs: {
+        query: vi.fn(async (query: { active?: boolean; windowId?: number; lastFocusedWindow?: boolean }) =>
+          tabs.filter((tab) => (query.windowId === undefined || tab.windowId === query.windowId) && (!query.lastFocusedWindow || tab.windowId === 1))),
+        update: vi.fn(async () => {}),
+        goBack: vi.fn(async () => {}),
+        sendMessage: vi.fn(async (tabId: number, message: unknown) => {
+          const request = message as { id: string; type: string };
+          const tab = tabs.find((candidate) => candidate.id === tabId)!;
+          const text = `PAGE_OF_WINDOW_${tab.windowId}`;
+          if (request.type === "page.snapshot") return { v: 1, id: request.id, ok: true, type: "page.snapshot", snapshot: {
+            version: 2, tabId, documentId: `doc-${tabId}`, url: tab.url, title: tab.title, text, offset: 0, end: text.length, totalChars: text.length, selectionText: "" } };
+          throw new Error(`unhandled request type: ${request.type}`);
+        }),
+        onUpdated: { addListener: vi.fn(), removeListener: vi.fn() },
+      },
+    };
+    return new TabController(api);
+  }
+
+  /** A sidebar Port whose closing the test controls. */
+  function closablePort(): FakePort & { close(): void } {
+    const port = fakePort();
+    const listeners: Array<() => void> = [];
+    Object.assign(port, { onDisconnect: { addListener: (listener: () => void) => listeners.push(listener) } });
+    return Object.assign(port, { close: () => { for (const listener of listeners) listener(); } });
+  }
+
+  /** `fallback` false: each sidebar shows the chat its window's tab gives it (these windows report no active tab, so a new empty one). */
+  async function setup(options: { provider?: FakeProvider; focused?: number | null; tabControllerFactory?: () => TabController; fallback?: boolean } = {}) {
+    await saveOpenAICredential("sk-test");
+    const hub = new SidebarHub();
+    const provider = options.provider ?? new FakeProvider();
+    if (!options.provider) provider.script = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
+    const focus = { window: options.focused === undefined ? 1 : options.focused };
+    const windows = { getLastFocused: vi.fn(async () => focus.window === null ? undefined : { id: focus.window }) };
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: options.tabControllerFactory ?? unsupportedPageTabControllerFactory, windows });
+    hub.delegate = runtime;
+    await runtime.initialize();
+    const one = await attachView(hub, closablePort(), 1, options.fallback);
+    const two = await attachView(hub, closablePort(), 2, options.fallback);
+    const send = (port: FakePort, command: Record<string, unknown>) => port.send({ v: 1, id: crypto.randomUUID(), ...command });
+    const shows = (port: FakePort) => hub.viewOf(port)!.sessionId;
+    /** The last snapshot a sidebar was sent. */
+    const last = (port: FakePort) => port.received.findLast((event) => event.type === "state.snapshot")?.payload as RuntimeSnapshot | undefined;
+    return { hub, runtime, provider, one, two, send, shows, last, focus, windows };
+  }
+
+  it("lets two windows show different chats, each snapshot carrying its own chat and queue", async () => {
+    const { runtime, hub, one, two, send, shows, last } = await setup({ fallback: false });
+    // Each sidebar starts on its own empty chat.
+    const first = shows(one);
+    const second = shows(two);
+    expect(second).not.toBe(first);
+    await send(one, { type: "run.start", prompt: "Question one", sessionId: first });
+    // New chat in a view already showing an empty chat keeps it.
+    await send(two, { type: "session.create" });
+    expect(shows(two)).toBe(second);
+    expect(shows(one)).toBe(first);
+    expect(last(one)?.conversation.id).toBe(first);
+    expect(last(two)?.conversation).toMatchObject({ id: second, items: [] });
+    // A newly opened sidebar gets an empty chat of its own, and the fallback is not written.
+    const three = await attachView(hub, fakePort(), 3, false);
+    expect([first, second]).not.toContain(hub.viewOf(three)!.sessionId);
+    expect(await getOpenSessionId()).toBeNull();
+    await send(two, { type: "run.start", prompt: "Question two", sessionId: second });
+    expect(texts(await getConversation(first))).toEqual(["Question one", "Done."]);
+    expect(texts(await getConversation(second))).toEqual(["Question two", "Done."]);
+    const [a, b] = await runtime.getSnapshots([hub.viewOf(one), hub.viewOf(two)]);
+    expect([a!.conversation.id, b!.conversation.id]).toEqual([first, second]);
+  });
+
+  it("refuses a run command naming another chat than the sender's view shows, with a notice and no run", async () => {
+    const { provider, one, two, send, shows, last } = await setup();
+    await send(two, { type: "session.open", sessionId: await createSessionWith(prompt("u0", "Elsewhere")) });
+    await send(two, { type: "run.start", prompt: "Hello", sessionId: shows(one) });
+    expect(provider.requests).toHaveLength(0);
+    expect(last(two)?.notice).toContain("This chat changed");
+    expect((await getConversation(shows(one)))!.items).toEqual([]);
+
+    // A failed turn can be retried only from a view showing its chat.
+    provider.script = () => ({ [Symbol.asyncIterator]: async function* () { throw new ProviderStreamError("Try again", "NETWORK"); } });
+    await send(one, { type: "run.start", prompt: "Fails", sessionId: shows(one) });
+    expect(provider.requests).toHaveLength(1);
+    await send(two, { type: "run.retry", sessionId: shows(one) });
+    expect(provider.requests).toHaveLength(1);
+    provider.script = [{ type: "turn.completed", replayState: null }];
+    await send(one, { type: "run.retry", sessionId: shows(one) });
+    expect(provider.requests).toHaveLength(2);
+  });
+
+  it("refuses to steer another chat's run from a view", async () => {
+    const { provider, release } = blockingProvider();
+    const { runtime, one, two, send, shows, last } = await setup({ provider });
+    const busy = shows(one);
+    const running = send(one, { type: "run.start", prompt: "Long task", sessionId: busy });
+    await untilRequested(provider);
+    const runId = (await runtime.getSnapshot()).runs[0]!.runId;
+    await send(two, { type: "session.create" });
+    await send(two, { type: "run.steer", runId, text: "Hijack", sessionId: shows(two) });
+    expect(last(two)?.notice).toContain("another chat");
+    expect(await loadMessageQueue(busy)).toEqual([]);
+    expect((await getConversation(shows(two)))!.items).toEqual([]);
+    release(); await running;
+  });
+
+  it("checks attachments and workspace images against the sender's view", async () => {
+    const { hub, one, two, send, shows } = await setup();
+    await send(two, { type: "session.open", sessionId: await createSessionWith(prompt("u0", "Elsewhere")) });
+    const reply = async (port: FakePort, type: SidebarEvent["type"]) => port.received.findLast((event) => event.type === type)?.payload;
+    await send(two, { type: "attachment.prepare", sessionId: shows(one), name: "a.txt", mimeType: "text/plain", data: btoa("hi") });
+    expect(await reply(two, "attachment.prepared")).toMatchObject({ result: { error: expect.stringContaining("chat changed") } });
+    await send(one, { type: "attachment.prepare", sessionId: shows(one), name: "a.txt", mimeType: "text/plain", data: btoa("hi") });
+    expect(await reply(one, "attachment.prepared")).toMatchObject({ result: { attachment: { name: "a.txt" } } });
+    await send(two, { type: "workspace.image", sessionId: shows(one), path: "/workspace/shot.png" });
+    expect(await reply(two, "workspace.image.loaded")).toMatchObject({ result: { ok: false, reason: "session" } });
+    await send(one, { type: "workspace.image", sessionId: shows(one), path: "/workspace/shot.png" });
+    expect(await reply(one, "workspace.image.loaded")).toMatchObject({ result: { ok: false, reason: "missing" } });
+    expect(hub.views()).toHaveLength(2);
+  });
+
+  it("lists and watches only the agent tabs of the chat the sender's view shows", async () => {
+    const chatA = await createSessionWith(prompt("a", "A"));
+    const chatB = await createSessionWith(prompt("b", "B"));
+    await setOpenSessionId(chatA);
+    const tabs = [{ id: 1, url: "https://user.test/", title: "User", hidden: false }, { id: 5, url: "https://agent-5.test/", title: "Agent", hidden: true }];
+    const { factory } = fakeTabsApi(tabs, new Map<number, unknown>([[5, { v: 2, role: "agent", sessionId: chatA, lastUsedAt: Date.now() }]]));
+    const { runtime, one, two, send, shows } = await setup({ tabControllerFactory: factory });
+    expect(shows(one)).toBe(chatA);
+    await send(two, { type: "session.open", sessionId: chatB });
+    const paths = async (port: FakePort) => {
+      await send(port, { type: "tabs.list" });
+      return (port.received.findLast((event) => event.type === "tabs.listed")!.payload as { tabs: Array<{ path: string }> }).tabs.map((tab) => tab.path);
+    };
+    expect(await paths(one)).toEqual(["/tabs/1/page.md", "/agent-tabs/5/page.md"]);
+    expect(await paths(two)).toEqual(["/tabs/1/page.md"]);
+    await send(two, { type: "tabs.watch", tabId: 5 });
+    expect((await runtime.getSnapshot()).agentTabs.watching).toBeNull();
+    await send(one, { type: "tabs.watch", tabId: 5 });
+    expect((await runtime.getSnapshot()).agentTabs.watching).toBe(5);
+  });
+
+  it("deletes an untouched chat only once no view shows it, and never lists one", async () => {
+    const { hub, one, two, send, shows } = await setup();
+    const untouched = shows(one);
+    expect(shows(two)).toBe(untouched);
+    const listed = async (port: FakePort) => {
+      await send(port, { type: "session.list" });
+      return (port.received.findLast((event) => event.type === "session.listed")!.payload as { sessions: ConversationSummary[] }).sessions.map((session) => session.id);
+    };
+    expect(await listed(one)).toEqual([]);
+    const named = await createSessionWith(prompt("u1", "Earlier"));
+    // Window one leaves the untouched chat; window two still shows it.
+    await send(one, { type: "session.open", sessionId: named });
+    expect(await getConversation(untouched)).not.toBeNull();
+    expect(await listed(one)).toEqual([named]);
+    // Window two's sidebar closes: nothing shows it any more.
+    (two as ReturnType<typeof closablePort>).close();
+    await vi.waitFor(async () => expect(await getConversation(untouched)).toBeNull());
+    expect(hub.views().map((view) => view.sessionId)).toEqual([named]);
+
+    // An empty chat goes with the last sidebar that showed it; the next sidebar gets its own.
+    await send(one, { type: "session.create" });
+    const fresh = shows(one);
+    (one as ReturnType<typeof closablePort>).close();
+    await vi.waitFor(async () => expect(await getConversation(fresh)).toBeNull());
+    const again = await attachView(hub, fakePort(), 1, false);
+    expect([fresh, named]).not.toContain(hub.viewOf(again)!.sessionId);
+    expect((await listSessions()).map((session) => session.id).sort()).toEqual([named, hub.viewOf(again)!.sessionId].sort());
+  });
+
+  it("drops untouched chats an earlier background left at startup, keeping the fallback", async () => {
+    const kept = await createSession();
+    const abandoned = await createSession();
+    const named = await createSessionWith(prompt("u1", "Keep me"));
+    await setOpenSessionId(kept.id);
+    const { hub, one } = await setup();
+    expect(await getConversation(abandoned.id)).toBeNull();
+    expect((await listSessions()).map((session) => session.id).sort()).toEqual([kept.id, named].sort());
+    expect(hub.viewOf(one)!.sessionId).toBe(kept.id);
+  });
+
+  it("keeps the Ask chip and composer focus to the window it was clicked in", async () => {
+    const { runtime, provider, one, two, send, shows, last } = await setup();
+    const chip = buildAskContext("selection", { selectionText: "Window two text" }, { id: 22, url: "https://two.test/", title: "Two" }, "ask-2", 1)!;
+    runtime.setAsk(chip, 2);
+    expect(one.received.some((event) => event.type === "ask.changed" || event.type === "composer.focus")).toBe(false);
+    expect(two.received.filter((event) => event.type === "ask.changed" || event.type === "composer.focus").map((event) => event.type)).toEqual(["ask.changed", "composer.focus"]);
+    await send(one, { type: "state.subscribe", lastSeq: null });
+    expect(last(one)?.ask).toBeNull();
+    await send(two, { type: "state.subscribe", lastSeq: null });
+    expect(last(two)?.ask).toEqual(chip);
+    // Another window can neither send nor dismiss it.
+    await send(one, { type: "ask.dismiss", askId: "ask-2" });
+    await send(one, { type: "run.start", prompt: "Explain", askId: "ask-2", sessionId: shows(one) });
+    expect(provider.requests).toHaveLength(0);
+    expect(last(one)?.notice).toContain("page context");
+    await send(two, { type: "run.start", prompt: "Explain", askId: "ask-2", sessionId: shows(two) });
+    expect(provider.requests).toHaveLength(1);
+    expect((await getConversation(shows(two)))!.items.find(isTurnStart)).toMatchObject({ ask: { id: "ask-2" } });
+    expect(two.received.findLast((event) => event.type === "ask.changed")?.payload).toEqual({ ask: null });
+  });
+
+  it("attaches the active page of the sender's window to its run", async () => {
+    const { provider, one, two, send, shows } = await setup({ tabControllerFactory: twoWindowsTabControllerFactory });
+    await send(two, { type: "session.create" });
+    await send(two, { type: "run.start", prompt: "What is here?", sessionId: shows(two) });
+    expect(JSON.stringify(provider.requests[0]!.context.messages)).toContain("PAGE_OF_WINDOW_2");
+    expect(JSON.stringify(provider.requests[0]!.context.messages)).not.toContain("PAGE_OF_WINDOW_1");
+    await send(one, { type: "run.start", prompt: "And here?", sessionId: shows(one) });
+    expect(JSON.stringify(provider.requests[1]!.context.messages)).toContain("PAGE_OF_WINDOW_1");
+  });
+
+  it("sends each view its own window's page in its snapshot", async () => {
+    const query = vi.spyOn(browser.tabs, "query").mockResolvedValue([
+      { id: 11, windowId: 1, url: "https://one.test/", title: "One", active: true },
+      { id: 22, windowId: 2, url: "https://two.test/", title: "Two", active: true },
+    ] as never);
+    try {
+      const { one, two, send, last } = await setup();
+      await send(one, { type: "state.subscribe", lastSeq: null });
+      await send(two, { type: "state.subscribe", lastSeq: null });
+      expect(last(one)?.page?.tabId).toBe(11);
+      expect(last(two)?.page?.tabId).toBe(22);
+    } finally { query.mockRestore(); }
+  });
+
+  it("opens results, attention, and New chat in the last-focused window's sidebar, or for the next sidebar to attach", async () => {
+    const { runtime, hub, one, two, shows, focus } = await setup({ focused: 2 });
+    const results = await createSessionWith(prompt("u1", "Results"));
+    const before = shows(one);
+    await runtime.openResultsSession(results);
+    expect(shows(two)).toBe(results);
+    expect(shows(one)).toBe(before);
+
+    await runtime.newChat();
+    const fresh = shows(two);
+    expect(fresh).not.toBe(results);
+    expect((await getConversation(fresh))!.items).toEqual([]);
+    expect(two.received.at(-1)?.type === "composer.focus" || two.received.some((event) => event.type === "composer.focus")).toBe(true);
+    expect(one.received.some((event) => event.type === "composer.focus")).toBe(false);
+
+    // The focused window has no sidebar: no view changes (see "tab chats" for the tab it binds).
+    focus.window = 5;
+    await runtime.openResultsSession(results);
+    expect([shows(one), shows(two)]).toEqual([before, fresh]);
+    void hub;
+  });
+
+  it("moves every view that showed a deleted chat, and gives each a fresh chat after Delete all history", async () => {
+    const { runtime, one, two, send, shows } = await setup();
+    const shared = await createSessionWith(prompt("u1", "Shared"));
+    const other = await createSessionWith(prompt("u2", "Other"));
+    await send(one, { type: "session.open", sessionId: shared });
+    await send(two, { type: "session.open", sessionId: shared });
+    await send(one, { type: "session.delete", sessionId: shared, closeAgentTabs: true });
+    // Each view follows its tab again, which no chat is bound to: an empty chat of its own.
+    for (const port of [one, two]) {
+      expect([shared, other]).not.toContain(shows(port));
+      expect((await getConversation(shows(port)))!.items).toEqual([]);
+    }
+    expect(shows(one)).not.toBe(shows(two));
+
+    await send(one, { type: "session.open", sessionId: other });
+    expect(await runtime.handleHistoryRequest({ v: 1, id: "all", type: "history.deleteAll" })).toMatchObject({ ok: true });
+    expect(shows(one)).not.toBe(other);
+    expect(shows(one)).not.toBe(shows(two));
+    for (const port of [one, two]) expect((await getConversation(shows(port)))!.items).toEqual([]);
+  });
+
+  const texts = (conversation: { items: ConversationItem[] } | null) => conversation!.items.flatMap((item) => item.kind === "message" ? [item.text] : []);
+});
+
+describe("BackgroundRuntime: tab chats", () => {
+  type WorldTab = { id: number; windowId: number; index: number; url: string; title: string; hidden: boolean; active: boolean };
+
+  /**
+   * Two windows of tabs with `sessions` tab values, like Firefox: window 1
+   * (focused) has tabs 11, 12 and a new-tab page 13; window 2 has tab 21.
+   * Every web page answers snapshots with its own text.
+   */
+  function tabWorld(values: Map<string, unknown>, extra: WorldTab[]) {
+    const tabs: WorldTab[] = [
+      { id: 11, windowId: 1, index: 0, url: "https://a.test/", title: "A", hidden: false, active: true },
+      { id: 12, windowId: 1, index: 1, url: "https://b.test/", title: "B", hidden: false, active: false },
+      { id: 13, windowId: 1, index: 2, url: "about:newtab", title: "New Tab", hidden: false, active: false },
+      { id: 21, windowId: 2, index: 0, url: "https://c.test/", title: "C", hidden: false, active: true },
+      ...extra,
+    ];
+    const open = (tabId: number) => { if (!tabs.some((tab) => tab.id === tabId)) throw new Error("Invalid tab ID"); };
+    const key = (tabId: number, name: string) => `${tabId}:${name}`;
+    function activate(tabId: number) {
+      const tab = tabs.find((candidate) => candidate.id === tabId)!;
+      for (const other of tabs) if (other.windowId === tab.windowId) other.active = other === tab;
+      tab.hidden = false;
+    }
+    const api = {
+      tabs: {
+        query: vi.fn(async (query: { active?: boolean; windowId?: number; lastFocusedWindow?: boolean }) => tabs
+          .filter((tab) => (query.active === undefined || tab.active === query.active) && (query.windowId === undefined || tab.windowId === query.windowId) && (!query.lastFocusedWindow || tab.windowId === 1))
+          .map((tab) => ({ ...tab }))),
+        update: vi.fn(async (tabId: number, properties: { url: string } | { active: true }) => { if ("active" in properties) activate(tabId); }),
+        // New tabs (pop-out pages) get ids from 100.
+        create: vi.fn(async (properties: { url: string; active: boolean; windowId?: number; index?: number }) => {
+          const id = 100 + tabs.filter((tab) => tab.id >= 100).length;
+          const windowId = properties.windowId ?? 1;
+          const index = properties.index ?? tabs.filter((tab) => tab.windowId === windowId).length;
+          for (const tab of tabs) if (tab.windowId === windowId && tab.index >= index) tab.index += 1;
+          tabs.push({ id, windowId, index, url: properties.url, title: "bside", hidden: false, active: false });
+          if (properties.active) activate(id);
+          return { id, windowId, index, url: properties.url };
+        }),
+        hide: vi.fn(async (tabId: number) => { tabs.find((tab) => tab.id === tabId)!.hidden = true; return [tabId]; }),
+        show: vi.fn(async (tabId: number) => { tabs.find((tab) => tab.id === tabId)!.hidden = false; }),
+        goBack: vi.fn(async () => {}),
+        sendMessage: vi.fn(async (tabId: number, message: unknown) => {
+          const request = message as { id: string; type: string };
+          const tab = tabs.find((candidate) => candidate.id === tabId)!;
+          const text = `PAGE_${tabId}`;
+          if (request.type === "page.health") return { v: 1, id: request.id, ok: true, type: "page.health", url: tab.url };
+          if (request.type === "page.snapshot") return { v: 1, id: request.id, ok: true, type: "page.snapshot", snapshot: {
+            version: 2, tabId, documentId: `doc-${tabId}`, url: tab.url, title: tab.title, text, offset: 0, end: text.length, totalChars: text.length, selectionText: "" } };
+          throw new Error("no content script");
+        }),
+        onUpdated: { addListener: vi.fn(), removeListener: vi.fn() },
+      },
+      sessions: {
+        getTabValue: vi.fn(async (tabId: number, name: string): Promise<unknown> => { open(tabId); return structuredClone(values.get(key(tabId, name))); }),
+        setTabValue: vi.fn(async (tabId: number, name: string, value: unknown) => { open(tabId); values.set(key(tabId, name), structuredClone(value)); }),
+        removeTabValue: vi.fn(async (tabId: number, name: string) => { open(tabId); values.delete(key(tabId, name)); }),
+      },
+    } satisfies TabControllerBrowserApi;
+    /** The chat a tab's value names, as Firefox keeps it with the tab. */
+    const chatValue = (tabId: number) => (values.get(key(tabId, CHAT_TAB_KEY)) as { sessionId?: string } | undefined)?.sessionId;
+    return { tabs, values, api, activate, chatValue, factory: () => new TabController(api) };
+  }
+
+  /** The runtime over `tabWorld`, started, with window 1's and window 2's sidebars attached unless `attach` is false. */
+  async function setup(options: { provider?: FakeProvider; values?: Map<string, unknown>; extra?: WorldTab[]; attach?: boolean } = {}) {
+    await saveOpenAICredential("sk-test");
+    const world = tabWorld(options.values ?? new Map(), options.extra ?? []);
+    const hub = new SidebarHub();
+    const provider = options.provider ?? new FakeProvider();
+    if (!options.provider) provider.script = [{ type: "text.delta", delta: "Done." }, { type: "turn.completed", replayState: null }];
+    const focus = { window: 1 };
+    const focusWindow = vi.fn(async (windowId: number, _info: { focused: boolean }) => { focus.window = windowId; });
+    const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: world.factory, windows: { getLastFocused: async () => ({ id: focus.window }), update: focusWindow } });
+    hub.delegate = runtime;
+    await runtime.initialize();
+    const one = fakePort();
+    const two = fakePort();
+    if (options.attach !== false) { await attachView(hub, one, 1, false); await attachView(hub, two, 2, false); }
+    const send = (port: FakePort, command: Record<string, unknown>) => port.send({ v: 1, id: crypto.randomUUID(), ...inView(hub, port, command) });
+    const shows = (port: FakePort) => hub.viewOf(port)!.sessionId;
+    /** The user switches to a tab in its window's tab strip. */
+    const switchTo = async (tabId: number) => {
+      world.activate(tabId);
+      await runtime.handleTabActivated(tabId, world.tabs.find((tab) => tab.id === tabId)!.windowId);
+    };
+    return { ...world, hub, runtime, provider, one, two, send, shows, switchTo, focus, focusWindow };
+  }
+
+  const items = async (sessionId: string) => (await getConversation(sessionId))?.items.flatMap((item) => item.kind === "message" ? [item.text] : []);
+  /** A provider whose first round reads `path` with a program and whose second answers. */
+  const reading = (path: string) => {
+    const provider = new FakeProvider();
+    provider.script = () => {
+      const done = JSON.stringify(provider.requests.at(-1)?.context.messages).includes("toolResult");
+      const events: ScriptedProviderEvent[] = done
+        ? [{ type: "text.delta", delta: "Read it." }, { type: "turn.completed", replayState: null }]
+        : [{ type: "tool.call", call: { id: "read", name: "browser_program", arguments: { source: `await fs.read("${path}");` } } }, { type: "turn.completed", replayState: null }];
+      return { [Symbol.asyncIterator]: async function* () { yield* events; } };
+    };
+    return provider;
+  };
+
+  it("shows each tab's own chat, a fresh empty chat for a tab no chat is bound to, and the tab's chat again on switching back", async () => {
+    const { one, two, send, shows, switchTo, chatValue } = await setup();
+    const chatA = shows(one);
+    expect(await items(chatA)).toEqual([]);
+    await send(one, { type: "run.start", prompt: "About A" });
+    expect(await items(chatA)).toEqual(["About A", "Done."]);
+    await vi.waitFor(() => expect(chatValue(11)).toBe(chatA));
+
+    // Tab B has no chat: a fresh empty one; A keeps its own.
+    await switchTo(12);
+    const emptyB = shows(one);
+    expect(emptyB).not.toBe(chatA);
+    expect(await items(emptyB)).toEqual([]);
+    expect(chatValue(12)).toBeUndefined();
+    expect(one.received.findLast((event) => event.type === "state.snapshot")?.payload).toMatchObject({ conversation: { id: emptyB }, viewTabId: 12 });
+
+    // Back to A: its chat reappears, and B's empty chat, shown nowhere now, is gone.
+    await switchTo(11);
+    expect(shows(one)).toBe(chatA);
+    expect(one.received.findLast((event) => event.type === "state.snapshot")?.payload).toMatchObject({ conversation: { id: chatA }, viewTabId: 11 });
+    expect(await getConversation(emptyB)).toBeNull();
+
+    // A new-tab page has a chat like any other tab.
+    await switchTo(13);
+    const chatNewTab = shows(one);
+    await send(one, { type: "run.start", prompt: "About nothing" });
+    await vi.waitFor(() => expect(chatValue(13)).toBe(chatNewTab));
+    await switchTo(11);
+    expect(shows(one)).toBe(chatA);
+    await switchTo(13);
+    expect(shows(one)).toBe(chatNewTab);
+    expect((await listSessions()).map((session) => session.id).sort()).toEqual([chatA, chatNewTab, shows(two)].sort());
+  });
+
+  it("keeps one empty chat for the unbound tabs of a window, rather than one per switch", async () => {
+    const { one, two, shows, switchTo } = await setup();
+    const empty = shows(one);
+    const count = (await listSessions()).length;
+    await switchTo(12);
+    expect(shows(one)).toBe(empty);
+    await switchTo(13);
+    expect(shows(one)).toBe(empty);
+    expect((await listSessions()).length).toBe(count);
+    // Another window's switches leave this one alone.
+    const other = shows(two);
+    await switchTo(21);
+    expect(shows(two)).toBe(other);
+    expect(shows(one)).toBe(empty);
+  });
+
+  it("binds the tabs a run leases to its chat without switching a view, even the one showing that tab", async () => {
+    const provider = reading("/tabs/21/page.md");
+    const { one, two, send, shows, switchTo, chatValue } = await setup({ provider });
+    const chat = shows(one);
+    const before = shows(two);
+    await send(one, { type: "run.start", prompt: "Read tab C" });
+    expect(JSON.stringify(provider.requests.at(-1)?.context.messages)).toContain("PAGE_21");
+    // The page it attached (tab A, where it was sent) and the tab it read are both the chat's now.
+    await vi.waitFor(() => expect([chatValue(11), chatValue(21)]).toEqual([chat, chat]));
+    // Window two shows tab C, whose binding changed under it: it stays put until the user switches.
+    expect(shows(two)).toBe(before);
+    await switchTo(21);
+    expect(shows(two)).toBe(chat);
+  });
+
+  it.each(["follow-up", "steer"] as const)("binds the tab a %s was sent from to the chat it went to", async (mode) => {
+    const gate = Promise.withResolvers<void>();
+    const provider = reading("/tabs/11/page.md");
+    const read = provider.script as () => AsyncIterable<ScriptedProviderEvent>;
+    provider.script = () => JSON.stringify(provider.requests.at(-1)?.context.messages).includes("Hold")
+      ? { [Symbol.asyncIterator]: async function* () { await gate.promise; yield { type: "turn.completed", replayState: null } as ScriptedProviderEvent; } }
+      : read();
+    const { hub, runtime, one, two, send, shows, chatValue } = await setup({ provider });
+    // Chat X runs from tab A with a chip from tab B, so its run holds B's lease, not A's.
+    runtime.setAsk(buildAskContext("selection", { selectionText: "From B" }, { id: 12, url: "https://b.test/", title: "B" }, "ask-b", 1)!, 1);
+    const x = shows(one);
+    const holding = send(one, { type: "run.start", prompt: "Hold", askId: "ask-b" });
+    await untilRequested(provider);
+    await vi.waitFor(() => expect([chatValue(11), chatValue(12)]).toEqual([x, x]));
+    // Chat Y, in window two, reads tab A: A is Y's now, though window one still shows X for it.
+    await send(two, { type: "run.start", prompt: "Read tab A" });
+    await vi.waitFor(() => expect(chatValue(11)).toBe(shows(two)));
+    expect(shows(one)).toBe(x);
+
+    const runId = (await runtime.getSnapshot(hub.viewOf(one))).runs.find((run) => run.conversationId === x)!.runId;
+    if (mode === "steer") await send(one, { type: "run.steer", runId, text: "Also this" });
+    else await send(one, { type: "run.start", prompt: "Afterwards" });
+    expect((await loadMessageQueue(x)).map((message) => message.mode)).toEqual([mode]);
+    await vi.waitFor(() => expect(chatValue(11)).toBe(x));
+    gate.resolve(); await holding;
+  });
+
+  it("New chat unbinds the tab, so it shows an empty chat until something binds it again", async () => {
+    const { one, send, shows, switchTo, chatValue } = await setup();
+    await send(one, { type: "run.start", prompt: "About A" });
+    const chat = shows(one);
+    await vi.waitFor(() => expect(chatValue(11)).toBe(chat));
+    await send(one, { type: "session.create" });
+    expect(shows(one)).not.toBe(chat);
+    await vi.waitFor(() => expect(chatValue(11)).toBeUndefined());
+    await switchTo(12);
+    await switchTo(11);
+    expect(shows(one)).not.toBe(chat);
+    expect(await items(shows(one))).toEqual([]);
+    expect(await items(chat)).toEqual(["About A", "Done."]);
+  });
+
+  it("binds the tab to a chat opened from history, never to an untouched one", async () => {
+    const { one, two, send, shows, switchTo, chatValue } = await setup();
+    const named = await createSessionWith(prompt("u1", "Earlier"));
+    await send(one, { type: "session.open", sessionId: named });
+    expect(shows(one)).toBe(named);
+    await vi.waitFor(() => expect(chatValue(11)).toBe(named));
+    await switchTo(12);
+    await switchTo(11);
+    expect(shows(one)).toBe(named);
+    // Window two's empty chat, opened in window one, binds nothing.
+    const empty = shows(two);
+    await switchTo(12);
+    await send(one, { type: "session.open", sessionId: empty });
+    expect(shows(one)).toBe(empty);
+    expect(chatValue(12)).toBeUndefined();
+  });
+
+  it("shows an agent tab's owning chat when it is in front, and never gives it a chat value", async () => {
+    const owner = await createSessionWith(prompt("u1", "Owner"));
+    const values = new Map<string, unknown>([[`5:${AGENT_TAB_TAG_KEY}`, { v: 2, role: "agent", sessionId: owner, lastUsedAt: Date.now() }]]);
+    const { one, send, shows, switchTo, chatValue, values: stored } = await setup({ values, extra: [{ id: 5, windowId: 1, index: 3, url: "https://agent.test/", title: "Agent", hidden: true, active: false }] });
+    // The user watches it (Firefox shows and activates it).
+    await switchTo(5);
+    expect(shows(one)).toBe(owner);
+    await send(one, { type: "run.start", prompt: "More here" });
+    expect(await items(owner)).toEqual(["Owner", "More here", "Done."]);
+    expect(chatValue(5)).toBeUndefined();
+    expect(stored.get(`5:${AGENT_TAB_TAG_KEY}`)).toMatchObject({ sessionId: owner });
+  });
+
+  it("restores bindings from tab values at startup and for restored tabs, dropping values that name no chat", async () => {
+    const kept = await createSessionWith(prompt("u1", "Kept"));
+    const values = new Map<string, unknown>([
+      [`11:${CHAT_TAB_KEY}`, { v: 1, sessionId: kept }],
+      [`12:${CHAT_TAB_KEY}`, { v: 1, sessionId: "gone-chat" }],
+      [`13:${CHAT_TAB_KEY}`, { v: 9, sessionId: kept }],
+    ]);
+    const { runtime, one, shows, switchTo, chatValue, tabs, values: stored } = await setup({ values });
+    expect(shows(one)).toBe(kept);
+    expect([chatValue(11), chatValue(12), stored.has(`13:${CHAT_TAB_KEY}`)]).toEqual([kept, undefined, false]);
+
+    // Firefox restores a closed tab (a new id, the old value) after startup.
+    tabs.push({ id: 14, windowId: 1, index: 3, url: "https://d.test/", title: "D", hidden: false, active: false });
+    stored.set(`14:${CHAT_TAB_KEY}`, { v: 1, sessionId: kept });
+    tabs.push({ id: 15, windowId: 1, index: 4, url: "https://e.test/", title: "E", hidden: false, active: false });
+    stored.set(`15:${CHAT_TAB_KEY}`, { v: 1, sessionId: "gone-chat" });
+    await runtime.handleTabCreated(14);
+    await runtime.handleTabCreated(15);
+    await switchTo(12);
+    await switchTo(14);
+    expect(shows(one)).toBe(kept);
+    await vi.waitFor(() => expect(stored.has(`15:${CHAT_TAB_KEY}`)).toBe(false));
+
+    // A closed tab's binding ends with it.
+    runtime.handleTabRemoved(14);
+    tabs.splice(tabs.findIndex((tab) => tab.id === 14), 1);
+    await switchTo(11);
+    expect(shows(one)).toBe(kept);
+  });
+
+  it("unbinds a deleted chat's tabs, and each view that showed it follows its tab to an empty chat", async () => {
+    const { runtime, one, two, send, shows, switchTo, chatValue } = await setup();
+    await send(one, { type: "run.start", prompt: "About A" });
+    const chat = shows(one);
+    await switchTo(12);
+    await send(one, { type: "session.open", sessionId: chat });
+    await send(two, { type: "session.open", sessionId: chat });
+    await vi.waitFor(() => expect([chatValue(11), chatValue(12), chatValue(21)]).toEqual([chat, chat, chat]));
+    await send(one, { type: "session.delete", sessionId: chat, closeAgentTabs: true });
+    await vi.waitFor(() => expect([chatValue(11), chatValue(12), chatValue(21)]).toEqual([undefined, undefined, undefined]));
+    expect(shows(one)).not.toBe(chat);
+    expect(shows(two)).not.toBe(chat);
+    expect(shows(one)).not.toBe(shows(two));
+
+    // Delete all history and retention unbind too.
+    await send(one, { type: "run.start", prompt: "Again" });
+    const again = shows(one);
+    await vi.waitFor(() => expect(chatValue(12)).toBe(again));
+    expect(await runtime.handleHistoryRequest({ v: 1, id: "all", type: "history.deleteAll" })).toMatchObject({ ok: true });
+    await vi.waitFor(() => expect(chatValue(12)).toBeUndefined());
+    expect(shows(one)).not.toBe(again);
+  });
+
+  it("prunes a bound chat no view shows by retention, and unbinds its tabs", async () => {
+    const { runtime, one, send, shows, switchTo, chatValue } = await setup();
+    await send(one, { type: "run.start", prompt: "About A" });
+    const chat = shows(one);
+    await vi.waitFor(() => expect(chatValue(11)).toBe(chat));
+    await switchTo(12);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + 40 * 24 * 60 * 60_000);
+      expect(await runtime.handleHistoryRequest({ v: 1, id: "r", type: "history.retention.save", retention: "30d" })).toMatchObject({ ok: true });
+    } finally { vi.useRealTimers(); }
+    expect(await getConversation(chat)).toBeNull();
+    await vi.waitFor(() => expect(chatValue(11)).toBeUndefined());
+  });
+
+  it("binds the focused window's active tab for a results click before its sidebar attaches, and New chat unbinds it", async () => {
+    const results = await createSessionWith(prompt("u1", "Results"));
+    const { hub, runtime, chatValue, focus } = await setup({ attach: false });
+    await runtime.openResultsSession(results);
+    await vi.waitFor(() => expect(chatValue(11)).toBe(results));
+    const sidebar = await attachView(hub, fakePort(), 1, false);
+    expect(hub.viewOf(sidebar)!.sessionId).toBe(results);
+
+    focus.window = 2;
+    await runtime.openResultsSession(results);
+    await vi.waitFor(() => expect(chatValue(21)).toBe(results));
+    await runtime.newChat();
+    await vi.waitFor(() => expect(chatValue(21)).toBeUndefined());
+    const second = await attachView(hub, fakePort(), 2, false);
+    expect(hub.viewOf(second)!.sessionId).not.toBe(results);
+  });
+
+  describe("pop-out chats", () => {
+    const chatPage = (sessionId: string | null) => `${browser.runtime.getURL("/chat.html")}${sessionId === null ? "" : `#/${sessionId}`}`;
+
+    /** A pop-out page (`chat.html#/<hash>`) in tab `tabId` connecting and attaching, as the page does when it loads; `close` is its Port closing. */
+    async function popOutPage(hub: SidebarHub, tabId: number, hash: string | null) {
+      let disconnect = () => {};
+      const port = Object.assign(fakePort(), {
+        sender: { id: browser.runtime.id, url: chatPage(hash), tab: { id: tabId, windowId: 1 } },
+        onDisconnect: { addListener: (listener: () => void) => { disconnect = listener; } },
+      });
+      hub.handleConnect(port);
+      await port.send({ v: 1, id: crypto.randomUUID(), type: "view.attach", popOut: { sessionId: hash } });
+      return { port, close: () => disconnect() };
+    }
+    const lastSnapshot = (port: FakePort) => port.received.findLast((event) => event.type === "state.snapshot")?.payload as RuntimeSnapshot | undefined;
+
+    it("opens a chat in a tab right after the active tab, keeps it in the sidebar, and focuses that tab the next time", async () => {
+      const { hub, runtime, api, tabs, one, send, shows, switchTo, chatValue, focus, focusWindow } = await setup();
+      await send(one, { type: "run.start", prompt: "About A" });
+      const chat = shows(one);
+      await send(one, { type: "session.popOut", sessionId: chat });
+      expect(api.tabs.create).toHaveBeenCalledTimes(1);
+      expect(api.tabs.create).toHaveBeenCalledWith({ url: chatPage(chat), active: true, windowId: 1, index: 1 });
+      // Firefox switches to the new tab before its page connects: the sidebar keeps showing the chat.
+      await runtime.handleTabActivated(100, 1);
+      expect(shows(one)).toBe(chat);
+      const page = await popOutPage(hub, 100, chat);
+      expect(hub.viewOf(page.port)).toEqual({ kind: "tab", tabId: 100, sessionId: chat });
+      expect(shows(one)).toBe(chat);
+      await page.port.send({ v: 1, id: "s", type: "state.subscribe", lastSeq: null });
+      expect(lastSnapshot(page.port)).toMatchObject({ conversation: { id: chat }, page: null, ask: null, viewTabId: 100 });
+
+      // Whenever the pop-out tab is active, the window's sidebar shows its chat; it never gets a tab value.
+      await switchTo(12);
+      expect(shows(one)).not.toBe(chat);
+      await switchTo(100);
+      expect(shows(one)).toBe(chat);
+      await send(one, { type: "run.start", prompt: "From the sidebar" });
+      expect(await items(chat)).toEqual(["About A", "Done.", "From the sidebar", "Done."]);
+      expect(chatValue(100)).toBeUndefined();
+
+      // Popping it out again, from another tab, focuses the tab and its window instead of opening another.
+      await switchTo(11);
+      expect(shows(one)).toBe(chat);
+      focus.window = 2;
+      await send(one, { type: "session.popOut", sessionId: chat });
+      expect(api.tabs.create).toHaveBeenCalledTimes(1);
+      expect(api.tabs.update).toHaveBeenLastCalledWith(100, { active: true });
+      expect(focusWindow).toHaveBeenLastCalledWith(1, { focused: true });
+      expect(tabs.find((tab) => tab.id === 100)!.active).toBe(true);
+    });
+
+    it("refuses to pop out an untouched chat, or a chat the sender's view does not show", async () => {
+      const { api, one, two, send, shows } = await setup();
+      await send(one, { type: "session.popOut", sessionId: shows(one) });
+      expect(lastSnapshot(one)?.notice).toMatch(/Send a message first/);
+      await send(two, { type: "run.start", prompt: "About C" });
+      await send(one, { type: "session.popOut", sessionId: shows(two) });
+      expect(lastSnapshot(one)?.notice).toMatch(/This chat changed/);
+      expect(api.tabs.create).not.toHaveBeenCalled();
+    });
+
+    it("shows a pop-out the chat its hash names, or a new empty chat when that is gone, and changes only its own chat", async () => {
+      const { hub, one, send, shows, chatValue } = await setup();
+      await send(one, { type: "run.start", prompt: "About A" });
+      const chat = shows(one);
+      const page = await popOutPage(hub, 100, "gone-chat");
+      const view = () => hub.viewOf(page.port)!;
+      const fresh = view().sessionId;
+      expect(fresh).not.toBe("gone-chat");
+      expect(await items(fresh)).toEqual([]);
+
+      // Its history drawer opens a chat there alone; the empty chat it left is gone, and no tab is bound.
+      await send(page.port, { type: "session.open", sessionId: chat });
+      expect(view().sessionId).toBe(chat);
+      expect(await getConversation(fresh)).toBeNull();
+      expect(chatValue(100)).toBeUndefined();
+      expect(lastSnapshot(page.port)?.conversation.id).toBe(chat);
+
+      // New chat there leaves the chat it showed, and the sidebar, alone.
+      await send(page.port, { type: "session.create" });
+      expect(view().sessionId).not.toBe(chat);
+      expect(await items(view().sessionId)).toEqual([]);
+      expect(shows(one)).toBe(chat);
+
+      // Deleting its chat elsewhere gives it a new empty chat.
+      await send(page.port, { type: "session.open", sessionId: chat });
+      await send(one, { type: "session.delete", sessionId: chat, closeAgentTabs: true });
+      expect(view().sessionId).not.toBe(chat);
+      expect(await items(view().sessionId)).toEqual([]);
+    });
+
+    it("starts a pop-out's runs with no page and no Ask chip, binding no tab", async () => {
+      const { hub, runtime, provider, one, send, shows, chatValue } = await setup();
+      await send(one, { type: "run.start", prompt: "About A" });
+      const chat = shows(one);
+      const page = await popOutPage(hub, 100, chat);
+      await send(page.port, { type: "run.start", prompt: "Next" });
+      const users = (await getConversation(chat))!.items.flatMap((item) => item.kind === "message" && item.role === "user" ? [item.context?.url ?? null] : []);
+      expect(users).toEqual(["https://a.test/", null]);
+      expect(JSON.stringify(provider.requests.at(-1)!.context.messages.at(-1))).not.toContain("PAGE_11");
+      expect(chatValue(100)).toBeUndefined();
+
+      // Window 1's chip is the sidebar's: a pop-out can neither see nor send it.
+      runtime.setAsk(buildAskContext("selection", { selectionText: "Chip" }, { id: 11, url: "https://a.test/", title: "A" }, "ask-a", 1)!, 1);
+      await page.port.send({ v: 1, id: "s", type: "state.subscribe", lastSeq: null });
+      expect(lastSnapshot(page.port)?.ask).toBeNull();
+      await send(page.port, { type: "run.start", prompt: "With the chip", askId: "ask-a" });
+      expect(await items(chat)).toEqual(["About A", "Done.", "Next", "Done."]);
+      expect(lastSnapshot(one)?.ask?.id).toBe("ask-a");
+    });
+
+    it("has the sidebar follow the pop-out's chat while its tab is active, and drops an untouched pop-out chat once its page closes", async () => {
+      const { hub, runtime, api, tabs, one, send, shows, switchTo } = await setup();
+      await send(one, { type: "run.start", prompt: "About A" });
+      const chat = shows(one);
+      // A pop-out page the user reopened (or reloaded) with no chat in its hash.
+      await api.tabs.create({ url: chatPage(null), active: true, windowId: 1, index: 1 });
+      await runtime.handleTabActivated(100, 1);
+      const unbound = shows(one);
+      expect(unbound).not.toBe(chat);
+      const page = await popOutPage(hub, 100, null);
+      const empty = hub.viewOf(page.port)!.sessionId;
+      expect(shows(one)).toBe(empty);
+      expect(lastSnapshot(one)?.conversation.id).toBe(empty);
+      // The sidebar's own empty chat, which nothing shows now, is gone.
+      expect(await getConversation(unbound)).toBeNull();
+
+      // Opening a chat in the pop-out shows it in the sidebar too; the pop-out's empty chat goes.
+      await send(page.port, { type: "session.open", sessionId: chat });
+      expect(shows(one)).toBe(chat);
+      expect(lastSnapshot(one)?.conversation.id).toBe(chat);
+      expect(await getConversation(empty)).toBeNull();
+
+      // The pop-out page closes: the sidebar follows its tab again, to an empty chat, until the user switches.
+      page.close();
+      runtime.handleTabRemoved(100);
+      await vi.waitFor(() => expect(shows(one)).not.toBe(chat));
+      tabs.splice(tabs.findIndex((tab) => tab.id === 100), 1);
+      await switchTo(11);
+      expect(shows(one)).toBe(chat);
+
+      // An untouched pop-out chat goes once its page closes, like any untouched chat no view shows.
+      const second = await popOutPage(hub, 101, null);
+      const untouched = hub.viewOf(second.port)!.sessionId;
+      second.close();
+      await vi.waitFor(async () => expect(await getConversation(untouched)).toBeNull());
+      expect(await getConversation(chat)).not.toBeNull();
+    });
   });
 });

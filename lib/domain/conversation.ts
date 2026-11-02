@@ -148,6 +148,16 @@ export interface ConversationSummary {
   usage: UsageTotals;
 }
 
+/**
+ * Whether an index entry is an untouched new chat: no items, no pin, no user
+ * title. The index's item count can lag the record's by one turn (it is
+ * refreshed at turn boundaries), so callers that must be exact read the
+ * record (`isSessionUntouched` in storage).
+ */
+export function isUntouchedSummary(session: Pick<ConversationSummary, "itemCount" | "pinned" | "titleSource">): boolean {
+  return session.itemCount === 0 && !session.pinned && session.titleSource !== "user";
+}
+
 export interface ConversationIndexV1 {
   version: 1;
   sessions: ConversationSummary[];

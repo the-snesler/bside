@@ -103,7 +103,7 @@ function snapshotFor(id: string, items: ConversationItem[] = []): RuntimeSnapsho
     provider: OPENAI_API_KEY_PROVIDER,
     settings: { version: 1, providerId: "openai", modelId: "gpt-5.6-terra", reasoningEffort: "medium" },
     permissionMode: "ask",
-    page: null, ask: null, agentTabs: { bySession: {}, watching: null, takenOver: false }, queue: [], runs: [], notice: null,
+    page: null, viewTabId: null, ask: null, agentTabs: { bySession: {}, watching: null, takenOver: false }, queue: [], runs: [], notice: null,
   };
 }
 
@@ -242,6 +242,20 @@ describe("pending files in the sidebar", () => {
     await f.unmount();
   });
 
+  it("keeps the files of the open chat, which history does not list while it is untouched, and drops those of a chat that went", async () => {
+    const f = await mountHook();
+    const summary = (id: string) => ({ id, title: "", titleSource: "prompt" as const, createdAt: 0, updatedAt: 0, pinned: false, itemCount: 1, lastModelId: null, usage: EMPTY_USAGE });
+    await act(() => f.view.current!.attachFiles([new File(["a"], "a.txt")], "picker"));
+    await settle();
+    // The list leaves out the untouched open chat: its file stays.
+    await f.emit({ runId: null, conversationId: null, type: "session.listed", payload: { sessions: [summary("s9")] } });
+    expect(f.view.current!.pendingFiles.map((file) => file.sessionId)).toEqual(["s1"]);
+    // The sidebar moves to another untouched chat, and the one it left is deleted: its file goes, though the open chat is not listed either.
+    await f.emit({ runId: null, conversationId: "s2", type: "state.snapshot", payload: snapshotFor("s2") });
+    expect(f.view.current!.pendingFiles).toEqual([]);
+    await f.unmount();
+  });
+
   it("keeps the attachments of a started run on its optimistic user message", async () => {
     const f = await mountHook();
     const ref: AttachmentRefV1 = { v: 1, path: "/workspace/uploads/cv.pdf", name: "CV.pdf", mimeType: "application/pdf", bytes: 2_000, text: false };
@@ -267,6 +281,16 @@ describe("sidebar attachments UI", () => {
     await port.emit({ runId: null, conversationId: "s1", type: "state.snapshot", payload: { ...snapshotFor("s1", items), queue } });
     return { ...port, root, unmount: () => act(() => render(null, root)) };
   }
+
+  it("keeps the composer's text per tab only while the chat is empty, and per chat once it has messages", async () => {
+    const f = await mountApp();
+    await f.emit({ runId: null, conversationId: "s1", type: "state.snapshot", payload: { ...snapshotFor("s1"), viewTabId: 12 } });
+    expect(composer.props).toMatchObject({ sessionId: "s1", draftTabId: 12 });
+    const item: ConversationItem = { id: "u1", kind: "message", role: "user", text: "Hi", context: null, at: 1 };
+    await f.emit({ runId: null, conversationId: "s1", type: "state.snapshot", payload: { ...snapshotFor("s1", [item]), viewTabId: 12 } });
+    expect(composer.props).toMatchObject({ sessionId: "s1", draftTabId: null });
+    f.unmount();
+  });
 
   it("shows a drop overlay only for drags carrying files, cancels their default, and attaches dropped files", async () => {
     const f = await mountApp();

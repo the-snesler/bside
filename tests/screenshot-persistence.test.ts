@@ -4,7 +4,10 @@ import { SidebarHub } from "@/lib/background/sidebar-hub";
 import { TabController, type CaptureOptions, type TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import type { ProviderAdapter, ProviderAuth, ProviderTurnRequest } from "@/lib/domain/provider";
 import type { CaptureGeometry, PageSnapshot } from "@/lib/domain/tools";
-import { getConversation, getOpenSessionId, listRunCheckpoints, saveOpenAICredential } from "@/lib/storage";
+import { ensureOpenSession, getConversation, getOpenSessionId, listRunCheckpoints, saveOpenAICredential } from "@/lib/storage";
+
+/** The fallback session, which commands without a sidebar Port act on and run commands must name. */
+const fallbackId = () => ensureOpenSession();
 import { splitSystemMessage, TEST_MODEL, toPiStream, type ScriptedProviderEvent } from "@/tests/helpers/pi-provider";
 
 /** The fake image's base64; nothing persisted or exported may contain it. */
@@ -66,7 +69,7 @@ describe("screenshots are never persisted", () => {
     const provider = new ScreenshotProvider();
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: screenshotTabControllerFactory });
     hub.delegate = runtime;
-    await runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "What does the chart show?" });
+    await runtime.handleCommand({ v: 1, id: "run", type: "run.start", sessionId: await fallbackId(), prompt: "What does the chart show?" });
     const sessionId = (await getOpenSessionId())!;
     await vi.waitFor(async () => expect((await getConversation(sessionId))?.items.some((item) => item.kind === "run-digest")).toBe(true));
 
@@ -93,7 +96,7 @@ describe("screenshots are never persisted", () => {
     const provider = new ScreenshotProvider('await browser.tab("/tabs/1/page.md").screenshot({save: "/workspace/chart.jpg"});');
     const runtime = new BackgroundRuntime(hub, { provider, tabControllerFactory: screenshotTabControllerFactory });
     hub.delegate = runtime;
-    await runtime.handleCommand({ v: 1, id: "run", type: "run.start", prompt: "Save the chart" });
+    await runtime.handleCommand({ v: 1, id: "run", type: "run.start", sessionId: await fallbackId(), prompt: "Save the chart" });
     const sessionId = (await getOpenSessionId())!;
     await vi.waitFor(async () => expect((await getConversation(sessionId))?.items.some((item) => item.kind === "run-digest")).toBe(true));
 

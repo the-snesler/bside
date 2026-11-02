@@ -111,3 +111,55 @@ describe("composer attachments", () => {
     expect(props.onClearFileNotice).toHaveBeenCalled();
   });
 });
+
+describe("composer drafts", () => {
+  const text = () => Editor.string(view.editor, []);
+  async function show(props: Record<string, unknown>, change: Record<string, unknown>) {
+    Object.assign(props, change);
+    await act(async () => render(h(Composer, { ...props } as Parameters<typeof Composer>[0]), root));
+  }
+
+  it("keeps each chat's unsent text, mentions included, and restores it when the chat comes back", async () => {
+    const props = await mount();
+    await type("Draft for one ");
+    const mention = { id: 4, title: "Docs", url: "https://docs.test/", path: "/tabs/4/page.md" };
+    await act(async () => { Transforms.insertNodes(view.editor, { type: "mention", tab: mention, children: [{ text: "" }] }); view.change(); });
+    await show(props, { sessionId: "s2" });
+    expect(text()).toBe("");
+    expect(sendButton().disabled).toBe(true);
+    await type("Draft for two");
+    await show(props, { sessionId: "s1" });
+    expect(text()).toBe("Draft for one ");
+    expect(view.editor.children[0]).toMatchObject({ children: expect.arrayContaining([expect.objectContaining({ type: "mention", tab: mention })]) });
+    expect(sendButton().disabled).toBe(false);
+    await show(props, { sessionId: "s2" });
+    expect(text()).toBe("Draft for two");
+    // Undo never brings back another chat's text.
+    await act(async () => { (view.editor as unknown as { undo(): void }).undo(); view.change(); });
+    expect(text()).not.toContain("one");
+  });
+
+  it("keeps an empty chat's text per tab, and keeps what is being typed when the chat gets its first message", async () => {
+    const props = await mount({ draftTabId: 11 });
+    await type("For tab A");
+    // The same empty chat, shown for another unbound tab.
+    await show(props, { draftTabId: 12 });
+    expect(text()).toBe("");
+    await type("For tab B");
+    await show(props, { draftTabId: 11 });
+    expect(text()).toBe("For tab A");
+    // Its first message went: the chat is no longer empty, and the text being typed stays.
+    await show(props, { draftTabId: null });
+    expect(text()).toBe("For tab A");
+  });
+
+  it("forgets text that was sent", async () => {
+    const props = await mount();
+    await type("Send me");
+    await act(async () => sendButton().click());
+    expect(props.onSend).toHaveBeenCalledWith("Send me");
+    await show(props, { sessionId: "s2" });
+    await show(props, { sessionId: "s1" });
+    expect(text()).toBe("");
+  });
+});

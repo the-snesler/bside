@@ -19,20 +19,22 @@ function fakePort(): FakePort {
   } as unknown as FakePort;
 }
 
-/** A hub whose delegate answers with a minimal snapshot; only the hub's own behavior is under test. */
+/** A hub whose delegate shows every view the session "open" and answers with a minimal snapshot of it; only the hub's own behavior is under test. */
 function hubWithSnapshot(): SidebarHub {
   const hub = new SidebarHub();
   hub.delegate = {
-    getSnapshot: async () => ({ conversation: { id: "open" }, runs: [] }) as unknown as RuntimeSnapshot,
+    getSnapshots: async (views) => views.map((view) => ({ conversation: { id: view.sessionId }, runs: [] }) as unknown as RuntimeSnapshot),
+    attachView: async (view) => { view.sessionId = "open"; },
     handleCommand: async () => {},
   };
   return hub;
 }
 
-/** A fresh sidebar connection; drops the `page.attached` every connection gets. */
-function connect(hub: SidebarHub): FakePort {
+/** A fresh sidebar connection, attached as the view of `windowId`; drops the `page.attached` every attached view gets. */
+async function connect(hub: SidebarHub, windowId = 1): Promise<FakePort> {
   const port = fakePort();
   hub.handleConnect(port);
+  await port.send({ v: 1, id: crypto.randomUUID(), type: "view.attach", windowId });
   port.received.length = 0;
   return port;
 }
@@ -48,9 +50,9 @@ afterEach(() => {
 });
 
 describe("SidebarHub: per-run sequencing", () => {
-  it("numbers two interleaved runs independently and stamps each event with its own run's session", () => {
+  it("numbers two interleaved runs independently and stamps each event with its own run's session", async () => {
     const hub = hubWithSnapshot();
-    const port = connect(hub);
+    const port = await connect(hub);
     hub.startRun("a", "chat-a");
     hub.startRun("b", "chat-b");
     delta(hub, "a", "a1");
@@ -65,9 +67,9 @@ describe("SidebarHub: per-run sequencing", () => {
     expect(hub.lastSeq("never")).toBe(0);
   });
 
-  it("drops events of a run that was never registered, and keeps a registered run's seqs when it is registered again", () => {
+  it("drops events of a run that was never registered, and keeps a registered run's seqs when it is registered again", async () => {
     const hub = hubWithSnapshot();
-    const port = connect(hub);
+    const port = await connect(hub);
     delta(hub, "ghost", "lost");
     expect(port.received).toEqual([]);
     hub.startRun("a", "chat-a");
@@ -83,21 +85,21 @@ describe("SidebarHub: per-run sequencing", () => {
 
   it("gives every non-run event seq 0 without disturbing run seqs or replays", async () => {
     const hub = hubWithSnapshot();
-    const port = connect(hub);
+    const port = await connect(hub);
     hub.startRun("a", "chat-a");
     delta(hub, "a", "a1");
-    hub.publishAsk(null);
+    hub.publishAsk(1, null);
     hub.publishQueue("chat-a", []);
     hub.publishSessions([]);
     hub.publishPermissionMode("auto");
     hub.publishAgentTabs({ bySession: {}, watching: null, takenOver: false });
-    hub.focusComposer();
+    hub.focusComposer(1);
     hub.contentAccepted(port, ["c1"]);
     delta(hub, "a", "a2");
     expect(port.received.filter((event) => event.runId === null).map((event) => event.seq)).toEqual([0, 0, 0, 0, 0, 0, 0]);
     expect(seqsOf(port.received.filter((event) => event.runId !== null))).toEqual([["a", 1, "a1"], ["a", 2, "a2"]]);
 
-    const back = connect(hub);
+    const back = await connect(hub);
     await subscribe(back, { a: 0 });
     expect(seqsOf(back.received)).toEqual([["a", 1, "a1"], ["a", 2, "a2"]]);
   });
@@ -115,13 +117,13 @@ describe("SidebarHub: reconnect replay", () => {
     delta(hub, "b", "b3");
     delta(hub, "a", "a3");
 
-    const port = connect(hub);
+    const port = await connect(hub);
     await subscribe(port, { a: 2, b: 1 });
     expect(seqsOf(port.received)).toEqual([["b", 2, "b2"], ["b", 3, "b3"], ["a", 3, "a3"]]);
     expect(port.received.some((event) => event.type === "state.snapshot")).toBe(false);
 
     // A sidebar that is up to date gets nothing.
-    const current = connect(hub);
+    const current = await connect(hub);
     await subscribe(current, { a: 3, b: 3 });
     expect(current.received).toEqual([]);
   });
@@ -132,7 +134,7 @@ describe("SidebarHub: reconnect replay", () => {
     delta(hub, "a", "a1");
     hub.startRun("b", "chat-b");
     delta(hub, "b", "b1");
-    const port = connect(hub);
+    const port = await connect(hub);
     await subscribe(port, { a: 1 });
     expect(seqsOf(port.received)).toEqual([["b", 1, "b1"]]);
   });
@@ -145,13 +147,13 @@ describe("SidebarHub: reconnect replay", () => {
     for (let index = 1; index <= MAX_REPLAY_EVENTS_PER_RUN + 1; index += 1) delta(hub, "a", `a${index}`);
     delta(hub, "b", "b2");
 
-    const port = connect(hub);
+    const port = await connect(hub);
     await subscribe(port, { a: 0, b: 1 });
     expect(port.received.map((event) => event.type)).toEqual(["state.snapshot"]);
     expect(port.received[0]!.seq).toBe(0);
 
     // The oldest event still buffered is a2, so a sidebar that applied a1 can still catch up.
-    const close = connect(hub);
+    const close = await connect(hub);
     await subscribe(close, { a: 1, b: 1 });
     expect(close.received).toHaveLength(MAX_REPLAY_EVENTS_PER_RUN + 1);
     expect(close.received[0]).toMatchObject({ runId: "a", seq: 2 });
@@ -166,13 +168,13 @@ describe("SidebarHub: reconnect replay", () => {
       for (let index = 1; index <= MAX_REPLAY_EVENTS_PER_RUN; index += 1) delta(hub, `r${run}`, `${run}:${index}`);
     }
     const all = Object.fromEntries(Array.from({ length: runs }, (_, run) => [`r${run}`, 0]));
-    const port = connect(hub);
+    const port = await connect(hub);
     await subscribe(port, all);
     expect(port.received.map((event) => event.type)).toEqual(["state.snapshot"]);
 
     // The newest runs are still fully replayable; the oldest run's events are gone.
     const latest = Object.fromEntries(Array.from({ length: runs }, (_, run) => [`r${run}`, run === 0 ? MAX_REPLAY_EVENTS_PER_RUN : 0]));
-    const newest = connect(hub);
+    const newest = await connect(hub);
     await subscribe(newest, latest);
     expect(newest.received).toHaveLength(MAX_REPLAY_EVENTS_TOTAL);
     expect(newest.received.every((event) => event.type === "assistant.delta")).toBe(true);
@@ -185,23 +187,23 @@ describe("SidebarHub: reconnect replay", () => {
     delta(hub, "a", "a1");
     hub.publishRunEvent("a", "run.completed", { messageId: "m1" });
 
-    const port = connect(hub);
+    const port = await connect(hub);
     await subscribe(port, { a: 1 });
     expect(port.received.map((event) => [event.seq, event.type])).toEqual([[2, "run.completed"]]);
 
     // A sidebar that never knew the run cannot tell from a replay what it ended with.
-    const stranger = connect(hub);
+    const stranger = await connect(hub);
     await subscribe(stranger, {});
     expect(stranger.received.map((event) => event.type)).toEqual(["state.snapshot"]);
 
     vi.advanceTimersByTime(ENDED_RUN_GRACE_MS + 1);
-    const late = connect(hub);
+    const late = await connect(hub);
     await subscribe(late, { a: 1 });
     expect(late.received.map((event) => event.type)).toEqual(["state.snapshot"]);
     expect(hub.lastSeq("a")).toBe(0);
   });
 
-  it("forgets the oldest ended runs past MAX_ENDED_RUNS", () => {
+  it("forgets the oldest ended runs past MAX_ENDED_RUNS", async () => {
     const hub = hubWithSnapshot();
     for (let run = 0; run <= MAX_ENDED_RUNS; run += 1) {
       hub.startRun(`r${run}`, `chat-${run}`);
@@ -217,9 +219,199 @@ describe("SidebarHub: reconnect replay", () => {
     hub.startRun("a", "chat-a");
     delta(hub, "a", "a1");
     for (const lastSeq of [null, { a: 1, gone: 3 }, { a: 5 }] as Array<Record<string, number> | null>) {
-      const port = connect(hub);
+      const port = await connect(hub);
       await subscribe(port, lastSeq);
       expect(port.received.map((event) => [event.type, event.seq])).toEqual([["state.snapshot", 0]]);
     }
+  });
+});
+
+describe("SidebarHub: views", () => {
+  /** A hub whose delegate records what it is asked and shows each window's view the session named for it. */
+  function recordingHub(sessionFor: (windowId: number) => string = (windowId) => `chat-${windowId}`) {
+    const hub = new SidebarHub();
+    const asked: string[][] = [];
+    const detached: string[] = [];
+    const released: object[] = [];
+    const commands: Array<{ type: string; owner: unknown }> = [];
+    hub.delegate = {
+      getSnapshots: async (views) => {
+        asked.push(views.map((view) => view.sessionId));
+        return views.map((view) => ({ conversation: { id: view.sessionId }, runs: [] }) as unknown as RuntimeSnapshot);
+      },
+      // A pop-out view shows the session its hash names, else a new one.
+      attachView: async (view, requested) => { view.sessionId = view.kind === "sidebar" ? sessionFor(view.windowId) : requested ?? "fresh"; },
+      detachView: (view) => { detached.push(view.sessionId); },
+      releaseOwner: (owner) => { released.push(owner); },
+      handleCommand: async (command, owner) => { commands.push({ type: command.type, owner }); },
+    };
+    return { hub, asked, detached, released, commands };
+  }
+  const snapshotsOf = (port: FakePort) => port.received.filter((event) => event.type === "state.snapshot").map((event) => event.conversationId);
+  const tab = (id: number, windowId: number, url = `https://example.com/${id}`) => ({ id, windowId, url, title: `Tab ${id}`, active: true }) as Browser.tabs.Tab;
+
+  it("answers a Port nothing until it attaches, then its waiting commands in order", async () => {
+    const { hub, commands } = recordingHub();
+    const port = fakePort();
+    hub.handleConnect(port);
+    const subscribed = port.send({ v: 1, id: "s", type: "state.subscribe", lastSeq: null });
+    const listed = port.send({ v: 1, id: "l", type: "session.list" });
+    await Promise.resolve();
+    await hub.broadcastSnapshot();
+    expect(port.received).toEqual([]);
+    expect(commands).toEqual([]);
+    expect(hub.views()).toEqual([]);
+
+    await port.send({ v: 1, id: "a", type: "view.attach", windowId: 7 });
+    await Promise.all([subscribed, listed]);
+    expect(snapshotsOf(port)).toEqual(["chat-7"]);
+    expect(commands).toEqual([{ type: "session.list", owner: port }]);
+    expect(hub.views()).toEqual([{ kind: "sidebar", windowId: 7, sessionId: "chat-7", tabId: null }]);
+    expect(hub.viewOf(port)).toEqual(hub.views()[0]);
+    // A second attach is ignored: a Port is one view for its lifetime.
+    await port.send({ v: 1, id: "again", type: "view.attach", windowId: 8 });
+    expect(hub.views()).toEqual([{ kind: "sidebar", windowId: 7, sessionId: "chat-7", tabId: null }]);
+  });
+
+  it("refuses a malformed attach and never answers a Port whose attach failed", async () => {
+    const { hub, commands } = recordingHub(() => "");
+    const port = fakePort();
+    hub.handleConnect(port);
+    await port.send({ v: 1, id: "bad", type: "view.attach", windowId: -1 });
+    expect(hub.views()).toEqual([]);
+    await port.send({ v: 1, id: "a", type: "view.attach", windowId: 3 });
+    await port.send({ v: 1, id: "s", type: "state.subscribe", lastSeq: null });
+    expect(port.received).toEqual([]);
+    expect(commands).toEqual([]);
+  });
+
+  it("builds each view's own snapshot in one call and sends it only to that view", async () => {
+    const { hub, asked } = recordingHub();
+    const one = await connect(hub, 1);
+    const two = await connect(hub, 2);
+    asked.length = 0;
+    await hub.broadcastSnapshot();
+    expect(asked).toEqual([["chat-1", "chat-2"]]);
+    expect(snapshotsOf(one)).toEqual(["chat-1"]);
+    expect(snapshotsOf(two)).toEqual(["chat-2"]);
+  });
+
+  it("sends snapshots only to the views named, such as those that followed their window's tab to another chat", async () => {
+    const { hub, asked } = recordingHub();
+    const one = await connect(hub, 1);
+    const two = await connect(hub, 2);
+    asked.length = 0;
+    hub.viewOf(two)!.sessionId = "chat-2b";
+    await hub.broadcastSnapshot([hub.viewOf(two)!]);
+    expect(asked).toEqual([["chat-2b"]]);
+    expect(snapshotsOf(one)).toEqual([]);
+    expect(snapshotsOf(two)).toEqual(["chat-2b"]);
+  });
+
+  it("sends each window's views that window's active page, and only when it changes", async () => {
+    const query = vi.spyOn(browser.tabs, "query").mockResolvedValue([tab(10, 1), tab(20, 2)] as never);
+    try {
+      const { hub } = recordingHub();
+      const one = fakePort(); hub.handleConnect(one);
+      await one.send({ v: 1, id: "a", type: "view.attach", windowId: 1 });
+      const two = fakePort(); hub.handleConnect(two);
+      await two.send({ v: 1, id: "b", type: "view.attach", windowId: 2 });
+      const pages = (port: FakePort) => port.received.filter((event) => event.type === "page.attached").map((event) => (event.payload as { tabId: number } | null)?.tabId ?? null);
+      expect(pages(one)).toEqual([10]);
+      expect(pages(two)).toEqual([20]);
+      expect(hub.currentAttachment(1)?.tabId).toBe(10);
+
+      query.mockResolvedValue([tab(10, 1), tab(21, 2, "about:addons")] as never);
+      await hub.refreshAttachment();
+      expect(pages(one)).toEqual([10]);
+      expect(pages(two)).toEqual([20, null]);
+      expect(query).toHaveBeenLastCalledWith({ active: true });
+    } finally { query.mockRestore(); }
+  });
+
+  it("sends the Ask chip and composer focus only to their window's views", async () => {
+    const { hub } = recordingHub();
+    const one = await connect(hub, 1);
+    const two = await connect(hub, 2);
+    hub.publishAsk(2, null);
+    hub.focusComposer(2);
+    hub.focusComposer(null);
+    expect(one.received).toEqual([]);
+    expect(two.received.map((event) => event.type)).toEqual(["ask.changed", "composer.focus"]);
+    // Every Port, attached or not, still gets the shared events.
+    const waiting = fakePort(); hub.handleConnect(waiting);
+    hub.publishSessions([]);
+    expect([one, two, waiting].map((port) => port.received.at(-1)?.type)).toEqual(["session.listed", "session.listed", "session.listed"]);
+  });
+
+  it("detaches a view and releases what its Port prepared when the Port closes", async () => {
+    const { hub, detached, released } = recordingHub();
+    const port = fakePort();
+    let disconnect!: () => void;
+    Object.assign(port, { onDisconnect: { addListener: (listener: () => void) => { disconnect = listener; } } });
+    hub.handleConnect(port);
+    await port.send({ v: 1, id: "a", type: "view.attach", windowId: 4 });
+    disconnect();
+    expect(detached).toEqual(["chat-4"]);
+    expect(released).toEqual([port]);
+    expect(hub.views()).toEqual([]);
+    expect(hub.viewOf(port)).toBeNull();
+  });
+
+  /** A Port as Firefox sends it from one of this extension's pages (or another sender), optionally in a tab. */
+  const from = (url: string, tab?: number, id = browser.runtime.id) =>
+    Object.assign(fakePort(), { sender: { id, url, ...(tab === undefined ? {} : { tab: { id: tab, windowId: 1 } }) } });
+  const attached = async (hub: SidebarHub, port: FakePort, command: Record<string, unknown>) => {
+    hub.handleConnect(port);
+    await port.send({ v: 1, id: crypto.randomUUID(), type: "view.attach", ...command });
+    return hub.viewOf(port);
+  };
+
+  it("accepts exactly the sidebar and pop-out pages of this extension, and a pop-out only in a tab", async () => {
+    const { hub } = recordingHub();
+    const sidebar = browser.runtime.getURL("/sidepanel.html");
+    const chat = browser.runtime.getURL("/chat.html");
+    expect(await attached(hub, from(sidebar), { windowId: 1 })).toMatchObject({ kind: "sidebar", windowId: 1 });
+    expect(await attached(hub, from(`${chat}#/abc`, 42), { popOut: { sessionId: "abc" } })).toEqual({ kind: "tab", tabId: 42, sessionId: "abc" });
+    expect(await attached(hub, from(chat, 43), { popOut: { sessionId: null } })).toEqual({ kind: "tab", tabId: 43, sessionId: "fresh" });
+
+    // Other pages and senders are never attached: not even their commands are read.
+    for (const port of [
+      from(chat), // a pop-out page outside a tab
+      from(`${chat}?x=1`, 44),
+      from(browser.runtime.getURL("/options.html"), 45),
+      from(browser.runtime.getURL("/onboarding.html")),
+      from(`${chat}x`, 46),
+      from(chat, 47, "another-extension@example"),
+      from("https://example.com/chat.html", 48, "another-extension@example"),
+    ]) {
+      expect(await attached(hub, port, port.sender?.tab ? { popOut: { sessionId: "abc" } } : { windowId: 1 })).toBeNull();
+      expect(port.received).toEqual([]);
+    }
+    expect(hub.views().map((view) => view.kind)).toEqual(["sidebar", "tab", "tab"]);
+  });
+
+  it("attaches a pop-out page only as its own tab's view, with no page, Ask chip, or composer focus", async () => {
+    const query = vi.spyOn(browser.tabs, "query").mockResolvedValue([tab(10, 1)] as never);
+    try {
+      const { hub } = recordingHub();
+      const chat = browser.runtime.getURL("/chat.html");
+      // The page cannot choose its form or tab: a sidebar attach from chat.html, or a pop-out attach from the sidebar, never attaches.
+      expect(await attached(hub, from(chat, 7), { windowId: 1 })).toBeNull();
+      expect(await attached(hub, from(browser.runtime.getURL("/sidepanel.html")), { popOut: { sessionId: "abc" } })).toBeNull();
+      const popOut = from(`${chat}#/abc`, 8);
+      expect(await attached(hub, popOut, { popOut: { sessionId: "abc", tabId: 99 } })).toEqual({ kind: "tab", tabId: 8, sessionId: "abc" });
+
+      const sidebar = await connect(hub, 1);
+      hub.publishAsk(1, null);
+      hub.focusComposer(1);
+      await hub.refreshAttachment();
+      expect(sidebar.received.map((event) => event.type)).toEqual(["ask.changed", "composer.focus"]);
+      expect(popOut.received.map((event) => event.type)).toEqual([]);
+      // It answers like any view, and gets the shared events.
+      await popOut.send({ v: 1, id: "s", type: "state.subscribe", lastSeq: null });
+      hub.publishSessions([]);
+      expect(popOut.received.map((event) => [event.type, event.conversationId])).toEqual([["state.snapshot", "abc"], ["session.listed", null]]);
+    } finally { query.mockRestore(); }
   });
 });

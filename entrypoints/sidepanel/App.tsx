@@ -1,5 +1,5 @@
 import { McpContentChip } from "@/lib/ui/McpContentChip";
-import { Fragment } from "preact";
+import { Fragment, type RenderableProps } from "preact";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import History from "~icons/tabler/history";
 import Settings from "~icons/tabler/settings";
@@ -17,6 +17,8 @@ import { Composer, parsePromptMentions } from "@/lib/ui/Composer";
 import { useBottomScroll } from "@/lib/ui/use-bottom-scroll";
 import type { ReasoningEffort } from "@/lib/domain/provider";
 import type { PermissionMode } from "@/lib/domain/permissions";
+import type { RunState } from "@/lib/protocol";
+import type { RunDigestStatus } from "@/lib/domain/conversation";
 import { useBackground } from "@/lib/ui/use-background";
 import type { PageArtifactSummary } from "@/lib/domain/tools";
 import { TurnTrace } from "@/lib/ui/TurnTrace";
@@ -36,6 +38,10 @@ import { OtherRunsStrip, runAttention, type OtherRun } from "@/lib/ui/OtherRuns"
 import { AttachmentRefChips } from "@/lib/ui/AttachmentChip";
 import { dragHasFiles, filesFromTransfer } from "@/lib/ui/attachments";
 import FileUpload from "~icons/tabler/file-upload";
+import ExternalLink from "~icons/tabler/external-link";
+import { isUntouchedSummary } from "@/lib/domain/conversation";
+import type { SurfaceMode } from "@/lib/ui/use-background";
+import { CHAT_TAB_ICONS, chatHash, chatTabStatus, chatTabTitle } from "@/lib/ui/chat-tab";
 
 const PERMISSION_MODE_OPTIONS: { mode: PermissionMode; label: string; title: string; Icon: typeof ShieldCheck }[] = [
   { mode: "ask", label: "Ask first", title: "Asks before sending, submitting, buying, or deleting", Icon: ShieldCheck },
@@ -74,7 +80,14 @@ function describeAttachment(page: PageArtifactSummary): string {
   return page.title ? `${page.title} · ${origin}` : origin;
 }
 
-export function App() {
+/**
+ * The chat surface: the native sidebar, or (`mode: "tab"`) a chat popped out
+ * into a tab of its own, with a wider centered layout, no page or Ask chip,
+ * its hash kept naming the chat it shows, and its status in the tab's
+ * favicon and title.
+ */
+export function App(props: RenderableProps<{ mode?: SurfaceMode }>) {
+  const mode = props.mode ?? "sidebar";
   const {
     conversation,
     page: activePage,
@@ -97,6 +110,7 @@ export function App() {
     saveSettings,
     permissionMode,
     savePermissionMode,
+    viewTabId,
     sendPrompt,
     listMcpContent, prepareMcpContent, dismissMcpContent, mcpAttachments,
     pendingFiles, fileNotice, attachFiles, removeFile, clearFileNotice,
@@ -110,6 +124,7 @@ export function App() {
     denyAction,
     resolveHelp,
     newChat,
+    popOut,
     sessions,
     listSessions,
     openSession,
@@ -124,11 +139,13 @@ export function App() {
     memoryUndo,
     undoMemory,
     loadWorkspaceImage,
-    ask,
+    ask: windowAsk,
     dismissAsk,
     focusVersion,
-  } = useBackground();
-  const page = ask ? { tabId: ask.tabId, artifactId: `ask:${ask.id}`, kind: "page" as const, title: ask.pageTitle, url: ask.pageUrl, capturedAt: ask.at } : activePage;
+  } = useBackground(mode);
+  // A pop-out has no window of its own: no page from the active tab, and no Ask chip.
+  const ask = mode === "tab" ? null : windowAsk;
+  const page = mode === "tab" ? null : ask ? { tabId: ask.tabId, artifactId: `ask:${ask.id}`, kind: "page" as const, title: ask.pageTitle, url: ask.pageUrl, capturedAt: ask.at } : activePage;
   const scroll = useBottomScroll();
   const [historyOpen, setHistoryOpen] = useState(false);
   const [draft, setDraft] = useState<{ id: string; text: string } | null>(null);
@@ -159,6 +176,9 @@ export function App() {
   const images = useMemo(() => ({ sessionId: conversation.id, load: loadWorkspaceImage }), [conversation.id, loadWorkspaceImage]);
   const pendingApproval = hereRun?.pendingApproval ?? null;
   const pendingHelp = hereRun?.pendingHelp ?? null;
+  // An untouched new chat (never listed in history) cannot be popped out.
+  const untouched = !runHere && isUntouchedSummary({ itemCount: conversation.items.length, pinned: conversation.pinned, titleSource: conversation.titleSource });
+  useChatTab(mode, conversation.id, conversation.title, hereRun, turns.at(-1)?.outcome ?? null, lastError !== null);
 
   // This chat's agent tabs ride on the composer. The attached page is one of
   // them while the user watches it; another chat's agent tab is never shown as attached.
@@ -225,7 +245,7 @@ export function App() {
 
 
   return (
-    <div class="sidebar">
+    <div class={mode === "tab" ? "sidebar sidebar--tab" : "sidebar"}>
       {dropping && (
         <div class="drop-overlay" aria-hidden="true">
           <FileUpload />
@@ -264,6 +284,17 @@ export function App() {
         >
           <MessagePlus />
         </button>
+        {mode === "sidebar" && !untouched && conversation.id && (
+          <button
+            type="button"
+            class="icon-button"
+            onClick={popOut}
+            aria-label="Open in a tab"
+            title="Open in a tab"
+          >
+            <ExternalLink />
+          </button>
+        )}
         <button
           type="button"
           class="icon-button"
@@ -497,6 +528,7 @@ export function App() {
               )}
               <Composer
                 sessionId={conversation.id}
+                draftTabId={conversation.items.length === 0 && !runHere ? viewTabId : null}
                 attachments={mcpAttachments.filter(item => item.sessionId === conversation.id)}
                 onListMcpContent={listMcpContent}
                 onPrepareMcpContent={prepareMcpContent}
@@ -595,4 +627,49 @@ export function App() {
       </div>
     </div>
   );
+}
+
+/**
+ * A pop-out page's tab chrome: keeps the hash naming the chat it shows (with
+ * `history.replaceState`, so the history drawer and New chat add no history
+ * entries, and a reload reopens that chat), and shows the chat's status in
+ * the favicon and title (`chatTabStatus`). A run that ends while the tab is
+ * hidden marks it finished until the tab is seen again. The chat's title is
+ * untrusted text: it only ever goes into `document.title`. Nothing in the sidebar.
+ */
+function useChatTab(mode: SurfaceMode, sessionId: string, title: string, run: RunState | null, outcome: RunDigestStatus | null, failed: boolean) {
+  const [unseen, setUnseen] = useState(false);
+  const running = useRef(false);
+  useEffect(() => {
+    const wasRunning = running.current;
+    running.current = run !== null;
+    if (mode === "tab" && wasRunning && run === null && document.hidden) setUnseen(true);
+  }, [mode, run === null]);
+  useEffect(() => { setUnseen(false); running.current = false; }, [sessionId]);
+  useEffect(() => {
+    if (mode !== "tab") return;
+    const seen = () => { if (!document.hidden) setUnseen(false); };
+    document.addEventListener("visibilitychange", seen);
+    return () => document.removeEventListener("visibilitychange", seen);
+  }, [mode]);
+  useEffect(() => {
+    if (mode !== "tab" || !sessionId) return;
+    const hash = chatHash(sessionId);
+    if (location.hash !== hash) history.replaceState(history.state, "", hash);
+  }, [mode, sessionId]);
+  const status = chatTabStatus({ run, outcome, failed, unseen });
+  useEffect(() => {
+    if (mode !== "tab" || !sessionId) return;
+    document.title = chatTabTitle(status, title);
+  }, [mode, sessionId, status, title]);
+  useEffect(() => {
+    if (mode !== "tab") return;
+    // A new link element, rather than a changed href, so Firefox picks the icon up again.
+    const icon = document.createElement("link");
+    icon.rel = "icon";
+    icon.type = "image/svg+xml";
+    icon.href = CHAT_TAB_ICONS[status];
+    for (const old of document.head.querySelectorAll('link[rel="icon"]')) old.remove();
+    document.head.append(icon);
+  }, [mode, status]);
 }

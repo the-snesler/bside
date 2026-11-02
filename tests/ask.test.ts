@@ -60,7 +60,7 @@ describe("background entry-point listeners", () => {
   function setup() {
     let clicked!: Parameters<EntryPointsApi["menus"]["onClicked"]["addListener"]>[0];
     let command!: Parameters<EntryPointsApi["commands"]["onCommand"]["addListener"]>[0];
-    const actions = { setAsk: vi.fn(), updateAskAlt: vi.fn(), newChat: vi.fn(async () => {}), focusComposer: vi.fn() };
+    const actions = { setAsk: vi.fn(), updateAskAlt: vi.fn(), newChat: vi.fn(async () => {}) };
     const order: string[] = [];
     const api = {
       menus: { removeAll: vi.fn(async () => {}), create: vi.fn(), onClicked: { addListener: (listener: typeof clicked) => { clicked = listener; } } },
@@ -69,7 +69,7 @@ describe("background entry-point listeners", () => {
       tabs: { sendMessage: vi.fn(async (_id: number, request: { id: string }) => ({ v: 1, id: request.id, type: "page.menu-target", ok: true, alt: "Image description" })) },
     };
     registerEntryPoints(api as unknown as EntryPointsApi, actions);
-    return { api, actions, order, click: (info: object) => clicked(info as never, tab as never), command: (value: string) => command(value) };
+    return { api, actions, order, click: (info: object, from: object = { ...tab, windowId: 3 }) => clicked(info as never, from as never), command: (value: string) => command(value) };
   }
 
   it("registers four web-only menus and opens synchronously before preparing a draft", async () => {
@@ -77,8 +77,13 @@ describe("background entry-point listeners", () => {
     actions.setAsk.mockImplementation(() => order.push("draft"));
     click({ menuItemId: "bside-ask-selection", selectionText: "Selected" });
     expect(order).toEqual(["open", "draft"]);
-    expect(actions.setAsk).toHaveBeenCalledWith(expect.objectContaining({ kind: "selection", text: "Selected", tabId: 12, path: null }));
+    // The chip belongs to the clicked tab's window, whose sidebar alone shows it.
+    expect(actions.setAsk).toHaveBeenCalledWith(expect.objectContaining({ kind: "selection", text: "Selected", tabId: 12, path: null }), 3);
     expect(actions.newChat).not.toHaveBeenCalled();
+    // A tab Firefox names no window for has no sidebar to show a chip in; the sidebar still opens.
+    click({ menuItemId: "bside-ask-selection", selectionText: "Selected" }, tab);
+    expect(actions.setAsk).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(["open", "draft", "open"]);
     expect(api.tabs.sendMessage).not.toHaveBeenCalled();
     await Promise.resolve();
     expect(api.menus.create).toHaveBeenCalledTimes(4);
@@ -99,6 +104,7 @@ describe("background entry-point listeners", () => {
     expect(actions.newChat).not.toHaveBeenCalled();
     command("new-chat");
     expect(api.sidebarAction.open).toHaveBeenCalledTimes(3);
+    // The new chat (in the last-focused window) and its composer focus are the background's.
     expect(actions.newChat).toHaveBeenCalledTimes(1);
   });
 });

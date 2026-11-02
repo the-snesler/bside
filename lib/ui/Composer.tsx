@@ -1,6 +1,6 @@
 import { MCP_CONTENT_LIMITS, type McpContentChoice, type McpContentSnapshot } from "@/lib/domain/mcp-content";
 import { McpContentChip } from "@/lib/ui/McpContentChip";
-import { useEffect, useMemo, useRef, useState } from "preact/hooks";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
   createEditor,
   Editor,
@@ -12,7 +12,7 @@ import {
   type Descendant,
 } from "slate";
 import { Editable, ReactEditor, Slate, withReact } from "slate-react";
-import { withHistory } from "slate-history";
+import { HistoryEditor, withHistory } from "slate-history";
 import type { TabMention } from "@/lib/protocol";
 import type { SkillSummary } from "@/lib/domain/skills";
 import { PROMPT_MENTION_PATTERN } from "@/lib/domain/conversation";
@@ -51,6 +51,20 @@ export function serializeDraft(nodes: Descendant[]): string {
   return nodes.map(serialize).join("\n").trim();
 }
 
+const EMPTY_DRAFT: Descendant[] = [{ type: "paragraph", children: [{ text: "" }] }];
+
+/** Replaces the editor's whole document (mentions included) without an undo step, and starts its undo history afresh. */
+function replaceDocument(editor: Editor, nodes: Descendant[]): void {
+  HistoryEditor.withoutSaving(editor as Editor & HistoryEditor, () => {
+    Editor.withoutNormalizing(editor, () => {
+      Transforms.deselect(editor);
+      for (let index = editor.children.length - 1; index >= 0; index -= 1) Transforms.removeNodes(editor, { at: [index] });
+      Transforms.insertNodes(editor, structuredClone(nodes), { at: [0] });
+    });
+  });
+  (editor as Editor & HistoryEditor).history = { undos: [], redos: [] };
+}
+
 export type PromptSegment =
   | { kind: "text"; text: string }
   | { kind: "mention"; label: string; tabId: number; agentTab: boolean; url: string };
@@ -83,6 +97,12 @@ export function composerKeyAction(
 
 export function Composer(props: {
   sessionId?: string;
+  /**
+   * The tab the sidebar shows this chat for, while the chat is empty. One
+   * empty chat stands for every tab no chat is bound to, so its unsent text
+   * is kept per tab; once the chat has messages, per chat.
+   */
+  draftTabId?: number | null;
   attachments?: McpContentSnapshot[];
   onListMcpContent?: (kind: "prompt" | "resource") => Promise<{ choices: McpContentChoice[]; errors: { message: string }[] }>;
   onPrepareMcpContent?: (id: string, args: Record<string, string>) => Promise<void>;
@@ -144,6 +164,25 @@ export function Composer(props: {
   const filesBlocked = filesBusy || filesFailed;
   const currentSession = useRef(props.sessionId);
   currentSession.current = props.sessionId;
+  // Unsent text per chat (and per tab for an empty chat), in this sidebar's
+  // memory only: switching tabs, and so chats, and back restores it.
+  const drafts = useRef(new Map<string, Descendant[]>());
+  const draftKey = `${props.sessionId ?? ""}|${props.draftTabId ?? ""}`;
+  const shownDraft = useRef({ key: draftKey, sessionId: props.sessionId });
+  useLayoutEffect(() => {
+    const previous = shownDraft.current;
+    if (previous.key === draftKey) return;
+    shownDraft.current = { key: draftKey, sessionId: props.sessionId };
+    // The same chat, no longer empty (its first message went): what is being typed stays.
+    if (previous.sessionId === props.sessionId && props.draftTabId == null) return;
+    if (serializeDraft(editor.children)) drafts.current.set(previous.key, structuredClone(editor.children));
+    else drafts.current.delete(previous.key);
+    const next = drafts.current.get(draftKey);
+    drafts.current.delete(draftKey);
+    replaceDocument(editor, next ?? EMPTY_DRAFT);
+    setText(serializeDraft(editor.children));
+    setTarget(null);
+  }, [draftKey]);
   useEffect(() => {
     discoveryVersion.current++;
     setRemoteChoices([]); setSelectedPrompt(null); setRemoteError(""); setLoadingContent(false); setPreparing(false); setTarget(null);
@@ -247,7 +286,7 @@ export function Composer(props: {
   return (
     <Slate
       editor={editor}
-      initialValue={[{ type: "paragraph", children: [{ text: "" }] }]}
+      initialValue={EMPTY_DRAFT}
       onChange={() => {
         setText(serializeDraft(editor.children));
         const selection = editor.selection;

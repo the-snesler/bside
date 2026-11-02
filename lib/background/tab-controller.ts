@@ -5,7 +5,8 @@
  * a fixed settle/probe sequence. The bound tab never changes once captured; a
  * newly opened tab is never implicitly adopted. forTab creates a separate
  * controller for an explicitly selected workspace tab. Agent-tab ownership is
- * recorded as a session tab value (`AGENT_TAB_TAG_KEY`) on the tab itself.
+ * recorded as a session tab value (`AGENT_TAB_TAG_KEY`) on the tab itself,
+ * and so is the chat a user's tab is bound to (`CHAT_TAB_KEY`).
  * Screenshots go through `tabs.captureTab`, bounded here (see `screenshot`).
  *
  * A tab's outline is its top frame's, with each cross-origin frame's own
@@ -167,6 +168,18 @@ export interface AgentTabTagV1 {
   lastUsedAt: number;
 }
 
+export const CHAT_TAB_KEY = "bside.chat";
+
+/**
+ * Session value naming the chat a user's tab is bound to: the sidebar shows
+ * that chat while the tab is in front. Firefox keeps it with the tab like
+ * `AgentTabTagV2`. Agent tabs never carry one; they show their owning chat.
+ */
+export interface ChatTabValueV1 {
+  v: 1;
+  sessionId: string;
+}
+
 export type TabSnapshot = {
   id?: number;
   url?: string;
@@ -215,8 +228,8 @@ export interface Screenshot {
 
 export interface TabControllerBrowserApi {
   tabs: {
-    query(query: { active?: boolean; lastFocusedWindow?: boolean }): Promise<TabSnapshot[]>;
-    create?(properties: { url: string; active: boolean }): Promise<TabSnapshot>;
+    query(query: { active?: boolean; lastFocusedWindow?: boolean; windowId?: number }): Promise<TabSnapshot[]>;
+    create?(properties: { url: string; active: boolean; windowId?: number; index?: number }): Promise<TabSnapshot>;
     hide?(tabId: number): Promise<number[]>;
     show?(tabId: number): Promise<void>;
     move?(tabId: number, moveProperties: { windowId: number; index: number }): Promise<unknown>;
@@ -313,6 +326,24 @@ export class TabController {
     return tab.id;
   }
 
+  /**
+   * Opens one of this extension's own pages (a pop-out chat) as the active
+   * tab right after the active tab of `windowId` (by default the
+   * last-focused window). Returns the new tab's id.
+   */
+  async openExtensionTab(url: string, windowId?: number): Promise<number> {
+    if (!url.startsWith(browser.runtime.getURL("/"))) throw new Error("Expected one of bside's own pages.");
+    if (!this.#browserApi.tabs.create) throw new Error("Tab creation is unavailable.");
+    const [active] = await this.#browserApi.tabs.query(activeTabIn(windowId)).catch(() => []);
+    const tab = await this.#browserApi.tabs.create({
+      url, active: true,
+      ...(active?.windowId !== undefined ? { windowId: active.windowId } : windowId !== undefined ? { windowId } : {}),
+      ...(active?.index !== undefined ? { index: active.index + 1 } : {}),
+    });
+    if (tab.id === undefined) throw new Error("Tab creation failed.");
+    return tab.id;
+  }
+
   /** An empty background tab, for a search to load into (see `search`). */
   async createBlankTab(): Promise<number> {
     if (!this.#browserApi.tabs.create) throw new Error("Tab creation is unavailable.");
@@ -344,12 +375,13 @@ export class TabController {
   }
 
   /**
-   * Moves a hidden tab next to the last-focused window's active tab, shows
-   * it, and switches to it. Returns the tab that was active before, unless it
-   * is the revealed tab itself. A failed move only leaves the tab where it was.
+   * Moves a hidden tab next to the active tab of `windowId` (by default the
+   * last-focused window), shows it, and switches to it. Returns the tab that
+   * was active before, unless it is the revealed tab itself. A failed move
+   * only leaves the tab where it was.
    */
-  async revealTab(tabId: number): Promise<number | null> {
-    const [active] = await this.#browserApi.tabs.query({ active: true, lastFocusedWindow: true });
+  async revealTab(tabId: number, windowId?: number): Promise<number | null> {
+    const [active] = await this.#browserApi.tabs.query(activeTabIn(windowId));
     const previous = active?.id !== undefined && active.id !== tabId ? active.id : null;
     if (previous !== null && active!.windowId !== undefined && this.#browserApi.tabs.move) {
       await this.#browserApi.tabs.move(tabId, { windowId: active!.windowId, index: (active!.index ?? -2) + 1 }).catch(() => {});
@@ -382,6 +414,30 @@ export class TabController {
   async untagAgentTab(tabId: number): Promise<void> {
     if (!this.#browserApi.sessions) throw new Error("Session tab values are unavailable.");
     await this.#browserApi.sessions.removeTabValue(tabId, AGENT_TAB_TAG_KEY);
+  }
+
+  /** The chat the tab is bound to: `undefined` when it has no chat value, `null` when its value is malformed. */
+  async chatTabValue(tabId: number): Promise<ChatTabValueV1 | null | undefined> {
+    const value = await this.#browserApi.sessions?.getTabValue(tabId, CHAT_TAB_KEY);
+    if (value === undefined) return undefined;
+    return isChatTabValue(value) ? value : null;
+  }
+
+  async setChatTabValue(tabId: number, value: ChatTabValueV1): Promise<void> {
+    if (!this.#browserApi.sessions) throw new Error("Session tab values are unavailable.");
+    await this.#browserApi.sessions.setTabValue(tabId, CHAT_TAB_KEY, value);
+  }
+
+  async removeChatTabValue(tabId: number): Promise<void> {
+    if (!this.#browserApi.sessions) throw new Error("Session tab values are unavailable.");
+    await this.#browserApi.sessions.removeTabValue(tabId, CHAT_TAB_KEY);
+  }
+
+  /** The id of the active tab of `windowId`, whatever page it shows, or null when the window reports none. */
+  async activeTabId(windowId: number): Promise<number | null> {
+    const tabs = await this.#browserApi.tabs.query({ active: true, windowId });
+    const tab = tabs.find((candidate) => candidate.active === true && (candidate.windowId === undefined || candidate.windowId === windowId));
+    return tab?.id ?? null;
   }
 
   /**
@@ -427,9 +483,12 @@ export class TabController {
     };
   }
 
-  /** Binds this controller to the active HTTP(S) tab and captures the head of its outline. */
-  async captureActivePage(): Promise<PageOutcome<{ artifact: PageArtifactSummary; snapshot: PageSnapshot }>> {
-    const tabs = await this.#browserApi.tabs.query({ active: true, lastFocusedWindow: true });
+  /**
+   * Binds this controller to the active HTTP(S) tab of `windowId` (by default
+   * the last-focused window) and captures the head of its outline.
+   */
+  async captureActivePage(windowId?: number): Promise<PageOutcome<{ artifact: PageArtifactSummary; snapshot: PageSnapshot }>> {
+    const tabs = await this.#browserApi.tabs.query(activeTabIn(windowId));
     const tab = tabs[0];
     if (!tab || tab.id === undefined || !isSupportedUrl(tab.url)) {
       return pageError("UNSUPPORTED_PAGE", "This page cannot be attached.");
@@ -1044,6 +1103,12 @@ function isAgentTabTag(value: unknown): value is AgentTabTagV2 | AgentTabTagV1 {
     typeof v.lastUsedAt === "number" && Number.isFinite(v.lastUsedAt);
 }
 
+function isChatTabValue(value: unknown): value is ChatTabValueV1 {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return v.v === 1 && isSessionId(v.sessionId) && Object.keys(v).length === 2;
+}
+
 function pageError(code: PageErrorCode, message: string): { ok: false; error: NormalizedError } {
   return { ok: false, error: { code, message, retryable: false, phase: "page" } };
 }
@@ -1100,4 +1165,9 @@ function sleep(ms: number): Promise<void> {
   const { promise, resolve } = Promise.withResolvers<void>();
   setTimeout(resolve, ms);
   return promise;
+}
+
+/** The query for a window's active tab; the last-focused window's when none is named. */
+function activeTabIn(windowId: number | undefined): { active: true; windowId: number } | { active: true; lastFocusedWindow: true } {
+  return windowId === undefined ? { active: true, lastFocusedWindow: true } : { active: true, windowId };
 }

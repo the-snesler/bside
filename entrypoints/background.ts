@@ -37,10 +37,9 @@ export default defineBackground({
 
     registerSiteRequestHeaders(browser);
     registerEntryPoints(browser as unknown as EntryPointsApi, {
-      setAsk: (ask) => runtime.setAsk(ask),
+      setAsk: (ask, windowId) => runtime.setAsk(ask, windowId),
       updateAskAlt: (id, alt) => runtime.updateAskAlt(id, alt),
-      newChat: async () => { await runtime.handleCommand({ v: 1, id: crypto.randomUUID(), type: "session.create" }); },
-      focusComposer: () => sidebarHub.focusComposer(),
+      newChat: () => runtime.newChat(),
     });
 
     browser.alarms.onAlarm.addListener((alarm) => { void runtime.handleAlarm(alarm.name); });
@@ -60,14 +59,16 @@ export default defineBackground({
       // gesture; a pending approval or help request (in any run) or unread
       // scheduled results open the sidebar rather than closing it. The chat
       // to show (the run that has waited longest, else the newest unread
-      // results) is then selected asynchronously.
+      // results) is then selected asynchronously, in the last-focused
+      // window's sidebar (or, before it has attached, as the chat it shows).
       void (approvalBadge.attention ? sidebarAction.open() : sidebarAction.toggle());
       if (approvalBadge.attention) void runtime.openAttentionSession();
     });
 
-    browser.tabs.onActivated.addListener(({ tabId }) => {
+    // Each window's sidebar follows its active tab: it shows the chat the tab is bound to, else an empty one.
+    browser.tabs.onActivated.addListener(({ tabId, windowId }) => {
       void sidebarHub.refreshAttachment();
-      void runtime.handleTabActivated(tabId);
+      void runtime.handleTabActivated(tabId, windowId);
     });
 
     browser.tabs.onCreated.addListener((tab) => {
