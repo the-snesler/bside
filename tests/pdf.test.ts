@@ -124,6 +124,17 @@ class FakeWorker {
 }
 
 describe("PDF reader", () => {
+  it("waits for extraction after pdf.js announces its worker is ready", async () => {
+    const worker = new FakeWorker(null);
+    const pending = workerPdfExtractor(() => worker as unknown as Worker)(new Uint8Array(1));
+    worker.onmessage!({ data: { sourceName: "worker", targetName: "main", action: "ready", data: new Uint8Array() } } as MessageEvent);
+    expect(worker.terminated).toBe(false);
+    const pdf: PdfText = { pages: 1, pageTexts: ["Hello PDF"], title: "", cut: false };
+    worker.onmessage!({ data: { ok: true, pdf } } as MessageEvent);
+    await expect(pending).resolves.toEqual(pdf);
+    expect(worker.terminated).toBe(true);
+  });
+
   it("extracts in a fresh worker per PDF, transfers a copy of the bytes, and ends the worker", async () => {
     FakeWorker.instances = [];
     const extract = workerPdfExtractor(() => new FakeWorker((data) => ({ ok: true, pdf: { pages: 1, pageTexts: [`${data.byteLength} bytes`], title: "", cut: false } })) as unknown as Worker);

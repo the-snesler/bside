@@ -27,11 +27,15 @@ export function workerPdfExtractor(createWorker: () => Worker): PdfExtractor {
       settle();
     };
     const timer = setTimeout(() => finish(() => reject(new PdfError("Reading the PDF took too long."))), PDF_TIMEOUT_MS);
-    worker.onmessage = (event: MessageEvent<PdfWorkerResponse>) => finish(() => {
+    worker.onmessage = (event: MessageEvent<PdfWorkerResponse | { sourceName: string; targetName: string; action: string }>) => {
       const answer = event.data;
-      if (answer?.ok === true && isPdfText(answer.pdf)) resolve(answer.pdf);
-      else reject(new PdfError(answer?.ok === false && typeof answer.message === "string" ? answer.message.slice(0, 200) : "The PDF could not be read."));
-    });
+      // The bundled pdf.js auto-initializes in a browser worker and announces readiness before our result.
+      if (answer && "sourceName" in answer && answer.sourceName === "worker" && answer.targetName === "main" && answer.action === "ready") return;
+      finish(() => {
+        if (answer && "ok" in answer && answer.ok === true && isPdfText(answer.pdf)) resolve(answer.pdf);
+        else reject(new PdfError(answer && "ok" in answer && answer.ok === false && typeof answer.message === "string" ? answer.message.slice(0, 200) : "The PDF could not be read."));
+      });
+    };
     worker.onerror = () => finish(() => reject(new PdfError("The PDF reader stopped unexpectedly.")));
     // A copy, transferred: the worker owns it, and the caller's bytes stay usable.
     const buffer = data.slice().buffer;
