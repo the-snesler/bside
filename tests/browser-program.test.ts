@@ -162,6 +162,16 @@ describe("browser program output", () => {
     expect(result.summary).not.toContain("<page");
   });
 
+  it("prints a return before the last statement and keeps running", async () => {
+    const { run, actions } = setup();
+    const result = await run('const page = browser.tab("/tabs/1/page.md"); return "before"; await page.snapshot(); return await page.ref("e1").click(); const after = "x"; return after;');
+    expect(result.ok, result.summary).toBe(true);
+    expect(result.summary).toContain("[2] before");
+    expect(result.summary).toContain("[4] Clicked.");
+    expect(result.summary).toContain("[6] x");
+    expect(actions).toHaveLength(1);
+  });
+
   it("renders objects of page text as readable sections", async () => {
     const { run } = setup();
     const result = await run('const page = browser.tab("/tabs/1/page.md"); return {first: page.snapshot(), note: "x"};');

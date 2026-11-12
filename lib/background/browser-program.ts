@@ -21,7 +21,7 @@ import { sliceOutline } from "@/lib/domain/outline";
 
 export const PROGRAM_HELP = `Run a small browser/filesystem program. It is interpreted, not JavaScript: only const/let (including array destructuring), await, return, strings, numbers, booleans, arrays, objects, variables, + (strings and numbers), read-only property access on returned values (x.key, x[0], x.length), Promise.all, and the globals below. No loops, functions, selectors, or other globals. End statements with semicolons. Variables persist across programs in this run. The program stops at the first failure; earlier effects stay committed, so never replay completed steps.
 
-Output: bare expression statements (e.g. \`await x.click();\`) are printed, assignments are silent. Output over 40000 characters is cut with an explicit notice.
+Output: bare expression statements (e.g. \`await x.click();\`) and \`return\` statements are printed, assignments are silent. \`return\` may appear anywhere and does not end the program: later statements still run. Output over 40000 characters is cut with an explicit notice.
 
 Tabs: fs.list("/tabs") (user tabs), fs.list("/agent-tabs") (hidden tabs this chat opened). const page = browser.tab("/tabs/12/page.md"); const res = await browser.open("https://…") opens a hidden agent tab. A user tab another bside chat is using fails with TAB_IN_USE: open its URL with browser.open instead, or tell the user.
 Reading: await page.snapshot() returns the page outline: text in document order with interactive elements inlined as [e5 button "Save"], [e7 textbox "Email" type=email required value="…"], [e9 link "Docs" → /docs], [e3 combobox "Country" selected="…" options: …]. Includes open/closed shadow DOM and iframes: a cross-origin frame appears in place as [frame f2 "Title" (url)], its lines indented, then [/frame f2], and its refs carry the frame's name (f2:e4); a frame bside cannot read stays one [frame … not readable] line. Long pages are paged: snapshot({offset: 16000, maxChars: 16000}) continues where the notice says (maxChars ≤ 40000). fs.read(tabPath) equals snapshot(). A tab showing a PDF reads as its text ("PDF: N pages", then each page); it is read-only (no refs, actions, or screenshots), and page.savePdf("/workspace/name.pdf") saves the file.
@@ -687,8 +687,6 @@ export function parseProgram(source: string): Statement[] {
     if (returns) index++;
     statements.push({ name, returns, expression: expression() });
     if (index < tokens.length) take(";");
-    if (returns && index < tokens.length)
-      throw new Error("Return must be the last statement.");
   }
   return statements;
 }
