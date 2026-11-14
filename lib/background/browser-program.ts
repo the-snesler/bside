@@ -1281,7 +1281,7 @@ export class BrowserProgram {
     if (action.kind !== "hover") this.#refuseIfReadOnly(`${method}()`);
     // A lost response can follow a committed effect; disable automatic retry before dispatch.
     this.onEffect();
-    const outcome = await controller.act(action, frame);
+    const outcome = await controller.act(action, frame, signal);
     this.#usedPage(controller);
     this.#observeAction(receiver.tabId, frame, outcome.documentId);
     if (!outcome.result.ok)

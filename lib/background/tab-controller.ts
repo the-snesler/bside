@@ -17,12 +17,16 @@
  * is the PDF's text instead (see `#pdfOf`): another tab's content script
  * fetches the bytes, and the shared `PdfReader` extracts the text. Such a
  * tab is read-only.
+ *
+ * In a tab the user can see, a DOM action first shows bside's cursor gliding
+ * to its target (`lib/domain/cursor.ts`), paced by the shared `CursorPacer`.
  */
 
 import type {
   NormalizedError,
   PageCaptureDoneRequest,
   PageCapturePrepareRequest,
+  PageExecuteCancelRequest,
   PageExecuteRequest,
   PageFetchPdfRequest,
   PageFindRequest,
@@ -40,6 +44,7 @@ import type { CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutlin
 import { findInOutline, lineOffsets, sliceOutline } from "@/lib/domain/outline";
 import { base64ToBytes, isPdfHeader, looksLikePdfUrl, PDF_LIMITS, PdfError, renderPdfText, type PdfFetchResult, type PdfText } from "@/lib/domain/pdf";
 import { PdfReader } from "@/lib/background/pdf";
+import { CursorPacer, isCursorPoint, STOPPED_BEFORE_ACTION } from "@/lib/domain/cursor";
 import { base64Bytes, formatKeyChord, isSessionId, validateHttpUrl, WORKSPACE_MAX_BINARY_BYTES } from "@/lib/validation";
 
 const NAVIGATION_TIMEOUT_MS = 10_000;
@@ -269,6 +274,7 @@ export class TabController {
   #frames: FrameAliases;
   #pdfs: PdfReader;
   #visibility: VisibilityLock;
+  #cursor: CursorPacer;
   #tabId: number | null = null;
   #url: string | null = null;
   #title: string | null = null;
@@ -276,14 +282,16 @@ export class TabController {
   /**
    * Pass the background's one `FrameAliases` so every controller names a
    * tab's frames the same way, its one `PdfReader` so a PDF is parsed once,
-   * and its one `VisibilityLock` so only one screenshot at a time shows a hidden tab.
+   * its one `VisibilityLock` so only one screenshot at a time shows a hidden
+   * tab, and its one `CursorPacer` so a tab's cursor keeps one pace across runs.
    */
-  constructor(browserApi: TabControllerBrowserApi, isBlank: BlankImageCheck = isBlankImage, frames: FrameAliases = new FrameAliases(), pdfs: PdfReader = new PdfReader(), visibility: VisibilityLock = new VisibilityLock()) {
+  constructor(browserApi: TabControllerBrowserApi, isBlank: BlankImageCheck = isBlankImage, frames: FrameAliases = new FrameAliases(), pdfs: PdfReader = new PdfReader(), visibility: VisibilityLock = new VisibilityLock(), cursor: CursorPacer = new CursorPacer()) {
     this.#browserApi = browserApi;
     this.#isBlank = isBlank;
     this.#frames = frames;
     this.#pdfs = pdfs;
     this.#visibility = visibility;
+    this.#cursor = cursor;
   }
 
   get frames(): FrameAliases {
@@ -311,7 +319,7 @@ export class TabController {
   async forTab(tabId: number): Promise<TabController> {
     const tab = (await this.listTabs()).find((tab) => tab.id === tabId);
     if (!tab) throw new Error("Tab is closed or unsupported.");
-    const controller = new TabController(this.#browserApi, this.#isBlank, this.#frames, this.#pdfs, this.#visibility);
+    const controller = new TabController(this.#browserApi, this.#isBlank, this.#frames, this.#pdfs, this.#visibility, this.#cursor);
     controller.#tabId = tabId;
     controller.#url = tab.url!;
     controller.#title = tab.title ?? "";
@@ -860,8 +868,13 @@ export class TabController {
    * Forwards one DOM action to the top document (`frame` 0) or to the frame
    * of that name. A click/press that tears down the document settles like a
    * navigation instead of repeating.
+   *
+   * When the tab is the active tab of its window, the top document first
+   * shows bside's cursor gliding to the target. If `signal` aborts during
+   * the glide, the page is told to stop, and an action whose events have not
+   * been dispatched yet does nothing (`SKIPPED`).
    */
-  async act(action: DomAction, frame = 0): Promise<ActionOutcome> {
+  async act(action: DomAction, frame = 0, signal?: AbortSignal): Promise<ActionOutcome> {
     const tabId = this.#tabId;
     if (tabId === null) return { result: { ok: false, code: "UNSUPPORTED_PAGE", summary: "No page is attached." }, documentId: null };
     if (await this.#isPdf()) {
@@ -869,7 +882,14 @@ export class TabController {
     }
     const route = this.#route(tabId, frame);
     if (!route) return { result: { ok: false, code: "TARGET_MISSING", summary: `Frame f${frame} is not on this page. Read a fresh snapshot.` }, documentId: null };
-    const request: PageExecuteRequest = { v: 1, id: crypto.randomUUID(), type: "page.execute", frameId: route.frameId, tabId, refPrefix: route.refPrefix, action };
+    const present = await this.#presentation(tabId, action, frame);
+    const request: PageExecuteRequest = { v: 1, id: crypto.randomUUID(), type: "page.execute", frameId: route.frameId, tabId, refPrefix: route.refPrefix, action, present };
+    const stop = () => {
+      const cancel: PageExecuteCancelRequest = { v: 1, id: crypto.randomUUID(), type: "page.execute-cancel", frameId: TOP_FRAME, tabId, executeId: request.id };
+      this.#browserApi.tabs.sendMessage(tabId, cancel, { frameId: TOP_FRAME }).catch(() => {});
+    };
+    if (present && signal?.aborted) return { result: STOPPED_BEFORE_ACTION, documentId: null };
+    if (present) signal?.addEventListener("abort", stop, { once: true });
 
     let response: PageResponse | undefined;
     try {
@@ -888,16 +908,39 @@ export class TabController {
         result: { ok: true, summary: `${action.kind === "click" ? "Clicked" : `Pressed ${formatKeyChord(action.key, action.modifiers)}`}; the page navigated to ${this.#url} (${JSON.stringify(this.#title ?? "")}). Earlier refs are invalid; read a snapshot or use page.find().` },
         documentId: null,
       };
+    } finally {
+      signal?.removeEventListener("abort", stop);
     }
 
     if (!response) return { result: { ok: false, code: "TAB_CHANGED", summary: "The page did not respond." }, documentId: null };
     if (!response.ok) return { result: { ok: false, code: toToolResultCode(response.error.code), summary: response.error.message }, documentId: null };
     if (response.type !== "page.execute") return { result: { ok: false, code: "TARGET_MISSING", summary: "Unexpected response from the page." }, documentId: null };
+    if (present) this.#cursor.landed(tabId, isCursorPoint(response.cursor) ? response.cursor : null);
     // A frame's diff covers only that frame; what its click did to the page around it needs a fresh read.
     const outside = frame !== 0 && response.result.ok && (action.kind === "click" || action.kind === "press")
       ? `\nThe diff covers frame f${frame} only; read a snapshot to see changes elsewhere on the page.`
       : "";
     return { result: { ...response.result, summary: `${response.result.summary}${outside}` }, documentId: response.documentId };
+  }
+
+  /**
+   * How the page should show the cursor for an action: only for an element
+   * in the top document (cross-origin frames draw no cursor yet) of a tab
+   * that is its window's active tab. A tab out of sight restarts its pace.
+   */
+  async #presentation(tabId: number, action: DomAction, frame: number): Promise<PageExecuteRequest["present"]> {
+    if (!action.target) return null;
+    let visible = false;
+    try {
+      visible = (await this.#browserApi.tabs.query({ active: true })).some((tab) => tab.id === tabId && tab.active === true && tab.hidden !== true);
+    } catch {
+      visible = false;
+    }
+    if (!visible) {
+      this.#cursor.forget(tabId);
+      return null;
+    }
+    return frame === 0 ? this.#cursor.next(tabId) : null;
   }
 
   /** Firefox's id and the ref prefix for a named frame (0 is the top document); null for a name no outline of this tab gave out. */
