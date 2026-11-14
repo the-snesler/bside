@@ -39,6 +39,7 @@ import type { AgentTab } from "@/lib/background/browser-program";
 import type { ChatView, SidebarHub, SidebarView } from "@/lib/background/sidebar-hub";
 import { TabBindings } from "@/lib/background/tab-chats";
 import { FrameAliases, TabController, VisibilityLock } from "@/lib/background/tab-controller";
+import { CursorPacer } from "@/lib/domain/cursor";
 import { PdfReader, workerPdfExtractor } from "@/lib/background/pdf";
 import { browserSiteEnv } from "@/lib/sites";
 import type { SiteEnv } from "@/lib/sites/site-api";
@@ -454,7 +455,9 @@ export class BackgroundRuntime {
     const frameAliases = new FrameAliases();
     const pdfs = new PdfReader(workerPdfExtractor(() => new Worker(browser.runtime.getURL("/pdf-text.js"))));
     const visibility = new VisibilityLock();
-    this.#tabControllerFactory = options.tabControllerFactory ?? (() => new TabController(browser as unknown as TabControllerBrowserApi, undefined, frameAliases, pdfs, visibility));
+    // One cursor pace per tab across runs, so a new run in a tab the user is watching does not start slow again.
+    const cursor = new CursorPacer();
+    this.#tabControllerFactory = options.tabControllerFactory ?? (() => new TabController(browser as unknown as TabControllerBrowserApi, undefined, frameAliases, pdfs, visibility, cursor));
     this.#sites = options.sites ?? browserSiteEnv();
     this.#approvalBadge = options.approvalBadge ?? null;
     this.#mcp = options.mcp ?? null;

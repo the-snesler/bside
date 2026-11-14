@@ -14,7 +14,7 @@
  * and file inputs with a visible label are exposed and operated through that
  * label; other hidden elements are never targetable.
  *
- * Elements registered with `excludeFromOutline` (bside's own page shield) are
+ * Elements registered with `excludeFromOutline` (bside's own page shield and cursor) are
  * skipped entirely. Effects are dispatched straight to the resolved element;
  * nothing here hit-tests by coordinates (no `elementFromPoint`), so an overlay
  * never redirects or blocks an agent action.
@@ -26,6 +26,7 @@
  */
 
 import { TABLE_LIMITS } from "@/lib/domain/tools";
+import { STOPPED_BEFORE_ACTION } from "@/lib/domain/cursor";
 import type {
   CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, KeyModifier, PageFindResult, PageRect, PageSnapshot, PageTable, PressKey,
   TableRole, ToolResult, UploadFile,
@@ -1837,17 +1838,48 @@ function describeReorder(before: readonly string[], after: readonly string[]): s
   return lines;
 }
 
+/** What the agent's visible cursor does on arrival (`lib/tools/page-cursor.ts`): a click ripple, a ring around a field being typed in, nothing (hover), or a press-and-carry to `to`. */
+export type CursorGesture =
+  | { kind: "click"; element: Element }
+  | { kind: "type"; element: Element }
+  | { kind: "hover"; element: Element }
+  | { kind: "drag"; element: Element; to: Element };
+
+export interface ExecuteOptions extends OutlineOptions {
+  /**
+   * Shows the action's gesture before its events are dispatched (the agent's
+   * visible cursor). Resolves false when it was stopped, and the action then
+   * does nothing.
+   */
+  present?: (gesture: CursorGesture) => Promise<boolean>;
+}
+
+/** The cursor gesture for an action on `control` (and `to`, for a drag); null for a page scroll, which has no element. */
+function gestureFor(action: DomAction, control: OutlineControl | null, to: OutlineControl | null): CursorGesture | null {
+  if (!control) return null;
+  const element = control.proxy ?? control.element;
+  switch (action.kind) {
+    case "fill":
+    case "press": return { kind: "type", element };
+    case "hover":
+    case "scroll": return { kind: "hover", element };
+    case "drag": return { kind: "drag", element, to: to!.proxy ?? to!.element };
+    default: return { kind: "click", element };
+  }
+}
+
 /**
- * Resolves the target against a fresh outline, performs one effect, waits for
- * the DOM to settle, and reports the effect, validation feedback, and outline
- * changes. Never retries, and never guesses an alternative target.
+ * Resolves the target against a fresh outline, shows the cursor's gesture (if
+ * asked), performs one effect, waits for the DOM to settle, and reports the
+ * effect, validation feedback, and outline changes. Never retries, and never
+ * guesses an alternative target.
  */
 export async function executeDomAction(
   document: Document,
   registry: ElementRefRegistry,
   action: DomAction,
   settle: Settle = settleDom,
-  options: OutlineOptions = {},
+  options: ExecuteOptions = {},
 ): Promise<ToolResult> {
   const before = buildOutline(document, registry, options);
   const urlBefore = document.location?.href;
@@ -1863,6 +1895,8 @@ export async function executeDomAction(
     if (!resolved.ok) return { ...resolved.result, summary: `Drop target: ${resolved.result.summary}` };
     to = resolved.control;
   }
+  const gesture = options.present && gestureFor(action, control, to);
+  if (gesture && !await options.present!(gesture)) return STOPPED_BEFORE_ACTION;
   let effect: Effect;
   switch (action.kind) {
     case "click": effect = click(control!, before); break;
