@@ -14,13 +14,16 @@
 import { dwellMs, glideMs, type CursorPoint } from "@/lib/domain/cursor";
 import { excludeFromOutline, type CursorGesture } from "@/lib/tools/page-executor";
 
-const NAVY = "#15204f";
 const CREAM = "#fafcda";
 /** The mascot's body color, as RGB channels. */
 const PERIWINKLE = "107 130 219";
+/** The arrow's fill. */
+const BLUE = "#2f6bf3";
 const SVG = "http://www.w3.org/2000/svg";
+/** The arrow's outline (Tabler's "pointer" icon), in a 24 × 24 box drawn at 24 px. */
+const ARROW_PATH = "M11 21L4 4l17 7l-6.265 2.685a2 2 0 0 0-1.05 1.05z";
 /** The arrow's tip, from the cursor element's top-left corner. */
-const TIP = { x: 3, y: 2 };
+const TIP = { x: 4, y: 4 };
 /** The cursor fades out this long after its last gesture. */
 const IDLE_FADE_MS = 2_500;
 
@@ -123,21 +126,29 @@ export function createPageCursor(document: Document): PageCursor {
   const cursor = document.createElement("div");
   css(cursor, { position: "fixed", left: "0", top: "0", display: "flex", "align-items": "flex-start", opacity: "0", transition: "opacity 180ms ease-out", "will-change": "transform" });
   const arrow = document.createElementNS(SVG, "svg");
-  arrow.setAttribute("width", "20");
-  arrow.setAttribute("height", "22");
-  arrow.setAttribute("viewBox", "0 0 20 22");
-  css(arrow, { display: "block", overflow: "visible", filter: "drop-shadow(0 1px 2px rgb(0 0 0 / 0.35))", "transform-origin": `${TIP.x}px ${TIP.y}px`, transition: "transform 90ms ease-out" });
-  const path = document.createElementNS(SVG, "path");
-  path.setAttribute("d", "M3 2 L3 18 L7.5 14 L10.5 20.5 L13.5 19.2 L10.6 12.8 L16.5 12.6 Z");
-  path.setAttribute("fill", NAVY);
-  path.setAttribute("stroke", CREAM);
-  path.setAttribute("stroke-width", "1.6");
-  path.setAttribute("stroke-linejoin", "round");
-  arrow.append(path);
+  arrow.setAttribute("width", "24");
+  arrow.setAttribute("height", "24");
+  arrow.setAttribute("viewBox", "0 0 24 24");
+  css(arrow, {
+    display: "block", overflow: "visible", "transform-origin": `${TIP.x}px ${TIP.y}px`, transition: "transform 90ms ease-out",
+    filter: "drop-shadow(0 2px 3px rgb(0 0 0 / 0.35)) drop-shadow(0 0 1px rgb(0 0 0 / 0.25))",
+  });
+  // A white border (a wide white stroke underneath), then the blue arrow with rounded corners on top.
+  const border = document.createElementNS(SVG, "path");
+  const fill = document.createElementNS(SVG, "path");
+  for (const [path, color, width] of [[border, "#ffffff", "5"], [fill, BLUE, "2"]] as const) {
+    path.setAttribute("d", ARROW_PATH);
+    path.setAttribute("fill", color);
+    path.setAttribute("stroke", color);
+    path.setAttribute("stroke-width", width);
+    path.setAttribute("stroke-linecap", "round");
+    path.setAttribute("stroke-linejoin", "round");
+  }
+  arrow.append(border, fill);
   const tag = document.createElement("span");
   tag.textContent = "bside";
   css(tag, {
-    margin: "14px 0 0 -2px", padding: "1px 7px", "border-radius": "999px", background: `rgb(${PERIWINKLE})`, color: CREAM,
+    margin: "18px 0 0 -4px", padding: "1px 7px", "border-radius": "999px", background: `rgb(${PERIWINKLE})`, color: CREAM,
     font: "600 11px/1.4 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif", "letter-spacing": "normal", "white-space": "nowrap",
     "box-shadow": "0 1px 3px rgb(0 0 0 / 0.3)",
   });
