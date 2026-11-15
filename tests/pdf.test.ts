@@ -1,13 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BrowserProgram, ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
-import { PdfReader, workerPdfExtractor, type PdfExtractor } from "@/lib/background/pdf";
+import { workerPdfExtractor, type PdfExtractor } from "@/lib/background/pdf";
+import { TabFiles } from "@/lib/background/tab-files";
 import { TabController, type TabControllerBrowserApi, type TabSnapshot } from "@/lib/background/tab-controller";
 import { BackgroundRuntime } from "@/lib/background/runtime";
 import { SidebarHub } from "@/lib/background/sidebar-hub";
-import { bytesToBase64, isPdfHeader, looksLikePdfUrl, PDF_LIMITS, PDF_TIMEOUT_MS, PdfError, renderPdfText, type PdfText } from "@/lib/domain/pdf";
+import { bytesToBase64, isPdfHeader, PDF_LIMITS, PDF_TIMEOUT_MS, PdfError, renderPdfText, type PdfText } from "@/lib/domain/pdf";
+import { FILE_LIMITS, looksLikeFileUrl } from "@/lib/domain/files";
 import { extractPdfText } from "@/lib/pdf/extract";
-import { fetchPdf } from "@/lib/pdf/fetch";
-import { isPageFetchPdfRequest } from "@/lib/protocol";
+import { fetchFile } from "@/lib/files/fetch";
+import { isPageFetchFileRequest } from "@/lib/protocol";
 import { makePdf } from "./helpers/pdf";
 
 afterEach(() => {
@@ -51,8 +53,8 @@ describe("PDF text extraction", () => {
     expect(isPdfHeader(makePdf([["x"]]))).toBe(true);
     expect(isPdfHeader(new TextEncoder().encode(`${" ".repeat(200)}%PDF-1.7`))).toBe(true);
     expect(isPdfHeader(new TextEncoder().encode("<!doctype html>"))).toBe(false);
-    expect(looksLikePdfUrl("https://example.com/files/Report.PDF?download=1")).toBe(true);
-    expect(looksLikePdfUrl("https://example.com/report")).toBe(false);
+    expect(looksLikeFileUrl("https://example.com/files/Report.PDF?download=1")).toBe(true);
+    expect(looksLikeFileUrl("https://example.com/report")).toBe(false);
   });
 });
 
@@ -71,36 +73,42 @@ function fakeFetch(body: Uint8Array | string, init: { status?: number; headers?:
   });
 }
 
-describe("fetching a PDF in a content script", () => {
-  it("returns the bytes as base64, without a referrer, from the HTTP cache when it can", async () => {
+describe("fetching a file in a content script", () => {
+  const options = { credentials: "include" as const, cache: "force-cache" as const };
+
+  it("returns the bytes as base64 with their type and name, without a referrer, from the HTTP cache when asked", async () => {
     const pdf = makePdf([["Hello"]]);
-    const fetchImpl = fakeFetch(pdf);
-    expect(await fetchPdf("https://example.com/a.pdf", "include", fetchImpl)).toEqual({ kind: "pdf", base64: bytesToBase64(pdf), bytes: pdf.length });
+    const fetchImpl = fakeFetch(pdf, { headers: { "content-type": "application/pdf", "content-disposition": 'attachment; filename="Q3 report.pdf"' } });
+    expect(await fetchFile("https://example.com/a.pdf", options, fetchImpl)).toEqual({
+      kind: "file", base64: bytesToBase64(pdf), bytes: pdf.length, contentType: "application/pdf", name: "Q3 report.pdf", url: "https://example.com/a.pdf",
+    });
     expect(fetchImpl).toHaveBeenCalledWith("https://example.com/a.pdf", expect.objectContaining({ credentials: "include", referrerPolicy: "no-referrer", cache: "force-cache" }));
   });
 
-  it("stops at the first bytes of something that is not a PDF", async () => {
-    expect(await fetchPdf("https://example.com/page", "omit", fakeFetch("<html>".repeat(1000)))).toEqual({ kind: "not-pdf" });
+  it("fetches any file, named by its URL when no header names it", async () => {
+    const result = await fetchFile("https://example.com/data/rows.csv?x=1", { credentials: "omit", cache: "default" }, fakeFetch("a,b\n1,2\n", { headers: { "content-type": "text/csv" } }));
+    expect(result).toMatchObject({ kind: "file", bytes: 8, contentType: "text/csv", name: "rows.csv" });
   });
 
-  it("refuses PDFs over the byte limit, by header or while streaming", async () => {
-    expect(await fetchPdf("https://example.com/a.pdf", "omit", fakeFetch(makePdf([["x"]]), { headers: { "content-length": String(PDF_LIMITS.bytes + 1) } }))).toEqual({ kind: "too-large" });
-    const huge = new Uint8Array(PDF_LIMITS.bytes + 10);
-    huge.set(new TextEncoder().encode("%PDF-1.4"));
-    expect(await fetchPdf("https://example.com/a.pdf", "omit", vi.fn(async () => new Response(huge)))).toEqual({ kind: "too-large" });
+  it("refuses files over the byte limit, by header or while streaming", async () => {
+    expect(await fetchFile("https://example.com/a.pdf", options, fakeFetch(makePdf([["x"]]), { headers: { "content-length": String(FILE_LIMITS.bytes + 1) } }))).toEqual({ kind: "too-large" });
+    const huge = new Uint8Array(FILE_LIMITS.bytes + 10);
+    expect(await fetchFile("https://example.com/a.bin", options, vi.fn(async () => new Response(huge)))).toEqual({ kind: "too-large" });
   });
 
   it("reports HTTP and network failures without their bodies", async () => {
-    expect(await fetchPdf("https://example.com/a.pdf", "omit", fakeFetch("Forbidden", { status: 403 }))).toEqual({ kind: "failed", status: 403 });
-    expect(await fetchPdf("https://example.com/a.pdf", "omit", vi.fn(async () => { throw new TypeError("NetworkError"); }))).toEqual({ kind: "failed", status: null });
+    expect(await fetchFile("https://example.com/a.pdf", options, fakeFetch("Forbidden", { status: 403 }))).toEqual({ kind: "failed", status: 403 });
+    expect(await fetchFile("https://example.com/a.pdf", options, vi.fn(async () => { throw new TypeError("NetworkError"); }))).toEqual({ kind: "failed", status: null });
   });
 
-  it("validates fetch requests: top frame, an HTTP(S) URL, and a credentials mode", () => {
-    const request = { v: 1, id: "1", type: "page.fetch-pdf", frameId: 0, tabId: 3, url: "https://example.com/a.pdf", credentials: "include" };
-    expect(isPageFetchPdfRequest(request)).toBe(true);
-    expect(isPageFetchPdfRequest({ ...request, frameId: 2 })).toBe(false);
-    expect(isPageFetchPdfRequest({ ...request, url: "file:///etc/passwd" })).toBe(false);
-    expect(isPageFetchPdfRequest({ ...request, credentials: "same-origin" })).toBe(false);
+  it("validates fetch requests: top frame, an HTTP(S) URL, a credentials mode, and a cache mode", () => {
+    const request = { v: 1, id: "1", type: "page.fetch-file", frameId: 0, tabId: 3, url: "https://example.com/a.pdf", credentials: "include", cache: "force-cache" };
+    expect(isPageFetchFileRequest(request)).toBe(true);
+    expect(isPageFetchFileRequest({ ...request, cache: "default" })).toBe(true);
+    expect(isPageFetchFileRequest({ ...request, frameId: 2 })).toBe(false);
+    expect(isPageFetchFileRequest({ ...request, url: "file:///etc/passwd" })).toBe(false);
+    expect(isPageFetchFileRequest({ ...request, credentials: "same-origin" })).toBe(false);
+    expect(isPageFetchFileRequest({ ...request, cache: "reload" })).toBe(false);
   });
 });
 
@@ -123,7 +131,7 @@ class FakeWorker {
   }
 }
 
-describe("PDF reader", () => {
+describe("PDF extraction workers and the file cache", () => {
   it("waits for extraction after pdf.js announces its worker is ready", async () => {
     const worker = new FakeWorker(null);
     const pending = workerPdfExtractor(() => worker as unknown as Worker)(new Uint8Array(1));
@@ -163,24 +171,25 @@ describe("PDF reader", () => {
     expect(FakeWorker.instances[0]!.terminated).toBe(true);
   });
 
-  it("parses a PDF once for concurrent and later reads, remembers non-PDFs, and retries failures", async () => {
+  it("parses a PDF once for concurrent and later reads, remembers web pages, and retries failures", async () => {
     const extract = vi.fn<PdfExtractor>(async () => ({ pages: 1, pageTexts: ["text"], title: "", cut: false }));
-    const reader = new PdfReader(extract);
-    const load = vi.fn(async () => makePdf([["x"]]));
-    const [a, b] = await Promise.all([reader.read("k", load), reader.read("k", load)]);
+    const files = new TabFiles(extract);
+    const load = vi.fn(async () => ({ url: "https://x.test/a.pdf", data: makePdf([["x"]]), contentType: "application/pdf", name: "a.pdf" }));
+    const [a, b] = await Promise.all([files.read("k", load), files.read("k", load)]);
     expect(a).toBe(b);
-    await reader.read("k", load);
+    expect(a?.body.kind).toBe("pdf");
+    await files.read("k", load);
     expect(load).toHaveBeenCalledTimes(1);
     expect(extract).toHaveBeenCalledTimes(1);
 
-    const notPdf = vi.fn(async () => null);
-    expect(await reader.read("html", notPdf)).toBeNull();
-    expect(await reader.read("html", notPdf)).toBeNull();
-    expect(notPdf).toHaveBeenCalledTimes(1);
+    const page = vi.fn(async () => ({ url: "https://x.test/", data: new TextEncoder().encode("<html>"), contentType: "text/html; charset=utf-8", name: "x" }));
+    expect(await files.read("html", page)).toBeNull();
+    expect(await files.read("html", page)).toBeNull();
+    expect(page).toHaveBeenCalledTimes(1);
 
-    const failing = vi.fn(async (): Promise<Uint8Array> => { throw new PdfError("Downloading it failed."); });
-    await expect(reader.read("bad", failing)).rejects.toThrow("Downloading it failed.");
-    await expect(reader.read("bad", failing)).rejects.toThrow("Downloading it failed.");
+    const failing = vi.fn(async (): Promise<null> => { throw new PdfError("Downloading it failed."); });
+    await expect(files.read("bad", failing)).rejects.toThrow("Downloading it failed.");
+    await expect(files.read("bad", failing)).rejects.toThrow("Downloading it failed.");
     expect(failing).toHaveBeenCalledTimes(2);
   });
 });
@@ -196,11 +205,11 @@ function pdfBrowser(tabs: (TabSnapshot & { pdf?: boolean })[], files: Record<str
     const tab = tabs.find((candidate) => candidate.id === tabId)!;
     if (tab.pdf) throw new Error("Could not establish connection. Receiving end does not exist.");
     const request = message as { id: string; type: string; url: string; credentials: string; offset: number; maxChars: number };
-    if (request.type === "page.health") return { v: 1, id: request.id, ok: true, type: "page.health", url: tab.url };
-    if (request.type === "page.fetch-pdf") {
+    if (request.type === "page.health") return { v: 1, id: request.id, ok: true, type: "page.health", url: tab.url, contentType: "text/html" };
+    if (request.type === "page.fetch-file") {
       fetches.push({ tabId, url: request.url, credentials: request.credentials });
-      const file = files[request.url];
-      return { v: 1, id: request.id, ok: true, type: "page.fetch-pdf", result: file ? { kind: "pdf", base64: bytesToBase64(file), bytes: file.length } : { kind: "not-pdf" } };
+      const file = files[request.url] ?? new TextEncoder().encode("<!doctype html><p>Viewer</p>");
+      return { v: 1, id: request.id, ok: true, type: "page.fetch-file", result: { kind: "file", base64: bytesToBase64(file), bytes: file.length, contentType: files[request.url] ? "application/pdf" : "text/html", name: request.url.split("/").pop(), url: request.url } };
     }
     if (request.type === "page.snapshot") {
       const text = "Page text";
@@ -237,7 +246,7 @@ function pdfSetup(tabs: (TabSnapshot & { pdf?: boolean })[] = [
 ]) {
   const browser = pdfBrowser(tabs, { [REPORT_URL]: REPORT });
   const extract = vi.fn<PdfExtractor>((data) => extractPdfText(data));
-  const reader = new PdfReader(extract);
+  const reader = new TabFiles(extract);
   const controller = new TabController(browser.api, undefined, undefined, reader);
   return { ...browser, extract, reader, controller };
 }
@@ -249,7 +258,7 @@ describe("PDF tabs", () => {
     const snapshot = await tab.snapshot({ offset: 0, maxChars: 16_000 });
     expect(snapshot.ok).toBe(true);
     if (!snapshot.ok) return;
-    expect(snapshot.value).toMatchObject({ tabId: 3, url: REPORT_URL, title: "Q3 Report", pdf: { pages: 2 }, documentId: expect.stringMatching(/^pdf-[0-9a-f]{8}$/) });
+    expect(snapshot.value).toMatchObject({ tabId: 3, url: REPORT_URL, title: "Q3 Report", file: { kind: "pdf", pages: 2 }, documentId: expect.stringMatching(/^pdf-[0-9a-f]{8}$/) });
     expect(snapshot.value.text).toBe("PDF: 2 pages · Q3 Report\n\n--- Page 1 ---\nQuarterly report\nRevenue grew 12%\n\n--- Page 2 ---\nAppendix A\nMethods");
     expect(fetches).toEqual([{ tabId: 2, url: REPORT_URL, credentials: "include" }]);
 
@@ -290,6 +299,8 @@ describe("PDF tabs", () => {
     await tab.snapshot();
     const outcome = await tab.act({ kind: "click", target: { kind: "ref", ref: "e1", documentId: "x" } });
     expect(outcome.result).toMatchObject({ ok: false, code: "UNSUPPORTED_PAGE", summary: expect.stringContaining("bside can read it (snapshot, find) but not operate it") });
+    const shot = await tab.screenshot({ area: "viewport", target: null, frame: 0, format: "jpeg" });
+    expect(shot).toMatchObject({ ok: false, error: { code: "UNSUPPORTED_PAGE" } });
   });
 
   it("keeps the original error for an unresponsive tab that is not a PDF", async () => {
@@ -335,28 +346,29 @@ describe("PDFs in browser programs", () => {
     expect(program.tainted).toBe(true);
   });
 
-  it("saves a PDF tab to /workspace and reads it back as paged text, which taints the run", async () => {
+  it("keeps a PDF tab's file in /workspace/downloads and reads it back as paged text, which taints the run", async () => {
     const { run, files, program } = programSetup();
-    const saved = await run('return await browser.tab("/tabs/3/page.md").savePdf("/workspace/q3.pdf");');
+    const saved = await run('return await browser.tab("/tabs/3/page.md").saveFile();');
     expect(saved.ok, saved.summary).toBe(true);
-    expect(saved.summary).toBe(`Saved the PDF ${REPORT_URL} to /workspace/q3.pdf (${REPORT.length} bytes).`);
-    expect(await files.read("/workspace/q3.pdf")).toMatchObject({ kind: "binary", mimeType: "application/pdf", bytes: REPORT.length });
+    expect(saved.summary).toBe(`${REPORT_URL} is a file, not a web page: kept as /workspace/downloads/q3.pdf ("q3.pdf", application/pdf, ${REPORT.length.toLocaleString("en-US")} bytes); fs.read(path) returns its text. Nothing reached the user's Downloads folder.`);
+    expect(await files.read("/workspace/downloads/q3.pdf")).toMatchObject({ kind: "download", mimeType: "application/pdf", bytes: REPORT.length, url: REPORT_URL, text: false });
+    // Keeping it again is the same file.
+    expect((await run('return await browser.tab("/tabs/3/page.md").saveFile();')).summary).toContain("already kept as /workspace/downloads/q3.pdf");
 
-    const fresh = new BrowserProgram(new TabController(pdfBrowser([], {}).api, undefined, undefined, new PdfReader(extractPdfText)), { state: new WorkspaceState(), runId: "r1", sessionId: "s1", files }, () => {});
-    const read = await fresh.execute('return await fs.read("/workspace/q3.pdf");', new AbortController().signal);
+    const fresh = new BrowserProgram(new TabController(pdfBrowser([], {}).api, undefined, undefined, new TabFiles(extractPdfText)), { state: new WorkspaceState(), runId: "r1", sessionId: "s1", files }, () => {});
+    const read = await fresh.execute('return await fs.read("/workspace/downloads/q3.pdf");', new AbortController().signal);
     expect(read.ok, read.summary).toBe(true);
-    expect(read.summary).toContain("File: /workspace/q3.pdf (PDF, read-only)\nBEGIN_UNTRUSTED_PAGE\nPDF: 2 pages · Q3 Report");
+    expect(read.summary).toContain("File: /workspace/downloads/q3.pdf (PDF, read-only)\nBEGIN_UNTRUSTED_PAGE\nPDF: 2 pages · Q3 Report");
     expect(fresh.tainted).toBe(true);
-    const paged = await fresh.execute('return await fs.read("/workspace/q3.pdf", {offset: 58, maxChars: 500});', new AbortController().signal);
+    const paged = await fresh.execute('return await fs.read("/workspace/downloads/q3.pdf", {offset: 58, maxChars: 500});', new AbortController().signal);
     expect(paged.summary).toContain("BEGIN_UNTRUSTED_PAGE\nRevenue grew 12%");
     expect(paged.summary).toContain("end of file");
     expect(program.tainted).toBe(true);
   });
 
-  it("refuses savePdf on a web page and on a path that is not a .pdf", async () => {
+  it("refuses saveFile on a web page", async () => {
     const { run } = programSetup();
-    expect((await run('return await browser.tab("/tabs/1/page.md").savePdf("/workspace/x.pdf");')).summary).toContain("This tab does not show a PDF.");
-    expect((await run('return await browser.tab("/tabs/3/page.md").savePdf("/workspace/x.txt");')).summary).toContain("savePdf() expects a /workspace path ending in .pdf.");
+    expect((await run('return await browser.tab("/tabs/1/page.md").saveFile();')).summary).toContain("This tab shows a web page, not a file.");
   });
 
   it("reports an unreadable /workspace PDF safely", async () => {

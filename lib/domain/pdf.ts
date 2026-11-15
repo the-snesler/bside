@@ -29,15 +29,6 @@ export interface PdfText {
   cut: boolean;
 }
 
-/** Whether a URL's path names a PDF (`/a/report.pdf`); others are recognized by their bytes. */
-export function looksLikePdfUrl(url: string): boolean {
-  try {
-    return /\.pdf$/i.test(new URL(url).pathname);
-  } catch {
-    return false;
-  }
-}
-
 /** Whether bytes are a PDF: the `%PDF-` header within the first 1024 bytes, as readers accept it. */
 export function isPdfHeader(bytes: Uint8Array): boolean {
   const end = Math.min(bytes.length, 1024) - 5;
@@ -69,16 +60,6 @@ export interface PdfWorkerRequest {
   data: ArrayBuffer;
 }
 export type PdfWorkerResponse = { ok: true; pdf: PdfText } | { ok: false; message: string };
-
-/**
- * What a content script reports after fetching a PDF for a tab showing it in
- * Firefox's viewer (`page.fetch-pdf`): the bytes as base64, or why not.
- */
-export type PdfFetchResult =
-  | { kind: "pdf"; base64: string; bytes: number }
-  | { kind: "not-pdf" }
-  | { kind: "too-large" }
-  | { kind: "failed"; status: number | null };
 
 /** A PDF failure whose message is safe to show the model. */
 export class PdfError extends Error {}

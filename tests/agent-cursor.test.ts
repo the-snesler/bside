@@ -152,7 +152,7 @@ describe("TabController: the cursor in a tab the user can see", () => {
         goBack: vi.fn(async () => {}),
         sendMessage: vi.fn(async (_tabId: number, message: unknown) => {
           const request = message as { id: string; type: string };
-          if (request.type === "page.health") return { v: 1, id: request.id, ok: true, type: "page.health", url: "https://example.com/" } satisfies PageResponse;
+          if (request.type === "page.health") return { v: 1, id: request.id, ok: true, type: "page.health", url: "https://example.com/", contentType: "text/html" } satisfies PageResponse;
           if (request.type === "page.execute-cancel") {
             cancels.push(request);
             release?.();

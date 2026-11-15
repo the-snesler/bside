@@ -1,19 +1,15 @@
 /**
- * Reads PDFs for the background: tabs showing one in Firefox's viewer (bytes
- * fetched by `TabController`) and `/workspace/*.pdf` files. Text extraction
- * runs in a fresh `pdf-text` worker per PDF (`workerPdfExtractor`), so the
- * bundled pdf.js never loads into the background page. Texts are cached by
- * key, a few at a time, so reading a long PDF page by page parses it once.
+ * Extracts a PDF's text for the background (`TabFiles` caches the results):
+ * a fresh `pdf-text` worker per PDF (`workerPdfExtractor`), so the bundled
+ * pdf.js never loads into the background page.
  */
 
 import { PDF_LIMITS, PDF_TIMEOUT_MS, PdfError, type PdfText, type PdfWorkerRequest, type PdfWorkerResponse } from "@/lib/domain/pdf";
 
 export type PdfExtractor = (data: Uint8Array) => Promise<PdfText>;
 
-/** PDFs whose text stays cached. */
-const CACHED_PDFS = 8;
-
-const unavailable: PdfExtractor = async () => {
+/** Where no worker can run (tests that read no PDF): every PDF fails to read. */
+export const unavailablePdfExtractor: PdfExtractor = async () => {
   throw new PdfError("PDF reading is unavailable here.");
 };
 
@@ -41,55 +37,6 @@ export function workerPdfExtractor(createWorker: () => Worker): PdfExtractor {
     const buffer = data.slice().buffer;
     worker.postMessage({ data: buffer } satisfies PdfWorkerRequest, [buffer]);
   });
-}
-
-export class PdfReader {
-  readonly #extract: PdfExtractor;
-  /** Text (or null: not a PDF) by key, oldest first; pending reads are shared. */
-  #texts = new Map<string, Promise<PdfText | null>>();
-
-  constructor(extract: PdfExtractor = unavailable) {
-    this.#extract = extract;
-  }
-
-  /** A tab's document changed, even if its URL stayed the same. */
-  forgetTab(tabId: number): void {
-    for (const key of this.#texts.keys()) {
-      if (key.startsWith(`tab ${tabId} `)) this.#texts.delete(key);
-    }
-  }
-
-  /**
-   * The text of the PDF `load` yields, cached under `key`. `load` returns
-   * null for something that is not a PDF, remembered like a text. A failure
-   * (thrown as `PdfError`, safe to show) is not cached.
-   */
-  read(key: string, load: () => Promise<Uint8Array | null>): Promise<PdfText | null> {
-    const cached = this.#texts.get(key);
-    if (cached) {
-      this.#texts.delete(key);
-      this.#texts.set(key, cached);
-      return cached;
-    }
-    const pending = (async () => {
-      const data = await load();
-      if (data === null) return null;
-      if (data.byteLength > PDF_LIMITS.bytes) throw new PdfError(`The PDF is larger than ${PDF_LIMITS.bytes.toLocaleString("en-US")} bytes.`);
-      return this.#extract(data);
-    })();
-    this.#texts.set(key, pending);
-    pending.catch(() => {
-      if (this.#texts.get(key) === pending) this.#texts.delete(key);
-    });
-    while (this.#texts.size > CACHED_PDFS) this.#texts.delete(this.#texts.keys().next().value!);
-    return pending;
-  }
-
-  /** The cached text under `key`, if it has been read and is a PDF. */
-  async cached(key: string): Promise<PdfText | null> {
-    const pending = this.#texts.get(key);
-    return pending ? pending.catch(() => null) : null;
-  }
 }
 
 function isPdfText(value: unknown): value is PdfText {

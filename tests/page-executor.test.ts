@@ -395,6 +395,18 @@ describe("actions and outcome feedback", () => {
     expect(link.summary).toContain('page.navigate("https://example.com/x")');
     expect(await act(registry, { kind: "fill", target: role("textbox", "Pass"), text: "x" })).toMatchObject({ ok: false, code: "NOT_INTERACTABLE" });
   });
+
+  it("hands a download link to the content script to fetch instead of clicking it", async () => {
+    setBody('<a href="https://example.com/files/report.csv" download="Q3 report.csv">Export</a><a href="/notes.txt" download>Notes</a>');
+    let clicks = 0;
+    document.querySelectorAll("a").forEach((link) => link.addEventListener("click", (event) => { event.preventDefault(); clicks++; }));
+    const registry = createElementRefRegistry("doc");
+    const exported = await act(registry, { kind: "click", target: role("link", "Export") });
+    expect(exported).toMatchObject({ ok: true, download: { url: "https://example.com/files/report.csv", name: "Q3 report.csv" } });
+    expect(exported.summary).toContain("is a download link; bside fetched its file instead of clicking it");
+    expect((await act(registry, { kind: "click", target: role("link", "Notes") })).download).toEqual({ url: new URL("/notes.txt", location.href).href, name: null });
+    expect(clicks).toBe(0);
+  });
 });
 
 describe("change descriptions", () => {

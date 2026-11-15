@@ -4,7 +4,7 @@ import {
   type ScratchFileEntry, type ScratchStore, type UploadInput,
 } from "@/lib/background/browser-program";
 import { ImageScaleError, scaleImageInPage, type ImageScaler } from "@/lib/background/image-scale";
-import { PdfReader } from "@/lib/background/pdf";
+import { TabFiles } from "@/lib/background/tab-files";
 import { TabController, type TabControllerBrowserApi, type TabSnapshot } from "@/lib/background/tab-controller";
 import { bytesToBase64 } from "@/lib/domain/pdf";
 import type { DomAction, ElementTarget } from "@/lib/domain/tools";
@@ -69,7 +69,7 @@ function fakeTab() {
 function setup(options: { files?: ScratchFiles; scaleImage?: ImageScaler; maxImages?: number } = {}) {
   const { api, executed } = fakeTab();
   const files = options.files ?? new ScratchFiles();
-  const program = new BrowserProgram(new TabController(api, async () => false, undefined, new PdfReader(extractPdfText)),
+  const program = new BrowserProgram(new TabController(api, async () => false, undefined, new TabFiles(extractPdfText)),
     { state: new WorkspaceState(), runId: "r1", sessionId: "s1", files, maxImages: options.maxImages ?? 3, scaleImage: options.scaleImage }, () => {});
   const run = (source: string) => program.execute(source, new AbortController().signal);
   return { run, program, files, executed };

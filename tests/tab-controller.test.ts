@@ -16,7 +16,7 @@ function snapshotResponse(id: string, url: string, title: string): PageResponse 
 }
 
 function healthResponse(id: string, url: string): PageResponse {
-  return { v: 1, id, ok: true, type: "page.health", url };
+  return { v: 1, id, ok: true, type: "page.health", url, contentType: "text/html" };
 }
 
 /**

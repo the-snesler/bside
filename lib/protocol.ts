@@ -32,7 +32,7 @@ import { MAX_HELP_NOTE_CHARS, TABLE_LIMITS } from "@/lib/domain/tools";
 import { isPermissionMode, type PermissionMode } from "@/lib/domain/permissions";
 import { REASONING_EFFORTS, type AppSettingsV1, type ChatGPTStatus, type ProviderDefinition } from "@/lib/domain/provider";
 import type { RunUsageV1 } from "@/lib/domain/usage";
-import type { PdfFetchResult } from "@/lib/domain/pdf";
+import type { FileFetchResult } from "@/lib/domain/files";
 import { isCursorPresentation, type CursorPoint, type CursorPresentation } from "@/lib/domain/cursor";
 import { isSkill, isSkillName, type Skill, type SkillSummary } from "@/lib/domain/skills";
 import { isCustomInstructionsText, isSiteNote, isSiteOrigin, type SiteNote } from "@/lib/domain/instructions";
@@ -50,7 +50,7 @@ import { isTaskDraft, isTaskId, type TaskDraft, type ScheduledTask, type Schedul
 // it is for (`frameId`, Firefox's id: 0 is the top frame) and is sent with
 // `tabs.sendMessage(tabId, request, { frameId })`; a content script answers
 // only requests naming its own frame. Snapshot, find, search results, the
-// shield, capture-done, execute-cancel, and fetch-pdf are top-frame requests (`frameId` 0); health,
+// shield, capture-done, execute-cancel, and fetch-file are top-frame requests (`frameId` 0); health,
 // outline, execute, table, capture-prepare, and menu-target may go to any frame. A frame other
 // than the top renders its refs with the prefix the background names it by
 // (`refPrefix`, e.g. `f3:`); the top frame's prefix is empty.
@@ -196,18 +196,21 @@ export interface PageCaptureDoneRequest {
 }
 
 /**
- * Fetches a PDF for another tab, one showing it in Firefox's viewer, where no
- * content script runs (the background cannot fetch it: `connect-src`). With
- * `credentials: "include"` only from a page on the PDF's own origin.
+ * Fetches a file for the background, which cannot fetch the web itself
+ * (`connect-src`): the file another tab shows (Firefox's JSON or PDF viewer,
+ * or a file loaded before bside watched the tab), or a URL for
+ * `browser.download`. With `credentials: "include"` only from a page on the
+ * file's own origin; `force-cache` for a file a tab just loaded.
  */
-export interface PageFetchPdfRequest {
+export interface PageFetchFileRequest {
   v: 1;
   id: string;
-  type: "page.fetch-pdf";
+  type: "page.fetch-file";
   frameId: number;
   tabId: number;
   url: string;
   credentials: "include" | "omit";
+  cache: "force-cache" | "default";
 }
 
 /**
@@ -225,7 +228,7 @@ export interface PageMenuTargetRequest {
 }
 
 export type PageRequest = PageHealthRequest | PageSnapshotRequest | PageFindRequest | PageOutlineRequest | PageSearchResultsRequest | PageExecuteRequest |
-  PageExecuteCancelRequest | PageTableRequest | PageShieldRequest | PageCapturePrepareRequest | PageCaptureDoneRequest | PageFetchPdfRequest | PageMenuTargetRequest;
+  PageExecuteCancelRequest | PageTableRequest | PageShieldRequest | PageCapturePrepareRequest | PageCaptureDoneRequest | PageFetchFileRequest | PageMenuTargetRequest;
 
 export interface PageHealthResponse {
   v: 1;
@@ -233,6 +236,8 @@ export interface PageHealthResponse {
   ok: true;
   type: "page.health";
   url: string;
+  /** The document's `contentType`: anything but HTML or XHTML is a file, read by the background rather than as an outline. */
+  contentType: string;
 }
 
 export interface PageSnapshotResponse {
@@ -278,6 +283,8 @@ export interface PageExecuteResponse {
   type: "page.execute";
   result: ToolResult;
   documentId: string;
+  /** A click on a download link (`<a download>`): the frame fetched the file instead of clicking, and the page is untouched. */
+  download?: { result: FileFetchResult; pageUrl: string };
   /** Where the cursor ended, in the top viewport; null when none was shown. */
   cursor: CursorPoint | null;
 }
@@ -321,12 +328,12 @@ export interface PageCaptureDoneResponse {
   type: "page.capture-done";
 }
 
-export interface PageFetchPdfResponse {
+export interface PageFetchFileResponse {
   v: 1;
   id: string;
   ok: true;
-  type: "page.fetch-pdf";
-  result: PdfFetchResult;
+  type: "page.fetch-file";
+  result: FileFetchResult;
 }
 
 /** `alt`: untrusted page text, bounded by the background (`withAlt`); `null` when the element is gone or has none. */
@@ -357,7 +364,7 @@ export type PageResponse =
   | PageShieldResponse
   | PageCapturePrepareResponse
   | PageCaptureDoneResponse
-  | PageFetchPdfResponse
+  | PageFetchFileResponse
   | PageMenuTargetResponse
   | PageErrorResponse;
 
@@ -440,11 +447,11 @@ export function isPageCaptureDoneRequest(value: unknown): value is PageCaptureDo
   return candidate.frameId === 0 && isTabId(candidate.tabId);
 }
 
-export function isPageFetchPdfRequest(value: unknown): value is PageFetchPdfRequest {
-  if (!isEnvelope(value) || value.type !== "page.fetch-pdf") return false;
+export function isPageFetchFileRequest(value: unknown): value is PageFetchFileRequest {
+  if (!isEnvelope(value) || value.type !== "page.fetch-file") return false;
   const candidate = value as Record<string, unknown>;
   return candidate.frameId === 0 && isTabId(candidate.tabId) && validateHttpUrl(candidate.url) !== null &&
-    (candidate.credentials === "include" || candidate.credentials === "omit");
+    (candidate.credentials === "include" || candidate.credentials === "omit") && (candidate.cache === "force-cache" || candidate.cache === "default");
 }
 
 export function isPageMenuTargetRequest(value: unknown): value is PageMenuTargetRequest {

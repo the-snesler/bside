@@ -4,7 +4,7 @@ import {
   isPageCapturePrepareRequest,
   isPageExecuteCancelRequest,
   isPageExecuteRequest,
-  isPageFetchPdfRequest,
+  isPageFetchFileRequest,
   isPageFindRequest,
   isPageHealthRequest,
   isPageOutlineRequest,
@@ -32,7 +32,11 @@ import {
 import { createPageCursor } from "@/lib/tools/page-cursor";
 import { createPageShield } from "@/lib/tools/page-shield";
 import { readSearchPage } from "@/lib/tools/search-results";
-import { fetchPdf } from "@/lib/pdf/fetch";
+import { fetchFile } from "@/lib/files/fetch";
+import { isPageContentType } from "@/lib/domain/files";
+
+/** What a content script answers in a document that is a file, not a web page: the background reads the file itself. */
+const FILE_DOCUMENT = "This tab shows a file, not a web page: bside reads the file itself, and it has no refs or actions.";
 
 /** The shield shows again on its own if the background never ends a capture. */
 const CAPTURE_SHIELD_TIMEOUT_MS = 5_000;
@@ -96,7 +100,7 @@ export default defineContentScript({
       const present = cursor && message.present && document.visibilityState === "visible" ? message.present : null;
       if (present) glides.set(message.id, stop);
       try {
-        const result = await executeDomAction(document, registry, message.action, settleDom, {
+        const { download, ...result } = await executeDomAction(document, registry, message.action, settleDom, {
           refPrefix: message.refPrefix,
           frameIdOf,
           ...(present ? {
@@ -108,7 +112,13 @@ export default defineContentScript({
             },
           } : {}),
         });
-        return { v: 1, id: message.id, ok: true, type: "page.execute", result, documentId: registry.documentId, cursor: landed };
+        if (!download) return { v: 1, id: message.id, ok: true, type: "page.execute", result, documentId: registry.documentId, cursor: landed };
+        // Only this frame can read the page's own blob: URLs; its cookies go only to its own origin, as the page's would.
+        let sameOrigin = false;
+        try { sameOrigin = new URL(download.url).origin === location.origin; } catch { /* An unparsable href fails the fetch below. */ }
+        const fetched = await fetchFile(download.url, { credentials: sameOrigin ? "include" : "omit", cache: "default" });
+        const named = fetched.kind === "file" && download.name ? { ...fetched, name: download.name } : fetched;
+        return { v: 1, id: message.id, ok: true, type: "page.execute", result, documentId: registry.documentId, cursor: landed, download: { result: named, pageUrl: location.href } };
       } finally {
         glides.delete(message.id);
       }
@@ -125,7 +135,13 @@ export default defineContentScript({
       // Top-frame-only requests are validated to name frame 0, so a subframe never answers them.
       if ((message as { frameId?: unknown } | null)?.frameId !== ownFrameId) return undefined;
       if (isPageHealthRequest(message)) {
-        return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.health", url: location.href });
+        return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.health", url: location.href, contentType: document.contentType });
+      }
+      // A file Firefox shows (plain text, XML, an image, or one bside's file guard turned into a document) is read by the
+      // background from its bytes, never as an outline of the viewer's markup.
+      if (!isPageContentType(document.contentType) &&
+        (isPageSnapshotRequest(message) || isPageFindRequest(message) || isPageOutlineRequest(message) || isPageExecuteRequest(message) || isPageTableRequest(message))) {
+        return Promise.resolve({ v: 1, id: message.id, ok: false, error: { code: "UNSUPPORTED_PAGE", message: FILE_DOCUMENT, retryable: false, phase: "page" } });
       }
       if (isPageMenuTargetRequest(message)) {
         const menus = Reflect.get(browser, "menus") as { getTargetElement(id: number): Element | undefined };
@@ -182,8 +198,8 @@ export default defineContentScript({
         endCapture();
         return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.capture-done" });
       }
-      if (isPageFetchPdfRequest(message)) {
-        return fetchPdf(message.url, message.credentials).then((result) => ({ v: 1, id: message.id, ok: true, type: "page.fetch-pdf", result }));
+      if (isPageFetchFileRequest(message)) {
+        return fetchFile(message.url, { credentials: message.credentials, cache: message.cache }).then((result) => ({ v: 1, id: message.id, ok: true, type: "page.fetch-file", result }));
       }
       if (isPageShieldRequest(message) && shield) {
         shield.set(message.shield);

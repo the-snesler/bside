@@ -28,7 +28,7 @@ import { addRunUsage, EMPTY_USAGE, hasTokens, isValidRunUsage, isValidUsageTotal
 import { DEFAULT_MODEL_ID, DEFAULT_REASONING_EFFORT } from "@/lib/providers/openai-models";
 import { deviceKey, type DeviceKey } from "@/lib/background/device-key";
 import {
-  base64Bytes, binaryTypeFor, isBinaryFile, isFileName, isMimeType, isSessionId, isUploadPath, isWorkspacePath, validatePromptText, WORKSPACE_MAX_BINARY_TOTAL_BYTES,
+  base64Bytes, binaryTypeFor, isBinaryFile, isDownloadPath, isFileName, isMimeType, isSessionId, isUploadPath, isWorkspacePath, validateHttpUrl, validatePromptText, WORKSPACE_MAX_BINARY_TOTAL_BYTES,
   WORKSPACE_MAX_FILE_CHARS, WORKSPACE_MAX_FILES, WORKSPACE_MAX_UPLOAD_BYTES,
 } from "@/lib/validation";
 import type { ScratchFileEntry, ScratchStore } from "@/lib/background/browser-program";
@@ -927,7 +927,7 @@ export async function migrateConversation(): Promise<void> {
 // A session has WORKSPACE_MAX_FILES fixed slots, so writing, removing, or
 // renaming a file touches one key (at most WORKSPACE_MAX_FILE_CHARS of text,
 // WORKSPACE_MAX_BINARY_BYTES of a program's binary, or WORKSPACE_MAX_UPLOAD_BYTES
-// of a file the user attached), never the whole workspace, and deleting a
+// of a file the user attached or bside kept from the web), never the whole workspace, and deleting a
 // session removes a known key set without listing storage. The slot record
 // carries its path; there is no separate manifest that could disagree with the
 // files.
@@ -935,14 +935,17 @@ export async function migrateConversation(): Promise<void> {
 
 /**
  * One `/workspace` file: text, a binary of an allowed type as base64 whose
- * type its path's extension names, or (only under `/workspace/uploads/`) a
- * file the user attached, of any type, with its original name, the type its
- * record names, and whether its bytes are UTF-8 text.
+ * type its path's extension names, (only under `/workspace/uploads/`) a file
+ * the user attached, or (only under `/workspace/downloads/`) a file bside
+ * kept from the web; the last two of any type, with their original name, the
+ * type the record names, and whether the bytes are UTF-8 text, and a
+ * download with the HTTP(S) URL it came from.
  */
 export type WorkspaceFileV2 = { version: 2; path: string } & (
   | { kind: "text"; content: string }
   | { kind: "binary"; mimeType: string; data: string; bytes: number }
   | { kind: "upload"; name: string; mimeType: string; data: string; bytes: number; text: boolean }
+  | { kind: "download"; name: string; mimeType: string; data: string; bytes: number; text: boolean; url: string }
 );
 
 const workspaceKey = (id: string, slot: number) => `local:workspace:${id}:${slot}` as const;
@@ -951,18 +954,20 @@ const workspaceKeys = (id: string) => Array.from({ length: WORKSPACE_MAX_FILES }
 /**
  * The file a slot record holds, revalidated; null when it is malformed. A
  * pre-binary (version 1) record is a text file. Uploads live only under
- * `/workspace/uploads/`, and nothing else does.
+ * `/workspace/uploads/` and downloads only under `/workspace/downloads/`, and
+ * nothing else does.
  */
 function readWorkspaceFile(value: unknown): WorkspaceFileV2 | null {
   if (typeof value !== "object" || value === null) return null;
   const v = value as Record<string, unknown>;
   if (!isWorkspacePath(v.path)) return null;
   const upload = isUploadPath(v.path);
+  const download = isDownloadPath(v.path);
   const textType = binaryTypeFor(v.path) === null;
-  if (v.version === 1 && !upload && textType && typeof v.content === "string" && v.content.length <= WORKSPACE_MAX_FILE_CHARS) {
+  if (v.version === 1 && !upload && !download && textType && typeof v.content === "string" && v.content.length <= WORKSPACE_MAX_FILE_CHARS) {
     return { version: 2, path: v.path, kind: "text", content: v.content };
   }
-  if (v.version !== 2 || upload !== (v.kind === "upload")) return null;
+  if (v.version !== 2 || upload !== (v.kind === "upload") || download !== (v.kind === "download")) return null;
   if (v.kind === "text") return textType && typeof v.content === "string" && v.content.length <= WORKSPACE_MAX_FILE_CHARS ? { version: 2, path: v.path, kind: "text", content: v.content } : null;
   if (v.kind === "binary" && isBinaryFile(v.path, v.mimeType, v.data) && base64Bytes(v.data) === v.bytes) {
     return { version: 2, path: v.path, kind: "binary", mimeType: v.mimeType as string, data: v.data as string, bytes: v.bytes as number };
@@ -970,6 +975,10 @@ function readWorkspaceFile(value: unknown): WorkspaceFileV2 | null {
   if (v.kind === "upload" && isFileName(v.name) && isMimeType(v.mimeType) && typeof v.text === "boolean" &&
     typeof v.bytes === "number" && v.bytes >= 1 && v.bytes <= WORKSPACE_MAX_UPLOAD_BYTES && base64Bytes(v.data) === v.bytes) {
     return { version: 2, path: v.path, kind: "upload", name: v.name, mimeType: v.mimeType, data: v.data as string, bytes: v.bytes, text: v.text };
+  }
+  if (v.kind === "download" && isFileName(v.name) && isMimeType(v.mimeType) && typeof v.text === "boolean" && validateHttpUrl(v.url) !== null &&
+    typeof v.bytes === "number" && v.bytes >= 1 && v.bytes <= WORKSPACE_MAX_UPLOAD_BYTES && base64Bytes(v.data) === v.bytes) {
+    return { version: 2, path: v.path, kind: "download", name: v.name, mimeType: v.mimeType, data: v.data as string, bytes: v.bytes, text: v.text, url: v.url as string };
   }
   return null;
 }
