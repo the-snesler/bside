@@ -6,6 +6,7 @@ import {
   isContentMessageResponse,
   isCredentialRequest,
   isHistoryRequest,
+  isPageExecuteCancelRequest,
   isPageExecuteRequest,
   isPageFindRequest,
   isPageHealthRequest,
@@ -373,9 +374,9 @@ describe("frame-scoped requests", () => {
       expect(isPageOutlineRequest({ ...outline, refPrefix }), String(refPrefix)).toBe(false);
     }
     const click = { kind: "click", target: { kind: "ref", ref: "e1", documentId: "doc" } };
-    expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", frameId: 9, tabId: 1, refPrefix: "f2:", action: click })).toBe(true);
-    expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", frameId: 9, tabId: 1, action: click })).toBe(false);
-    expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", frameId: 0, tabId: 1, refPrefix: "f2:", action: click })).toBe(false);
+    expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", frameId: 9, tabId: 1, refPrefix: "f2:", action: click, present: null })).toBe(true);
+    expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", frameId: 9, tabId: 1, action: click, present: null })).toBe(false);
+    expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", frameId: 0, tabId: 1, refPrefix: "f2:", action: click, present: null })).toBe(false);
     const prepare = { v: 1, id: "1", type: "page.capture-prepare", frameId: 9, tabId: 1, refPrefix: "f2:", target: null, childFrameId: null };
     expect(isPageCapturePrepareRequest(prepare)).toBe(true);
     expect(isPageCapturePrepareRequest({ ...prepare, refPrefix: "" })).toBe(false);
@@ -393,7 +394,7 @@ describe("frame-scoped requests", () => {
 
 describe("isPageExecuteRequest: accepts the closed action union only", () => {
   const ref = { kind: "ref", ref: "e1", documentId: "doc-1" };
-  const execute = (action: unknown) => ({ v: 1, id: "1", type: "page.execute", frameId: 0, tabId: 1, refPrefix: "", action });
+  const execute = (action: unknown) => ({ v: 1, id: "1", type: "page.execute", frameId: 0, tabId: 1, refPrefix: "", action, present: null });
 
   it("accepts every action kind with ref and role targets", () => {
     for (const action of [
@@ -464,7 +465,27 @@ describe("isPageExecuteRequest: accepts the closed action union only", () => {
       { kind: "fill", target: ref, text: "x".repeat(16_001) },
     ]) expect(validateDomAction(action), JSON.stringify(action)).toBeNull();
     expect(isPageExecuteRequest(execute({ kind: "click" }))).toBe(false);
-    expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", frameId: 0, refPrefix: "", action: { kind: "click", target: ref } })).toBe(false);
+    expect(isPageExecuteRequest({ v: 1, id: "1", type: "page.execute", frameId: 0, refPrefix: "", action: { kind: "click", target: ref }, present: null })).toBe(false);
+  });
+
+  it("takes a bounded cursor presentation in the top frame only", () => {
+    const click = execute({ kind: "click", target: ref });
+    expect(isPageExecuteRequest({ ...click, present: { ms: 650, from: null } })).toBe(true);
+    expect(isPageExecuteRequest({ ...click, present: { ms: 120, from: { x: 10.5, y: -4 } } })).toBe(true);
+    expect(isPageExecuteRequest({ ...click, present: undefined })).toBe(false);
+    for (const present of [{ ms: 651, from: null }, { ms: -1, from: null }, { ms: 1.5, from: null }, { ms: 200 }, { ms: 200, from: { x: Infinity, y: 0 } }, { ms: 200, from: { x: "1", y: 0 } }]) {
+      expect(isPageExecuteRequest({ ...click, present }), JSON.stringify(present)).toBe(false);
+    }
+    expect(isPageExecuteRequest({ ...click, frameId: 9, refPrefix: "f2:", present: { ms: 200, from: null } })).toBe(false);
+  });
+
+  it("cancels a glide by its execute request id, in the top frame only", () => {
+    const cancel = { v: 1, id: "2", type: "page.execute-cancel", frameId: 0, tabId: 1, executeId: "1" };
+    expect(isPageExecuteCancelRequest(cancel)).toBe(true);
+    expect(isPageExecuteCancelRequest({ ...cancel, frameId: 9 })).toBe(false);
+    expect(isPageExecuteCancelRequest({ ...cancel, executeId: "" })).toBe(false);
+    expect(isPageExecuteCancelRequest({ ...cancel, executeId: "x".repeat(101) })).toBe(false);
+    expect(isPageExecuteCancelRequest({ ...cancel, tabId: undefined })).toBe(false);
   });
 });
 

@@ -39,6 +39,7 @@ import type { AgentTab } from "@/lib/background/browser-program";
 import type { ChatView, SidebarHub, SidebarView } from "@/lib/background/sidebar-hub";
 import { TabBindings } from "@/lib/background/tab-chats";
 import { FrameAliases, TabController, VisibilityLock } from "@/lib/background/tab-controller";
+import { CursorPacer } from "@/lib/domain/cursor";
 import { workerPdfExtractor } from "@/lib/background/pdf";
 import { TabFiles } from "@/lib/background/tab-files";
 import { FileGuard, type FileGuardWebRequest } from "@/lib/background/file-guard";
@@ -461,13 +462,15 @@ export class BackgroundRuntime {
     const frameAliases = new FrameAliases();
     const tabFiles = new TabFiles(workerPdfExtractor(() => new Worker(browser.runtime.getURL("/pdf-text.js"))));
     const visibility = new VisibilityLock();
+    // One cursor pace per tab across runs, so a new run in a tab the user is watching does not start slow again.
+    const cursor = new CursorPacer();
     if (options.fileGuard !== undefined) this.#fileGuard = options.fileGuard;
     else if (!options.tabControllerFactory) {
       const webRequest = (browser as unknown as { webRequest?: Partial<FileGuardWebRequest> }).webRequest;
       this.#fileGuard = typeof webRequest?.filterResponseData === "function" ? new FileGuard(webRequest as FileGuardWebRequest, tabFiles) : null;
     }
     const fileGuard = this.#fileGuard;
-    this.#tabControllerFactory = options.tabControllerFactory ?? (() => new TabController(browser as unknown as TabControllerBrowserApi, undefined, frameAliases, tabFiles, visibility, fileGuard));
+    this.#tabControllerFactory = options.tabControllerFactory ?? (() => new TabController(browser as unknown as TabControllerBrowserApi, undefined, frameAliases, tabFiles, visibility, fileGuard, cursor));
     this.#sites = options.sites ?? browserSiteEnv();
     this.#approvalBadge = options.approvalBadge ?? null;
     this.#mcp = options.mcp ?? null;

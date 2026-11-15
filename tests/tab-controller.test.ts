@@ -206,7 +206,7 @@ describe("TabController: action results pass through", () => {
     api.tabs.sendMessage = vi.fn(async (tabId: number, message: unknown, options: { frameId: number }) => {
       const request = message as { id: string; type: string };
       if (request.type === "page.execute") {
-        return { v: 1, id: request.id, ok: true, type: "page.execute", result: { ok: false, code: "STALE_SNAPSHOT", summary: "Ref came from an earlier page load." }, documentId: "doc-new" } satisfies PageResponse;
+        return { v: 1, id: request.id, ok: true, type: "page.execute", result: { ok: false, code: "STALE_SNAPSHOT", summary: "Ref came from an earlier page load." }, documentId: "doc-new", cursor: null } satisfies PageResponse;
       }
       return baseSendMessage(tabId, message, options);
     });

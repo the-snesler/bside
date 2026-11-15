@@ -2,6 +2,7 @@ import {
   isContentMessageResponse,
   isPageCaptureDoneRequest,
   isPageCapturePrepareRequest,
+  isPageExecuteCancelRequest,
   isPageExecuteRequest,
   isPageFetchFileRequest,
   isPageFindRequest,
@@ -13,7 +14,8 @@ import {
   isPageTableRequest,
   isPageMenuTargetRequest,
 } from "@/lib/protocol";
-import type { ContentMessage, PageResponse } from "@/lib/protocol";
+import type { ContentMessage, PageExecuteRequest, PageResponse } from "@/lib/protocol";
+import type { CursorPoint } from "@/lib/domain/cursor";
 import {
   buildOutline,
   createElementRefRegistry,
@@ -27,6 +29,7 @@ import {
   describeMenuTarget,
   settleDom,
 } from "@/lib/tools/page-executor";
+import { createPageCursor } from "@/lib/tools/page-cursor";
 import { createPageShield } from "@/lib/tools/page-shield";
 import { readSearchPage } from "@/lib/tools/search-results";
 import { fetchFile } from "@/lib/files/fetch";
@@ -86,10 +89,46 @@ export default defineContentScript({
       tellBackground("shield.sync");
       window.addEventListener("pageshow", (event) => { if (event.persisted) tellBackground("shield.sync"); });
     }
+    // Only the top frame draws the agent's cursor, over the whole tab; the
+    // background asks for it only when the user can see the tab.
+    const cursor = top ? createPageCursor(document) : null;
+    /** Glides still on the way, by `page.execute` request id, so a cancelled run can stop its action. */
+    const glides = new Map<string, AbortController>();
+    const execute = async (message: PageExecuteRequest): Promise<PageResponse> => {
+      let landed: CursorPoint | null = null;
+      const stop = new AbortController();
+      const present = cursor && message.present && document.visibilityState === "visible" ? message.present : null;
+      if (present) glides.set(message.id, stop);
+      try {
+        const { download, ...result } = await executeDomAction(document, registry, message.action, settleDom, {
+          refPrefix: message.refPrefix,
+          frameIdOf,
+          ...(present ? {
+            present: async (gesture) => {
+              const shown = await cursor!.present(gesture, present.ms, present.from, stop.signal);
+              glides.delete(message.id);
+              landed = shown.at;
+              return !shown.stopped;
+            },
+          } : {}),
+        });
+        if (!download) return { v: 1, id: message.id, ok: true, type: "page.execute", result, documentId: registry.documentId, cursor: landed };
+        // Only this frame can read the page's own blob: URLs; its cookies go only to its own origin, as the page's would.
+        let sameOrigin = false;
+        try { sameOrigin = new URL(download.url).origin === location.origin; } catch { /* An unparsable href fails the fetch below. */ }
+        const fetched = await fetchFile(download.url, { credentials: sameOrigin ? "include" : "omit", cache: "default" });
+        const named = fetched.kind === "file" && download.name ? { ...fetched, name: download.name } : fetched;
+        return { v: 1, id: message.id, ok: true, type: "page.execute", result, documentId: registry.documentId, cursor: landed, download: { result: named, pageUrl: location.href } };
+      } finally {
+        glides.delete(message.id);
+      }
+    };
+
     let captureTimer: ReturnType<typeof setTimeout> | undefined;
     const endCapture = () => {
       clearTimeout(captureTimer);
       shield?.hideForCapture(false);
+      cursor?.hideForCapture(false);
     };
 
     browser.runtime.onMessage.addListener((message: unknown): Promise<PageResponse> | undefined => {
@@ -127,16 +166,11 @@ export default defineContentScript({
       if (isPageSearchResultsRequest(message)) {
         return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.search-results", page: readSearchPage(document, location.href) });
       }
-      if (isPageExecuteRequest(message)) {
-        return executeDomAction(document, registry, message.action, settleDom, { refPrefix: message.refPrefix, frameIdOf }).then(async ({ download, ...result }) => {
-          if (!download) return { v: 1, id: message.id, ok: true, type: "page.execute", result, documentId: registry.documentId };
-          // Only this frame can read the page's own blob: URLs; its cookies go only to its own origin, as the page's would.
-          let sameOrigin = false;
-          try { sameOrigin = new URL(download.url).origin === location.origin; } catch { /* An unparsable href fails the fetch below. */ }
-          const fetched = await fetchFile(download.url, { credentials: sameOrigin ? "include" : "omit", cache: "default" });
-          const named = fetched.kind === "file" && download.name ? { ...fetched, name: download.name } : fetched;
-          return { v: 1, id: message.id, ok: true, type: "page.execute", result, documentId: registry.documentId, download: { result: named, pageUrl: location.href } };
-        });
+      if (isPageExecuteRequest(message)) return execute(message);
+      if (isPageExecuteCancelRequest(message)) {
+        const glide = glides.get(message.executeId);
+        glide?.abort();
+        return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.execute-cancel", cancelled: glide !== undefined });
       }
       if (isPageTableRequest(message)) {
         const read = extractTable(document, registry, message.target, { offset: message.offset, limit: message.limit }, { refPrefix: message.refPrefix, frameIdOf });
@@ -156,6 +190,7 @@ export default defineContentScript({
         }
         clearTimeout(captureTimer);
         shield?.hideForCapture(true);
+        cursor?.hideForCapture(true);
         captureTimer = setTimeout(endCapture, CAPTURE_SHIELD_TIMEOUT_MS);
         return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.capture-prepare", geometry: measured.geometry });
       }

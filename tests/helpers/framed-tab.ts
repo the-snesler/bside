@@ -72,7 +72,7 @@ export function createFramedTab(specs: FakeFrameSpec[], tabUrl = specs[0]!.url) 
         return { ...base, type: "page.outline", outline: { ...extractFrameOutline(document, registry, request.maxChars, { refPrefix: request.refPrefix, frameIdOf }), url: spec.url, title: spec.title ?? "" } };
       case "page.execute": {
         const result = await executeDomAction(document, registry, request.action, instant, { refPrefix: request.refPrefix, frameIdOf });
-        return { ...base, type: "page.execute", result, documentId: registry.documentId };
+        return { ...base, type: "page.execute", result, documentId: registry.documentId, cursor: null };
       }
       case "page.table": {
         const read = extractTable(document, registry, request.target, request, { refPrefix: request.refPrefix, frameIdOf });
