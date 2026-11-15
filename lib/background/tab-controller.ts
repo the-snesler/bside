@@ -1048,7 +1048,8 @@ export class TabController {
   async pointer(view: ShotView, action: PointerAction, signal?: AbortSignal): Promise<PageOutcome<PointerReport>> {
     const tabId = this.#tabId;
     if (tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
-    if (await this.#isPdf()) return pageError("UNSUPPORTED_PAGE", PDF_READ_ONLY);
+    if (await this.#isFile())
+      return pageError("UNSUPPORTED_PAGE", FILE_READ_ONLY);
     const present = action.kind === "locate" ? null : await this.#paceIfVisible(tabId, true);
     if (present && signal?.aborted) return { ok: true, value: { kind: "acted", frame: 0, documentId: null, result: STOPPED_BEFORE_ACTION } };
     let frameId = TOP_FRAME;
