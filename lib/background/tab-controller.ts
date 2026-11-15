@@ -13,10 +13,14 @@
  * outline spliced in at the frame's position (see `#composedOutline`). Frames
  * get short names (`f3`, see `FrameAliases`) that prefix their refs.
  *
- * A tab showing a PDF in Firefox's viewer has no content script. Its outline
- * is the PDF's text instead (see `#pdfOf`): another tab's content script
- * fetches the bytes, and the shared `PdfReader` extracts the text. Such a
- * tab is read-only.
+ * A tab showing a file instead of a web page (a JSON, XML, text, or PDF
+ * viewer, or a download the `FileGuard` turned into a document) reads as that
+ * file (see `#fileOf`): its text, a PDF's extracted text, or a note that
+ * bside cannot read it. Its bytes come from the guard's capture of the tab's
+ * own response, else another tab's content script fetches them; the shared
+ * `TabFiles` caches them. Such a tab is read-only. While a run's action or
+ * navigation in a tab settles, the guard watches it, so a file it loads is
+ * kept instead of downloaded (`takeFiles`).
  */
 
 import type {
@@ -24,7 +28,7 @@ import type {
   PageCaptureDoneRequest,
   PageCapturePrepareRequest,
   PageExecuteRequest,
-  PageFetchPdfRequest,
+  PageFetchFileRequest,
   PageFindRequest,
   PageHealthRequest,
   PageOutlineRequest,
@@ -38,9 +42,11 @@ import type {
 import { MAX_FRAME_OUTLINE_CHARS } from "@/lib/protocol";
 import type { CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, PageArtifactSummary, PageErrorCode, PageFindResult, PageRect, PageSnapshot, PageTable, SearchPage, ToolResult } from "@/lib/domain/tools";
 import { findInOutline, lineOffsets, sliceOutline } from "@/lib/domain/outline";
-import { base64ToBytes, isPdfHeader, looksLikePdfUrl, PDF_LIMITS, PdfError, renderPdfText, type PdfFetchResult, type PdfText } from "@/lib/domain/pdf";
-import { PdfReader } from "@/lib/background/pdf";
-import { base64Bytes, formatKeyChord, isSessionId, validateHttpUrl, WORKSPACE_MAX_BINARY_BYTES } from "@/lib/validation";
+import { base64ToBytes, PdfError, renderPdfText, type PdfText } from "@/lib/domain/pdf";
+import { FILE_LIMITS, FileError, isPageContentType, looksLikeFileUrl, readableText, type FileFetchResult } from "@/lib/domain/files";
+import { tabFileKey, TabFiles, type LoadedFile, type TabFile } from "@/lib/background/tab-files";
+import type { CapturedFile, FileGuard } from "@/lib/background/file-guard";
+import { base64Bytes, formatKeyChord, isSessionId, validateHttpUrl, VIEWABLE_IMAGE_TYPES, WORKSPACE_MAX_BINARY_BYTES } from "@/lib/validation";
 
 const NAVIGATION_TIMEOUT_MS = 10_000;
 const PROBE_DELAYS_MS = [100, 200, 400, 800, 1_600, 3_200];
@@ -59,9 +65,13 @@ const CAPTURE_ATTEMPTS = [{ scale: 1, quality: 70 }, { scale: 0.7, quality: 55 }
 
 /** Firefox's frame id for a tab's top-level document. */
 const TOP_FRAME = 0;
-/** Other tabs asked in turn to fetch a PDF until one has a content script that answers. */
-const PDF_HELPER_TABS = 4;
-const PDF_READ_ONLY = "This tab shows a PDF in Firefox's viewer: bside can read it (snapshot, find) but not operate it, and it has no refs or tables.";
+/** Other tabs asked in turn to fetch a file until one has a content script that answers. */
+const FILE_HELPER_TABS = 4;
+const FILE_READ_ONLY = "This tab shows a file, not a web page: bside can read it (snapshot, find) but not operate it, and it has no refs or tables.";
+/** How long the file guard keeps watching a user's tab after an action or navigation in it settles, for a download a script starts late. */
+const FILE_WATCH_GRACE_MS = 2_000;
+/** How long an action waits for a main-frame request it started (a navigation or a download) to answer. */
+const FILE_QUIET_MS = 5_000;
 
 /**
  * Bounds on the cross-origin frames composed into one tab outline: nesting
@@ -257,8 +267,8 @@ export interface TabControllerBrowserApi {
 }
 
 export type PageOutcome<T> = { ok: true; value: T } | { ok: false; error: NormalizedError };
-/** A DOM action's result plus the document it ran in (null when the page navigated away). */
-export type ActionOutcome = { result: ToolResult; documentId: string | null };
+/** A DOM action's result plus the document it ran in (null when the page navigated away); a click on a download link carries the file its frame fetched. */
+export type ActionOutcome = { result: ToolResult; documentId: string | null; download?: { result: FileFetchResult; pageUrl: string } };
 
 /** Whether a captured image is one flat color, as a tab that was not painted comes out. */
 export type BlankImageCheck = (dataUrl: string) => Promise<boolean>;
@@ -267,23 +277,26 @@ export class TabController {
   #browserApi: TabControllerBrowserApi;
   #isBlank: BlankImageCheck;
   #frames: FrameAliases;
-  #pdfs: PdfReader;
+  #files: TabFiles;
   #visibility: VisibilityLock;
+  #guard: FileGuard | null;
   #tabId: number | null = null;
   #url: string | null = null;
   #title: string | null = null;
 
   /**
    * Pass the background's one `FrameAliases` so every controller names a
-   * tab's frames the same way, its one `PdfReader` so a PDF is parsed once,
-   * and its one `VisibilityLock` so only one screenshot at a time shows a hidden tab.
+   * tab's frames the same way, its one `TabFiles` so a file is read once, its
+   * one `VisibilityLock` so only one screenshot at a time shows a hidden tab,
+   * and its one `FileGuard` (sharing that `TabFiles`) so files tabs load are kept.
    */
-  constructor(browserApi: TabControllerBrowserApi, isBlank: BlankImageCheck = isBlankImage, frames: FrameAliases = new FrameAliases(), pdfs: PdfReader = new PdfReader(), visibility: VisibilityLock = new VisibilityLock()) {
+  constructor(browserApi: TabControllerBrowserApi, isBlank: BlankImageCheck = isBlankImage, frames: FrameAliases = new FrameAliases(), files: TabFiles = new TabFiles(), visibility: VisibilityLock = new VisibilityLock(), guard: FileGuard | null = null) {
     this.#browserApi = browserApi;
     this.#isBlank = isBlank;
     this.#frames = frames;
-    this.#pdfs = pdfs;
+    this.#files = files;
     this.#visibility = visibility;
+    this.#guard = guard;
   }
 
   get frames(): FrameAliases {
@@ -294,9 +307,18 @@ export class TabController {
     return this.#tabId;
   }
 
-  /** Called on a tab's load/URL change so a viewer reload reads fresh PDF text. */
-  forgetPdf(tabId: number): void {
-    this.#pdfs.forgetTab(tabId);
+  /** Whether a file guard keeps the files tabs load (Firefox's `webRequest`); then `browser.open` loads its URL into a tab opened blank, so the guard sees the load. */
+  get keepsFiles(): boolean {
+    return this.#guard?.available === true;
+  }
+
+  /**
+   * Called on a tab's load or URL change so a reload reads the file afresh.
+   * `except` keeps the file at the URL the tab just moved to: the guard
+   * captured it from this very load before the tab reported the change.
+   */
+  forgetFile(tabId: number, except?: string): void {
+    this.#files.forgetTab(tabId, except === undefined ? undefined : tabFileKey(tabId, except));
   }
 
   async listTabs(): Promise<TabSnapshot[]> {
@@ -311,7 +333,7 @@ export class TabController {
   async forTab(tabId: number): Promise<TabController> {
     const tab = (await this.listTabs()).find((tab) => tab.id === tabId);
     if (!tab) throw new Error("Tab is closed or unsupported.");
-    const controller = new TabController(this.#browserApi, this.#isBlank, this.#frames, this.#pdfs, this.#visibility);
+    const controller = new TabController(this.#browserApi, this.#isBlank, this.#frames, this.#files, this.#visibility, this.#guard);
     controller.#tabId = tabId;
     controller.#url = tab.url!;
     controller.#title = tab.title ?? "";
@@ -397,7 +419,8 @@ export class TabController {
     await this.untagAgentTab(tabId).catch(() => {});
     await this.#browserApi.tabs.remove(tabId);
     this.#frames.forget(tabId);
-    this.forgetPdf(tabId);
+    this.forgetFile(tabId);
+    this.#guard?.forget(tabId);
   }
 
   /** The tab's agent tag (current or legacy), or null when it has none or holds anything malformed. */
@@ -465,10 +488,10 @@ export class TabController {
       });
       signal.throwIfAborted();
       if (await this.#probeHealth(tabId)) return;
-      if (delay >= PROBE_DELAYS_MS[1]! && await this.#showsPdf(tabId, true)) return;
+      if (delay >= PROBE_DELAYS_MS[1]! && await this.#showsFile(tabId, true)) return;
       if (Date.now() >= deadline) break;
     }
-    if (await this.#showsPdf(tabId)) return;
+    if (await this.#showsFile(tabId)) return;
     throw new Error(`Tab ${tabId} opened but its page is not ready; list tabs and retry reading it. Do not open a duplicate.`);
   }
 
@@ -523,7 +546,7 @@ export class TabController {
   /** The top frame slices its own outline; a page with cross-origin frames is composed and sliced here instead. */
   async #snapshotOf(tabId: number, options: { offset: number; maxChars: number }): Promise<PageOutcome<PageSnapshot>> {
     const top = await this.#request<{ snapshot: PageSnapshot; frames: number }>(tabId, { type: "page.snapshot", frameId: TOP_FRAME, tabId, ...options }, "page.snapshot");
-    if (!top.ok) return await this.#pdfSnapshot(tabId, options) ?? top;
+    if (!top.ok) return await this.#fileSnapshot(tabId, options) ?? top;
     if (!(top.value.frames > 0)) return { ok: true, value: top.value.snapshot };
     const composed = await this.#composedOutline(tabId);
     if (!composed.ok) return composed;
@@ -538,11 +561,11 @@ export class TabController {
     if (tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
     const top = await this.#request<{ result: PageFindResult; frames: number }>(tabId, { type: "page.find", frameId: TOP_FRAME, tabId, query }, "page.find");
     if (!top.ok) {
-      const pdf = await this.#pdfOf(tabId);
-      if (!pdf.ok) return pdf;
-      if (!pdf.value) return top;
-      const lines = renderPdfText(pdf.value.pdf).split("\n");
-      return { ok: true, value: { documentId: pdf.value.documentId, url: pdf.value.url, query, ...findInOutline(lines, lineOffsets(lines), query) } };
+      const file = await this.#fileOf(tabId);
+      if (!file.ok) return file;
+      if (!file.value) return top;
+      const lines = renderTabFile(file.value.file).split("\n");
+      return { ok: true, value: { documentId: file.value.documentId, url: file.value.url, query, ...findInOutline(lines, lineOffsets(lines), query) } };
     }
     if (!(top.value.frames > 0)) return { ok: true, value: top.value.result };
     const composed = await this.#composedOutline(tabId);
@@ -615,106 +638,131 @@ export class TabController {
   async table(target: ElementTarget, page: { offset: number; limit: number }, frame = 0): Promise<PageOutcome<PageTable>> {
     const tabId = this.#tabId;
     if (tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
-    if (await this.#isPdf()) return pageError("UNSUPPORTED_PAGE", PDF_READ_ONLY);
+    if (await this.#isFile()) return pageError("UNSUPPORTED_PAGE", FILE_READ_ONLY);
     const route = this.#route(tabId, frame);
     if (!route) return pageError("TARGET_MISSING", `Frame f${frame} is not on this page. Read a fresh snapshot.`);
     return this.#request<PageTable>(tabId, { type: "page.table", frameId: route.frameId, tabId, refPrefix: route.refPrefix, target, ...page }, "page.table");
   }
 
-  /** A tab showing a PDF: its text as a read-only outline (no refs); null when the tab shows no PDF. */
-  async #pdfSnapshot(tabId: number, options: { offset: number; maxChars: number }): Promise<PageOutcome<PageSnapshot> | null> {
-    const pdf = await this.#pdfOf(tabId);
-    if (!pdf.ok) return pdf;
-    if (!pdf.value) return null;
-    const { documentId, url, title } = pdf.value;
-    const text = renderPdfText(pdf.value.pdf);
+  /** A tab showing a file: its text as a read-only outline (no refs); null when the tab shows a web page. */
+  async #fileSnapshot(tabId: number, options: { offset: number; maxChars: number }): Promise<PageOutcome<PageSnapshot> | null> {
+    const shown = await this.#fileOf(tabId);
+    if (!shown.ok) return shown;
+    if (!shown.value) return null;
+    const { file, documentId, url, title } = shown.value;
+    const text = renderTabFile(file);
     const { start, end } = sliceOutline(text, options.offset, options.maxChars);
-    return { ok: true, value: { version: 2, tabId, documentId, url, title, text: text.slice(start, end), offset: start, end, totalChars: text.length, selectionText: "", pdf: { pages: pdf.value.pdf.pages } } };
+    const summary: PageSnapshot["file"] = file.body.kind === "pdf" ? { kind: "pdf", pages: file.body.pdf.pages } : { kind: file.body.kind, mimeType: file.mimeType, bytes: file.bytes };
+    return { ok: true, value: { version: 2, tabId, documentId, url, title, text: text.slice(start, end), offset: start, end, totalChars: text.length, selectionText: "", file: summary } };
   }
 
   /**
-   * The PDF a tab shows in Firefox's viewer, or null when it shows none. Only
-   * called for a tab no content script answers in, and only once it finished
-   * loading or when its URL names a PDF (`onlyPdfUrls` asks for just those);
-   * the bytes decide whether it is one.
+   * The file a tab shows, or null when it shows a web page. A file the guard
+   * captured from the tab's own load is read from the cache; otherwise one is
+   * looked for only when the tab's content script reports a document that is
+   * not HTML, or (none answering, as in Firefox's JSON and PDF viewers) once
+   * the tab finished loading or when its URL names a file (`onlyFileUrls`
+   * asks for just those). Another tab's content script then fetches it.
    */
-  async #pdfOf(tabId: number, onlyPdfUrls = false): Promise<PageOutcome<{ pdf: PdfText; documentId: string; url: string; title: string } | null>> {
+  async #fileOf(tabId: number, onlyFileUrls = false): Promise<PageOutcome<{ file: TabFile; documentId: string; url: string; title: string } | null>> {
     const tab = (await this.allTabs()).find((candidate) => candidate.id === tabId);
     const url = tab?.url;
-    if (!url || !isSupportedUrl(url) || !(looksLikePdfUrl(url) || (!onlyPdfUrls && tab.status === "complete"))) return { ok: true, value: null };
+    if (!url || !isSupportedUrl(url)) return { ok: true, value: null };
+    const key = tabFileKey(tabId, url);
+    if (!this.#files.has(key)) {
+      const health = await this.#probeHealth(tabId);
+      if (health ? isPageContentType(health.contentType) : !(looksLikeFileUrl(url) || (!onlyFileUrls && tab.status === "complete"))) return { ok: true, value: null };
+    }
     try {
-      const pdf = await this.#pdfs.read(pdfKey(tabId, url), async () => (await this.#fetchPdf(tabId, url))?.data ?? null);
-      return { ok: true, value: pdf && { pdf, documentId: pdfDocumentId(url, pdf), url, title: pdf.title || tab.title || "" } };
+      const file = await this.#files.read(key, async () => {
+        const loaded = await this.#fetchFile(tabId, url, "force-cache");
+        if (isPageContentType(loaded.contentType) && looksLikeFileUrl(url)) throw new FileError("Its server sent bside a web page instead of the file; it may need the user to be signed in.");
+        return loaded;
+      });
+      if (!file) return { ok: true, value: null };
+      const title = file.body.kind === "pdf" ? file.body.pdf.title || tab.title || "" : file.name;
+      return { ok: true, value: { file, documentId: fileDocumentId(file), url, title } };
     } catch (error) {
-      return pageError("UNSUPPORTED_PAGE", `This tab shows a PDF that bside could not read. ${error instanceof PdfError ? error.message : "Something unexpected went wrong."}`);
+      return pageError("UNSUPPORTED_PAGE", `This tab shows a file that bside could not read. ${error instanceof FileError || error instanceof PdfError ? error.message : "Something unexpected went wrong."}`);
     }
   }
 
-  /** Whether a tab no content script answers in shows a PDF (one that could not be read counts), as for `#pdfOf`. */
-  async #showsPdf(tabId: number, onlyPdfUrls = false): Promise<boolean> {
-    const pdf = await this.#pdfOf(tabId, onlyPdfUrls);
-    return !pdf.ok || pdf.value !== null;
+  /** Whether a tab shows a file (one that could not be read counts), as for `#fileOf`. */
+  async #showsFile(tabId: number, onlyFileUrls = false): Promise<boolean> {
+    const file = await this.#fileOf(tabId, onlyFileUrls);
+    return !file.ok || file.value !== null;
   }
 
   /**
-   * A PDF's bytes, fetched through another tab's content script (the
+   * A file's bytes, fetched through another tab's content script (the
    * background's own `connect-src` does not reach the web): a tab on the
-   * PDF's own origin first, with the user's cookies there as that site's own
+   * file's own origin first, with the user's cookies there as that site's own
    * page would send them; else any other readable tab, hidden agent tabs
-   * first, without cookies. Null when the URL serves something else.
+   * first, without cookies. Throws `FileError` with a safe message.
    */
-  async #fetchPdf(pdfTabId: number, url: string): Promise<{ data: Uint8Array; base64: string } | null> {
+  async #fetchFile(excludeTabId: number | null, url: string, cache: "force-cache" | "default"): Promise<LoadedFile> {
     const origin = new URL(url).origin;
     const sameOrigin = (tab: TabSnapshot) => URL.parse(tab.url ?? "")?.origin === origin;
-    const others = (await this.listTabs()).filter((tab) => tab.id !== pdfTabId);
+    const others = (await this.listTabs()).filter((tab) => tab.id !== excludeTabId);
     const helpers = [...others.filter(sameOrigin), ...others.filter((tab) => !sameOrigin(tab)).sort((a, b) => Number(b.hidden ?? false) - Number(a.hidden ?? false))];
-    for (const helper of helpers.slice(0, PDF_HELPER_TABS)) {
-      const fetched = await this.#request<PdfFetchResult>(helper.id!, { type: "page.fetch-pdf", frameId: TOP_FRAME, tabId: helper.id!, url, credentials: sameOrigin(helper) ? "include" : "omit" }, "page.fetch-pdf");
-      // No content script answered there (another PDF, a page still loading): ask the next tab.
+    for (const helper of helpers.slice(0, FILE_HELPER_TABS)) {
+      const fetched = await this.#request<FileFetchResult>(helper.id!, { type: "page.fetch-file", frameId: TOP_FRAME, tabId: helper.id!, url, credentials: sameOrigin(helper) ? "include" : "omit", cache }, "page.fetch-file");
+      // No content script answered there (a file tab, a page still loading): ask the next tab.
       if (!fetched.ok) continue;
-      const result = fetched.value;
-      if (result.kind === "pdf") {
-        const data = base64ToBytes(result.base64);
-        if (data.byteLength > PDF_LIMITS.bytes || !isPdfHeader(data)) throw new PdfError("The downloaded file was not a readable PDF.");
-        return { data, base64: result.base64 };
-      }
-      if (result.kind === "not-pdf") {
-        if (looksLikePdfUrl(url)) throw new PdfError("Its server did not send bside a PDF; it may need the user to be signed in.");
-        return null;
-      }
-      if (result.kind === "too-large") throw new PdfError(`It is larger than ${PDF_LIMITS.bytes.toLocaleString("en-US")} bytes.`);
-      throw new PdfError(`Downloading it failed${result.status ? ` (HTTP ${result.status})` : ""}.`);
+      return loadedFile(fetched.value, url);
     }
-    throw new PdfError("No open web page could fetch it for reading; open any web page (for example with browser.open) and try again.");
+    throw new FileError("No open web page could fetch it for bside; open any web page (for example with browser.open) and try again.");
   }
 
-  /** The bound tab's PDF as base64, to save in `/workspace`. */
-  async pdfData(): Promise<PageOutcome<{ base64: string; bytes: number; url: string }>> {
+  /** The bound tab's file, to keep in `/workspace/downloads`. */
+  async fileData(): Promise<PageOutcome<TabFile>> {
     const tabId = this.#tabId;
     if (tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
-    const url = (await this.allTabs()).find((tab) => tab.id === tabId)?.url;
-    if (!url || !isSupportedUrl(url) || await this.#probeHealth(tabId)) return pageError("UNSUPPORTED_PAGE", "This tab does not show a PDF.");
+    const shown = await this.#fileOf(tabId);
+    if (!shown.ok) return shown;
+    return shown.value ? { ok: true, value: shown.value.file } : pageError("UNSUPPORTED_PAGE", "This tab shows a web page, not a file.");
+  }
+
+  /** A URL's file, fetched through another tab without opening one (`browser.download`); a web page is refused. */
+  async download(url: string): Promise<PageOutcome<LoadedFile>> {
     try {
-      const pdf = await this.#fetchPdf(tabId, url);
-      return pdf ? { ok: true, value: { base64: pdf.base64, bytes: pdf.data.byteLength, url } } : pageError("UNSUPPORTED_PAGE", "This tab does not show a PDF.");
+      const loaded = await this.#fetchFile(null, url, "default");
+      if (isPageContentType(loaded.contentType)) return pageError("UNSUPPORTED_PAGE", `${url} is a web page, not a file; open it with browser.open(url) to read it.`);
+      return { ok: true, value: loaded };
     } catch (error) {
-      return pageError("UNSUPPORTED_PAGE", `This tab shows a PDF that bside could not fetch. ${error instanceof PdfError ? error.message : "Something unexpected went wrong."}`);
+      return pageError("UNSUPPORTED_PAGE", `bside could not download ${url}. ${error instanceof FileError ? error.message : "Something unexpected went wrong."}`);
     }
   }
 
   /** The text of a PDF held as base64 (a `/workspace` file). */
   async pdfText(base64: string): Promise<PageOutcome<PdfText>> {
     try {
-      const pdf = await this.#pdfs.read(`data ${hashText(base64)} ${base64.length}`, async () => base64ToBytes(base64));
+      const pdf = await this.#files.pdfText(`data ${hashText(base64)} ${base64.length}`, base64ToBytes(base64));
       return pdf ? { ok: true, value: pdf } : pageError("UNSUPPORTED_PAGE", "The file is not a readable PDF.");
     } catch (error) {
-      return pageError("UNSUPPORTED_PAGE", error instanceof PdfError ? error.message : "The file is not a readable PDF.");
+      return pageError("UNSUPPORTED_PAGE", error instanceof FileError || error instanceof PdfError ? error.message : "The file is not a readable PDF.");
     }
   }
 
-  /** Whether the bound tab is a PDF bside has read; it can be read but not operated. */
-  async #isPdf(): Promise<boolean> {
-    return this.#tabId !== null && this.#url !== null && (await this.#pdfs.cached(pdfKey(this.#tabId, this.#url))) !== null;
+  /** Whether the bound tab shows a file bside has read; it can be read but not operated. */
+  async #isFile(): Promise<boolean> {
+    return this.#tabId !== null && this.#url !== null && (await this.#files.cached(tabFileKey(this.#tabId, this.#url))) !== null;
+  }
+
+  /**
+   * Files the guard captured in the bound tab (or `tabId`) since they were
+   * last taken, each once loaded: the run's program keeps them in
+   * `/workspace/downloads` and reports them.
+   */
+  async takeFiles(tabId = this.#tabId): Promise<CapturedFile[]> {
+    return tabId === null || !this.#guard ? [] : this.#guard.take(tabId);
+  }
+
+  /** Has the guard watch `tabId` from now until `release` runs, then a short grace for a download a script starts late. */
+  #watchFiles(tabId: number): () => void {
+    const release = this.#guard?.watch(tabId);
+    if (!release) return () => {};
+    return () => { setTimeout(release, FILE_WATCH_GRACE_MS); };
   }
 
   /**
@@ -761,7 +809,7 @@ export class TabController {
     const measured = request.frame !== 0 && request.target
       ? await this.#measureInFrame(tabId, request.frame, request.target)
       : await this.#request<CaptureGeometry>(tabId, { type: "page.capture-prepare", frameId: TOP_FRAME, tabId, refPrefix: "", target: request.target, childFrameId: null }, "page.capture-prepare");
-    if (!measured.ok) return await this.#isPdf() ? pageError("UNSUPPORTED_PAGE", "Screenshots of PDF tabs are not supported; read the PDF's text with snapshot() or find().") : measured;
+    if (!measured.ok) return await this.#isFile() ? pageError("UNSUPPORTED_PAGE", "Screenshots of file tabs are not supported; read the file with snapshot() or find(), or keep it with page.saveFile() and fs.view an image.") : measured;
     try {
       const geometry = measured.value;
       const { rect, cut } = captureRect(geometry, request);
@@ -864,11 +912,23 @@ export class TabController {
   async act(action: DomAction, frame = 0): Promise<ActionOutcome> {
     const tabId = this.#tabId;
     if (tabId === null) return { result: { ok: false, code: "UNSUPPORTED_PAGE", summary: "No page is attached." }, documentId: null };
-    if (await this.#isPdf()) {
-      return { result: { ok: false, code: "UNSUPPORTED_PAGE", summary: PDF_READ_ONLY }, documentId: null };
+    if (await this.#isFile()) {
+      return { result: { ok: false, code: "UNSUPPORTED_PAGE", summary: FILE_READ_ONLY }, documentId: null };
     }
     const route = this.#route(tabId, frame);
     if (!route) return { result: { ok: false, code: "TARGET_MISSING", summary: `Frame f${frame} is not on this page. Read a fresh snapshot.` }, documentId: null };
+    // A click or keypress may load a file; the guard keeps it instead of letting it download.
+    const release = action.kind === "click" || action.kind === "press" ? this.#watchFiles(tabId) : () => {};
+    try {
+      const outcome = await this.#execute(tabId, frame, route, action);
+      if (action.kind === "click" || action.kind === "press") await this.#guard?.quiet(tabId, FILE_QUIET_MS);
+      return outcome;
+    } finally {
+      release();
+    }
+  }
+
+  async #execute(tabId: number, frame: number, route: { frameId: number; refPrefix: string }, action: DomAction): Promise<ActionOutcome> {
     const request: PageExecuteRequest = { v: 1, id: crypto.randomUUID(), type: "page.execute", frameId: route.frameId, tabId, refPrefix: route.refPrefix, action };
 
     let response: PageResponse | undefined;
@@ -893,6 +953,7 @@ export class TabController {
     if (!response) return { result: { ok: false, code: "TAB_CHANGED", summary: "The page did not respond." }, documentId: null };
     if (!response.ok) return { result: { ok: false, code: toToolResultCode(response.error.code), summary: response.error.message }, documentId: null };
     if (response.type !== "page.execute") return { result: { ok: false, code: "TARGET_MISSING", summary: "Unexpected response from the page." }, documentId: null };
+    if (response.download) return { result: response.result, documentId: response.documentId, download: response.download };
     // A frame's diff covers only that frame; what its click did to the page around it needs a fresh read.
     const outside = frame !== 0 && response.result.ok && (action.kind === "click" || action.kind === "press")
       ? `\nThe diff covers frame f${frame} only; read a snapshot to see changes elsewhere on the page.`
@@ -930,16 +991,41 @@ export class TabController {
   async navigate(url: string): Promise<ToolResult> {
     if (this.#tabId === null) return { ok: false, code: "UNSUPPORTED_PAGE", summary: "No page is attached." };
     if (!validateHttpUrl(url) || !isSupportedUrl(url)) return { ok: false, code: "INVALID_TOOL_ARGUMENTS", summary: "Expected a supported absolute HTTP(S) URL." };
-    this.forgetPdf(this.#tabId);
-    await this.#browserApi.tabs.update(this.#tabId, { url });
-    return this.#afterNavigation("Navigated");
+    this.forgetFile(this.#tabId);
+    const release = this.#watchFiles(this.#tabId);
+    try {
+      await this.#browserApi.tabs.update(this.#tabId, { url });
+      return await this.#afterNavigation("Navigated");
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Loads `url` in a tab bside just opened blank (`browser.open`), watched by
+   * the file guard from before the load starts, and waits until it is ready.
+   */
+  async openUrl(tabId: number, url: string, signal: AbortSignal): Promise<void> {
+    if (!validateHttpUrl(url) || !isSupportedUrl(url)) throw new Error("Expected a supported HTTP(S) URL.");
+    const release = this.#watchFiles(tabId);
+    try {
+      await this.#browserApi.tabs.update(tabId, { url });
+      await this.waitUntilReady(tabId, signal);
+    } finally {
+      release();
+    }
   }
 
   async goBack(): Promise<ToolResult> {
     if (this.#tabId === null) return { ok: false, code: "UNSUPPORTED_PAGE", summary: "No page is attached." };
-    this.forgetPdf(this.#tabId);
-    await this.#browserApi.tabs.goBack(this.#tabId);
-    return this.#afterNavigation("Went back");
+    this.forgetFile(this.#tabId);
+    const release = this.#watchFiles(this.#tabId);
+    try {
+      await this.#browserApi.tabs.goBack(this.#tabId);
+      return await this.#afterNavigation("Went back");
+    } finally {
+      release();
+    }
   }
 
   async #afterNavigation(verb: string): Promise<ToolResult> {
@@ -959,8 +1045,8 @@ export class TabController {
   async #request<T>(
     tabId: number,
     body: Omit<PageSnapshotRequest, "v" | "id"> | Omit<PageFindRequest, "v" | "id"> | Omit<PageOutlineRequest, "v" | "id"> | Omit<PageSearchResultsRequest, "v" | "id"> |
-      Omit<PageCapturePrepareRequest, "v" | "id"> | Omit<PageTableRequest, "v" | "id"> | Omit<PageFetchPdfRequest, "v" | "id">,
-    type: "page.snapshot" | "page.find" | "page.outline" | "page.search-results" | "page.capture-prepare" | "page.table" | "page.fetch-pdf",
+      Omit<PageCapturePrepareRequest, "v" | "id"> | Omit<PageTableRequest, "v" | "id"> | Omit<PageFetchFileRequest, "v" | "id">,
+    type: "page.snapshot" | "page.find" | "page.outline" | "page.search-results" | "page.capture-prepare" | "page.table" | "page.fetch-file",
   ): Promise<PageOutcome<T>> {
     const request = { v: 1, id: crypto.randomUUID(), ...body };
     let response: PageResponse | undefined;
@@ -978,7 +1064,7 @@ export class TabController {
     if (response.type === "page.search-results") return { ok: true, value: response.page as T };
     if (response.type === "page.capture-prepare") return { ok: true, value: response.geometry as T };
     if (response.type === "page.table") return { ok: true, value: response.table as T };
-    if (response.type === "page.fetch-pdf") return { ok: true, value: response.result as T };
+    if (response.type === "page.fetch-file") return { ok: true, value: response.result as T };
     return pageError("TAB_CHANGED", "Unexpected response from the page.");
   }
 
@@ -991,11 +1077,11 @@ export class TabController {
       if (remaining <= 0) break;
       await sleep(Math.min(delay, remaining));
       const health = await this.#probeHealth(tabId);
-      if (health) return { ok: true, value: health };
-      // Firefox's PDF viewer never answers; a URL naming a PDF is checked early, any other page once probing gives up.
-      if (delay >= PROBE_DELAYS_MS[1]! && await this.#showsPdf(tabId, true)) return { ok: true, value: { url: await this.#currentUrl(tabId) } };
+      if (health) return { ok: true, value: { url: health.url } };
+      // Firefox's JSON and PDF viewers never answer; a URL naming a file is checked early, any other page once probing gives up.
+      if (delay >= PROBE_DELAYS_MS[1]! && await this.#showsFile(tabId, true)) return { ok: true, value: { url: await this.#currentUrl(tabId) } };
     }
-    if (await this.#showsPdf(tabId)) return { ok: true, value: { url: await this.#currentUrl(tabId) } };
+    if (await this.#showsFile(tabId)) return { ok: true, value: { url: await this.#currentUrl(tabId) } };
     return pageError("NAVIGATION_INTERRUPTED", "Navigation did not complete in time.");
   }
 
@@ -1020,11 +1106,12 @@ export class TabController {
     return (await this.allTabs()).find((tab) => tab.id === tabId)?.url ?? "";
   }
 
-  async #probeHealth(tabId: number, frameId = TOP_FRAME): Promise<{ url: string } | null> {
+  async #probeHealth(tabId: number, frameId = TOP_FRAME): Promise<{ url: string; contentType: string } | null> {
     const request: PageHealthRequest = { v: 1, id: crypto.randomUUID(), type: "page.health", frameId };
     try {
       const response = (await this.#browserApi.tabs.sendMessage(tabId, request, { frameId })) as PageResponse | undefined;
-      if (response?.ok && response.type === "page.health") return { url: response.url };
+      // A content script from before `contentType` was reported reads a web page.
+      if (response?.ok && response.type === "page.health") return { url: response.url, contentType: typeof response.contentType === "string" ? response.contentType : "text/html" };
     } catch {
       // Content script not attached yet on the new document; keep probing.
     }
@@ -1129,7 +1216,8 @@ function toToolResultCode(code: NormalizedError["code"]): NonNullable<ToolResult
   }
 }
 
-function isSupportedUrl(url: string | undefined): boolean {
+/** An HTTP(S) URL bside may open and read (not Mozilla's own sites, where content scripts never run). */
+export function isSupportedUrl(url: string | undefined): boolean {
   if (!url) return false;
   let parsed: URL;
   try {
@@ -1141,13 +1229,34 @@ function isSupportedUrl(url: string | undefined): boolean {
   return !UNSUPPORTED_HOSTNAME_SUFFIXES.some((suffix) => parsed.hostname.endsWith(suffix));
 }
 
-function pdfKey(tabId: number, url: string): string {
-  return `tab ${tabId} ${url}`;
+/** A file's document id: the same content at the same URL is the same document. A PDF's is `pdf-…`, any other file's `file-…`. */
+function fileDocumentId(file: TabFile): string {
+  if (file.body.kind === "pdf") return `pdf-${hashText(`${file.url}\n${file.body.pdf.pages}\n${file.body.pdf.pageTexts.join("\f")}`)}`;
+  const sample = file.body.kind === "text" ? file.body.text.slice(0, 200_000) : String.fromCharCode(...file.data.subarray(0, 4096));
+  return `file-${hashText(`${file.url}\n${file.bytes}\n${sample}`)}`;
 }
 
-/** A PDF's document id: the same text at the same URL is the same document. */
-function pdfDocumentId(url: string, pdf: PdfText): string {
-  return `pdf-${hashText(`${url}\n${pdf.pages}\n${pdf.pageTexts.join("\f")}`)}`;
+/**
+ * A file tab's outline: a PDF's text as `renderPdfText` gives it; else a
+ * line naming the file, then its text (`readableText`), or a note that bside
+ * cannot read it.
+ */
+export function renderTabFile(file: TabFile): string {
+  if (file.body.kind === "pdf") return renderPdfText(file.body.pdf);
+  const header = `File: ${file.name} · ${file.mimeType} · ${file.bytes.toLocaleString("en-US")} bytes`;
+  if (file.body.kind === "text") return `${header}\n\n${readableText(file.body.text, file.mimeType)}`;
+  if (VIEWABLE_IMAGE_TYPES.includes(file.mimeType)) return `${header}\n\nAn image: fs.view shows it once it is kept in /workspace/downloads (page.saveFile() keeps it; a file a tab of yours loaded is kept already).`;
+  return `${header}\n\nbside cannot read this type of file. It is kept in /workspace/downloads once page.saveFile() keeps it (a file a tab of yours loaded is kept already), and setInputFiles can upload it to a page.`;
+}
+
+/** A content script's fetch result as a loaded file, or a `FileError` saying why there is none. */
+function loadedFile(result: FileFetchResult, url: string): LoadedFile {
+  if (result.kind === "file") {
+    const data = base64ToBytes(result.base64);
+    return { url: result.url || url, data, contentType: result.contentType, name: result.name ?? "download" };
+  }
+  if (result.kind === "too-large") throw new FileError(`It is larger than ${FILE_LIMITS.bytes.toLocaleString("en-US")} bytes.`);
+  throw new FileError(`Downloading it failed${result.status ? ` (HTTP ${result.status})` : ""}.`);
 }
 
 /** FNV-1a, as eight hex digits. */

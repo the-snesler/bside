@@ -9,6 +9,7 @@ import Checkbox from "~icons/tabler/checkbox";
 import Clock from "~icons/tabler/clock";
 import ExternalLink from "~icons/tabler/external-link";
 import FilePencil from "~icons/tabler/file-pencil";
+import FileDownload from "~icons/tabler/file-download";
 import FileText from "~icons/tabler/file-text";
 import Forms from "~icons/tabler/forms";
 import HandClick from "~icons/tabler/hand-click";
@@ -63,6 +64,7 @@ const PROGRAM_ACTIONS: [RegExp, Icon, string, string, string][] = [
   [/\.hover\s*\(/, HandFinger, "Hovering over a page control", "Hovered over a page control", "Couldn't hover over a page control"],
   [/web\.search\(/, WorldSearch, "Searching the web", "Searched the web", "Web search failed"],
   [/youtube\s*\.\s*\w+\s*\(/, BrandYoutube, "Reading YouTube", "Read YouTube", "Couldn't read YouTube"],
+  [/browser\s*\.\s*download\s*\(|\.saveFile\s*\(/, FileDownload, "Keeping a file", "Kept a file", "Couldn't keep a file"],
   [/\.navigate\(|\.goBack\(|browser\.open\(/, ExternalLink, "Opening a page", "Opened a page", "Couldn't open a page"],
   [/\.screenshot\s*\(/, Camera, "Taking a screenshot", "Took a screenshot", "Couldn't take a screenshot"],
   [/fs\s*\.\s*view\s*\(/, Photo, "Looking at an image", "Looked at an image", "Couldn't show an image"],

@@ -64,7 +64,7 @@ describe("user-tab leases", () => {
       'await browser.tab("/tabs/1/page.md").table("e1");',
       'await browser.tab("/tabs/1/page.md").navigate("https://example.com/next");',
       'await browser.tab("/tabs/1/page.md").goBack();',
-      'await browser.tab("/tabs/1/page.md").savePdf("/workspace/a.pdf");',
+      'await browser.tab("/tabs/1/page.md").saveFile();',
       'await fs.remove("/tabs/1/page.md");',
       'await fs.move("/tabs/1/page.md", "/agent-tabs/1/page.md");',
     ]) {

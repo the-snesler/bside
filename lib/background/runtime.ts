@@ -39,7 +39,9 @@ import type { AgentTab } from "@/lib/background/browser-program";
 import type { ChatView, SidebarHub, SidebarView } from "@/lib/background/sidebar-hub";
 import { TabBindings } from "@/lib/background/tab-chats";
 import { FrameAliases, TabController, VisibilityLock } from "@/lib/background/tab-controller";
-import { PdfReader, workerPdfExtractor } from "@/lib/background/pdf";
+import { workerPdfExtractor } from "@/lib/background/pdf";
+import { TabFiles } from "@/lib/background/tab-files";
+import { FileGuard, type FileGuardWebRequest } from "@/lib/background/file-guard";
 import { browserSiteEnv } from "@/lib/sites";
 import type { SiteEnv } from "@/lib/sites/site-api";
 import type { AgentTabTagV1, AgentTabTagV2, TabControllerBrowserApi, TabSnapshot } from "@/lib/background/tab-controller";
@@ -269,6 +271,10 @@ export class BackgroundRuntime {
   #chatgpt: ChatGPTAuth;
   #modelCatalog: readonly ModelDefinition[] = OPENAI_API_KEY_PROVIDER.models;
   #tabControllerFactory: () => TabController;
+  /** Keeps files bside's tabs load instead of letting Firefox download them; null where `webRequest` is missing (tests). */
+  #fileGuard: FileGuard | null = null;
+  /** The guard's hold on each agent tab, released when the tab stops being one or the user takes it over. */
+  #guardHolds = new Map<number, () => void>();
   #sites: SiteEnv;
   #approvalBadge: ApprovalBadge | null;
   /** Connected accounts' tools; none when absent. */
@@ -438,7 +444,7 @@ export class BackgroundRuntime {
 
   constructor(
     sidebarHub: SidebarHub,
-    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController; sites?: SiteEnv; approvalBadge?: ApprovalBadge; clock?: RuntimeClock; mcp?: McpConnections; alarms?: SchedulerAlarms; notifications?: RunNotifications; workspace?: WorkspaceState; scaleImage?: ImageScaler; windows?: RuntimeWindowsApi } = {},
+    options: { provider?: ProviderAdapter; chatgpt?: ChatGPTAuth; tabControllerFactory?: () => TabController; sites?: SiteEnv; approvalBadge?: ApprovalBadge; clock?: RuntimeClock; mcp?: McpConnections; alarms?: SchedulerAlarms; notifications?: RunNotifications; workspace?: WorkspaceState; scaleImage?: ImageScaler; windows?: RuntimeWindowsApi; fileGuard?: FileGuard | null } = {},
   ) {
     this.#sidebarHub = sidebarHub;
     this.#windows = options.windows ?? (typeof browser !== "undefined" ? browser.windows ?? null : null);
@@ -449,12 +455,19 @@ export class BackgroundRuntime {
       async (auth, signal) => auth.method === "chatgpt" ? this.#chatgpt.getAuth(signal) : auth,
       (id) => this.#modelCatalog.find((model) => model.id === id),
     );
-    // One set of frame names for the background's lifetime, so `f3:e12` names the same frame in every run,
-    // and one PDF reader, so a PDF is parsed once (in the bundled pdf-text worker, never in this page).
+    // One set of frame names for the background's lifetime, so `f3:e12` names the same frame in every run;
+    // one file cache, so a file is read once (a PDF in the bundled pdf-text worker, never in this page);
+    // and one file guard over it, so files bside's tabs load are kept rather than downloaded.
     const frameAliases = new FrameAliases();
-    const pdfs = new PdfReader(workerPdfExtractor(() => new Worker(browser.runtime.getURL("/pdf-text.js"))));
+    const tabFiles = new TabFiles(workerPdfExtractor(() => new Worker(browser.runtime.getURL("/pdf-text.js"))));
     const visibility = new VisibilityLock();
-    this.#tabControllerFactory = options.tabControllerFactory ?? (() => new TabController(browser as unknown as TabControllerBrowserApi, undefined, frameAliases, pdfs, visibility));
+    if (options.fileGuard !== undefined) this.#fileGuard = options.fileGuard;
+    else if (!options.tabControllerFactory) {
+      const webRequest = (browser as unknown as { webRequest?: Partial<FileGuardWebRequest> }).webRequest;
+      this.#fileGuard = typeof webRequest?.filterResponseData === "function" ? new FileGuard(webRequest as FileGuardWebRequest, tabFiles) : null;
+    }
+    const fileGuard = this.#fileGuard;
+    this.#tabControllerFactory = options.tabControllerFactory ?? (() => new TabController(browser as unknown as TabControllerBrowserApi, undefined, frameAliases, tabFiles, visibility, fileGuard));
     this.#sites = options.sites ?? browserSiteEnv();
     this.#approvalBadge = options.approvalBadge ?? null;
     this.#mcp = options.mcp ?? null;
@@ -594,6 +607,9 @@ export class BackgroundRuntime {
 
   /** A closed tab's lease and chat binding end with it (its tab value goes with it, and an undo-close brings it back). */
   handleTabRemoved(tabId: number): void {
+    this.#guardHolds.get(tabId)?.();
+    this.#guardHolds.delete(tabId);
+    this.#fileGuard?.forget(tabId);
     this.#workspace.releaseLease(tabId);
     this.#bindings.forget(tabId);
     this.#pendingPopOuts.delete(tabId);
@@ -601,7 +617,8 @@ export class BackgroundRuntime {
 
   /** Republishes an agent tab whose title, URL, or icon changed, so the sidebar's list stays current. */
   handleTabUpdated(tabId: number, changeInfo: { title?: string; url?: string; favIconUrl?: string; status?: string }): void {
-    if (changeInfo.status === "loading" || changeInfo.url !== undefined) this.#tabControllerFactory().forgetPdf(tabId);
+    // A new document reads its file afresh, except the one the file guard just captured from this very load.
+    if (changeInfo.status === "loading" || changeInfo.url !== undefined) this.#tabControllerFactory().forgetFile(tabId, changeInfo.url);
     if (!this.#workspace.agentTabs.has(tabId)) return;
     if (changeInfo.title === undefined && changeInfo.url === undefined && changeInfo.favIconUrl === undefined) return;
     void this.#queueAgentTabSync();
@@ -932,8 +949,28 @@ export class BackgroundRuntime {
     return true;
   }
 
+  /**
+   * The file guard watches every agent tab, except one the user took over
+   * while watching it: a download the user starts there is theirs. Runs
+   * synchronously, so a tab adopted just before a load is watched for it.
+   */
+  #syncFileGuard(): void {
+    const guard = this.#fileGuard;
+    if (!guard) return;
+    const takenOver = this.#watching?.takenOver ? this.#watching.tabId : null;
+    for (const [tabId, release] of this.#guardHolds) {
+      if (this.#workspace.agentTabs.has(tabId) && tabId !== takenOver) continue;
+      release();
+      this.#guardHolds.delete(tabId);
+    }
+    for (const tabId of this.#workspace.agentTabs.keys()) {
+      if (tabId !== takenOver && !this.#guardHolds.has(tabId)) this.#guardHolds.set(tabId, guard.watch(tabId));
+    }
+  }
+
   /** Serializes agent-tab writes; changes made while a write is queued share it. */
   #queueAgentTabSync(): Promise<void> {
+    this.#syncFileGuard();
     if (this.#agentTabSyncQueued) return this.#agentTabSync;
     this.#agentTabSyncQueued = true;
     this.#agentTabSync = this.#agentTabSync
@@ -1468,9 +1505,10 @@ export class BackgroundRuntime {
       latestRun?.outputs.length ? fence(`[\n${latestRun.outputs.join(",\n")}\n]`) : "No tool output captured for this chat in this background session.",
       "## Conversation log", fence(JSON.stringify(conversation, null, 2)),
       "## Partial response", fence(this.#runFor(sessionId)?.partialAssistantText ?? ""),
-      "## Scratch files", "This chat's /workspace files, kept until the chat is deleted. Binary files (saved screenshots and PDFs) are listed by type and size, and files the user attached (/workspace/uploads) by name, type, and size; their contents are not exported.",
+      "## Scratch files", "This chat's /workspace files, kept until the chat is deleted. Binary files (saved screenshots and PDFs) are listed by type and size, files the user attached (/workspace/uploads) by name, type, and size, and files bside kept from the web (/workspace/downloads) by name, type, size, and URL; their contents are not exported.",
       files ? fence(JSON.stringify(Object.fromEntries(files.map((file) => [file.path, file.kind === "text" ? file.content
-        : file.kind === "upload" ? `[attached ${JSON.stringify(file.name)}, ${file.mimeType}, ${file.bytes} bytes]` : `[binary ${file.mimeType}, ${file.bytes} bytes]`])), null, 2)) : "The scratch files could not be read.",
+        : file.kind === "upload" ? `[attached ${JSON.stringify(file.name)}, ${file.mimeType}, ${file.bytes} bytes]`
+        : file.kind === "download" ? `[downloaded ${JSON.stringify(file.name)}, ${file.mimeType}, ${file.bytes} bytes, from ${file.url}]` : `[binary ${file.mimeType}, ${file.bytes} bytes]`])), null, 2)) : "The scratch files could not be read.",
     ].join("\n\n") };
   }
 

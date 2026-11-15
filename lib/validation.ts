@@ -265,6 +265,8 @@ export const WORKSPACE_MAX_UPLOAD_BYTES = 10_000_000;
 export const WORKSPACE_MAX_BINARY_TOTAL_BYTES = 25_000_000;
 /** The directory holding the files the user attached; read-only to programs. */
 export const WORKSPACE_UPLOADS_DIR = "/workspace/uploads";
+/** The directory holding the files bside kept from the web (downloads); programs may only read and remove them. */
+export const WORKSPACE_DOWNLOADS_DIR = "/workspace/downloads";
 /** Longest original file name an upload keeps. */
 export const MAX_FILE_NAME_LEN = 255;
 const MAX_MIME_TYPE_LEN = 100;
@@ -306,6 +308,11 @@ export function isMimeType(value: unknown): value is string {
 /** A path inside `/workspace/uploads/`, where only the user's attachments live. */
 export function isUploadPath(path: string): boolean {
   return path.startsWith(`${WORKSPACE_UPLOADS_DIR}/`);
+}
+
+/** A path inside `/workspace/downloads/`, where only the files bside kept from the web live. */
+export function isDownloadPath(path: string): boolean {
+  return path.startsWith(`${WORKSPACE_DOWNLOADS_DIR}/`);
 }
 
 /** The bytes as text when they are valid UTF-8 without NUL bytes; null for anything else (a binary). */

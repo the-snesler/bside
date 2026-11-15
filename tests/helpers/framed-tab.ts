@@ -58,7 +58,7 @@ export function createFramedTab(specs: FakeFrameSpec[], tabUrl = specs[0]!.url) 
     const base = { v: 1 as const, id: request.id, ok: true as const };
     switch (request.type) {
       case "page.health":
-        return { ...base, type: "page.health", url: spec.url };
+        return { ...base, type: "page.health", url: spec.url, contentType: "text/html" };
       case "page.snapshot": {
         const outline = buildOutline(document, registry, { frameIdOf });
         const snapshot = extractSnapshot(document, request.tabId, registry, request, outline);

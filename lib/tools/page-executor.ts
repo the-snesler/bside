@@ -1420,7 +1420,16 @@ function submitterForm(element: Element): HTMLFormElement | null {
   return null;
 }
 
-interface Effect { ok: boolean; code?: ToolResult["code"]; message: string; notes?: string[] }
+interface Effect { ok: boolean; code?: ToolResult["code"]; message: string; notes?: string[]; download?: DownloadLink }
+
+/** A download link (`<a download>`) the agent clicked: its URL and the file name it suggests. The content script fetches it instead of clicking. */
+export interface DownloadLink {
+  url: string;
+  name: string | null;
+}
+
+/** An action's result; a click on a download link carries the link, and nothing on the page happened. */
+export type ActionResult = ToolResult & { download?: DownloadLink };
 
 function fill(control: OutlineControl, text: string): Effect {
   const element = control.element;
@@ -1745,8 +1754,9 @@ function decodeBase64(base64: string): Uint8Array<ArrayBuffer> {
 
 function click(control: OutlineControl, outline: Outline): Effect {
   const element = control.element;
-  if (isAnchor(element) && element.hasAttribute("download")) {
-    return { ok: false, code: "NOT_INTERACTABLE", message: "Download links are not supported." };
+  // A download link is fetched by this frame's content script and kept in /workspace/downloads; the page is not clicked.
+  if (isAnchor(element) && element.hasAttribute("download") && element.href) {
+    return { ok: true, message: `${describe(control)} is a download link; bside fetched its file instead of clicking it, so the page did not change.`, download: { url: element.href, name: element.getAttribute("download")?.trim() || null } };
   }
   if (isAnchor(element) && element.target === "_blank") {
     return { ok: false, code: "NOT_INTERACTABLE", message: `This link opens a new tab. Use page.navigate(${JSON.stringify(element.href)}) or browser.open(${JSON.stringify(element.href)}) instead.` };
@@ -1848,7 +1858,7 @@ export async function executeDomAction(
   action: DomAction,
   settle: Settle = settleDom,
   options: OutlineOptions = {},
-): Promise<ToolResult> {
+): Promise<ActionResult> {
   const before = buildOutline(document, registry, options);
   const urlBefore = document.location?.href;
   let control: OutlineControl | null = null;
@@ -1877,6 +1887,7 @@ export async function executeDomAction(
     case "scroll": effect = scroll(document, control, action.direction, action.amount); break;
   }
   if (!effect.ok) return { ok: false, code: effect.code ?? "NOT_INTERACTABLE", summary: effect.message };
+  if (effect.download) return { ok: true, summary: effect.message, download: effect.download };
   await settle(document);
   const after = buildOutline(document, registry, options);
   const location = document.location?.href;
