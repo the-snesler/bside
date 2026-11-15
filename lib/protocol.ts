@@ -33,6 +33,7 @@ import { isPermissionMode, type PermissionMode } from "@/lib/domain/permissions"
 import { REASONING_EFFORTS, type AppSettingsV1, type ChatGPTStatus, type ProviderDefinition } from "@/lib/domain/provider";
 import type { RunUsageV1 } from "@/lib/domain/usage";
 import type { PdfFetchResult } from "@/lib/domain/pdf";
+import { isCursorPresentation, type CursorPoint, type CursorPresentation } from "@/lib/domain/cursor";
 import { isSkill, isSkillName, type Skill, type SkillSummary } from "@/lib/domain/skills";
 import { isCustomInstructionsText, isSiteNote, isSiteOrigin, type SiteNote } from "@/lib/domain/instructions";
 import { isMemoryDraft, isMemoryName, MEMORY_WRITE_POLICIES, type MemoryApproval, type MemoryChange, type MemoryDraft, type MemoryEntry, type MemorySettingsV1 } from "@/lib/domain/memory";
@@ -49,7 +50,7 @@ import { isTaskDraft, isTaskId, type TaskDraft, type ScheduledTask, type Schedul
 // it is for (`frameId`, Firefox's id: 0 is the top frame) and is sent with
 // `tabs.sendMessage(tabId, request, { frameId })`; a content script answers
 // only requests naming its own frame. Snapshot, find, search results, the
-// shield, capture-done, and fetch-pdf are top-frame requests (`frameId` 0); health,
+// shield, capture-done, execute-cancel, and fetch-pdf are top-frame requests (`frameId` 0); health,
 // outline, execute, table, capture-prepare, and menu-target may go to any frame. A frame other
 // than the top renders its refs with the prefix the background names it by
 // (`refPrefix`, e.g. `f3:`); the top frame's prefix is empty.
@@ -113,6 +114,26 @@ export interface PageExecuteRequest {
   tabId: number;
   refPrefix: string;
   action: DomAction;
+  /**
+   * Shows the agent's cursor gliding to the target before the action
+   * (`lib/domain/cursor.ts`): only in the top frame, and only for a tab the
+   * user can see; null acts at once.
+   */
+  present: CursorPresentation | null;
+}
+
+/**
+ * Stops the cursor glide of a `page.execute` still in flight (`executeId`, its
+ * request id) when the run is cancelled; an action whose events have not been
+ * dispatched yet then does nothing. Top frame only, like the cursor.
+ */
+export interface PageExecuteCancelRequest {
+  v: 1;
+  id: string;
+  type: "page.execute-cancel";
+  frameId: number;
+  tabId: number;
+  executeId: string;
 }
 
 /** Reads one page of a table's data rows (`PageTable`); the target must name a table or grid in the frame's current document. */
@@ -204,7 +225,7 @@ export interface PageMenuTargetRequest {
 }
 
 export type PageRequest = PageHealthRequest | PageSnapshotRequest | PageFindRequest | PageOutlineRequest | PageSearchResultsRequest | PageExecuteRequest |
-  PageTableRequest | PageShieldRequest | PageCapturePrepareRequest | PageCaptureDoneRequest | PageFetchPdfRequest | PageMenuTargetRequest;
+  PageExecuteCancelRequest | PageTableRequest | PageShieldRequest | PageCapturePrepareRequest | PageCaptureDoneRequest | PageFetchPdfRequest | PageMenuTargetRequest;
 
 export interface PageHealthResponse {
   v: 1;
@@ -257,6 +278,17 @@ export interface PageExecuteResponse {
   type: "page.execute";
   result: ToolResult;
   documentId: string;
+  /** Where the cursor ended, in the top viewport; null when none was shown. */
+  cursor: CursorPoint | null;
+}
+
+export interface PageExecuteCancelResponse {
+  v: 1;
+  id: string;
+  ok: true;
+  type: "page.execute-cancel";
+  /** Whether a glide was still running and stopped its action. */
+  cancelled: boolean;
 }
 
 export interface PageTableResponse {
@@ -320,6 +352,7 @@ export type PageResponse =
   | PageOutlineResponse
   | PageSearchResultsResponse
   | PageExecuteResponse
+  | PageExecuteCancelResponse
   | PageTableResponse
   | PageShieldResponse
   | PageCapturePrepareResponse
@@ -366,7 +399,15 @@ export function isPageExecuteRequest(value: unknown): value is PageExecuteReques
   if (!isEnvelope(value) || value.type !== "page.execute") return false;
   const candidate = value as Record<string, unknown>;
   return isFrameId(candidate.frameId) && isRefPrefix(candidate.frameId, candidate.refPrefix) && isTabId(candidate.tabId) &&
-    validateDomAction(candidate.action) !== null;
+    validateDomAction(candidate.action) !== null &&
+    (candidate.present === null || (candidate.frameId === 0 && isCursorPresentation(candidate.present)));
+}
+
+export function isPageExecuteCancelRequest(value: unknown): value is PageExecuteCancelRequest {
+  if (!isEnvelope(value) || value.type !== "page.execute-cancel") return false;
+  const candidate = value as Record<string, unknown>;
+  return candidate.frameId === 0 && isTabId(candidate.tabId) && typeof candidate.executeId === "string" &&
+    candidate.executeId.length > 0 && candidate.executeId.length <= 100;
 }
 
 export function isPageTableRequest(value: unknown): value is PageTableRequest {

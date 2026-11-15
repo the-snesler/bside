@@ -8,7 +8,7 @@ It's a Firefox desktop extension (Manifest V2, Firefox 140 or later) built with 
 
 - **Chat about the page.** The current tab is attached as a text outline, including content from cross-origin frames. You can mention other tabs with `@`. The right-click **Ask** menu sends a selection, link, image, or the whole page to the sidebar as a draft. It never sends on its own.
 - **Act on pages.** The agent writes small browser programs that bside parses and interprets. It never runs them as JavaScript. They can click, type, fill forms, pick options, hover, drag, press keys, read tables, and take screenshots, and every action is checked against a fresh snapshot of the page first.
-- **Agent tabs.** The agent does its own browsing in hidden tabs that belong to the chat. You can watch one, take it over, or close them from the tray above the composer. While you watch, a shield blocks accidental input until you choose **Take over**.
+- **Agent tabs.** The agent does its own browsing in hidden tabs that belong to the chat. You can watch one, take it over, or close them from the tray above the composer. While you watch, a shield blocks accidental input until you choose **Take over**. Whenever bside acts in a tab you can see, a cursor tagged "bside" glides to each control before it's used, slower at first and quicker as a run goes on; stopping the run mid-glide stops that action.
 - **Search** goes through Firefox's default search engine in a hidden tab. bside has no search service of its own.
 - **PDFs** open in Firefox's viewer, and bside reads them as text.
 - **Confirmation and help.** The agent asks before consequential actions, and it can pause for you to handle a login, CAPTCHA, or permission prompt. A permission menu under the composer switches between **Ask**, **Read-only**, and **Auto**.
@@ -57,7 +57,7 @@ CI runs install, typecheck, test, build, `lint:ext`, and `check:manifest` on eve
 - `entrypoints/`: the persistent background page, sidebar, options page, onboarding and privacy pages, the content script, and the PDF text worker.
 - `lib/background/`: everything the background owns, including runs, the agent loop, tab control, sign-in, MCP, memory, skills, and the scheduler.
 - `lib/domain/` and `lib/protocol.ts`: versioned, validated contracts used across contexts.
-- `lib/tools/`: DOM snapshots and actions, the page shield, and search-result reading.
+- `lib/tools/`: DOM snapshots and actions, the page shield, the agent cursor, and search-result reading.
 - `lib/ui/`: Preact components for the sidebar and options page.
 - `tests/`: Vitest contract tests and fixture pages.
 
