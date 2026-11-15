@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Pointer fixture</title>
+  <style>
+    body { font: 15px/1.4 system-ui, sans-serif; margin: 24px; }
+    .row { display: flex; gap: 16px; align-items: flex-start; }
+    canvas { border: 2px solid #223; cursor: crosshair; touch-action: none; }
+    .swatches { display: flex; flex-direction: column; gap: 8px; }
+    .swatch { width: 32px; height: 32px; border-radius: 50%; border: 2px solid transparent; }
+    .swatch.picked { border-color: #223; }
+    #slider { position: relative; width: 240px; height: 8px; margin: 24px 0; background: #ccd; border-radius: 4px; }
+    #knob { position: absolute; top: -6px; left: 0; width: 20px; height: 20px; border-radius: 50%; background: #446; }
+  </style>
+</head>
+<body>
+  <h1>Guestbook</h1>
+  <p>Leave a drawing: pick a color, then click or drag on the grid. The canvas captures the pointer on pointerdown, the way drawing apps do.</p>
+  <div class="row">
+    <canvas id="grid" width="400" height="400" aria-hidden="true"></canvas>
+    <div class="swatches">
+      <div class="swatch picked" data-color="#223" style="background:#223"></div>
+      <div class="swatch" data-color="#e0607e" style="background:#e0607e"></div>
+      <div class="swatch" data-color="#a99ad0" style="background:#a99ad0"></div>
+      <div class="swatch" data-color="#fbeee8" style="background:#fbeee8"></div>
+    </div>
+  </div>
+  <p id="status">Painted 0 cells.</p>
+  <h2>Custom slider</h2>
+  <div id="slider"><div id="knob"></div></div>
+  <p id="volume">Volume 0</p>
+  <button type="button" id="clear">Clear</button>
+  <script>
+    const grid = document.getElementById("grid");
+    const context = grid.getContext("2d");
+    const CELLS = 16;
+    const SIZE = grid.width / CELLS;
+    let color = "#223";
+    let drawing = false;
+    const painted = new Set();
+    const status = () => { document.getElementById("status").textContent = `Painted ${painted.size} cells.`; };
+    const paint = (event) => {
+      const box = grid.getBoundingClientRect();
+      const column = Math.floor((event.clientX - box.left - grid.clientLeft) / SIZE);
+      const row = Math.floor((event.clientY - box.top - grid.clientTop) / SIZE);
+      if (column < 0 || row < 0 || column >= CELLS || row >= CELLS) return;
+      context.fillStyle = color;
+      context.fillRect(column * SIZE, row * SIZE, SIZE, SIZE);
+      painted.add(`${column},${row}`);
+      status();
+    };
+    grid.addEventListener("pointerdown", (event) => {
+      // No try/catch, as in many drawing apps: this throws if Firefox does not know the pointer id.
+      grid.setPointerCapture(event.pointerId);
+      drawing = true;
+      paint(event);
+    });
+    grid.addEventListener("pointermove", (event) => { if (drawing && event.buttons & 1) paint(event); });
+    grid.addEventListener("pointerup", () => { drawing = false; });
+    for (const swatch of document.querySelectorAll(".swatch")) {
+      swatch.addEventListener("click", () => {
+        document.querySelector(".swatch.picked").classList.remove("picked");
+        swatch.classList.add("picked");
+        color = swatch.dataset.color;
+      });
+    }
+    const slider = document.getElementById("slider");
+    const knob = document.getElementById("knob");
+    let sliding = false;
+    const slide = (event) => {
+      const box = slider.getBoundingClientRect();
+      const value = Math.round(Math.min(1, Math.max(0, (event.clientX - box.left) / box.width)) * 100);
+      knob.style.left = `${value / 100 * (box.width - knob.offsetWidth)}px`;
+      document.getElementById("volume").textContent = `Volume ${value}`;
+    };
+    knob.addEventListener("pointerdown", (event) => { knob.setPointerCapture(event.pointerId); sliding = true; });
+    knob.addEventListener("pointermove", (event) => { if (sliding) slide(event); });
+    knob.addEventListener("pointerup", () => { sliding = false; });
+    document.getElementById("clear").addEventListener("click", () => {
+      context.clearRect(0, 0, grid.width, grid.height);
+      painted.clear();
+      status();
+    });
+  </script>
+</body>
+</html>

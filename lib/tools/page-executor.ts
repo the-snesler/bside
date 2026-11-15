@@ -15,9 +15,10 @@
  * label; other hidden elements are never targetable.
  *
  * Elements registered with `excludeFromOutline` (bside's own page shield and cursor) are
- * skipped entirely. Effects are dispatched straight to the resolved element;
- * nothing here hit-tests by coordinates (no `elementFromPoint`), so an overlay
- * never redirects or blocks an agent action.
+ * skipped entirely. Effects are dispatched straight to the resolved element,
+ * so an overlay never redirects or blocks an agent action. Only pointer
+ * requests (`pointerAt`, coordinates read off a screenshot) hit-test by
+ * coordinates, and they skip excluded elements too.
  *
  * This file never touches `browser.*` APIs and never receives credentials or
  * generated JavaScript — it only ever sees a `Document`, opaque refs, and
@@ -26,11 +27,12 @@
  */
 
 import { TABLE_LIMITS } from "@/lib/domain/tools";
-import { STOPPED_BEFORE_ACTION } from "@/lib/domain/cursor";
+import { STOPPED_BEFORE_ACTION, type CursorPoint } from "@/lib/domain/cursor";
 import type {
-  CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, KeyModifier, PageFindResult, PageRect, PageSnapshot, PageTable, PressKey,
-  TableRole, ToolResult, UploadFile,
+  CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, KeyModifier, PageFindResult, PageRect, PageSnapshot, PageTable, PointerAction,
+  PointerButton, PointerOutcome, PressKey, ShotView, TableRole, ToolResult, UploadFile, ViewportPoint,
 } from "@/lib/domain/tools";
+import { pointerPoints } from "@/lib/domain/tools";
 import { formatKeyChord } from "@/lib/validation";
 import { boundOutline, findInOutline, sliceOutline } from "@/lib/domain/outline";
 
@@ -1249,9 +1251,12 @@ function centerOf(element: Element): { clientX: number; clientY: number } {
 function pointerEvent(element: Element, type: string, init: MouseEventInit): boolean {
   const bubbles = !type.endsWith("enter") && !type.endsWith("leave");
   const options = { bubbles, cancelable: bubbles, composed: true, view: element.ownerDocument.defaultView, ...init };
-  if (type.startsWith("pointer")) {
+  if (type.startsWith("pointer") || type.endsWith("pointercapture")) {
     if (typeof PointerEvent !== "function") return true;
-    return element.dispatchEvent(new PointerEvent(type, { pointerId: 1, pointerType: "mouse", isPrimary: true, ...options }));
+    const pointer: PointerEventInit = { pointerId: 1, pointerType: "mouse", isPrimary: true, ...options };
+    // A synthetic move has no coalesced events unless given some, and drawing apps often paint only `getCoalescedEvents()`.
+    if (type === "pointermove") pointer.coalescedEvents = [new PointerEvent(type, pointer)];
+    return element.dispatchEvent(new PointerEvent(type, pointer));
   }
   return element.dispatchEvent(new MouseEvent(type, options));
 }
@@ -1266,22 +1271,21 @@ function hoverChain(element: Element): Element[] {
 /** The element the agent's pointer is over in each document, so the next hover (or drag) leaves it first. */
 const HOVERED = new WeakMap<Document, Element>();
 
-/** Mouse buttons held while the pointer moves: none for a hover, the primary one during a drag. */
-type Buttons = 0 | 1;
-
 /**
  * Moves the agent's pointer onto `element` the way a real pointer would:
  * out of and leaving the element hovered before (if any), then over and
  * entering the new one (enter/leave on each ancestor crossed), then a move.
+ * The pointer lands at the element's center unless `at` places it, and
+ * `extra` goes on every event (a pointer id, a pressure).
  */
-function movePointerTo(element: Element, buttons: Buttons = 0): void {
+function movePointerTo(element: Element, buttons: number = 0, at: { clientX: number; clientY: number } = centerOf(element), extra: MouseEventInit = {}): void {
   const document = element.ownerDocument;
   const previous = HOVERED.get(document);
-  const point = { ...centerOf(element), buttons };
+  const point = { ...at, buttons, ...extra };
   const entered = hoverChain(element);
   if (previous && previous !== element && previous.isConnected) {
     const left = hoverChain(previous).filter((node) => !entered.includes(node));
-    const exit = { ...centerOf(previous), buttons, relatedTarget: element };
+    const exit = { ...at, buttons, relatedTarget: element, ...extra };
     pointerEvent(previous, "pointerout", exit);
     pointerEvent(previous, "mouseout", exit);
     for (const node of left) {
@@ -1318,9 +1322,30 @@ function dragEvent(element: Element, type: string, transfer: DataTransfer, point
   return element.dispatchEvent(event);
 }
 
-/** Lets the page's handlers run (animation frames, debounced listeners) between the steps of a drag. */
-function nextFrame(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 16));
+/**
+ * Waits for the page's next animation frame while it is shown, so a page
+ * that commits state after the press, or draws once per frame, sees each
+ * stretch of a drag; a hidden document runs no frames and throttles timers,
+ * so there it waits for one task (time for a framework to commit).
+ */
+function nextFrame(document: Document): Promise<void> {
+  const view = document.defaultView;
+  return new Promise((resolve) => {
+    if (view && document.visibilityState === "visible" && typeof view.requestAnimationFrame === "function") {
+      const fallback = setTimeout(resolve, 100);
+      view.requestAnimationFrame(() => {
+        clearTimeout(fallback);
+        resolve();
+      });
+      return;
+    }
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => {
+      channel.port1.close();
+      resolve();
+    };
+    channel.port2.postMessage(null);
+  });
 }
 
 /** Steps a pointer move takes from the source to the target, so libraries that need a minimum distance or several moves start dragging. */
@@ -1353,13 +1378,13 @@ async function drag(control: OutlineControl, to: OutlineControl): Promise<Effect
       return { ok: false, code: "NOT_INTERACTABLE", message: `The page cancelled dragging ${describe(control)} (its dragstart handler refused it).` };
     }
     dragEvent(source, "drag", transfer, from);
-    await nextFrame();
+    await nextFrame(source.ownerDocument);
     dragEvent(target, "dragenter", transfer, end);
     if (!source.contains(target) && !target.contains(source)) dragEvent(source, "dragleave", transfer, end);
     // dragover repeats while the pointer rests on the target; the last one decides whether it accepts the drop.
     dragEvent(source, "drag", transfer, end);
     dragEvent(target, "dragover", transfer, end);
-    await nextFrame();
+    await nextFrame(source.ownerDocument);
     dragEvent(source, "drag", transfer, end);
     const accepted = !dragEvent(target, "dragover", transfer, end);
     if (!accepted) {
@@ -1380,10 +1405,10 @@ async function drag(control: OutlineControl, to: OutlineControl): Promise<Effect
     };
     pointerEvent(source, "pointermove", { ...point, buttons: 1 });
     pointerEvent(source, "mousemove", { ...point, buttons: 1 });
-    await nextFrame();
+    await nextFrame(source.ownerDocument);
   }
   movePointerTo(target, 1);
-  await nextFrame();
+  await nextFrame(source.ownerDocument);
   pointerEvent(target, "pointerup", { ...end, button: 0, buttons: 0 });
   pointerEvent(target, "mouseup", { ...end, button: 0, buttons: 0 });
   return { ok: true, message: `Dragged ${label} (pointer events).` };
@@ -1848,12 +1873,21 @@ function describeReorder(before: readonly string[], after: readonly string[]): s
   return lines;
 }
 
-/** What the agent's visible cursor does on arrival (`lib/tools/page-cursor.ts`): a click ripple, a ring around a field being typed in, nothing (hover), or a press-and-carry to `to`. */
+/**
+ * What the agent's visible cursor does on arrival (`lib/tools/page-cursor.ts`):
+ * a click ripple, a ring around a field being typed in, nothing (hover), a
+ * press-and-carry to `to`, or a press at a drag's first point (a stroke,
+ * which then moves with the drag through `ExecuteOptions.follow`). Gestures
+ * at screenshot coordinates name their point (`at`, in the top viewport):
+ * the cursor goes exactly there and never scrolls the page, which would move
+ * what the coordinates point at.
+ */
 export type CursorGesture =
-  | { kind: "click"; element: Element }
+  | { kind: "click"; element: Element; at?: CursorPoint }
   | { kind: "type"; element: Element }
-  | { kind: "hover"; element: Element }
-  | { kind: "drag"; element: Element; to: Element };
+  | { kind: "hover"; element: Element; at?: CursorPoint }
+  | { kind: "drag"; element: Element; to: Element }
+  | { kind: "stroke"; element: Element; at: CursorPoint };
 
 export interface ExecuteOptions extends OutlineOptions {
   /**
@@ -1862,6 +1896,8 @@ export interface ExecuteOptions extends OutlineOptions {
    * does nothing.
    */
   present?: (gesture: CursorGesture) => Promise<boolean>;
+  /** Moves the cursor with a drag at screenshot coordinates as it happens (top-viewport points), and null once its button went up. */
+  follow?: (at: CursorPoint | null) => void;
 }
 
 /** The cursor gesture for an action on `control` (and `to`, for a drag); null for a page scroll, which has no element. */
@@ -1947,12 +1983,7 @@ export function measureForCapture(document: Document, registry: ElementRefRegist
   { ok: true; geometry: CaptureGeometry } | { ok: false; result: ToolResult } {
   const view = document.defaultView;
   const root = document.documentElement;
-  const viewport: PageRect = {
-    x: view?.scrollX ?? 0,
-    y: view?.scrollY ?? 0,
-    width: root?.clientWidth || view?.innerWidth || 0,
-    height: root?.clientHeight || view?.innerHeight || 0,
-  };
+  const viewport = viewportRect(document);
   const page = {
     width: Math.max(viewport.width, root?.scrollWidth ?? 0, document.body?.scrollWidth ?? 0),
     height: Math.max(viewport.height, root?.scrollHeight ?? 0, document.body?.scrollHeight ?? 0),
@@ -1986,13 +2017,31 @@ export function measureFrameForCapture(document: Document, registry: ElementRefR
   if (!measured.ok) return measured;
   const frame = frameElements(document).find((candidate) => frameIdOf(candidate) === frameId);
   if (!frame) return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: "The frame is no longer on the page. Read a fresh snapshot." } };
-  const border = documentRect(frame, document.defaultView);
+  return { ok: true, geometry: { ...measured.geometry, element: frameContentBox(frame, documentRect(frame, document.defaultView)) } };
+}
+
+/** The scrolled viewport in document coordinates: the scroll position and the visible size (without scrollbars). */
+function viewportRect(document: Document): PageRect {
+  const view = document.defaultView;
+  const root = document.documentElement;
+  return {
+    x: view?.scrollX ?? 0,
+    y: view?.scrollY ?? 0,
+    width: root?.clientWidth || view?.innerWidth || 0,
+    height: root?.clientHeight || view?.innerHeight || 0,
+  };
+}
+
+/** Where a frame element draws its document (its content box), given its border box in some coordinate space. */
+function frameContentBox(frame: Element, border: PageRect): PageRect {
   const style = styleOf(frame);
-  const x = border.x + frame.clientLeft + (parseFloat(style?.paddingLeft ?? "") || 0);
-  const y = border.y + frame.clientTop + (parseFloat(style?.paddingTop ?? "") || 0);
-  const width = frame.clientWidth - (parseFloat(style?.paddingLeft ?? "") || 0) - (parseFloat(style?.paddingRight ?? "") || 0);
-  const height = frame.clientHeight - (parseFloat(style?.paddingTop ?? "") || 0) - (parseFloat(style?.paddingBottom ?? "") || 0);
-  return { ok: true, geometry: { ...measured.geometry, element: { x, y, width: Math.max(0, width), height: Math.max(0, height) } } };
+  const padding = (side: string) => parseFloat(style?.getPropertyValue(`padding-${side}`) ?? "") || 0;
+  return {
+    x: border.x + frame.clientLeft + padding("left"),
+    y: border.y + frame.clientTop + padding("top"),
+    width: Math.max(0, frame.clientWidth - padding("left") - padding("right")),
+    height: Math.max(0, frame.clientHeight - padding("top") - padding("bottom")),
+  };
 }
 
 /** Every iframe/frame element in a document, its shadow roots, and its same-origin frames. */
@@ -2031,4 +2080,447 @@ function documentRect(element: Element, top: Window | null): PageRect {
 export function describeMenuTarget(element: Element | undefined): string | null {
   if (!element || element.localName !== "img") return null;
   return (element.getAttribute("alt") || element.getAttribute("aria-label") || "").slice(0, 300) || null;
+}
+
+// ---------------------------------------------------------------------------
+// Pointer requests: coordinates read off a screenshot
+// ---------------------------------------------------------------------------
+
+/** Same-origin frames a hit test descends into, like the outline's frame depth. */
+const MAX_HIT_FRAME_DEPTH = 3;
+/** Shadow roots a hit test descends through. */
+const MAX_HIT_SHADOW_DEPTH = 32;
+/** How far the scroll position or viewport size may drift (fractional scrolling, rounding) and still match a screenshot. */
+const VIEW_TOLERANCE_PX = 1;
+const MEDIA_TAGS = new Set(["canvas", "img", "svg", "video", "picture", "iframe", "frame", "embed", "object"]);
+
+/**
+ * What is at a point: an element (and where its document's viewport sits in
+ * the answering frame's viewport), or a cross-origin child frame for the
+ * background to ask (its content box in the answering frame's viewport).
+ */
+type PointTarget =
+  | { kind: "element"; element: Element; offset: ViewportPoint }
+  | { kind: "frame"; frameId: number; box: PageRect };
+
+/** The topmost element at a point in a document or shadow root, skipping bside's own page shield. */
+function topmostAt(root: Document | ShadowRoot, point: ViewportPoint): Element | null {
+  let stack: Element[];
+  try {
+    stack = Array.from((root as DocumentOrShadowRoot).elementsFromPoint?.(point.x, point.y) ?? []);
+  } catch {
+    return null;
+  }
+  return stack.find((element) => !OUTLINE_EXCLUDED.has(element)) ?? null;
+}
+
+function inside(point: ViewportPoint, box: PageRect): boolean {
+  return point.x >= box.x && point.y >= box.y && point.x < box.x + box.width && point.y < box.y + box.height;
+}
+
+/**
+ * Hit-tests a point in a document's viewport the way a real pointer would
+ * land: the topmost element (not bside's shield), then down through open and
+ * closed shadow roots and same-origin frames. A cross-origin frame is
+ * answered by its own content script, so it is returned for the background
+ * to address.
+ */
+function hitTest(document: Document, point: ViewportPoint, frameIdOf: ((frame: Element) => number) | undefined, depth = 0): PointTarget | null {
+  const element = deepestAt(document, point);
+  if (!element) return null;
+  const tag = tagOf(element);
+  if (tag === "iframe" || tag === "frame") {
+    const border = element.getBoundingClientRect();
+    const box = frameContentBox(element, { x: border.left, y: border.top, width: border.width, height: border.height });
+    if (inside(point, box)) {
+      let inner: Document | null = null;
+      try { inner = (element as HTMLIFrameElement).contentDocument; } catch { inner = null; }
+      if (inner) {
+        const nested = depth < MAX_HIT_FRAME_DEPTH ? hitTest(inner, { x: point.x - box.x, y: point.y - box.y }, frameIdOf, depth + 1) : null;
+        if (nested?.kind === "element") return { ...nested, offset: { x: nested.offset.x + box.x, y: nested.offset.y + box.y } };
+        if (nested?.kind === "frame") return { ...nested, box: { ...nested.box, x: nested.box.x + box.x, y: nested.box.y + box.y } };
+      } else {
+        const frameId = frameIdOf?.(element) ?? -1;
+        if (frameId > 0) return { kind: "frame", frameId, box };
+      }
+    }
+  }
+  return { kind: "element", element, offset: { x: 0, y: 0 } };
+}
+
+/** The topmost element at a point of one document, down through its open and closed shadow roots (not into frames). */
+function deepestAt(document: Document, point: ViewportPoint): Element | null {
+  let element = topmostAt(document, point);
+  for (let level = 0; element && level < MAX_HIT_SHADOW_DEPTH; level++) {
+    const shadow = shadowRootOf(element);
+    if (!shadow) break;
+    const inner = topmostAt(shadow, point);
+    // A shadow root's hit list also has the host and its ancestors; only nodes in the shadow tree go deeper.
+    if (!inner || inner === element || inner.getRootNode() !== shadow) break;
+    element = inner;
+  }
+  return element;
+}
+
+/** An element the outline has no ref for: its tag, a media element's size, and a little of its text or alt. */
+function plainLabel(element: Element): string {
+  const tag = tagOf(element);
+  if (MEDIA_TAGS.has(tag)) {
+    const box = element.getBoundingClientRect();
+    const alt = element.getAttribute("alt") || element.getAttribute("aria-label") || element.getAttribute("title") || "";
+    return `${tag} ${Math.round(box.width)}×${Math.round(box.height)}${alt ? ` ${JSON.stringify(clip(trimText(alt), 80))}` : ""}`;
+  }
+  const text = clip(trimText(composedText(element, 120)), 80);
+  return text ? `${tag} ${JSON.stringify(text)}` : tag;
+}
+
+/**
+ * How the model should know the element at a point: its control's ref when it
+ * is (or is inside) one in the outline, a media element inside a control as
+ * both, and anything else by tag and text.
+ */
+function describeHit(element: Element, outline: Outline): string {
+  const proxies = new Map<Element, OutlineControl>();
+  for (const control of outline.controls) if (control.proxy) proxies.set(control.proxy, control);
+  let node: Element | null = element;
+  for (let level = 0; node && level < 64; level++, node = composedParent(node)) {
+    const control = outline.byElement.get(node) ?? proxies.get(node);
+    if (!control) continue;
+    return node !== element && MEDIA_TAGS.has(tagOf(element)) ? `${plainLabel(element)} in ${describe(control)}` : describe(control);
+  }
+  return plainLabel(element);
+}
+
+/** Why the top frame no longer shows what a screenshot showed, or null when it still does. */
+function viewChange(document: Document, registry: ElementRefRegistry, view: ShotView): string | null {
+  if (view.documentId !== registry.documentId) return "The page loaded a new document since that screenshot.";
+  const live = viewportRect(document);
+  if (Math.abs(live.x - view.scrollX) > VIEW_TOLERANCE_PX || Math.abs(live.y - view.scrollY) > VIEW_TOLERANCE_PX) return "The page scrolled since that screenshot.";
+  if (Math.abs(live.width - view.width) > VIEW_TOLERANCE_PX || Math.abs(live.height - view.height) > VIEW_TOLERANCE_PX) return "The window was resized since that screenshot.";
+  return null;
+}
+
+/**
+ * The pointer id coordinate actions use: Firefox's mouse pointer. A page that
+ * captures the pointer by the event's id (`setPointerCapture(event.pointerId)`)
+ * gets the emulated capture (`emulatePointerCapture`), since Firefox itself
+ * refuses or ignores capture of a pointer whose button is not really down.
+ */
+const MOUSE_POINTER_ID = 0;
+/** CSS pixels between the moves a drag makes along its path, so pages that paint where each move lands miss nothing. */
+const DRAG_STEP_PX = 4;
+/** Most moves one drag dispatches; a longer path takes bigger steps. */
+const MAX_DRAG_MOVES = 2_000;
+/** Moves a drag dispatches per animation frame (24 px at 4 px steps, a quick hand's speed), more when it would take over `MAX_DRAG_FRAMES`. */
+const DRAG_FRAME_STEPS = 6;
+/** Most animation frames one drag spans (about 2 s at 60 Hz). */
+const MAX_DRAG_FRAMES = 120;
+const BUTTONS: Record<PointerButton, { button: number; buttons: number }> = { left: { button: 0, buttons: 1 }, middle: { button: 1, buttons: 4 }, right: { button: 2, buttons: 2 } };
+const FOCUSABLE_TAGS = new Set(["input", "select", "textarea", "button"]);
+
+/** Event fields for a coordinate action at a point: a mouse pointer with that id, pressing (pressure) only while a button is down. */
+function at(point: ViewportPoint, buttons: number): MouseEventInit {
+  return { clientX: point.x, clientY: point.y, screenX: point.x, screenY: point.y, buttons, pointerId: MOUSE_POINTER_ID, pressure: buttons ? 0.5 : 0, width: 1, height: 1 } as MouseEventInit;
+}
+
+/** What a real mousedown on the element focuses: its nearest focusable ancestor, else nothing (the focused element loses focus). */
+function focusFrom(element: Element): void {
+  for (let node: Element | null = element, level = 0; node && level < 64; node = composedParent(node), level++) {
+    const html = node as HTMLElement;
+    const tag = tagOf(node);
+    if (isDisabled(node)) continue;
+    if (FOCUSABLE_TAGS.has(tag) || (tag === "a" && node.hasAttribute("href")) || node.hasAttribute("tabindex") || html.isContentEditable) {
+      html.focus?.();
+      return;
+    }
+  }
+  (element.ownerDocument.activeElement as HTMLElement | null)?.blur?.();
+}
+
+/** Firefox's `exportFunction`, which makes a content-script function callable by the page (absent outside Firefox content scripts). */
+declare const exportFunction: (<T extends (...args: never[]) => unknown>(fn: T, scope: object) => T) | undefined;
+
+type CaptureMethods = Pick<Element, "setPointerCapture" | "releasePointerCapture" | "hasPointerCapture">;
+
+interface PointerCapture {
+  /** The element holding the capture, if the page took it; the first time, it gets gotpointercapture at `point`. */
+  holder(point: ViewportPoint, buttons: number): Element | null;
+  /** Ends the capture after the button went up (lostpointercapture at `point`). */
+  release(point: ViewportPoint): void;
+  /** Gives the page back its own capture methods. */
+  restore(): void;
+}
+
+/**
+ * Pointer capture for the synthetic mouse pointer while a coordinate action
+ * runs. Firefox's `setPointerCapture` throws NotFoundError for a pointer its
+ * content process has not seen (a hidden tab the real mouse never entered),
+ * and captures nothing for a pointer with no button really down, so a
+ * drawing app that captures in its pointerdown handler would stop right
+ * there. Until `restore`, the page's `setPointerCapture`,
+ * `releasePointerCapture`, and `hasPointerCapture` answer for
+ * `MOUSE_POINTER_ID` from this record (any other id goes to Firefox), and
+ * the action sends its moves and release to the element holding it.
+ */
+function emulatePointerCapture(element: Element): PointerCapture {
+  const view = element.ownerDocument.defaultView as (Window & { wrappedJSObject?: Window & typeof globalThis }) | null;
+  const page = view?.wrappedJSObject ?? view;
+  const prototype = (page as (Window & typeof globalThis) | null)?.Element?.prototype as CaptureMethods | undefined;
+  // The element as the page called on it; this side's view of it is found among the pressed element's ancestors.
+  let held: unknown = null;
+  let announced: Element | null = null;
+  const chain = hoverChain(element);
+  const ours = (node: unknown): Element | null => chain.find((candidate) => candidate === node || (candidate as { wrappedJSObject?: unknown }).wrappedJSObject === node) ?? (node instanceof Element ? node : null);
+  if (!prototype) return { holder: () => null, release: () => {}, restore: () => {} };
+  const original: CaptureMethods = { setPointerCapture: prototype.setPointerCapture, releasePointerCapture: prototype.releasePointerCapture, hasPointerCapture: prototype.hasPointerCapture };
+  const exported = <T extends (...args: never[]) => unknown>(fn: T): T => (typeof exportFunction === "function" ? exportFunction(fn, page!) : fn);
+  const shims: CaptureMethods = {
+    setPointerCapture: exported(function (this: Element, id: number) {
+      if (Number(id) !== MOUSE_POINTER_ID) return original.setPointerCapture.call(this, id);
+      held = this;
+    }),
+    releasePointerCapture: exported(function (this: Element, id: number) {
+      if (Number(id) !== MOUSE_POINTER_ID) return original.releasePointerCapture.call(this, id);
+      if (held === this) held = null;
+    }),
+    hasPointerCapture: exported(function (this: Element, id: number) {
+      return Number(id) === MOUSE_POINTER_ID ? held !== null && held === this : original.hasPointerCapture.call(this, id);
+    }),
+  };
+  Object.assign(prototype, shims);
+  const lose = (point: ViewportPoint) => {
+    if (announced?.isConnected) pointerEvent(announced, "lostpointercapture", at(point, 0));
+    announced = null;
+  };
+  return {
+    holder(point, buttons) {
+      const holder = held === null ? null : ours(held);
+      if (holder !== announced) {
+        lose(point);
+        if (holder) pointerEvent(holder, "gotpointercapture", at(point, buttons));
+        announced = holder;
+      }
+      return holder;
+    },
+    release(point) {
+      held = null;
+      lose(point);
+    },
+    restore() {
+      // Unconditionally: read back across the compartment boundary, an exported function is not identical to the one assigned.
+      Object.assign(prototype, original);
+    },
+  };
+}
+
+/** Where a click follows the release: on the element released over when that is the pressed one or holds it (an ancestor that captured the pointer), else nowhere. */
+function clickTarget(pressed: Element, released: Element): Element | null {
+  return released === pressed || hoverChain(pressed).includes(released) ? released : null;
+}
+
+/**
+ * Clicks an element at a point the way a mouse does: moves onto it, then
+ * down, up, and click (auxclick for the middle button, contextmenu for the
+ * right one), twice and then dblclick for a double click. A cancelled
+ * pointerdown suppresses the mouse events that follow it, as in a browser;
+ * an uncancelled primary mousedown focuses what the element is in. When the
+ * page captures the pointer on pointerdown, the release goes to the element
+ * holding it.
+ */
+function clickAt(element: Element, point: ViewportPoint, button: PointerButton, double: boolean): void {
+  const code = BUTTONS[button];
+  const capture = emulatePointerCapture(element);
+  try {
+    movePointerTo(element, 0, { clientX: point.x, clientY: point.y }, at(point, 0));
+    let target = element;
+    for (let detail = 1; detail <= (double ? 2 : 1); detail++) {
+      const down = { ...at(point, code.buttons), button: code.button, detail };
+      const up = { ...at(point, 0), button: code.button, detail };
+      const mouse = pointerEvent(element, "pointerdown", down);
+      if (mouse && pointerEvent(element, "mousedown", down) && button === "left") focusFrom(element);
+      const released = capture.holder(point, code.buttons) ?? element;
+      pointerEvent(released, "pointerup", up);
+      if (mouse) pointerEvent(released, "mouseup", up);
+      capture.release(point);
+      target = clickTarget(element, released) ?? element;
+      pointerEvent(target, button === "left" ? "click" : button === "middle" ? "auxclick" : "contextmenu", up);
+    }
+    if (double && button === "left") pointerEvent(target, "dblclick", { ...at(point, 0), button: 0, detail: 2 });
+  } finally {
+    capture.restore();
+  }
+}
+
+/** The path's points with steps of at most `DRAG_STEP_PX` between them (bigger past `MAX_DRAG_MOVES`), its first point left out. */
+function dragSteps(path: ViewportPoint[]): ViewportPoint[] {
+  let length = 0;
+  for (let i = 1; i < path.length; i++) length += Math.hypot(path[i]!.x - path[i - 1]!.x, path[i]!.y - path[i - 1]!.y);
+  const step = Math.max(DRAG_STEP_PX, length / MAX_DRAG_MOVES);
+  const steps: ViewportPoint[] = [];
+  for (let i = 1; i < path.length; i++) {
+    const from = path[i - 1]!;
+    const to = path[i]!;
+    const count = Math.max(1, Math.ceil(Math.hypot(to.x - from.x, to.y - from.y) / step));
+    for (let k = 1; k <= count; k++) steps.push({ x: from.x + ((to.x - from.x) * k) / count, y: from.y + ((to.y - from.y) * k) / count });
+  }
+  return steps;
+}
+
+/**
+ * Presses the primary button on an element at the path's first point, moves
+ * through the path in small steps, and releases at its last point, like a
+ * quick hand: it waits a frame after the press (so a page can commit its
+ * "drawing" state and add its move listeners), then sends
+ * `DRAG_FRAME_STEPS` moves per animation frame, and waits a frame before the
+ * release. Moves go to the element under each step, crossing over/out like a
+ * real pointer, or to the element holding the pointer once the page captured
+ * it (`setPointerCapture`, emulated), or to the last element when a step is
+ * outside the document. A click follows only when the button went up on the
+ * element it went down on (or one holding it). `follow` gets the last point
+ * of each frame's moves. Returns the element the button went up on.
+ */
+async function dragAlong(element: Element, path: ViewportPoint[], follow?: (point: ViewportPoint) => void): Promise<Element> {
+  const document = element.ownerDocument;
+  const [start] = path;
+  const capture = emulatePointerCapture(element);
+  try {
+    movePointerTo(element, 0, { clientX: start!.x, clientY: start!.y }, at(start!, 0));
+    const down = { ...at(start!, 1), button: 0, detail: 1 };
+    const mouse = pointerEvent(element, "pointerdown", down);
+    if (mouse && pointerEvent(element, "mousedown", down)) focusFrom(element);
+    const steps = dragSteps(path);
+    const perFrame = Math.max(DRAG_FRAME_STEPS, Math.ceil(steps.length / MAX_DRAG_FRAMES));
+    let current = element;
+    let last = start!;
+    for (let index = 0; index < steps.length; index += perFrame) {
+      await nextFrame(document);
+      for (const step of steps.slice(index, index + perFrame)) {
+        const holder = capture.holder(step, 1);
+        const under = holder ?? deepestAt(document, step) ?? current;
+        if (!holder && under !== current) movePointerTo(under, 1, { clientX: step.x, clientY: step.y }, at(step, 1));
+        else {
+          pointerEvent(under, "pointermove", { ...at(step, 1), button: -1 });
+          if (mouse) pointerEvent(under, "mousemove", { ...at(step, 1), button: 0 });
+        }
+        current = under;
+        last = step;
+      }
+      follow?.(last);
+    }
+    await nextFrame(document);
+    const released = capture.holder(last, 1) ?? current;
+    const up = { ...at(last, 0), button: 0, detail: 1 };
+    pointerEvent(released, "pointerup", up);
+    if (mouse) pointerEvent(released, "mouseup", up);
+    capture.release(last);
+    const clicked = clickTarget(element, released);
+    if (clicked) pointerEvent(clicked, "click", up);
+    return released;
+  } finally {
+    capture.restore();
+  }
+}
+
+/** Why a pointer action's points cannot all be used in this frame's document, or null: inside the viewport, and for clicks, all in one document. */
+function pointsProblem(document: Document, action: PointerAction, home: Document, frameIdOf: OutlineOptions["frameIdOf"]): string | null {
+  const viewport = viewportRect(document);
+  const points = pointerPoints(action);
+  // A drag may leave the viewport after it starts, as a real one can; it keeps going to the pressed element.
+  const checked = action.kind === "drag" ? points.slice(0, 1) : points;
+  for (const [index, point] of checked.entries()) {
+    if (point.x < 0 || point.y < 0 || point.x >= viewport.width || point.y >= viewport.height) {
+      return checked.length > 1 ? `Point ${index + 1} is outside the visible part of the page.` : "The point is outside the visible part of the page.";
+    }
+    if (action.kind !== "click" || index === 0) continue;
+    const target = hitTest(document, point, frameIdOf);
+    if (target?.kind !== "element" || target.element.ownerDocument !== home) {
+      return `Points 1 and ${index + 1} are in different frames; click each frame's points in a separate call.`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Answers a pointer request in this frame. The top frame first checks it
+ * still shows what the screenshot showed (`view`); a child frame gets no
+ * view, since the top frame checked it. The first point decides where the
+ * action happens and must be inside this frame's viewport: a point in a
+ * cross-origin child frame is answered with that frame for the background to
+ * ask. Otherwise `locate` reports the element there, and an effect is
+ * performed in that element's document (a same-origin frame's points moved
+ * into it), the DOM settles, and the result names what the first point
+ * landed on with the change to this frame's outline.
+ */
+export async function pointerAt(
+  document: Document,
+  registry: ElementRefRegistry,
+  view: ShotView | null,
+  action: PointerAction,
+  settle: Settle = settleDom,
+  options: ExecuteOptions = {},
+): Promise<{ ok: true; outcome: PointerOutcome } | { ok: false; result: ToolResult }> {
+  if (view) {
+    const changed = viewChange(document, registry, view);
+    if (changed) return { ok: false, result: { ok: false, code: "STALE_SNAPSHOT", summary: `${changed} Take a new screenshot and read the coordinates from it.` } };
+  }
+  const points = pointerPoints(action);
+  const first = points[0]!;
+  const viewport = viewportRect(document);
+  if (first.x < 0 || first.y < 0 || first.x >= viewport.width || first.y >= viewport.height) {
+    return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `The ${points.length > 1 ? "first point" : "point"} is outside the visible part of the ${view ? "page" : "frame"}.` } };
+  }
+  const target = hitTest(document, first, options.frameIdOf);
+  if (!target) return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: "Nothing on the page is at that point." } };
+  if (target.kind === "frame") return { ok: true, outcome: target };
+  const before = buildOutline(document, registry, options);
+  const label = describeHit(target.element, before);
+  if (action.kind === "locate") {
+    const border = target.element.getBoundingClientRect();
+    const box = { x: border.left + target.offset.x, y: border.top + target.offset.y, width: border.width, height: border.height };
+    return { ok: true, outcome: { kind: "hit", documentId: registry.documentId, hit: { label, box } } };
+  }
+  const home = target.element.ownerDocument;
+  const problem = pointsProblem(document, action, home, options.frameIdOf);
+  if (problem) return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: problem } };
+  // Points move into the document the first one landed in (a same-origin frame's viewport).
+  const local = points.map((point) => ({ x: point.x - target.offset.x, y: point.y - target.offset.y }));
+  const urlBefore = document.location?.href;
+  // The cursor is drawn by the top frame over the whole tab, at the request's own points (the top viewport's).
+  const show = async (gesture: CursorGesture) => !options.present || await options.present(gesture);
+  const stopped = (result: ToolResult): { ok: true; outcome: PointerOutcome } => ({ ok: true, outcome: { kind: "acted", documentId: registry.documentId, result } });
+  let message: string;
+  if (action.kind === "hover") {
+    if (!await show({ kind: "hover", element: target.element, at: first })) return stopped(STOPPED_BEFORE_ACTION);
+    movePointerTo(target.element, 0, { clientX: local[0]!.x, clientY: local[0]!.y }, at(local[0]!, 0));
+    message = `Moved the pointer onto ${label}.`;
+  } else if (action.kind === "drag") {
+    if (!await show({ kind: "stroke", element: target.element, at: first })) return stopped(STOPPED_BEFORE_ACTION);
+    const follow = options.follow;
+    let end: Element;
+    try {
+      end = await dragAlong(target.element, local, follow && ((point) => follow({ x: point.x + target.offset.x, y: point.y + target.offset.y })));
+    } finally {
+      follow?.(null);
+    }
+    const endLabel = end === target.element ? "the same element" : describeHit(end, before);
+    message = `Dragged from ${label} through ${points.length} points to ${endLabel}.`;
+  } else {
+    const verb = action.button === "right" ? "Right-clicked" : action.button === "middle" ? "Middle-clicked" : action.double ? "Double-clicked" : "Clicked";
+    for (const [index, point] of local.entries()) {
+      // Each click lands on what is there now: an earlier click may have changed the page.
+      const element = index === 0 ? target.element : deepestAt(home, point);
+      if (!element) return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: `${verb} ${index} point${index === 1 ? "" : "s"}; nothing is at point ${index + 1} any more, so the rest were not clicked.` } };
+      if (!await show({ kind: "click", element, at: points[index]! })) {
+        return stopped(index ? { ok: false, code: "SKIPPED", summary: `Stopped after clicking ${index} of ${local.length} points; the rest were not clicked.` } : STOPPED_BEFORE_ACTION);
+      }
+      clickAt(element, point, action.button, action.double);
+    }
+    message = local.length === 1 ? `${verb} ${label}.` : `${verb} ${local.length} points, the first on ${label}.`;
+  }
+  await settle(document);
+  const after = buildOutline(document, registry, options);
+  const parts = [message, describeChanges(before.lines, after.lines)];
+  const location = document.location?.href;
+  if (location && location !== urlBefore) parts.push(`URL changed to ${location}`);
+  return { ok: true, outcome: { kind: "acted", documentId: registry.documentId, result: { ok: true, summary: parts.join("\n") } } };
 }

@@ -36,6 +36,7 @@ import type {
   PageFindRequest,
   PageHealthRequest,
   PageOutlineRequest,
+  PagePointerRequest,
   PageResponse,
   PageSearchResultsRequest,
   PageShieldRequest,
@@ -44,7 +45,11 @@ import type {
   PageTableRequest,
 } from "@/lib/protocol";
 import { MAX_FRAME_OUTLINE_CHARS } from "@/lib/protocol";
-import type { CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, PageArtifactSummary, PageErrorCode, PageFindResult, PageRect, PageSnapshot, PageTable, SearchPage, ToolResult } from "@/lib/domain/tools";
+import type {
+  CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, PageArtifactSummary, PageErrorCode, PageFindResult, PageRect, PageSnapshot, PageTable, PointerAction,
+  PointHit, SearchPage, ShotView, ToolResult,
+} from "@/lib/domain/tools";
+import { pointerPoints, withPointerPoints } from "@/lib/domain/tools";
 import { findInOutline, lineOffsets, sliceOutline } from "@/lib/domain/outline";
 import { base64ToBytes, PdfError, renderPdfText, type PdfText } from "@/lib/domain/pdf";
 import { FILE_LIMITS, FileError, isPageContentType, looksLikeFileUrl, readableText, type FileFetchResult } from "@/lib/domain/files";
@@ -239,7 +244,24 @@ export interface Screenshot {
   documentId: string;
   /** Whether a full-page or element capture was cut at `FULL_PAGE_MAX_CSS`. */
   cut: boolean;
+  /**
+   * How the image maps onto the page: the document rectangle it shows (CSS
+   * pixels), the image pixels per CSS pixel, and what the top frame showed
+   * (document, scroll position, viewport size), so a point in the image is a
+   * point in the viewport while the top frame still shows that.
+   */
+  area: { rect: PageRect; scale: number; view: ShotView };
 }
+
+/**
+ * What a pointer request found or did, in the frame it landed in (0 for the
+ * top document, else its name number): the element at a `locate` point with
+ * its box in the top frame's viewport, or an effect's result and the document
+ * it ran in (null when the page navigated away).
+ */
+export type PointerReport =
+  | { kind: "hit"; frame: number; documentId: string; hit: PointHit }
+  | { kind: "acted"; frame: number; documentId: string | null; result: ToolResult };
 
 export interface TabControllerBrowserApi {
   tabs: {
@@ -836,9 +858,10 @@ export class TabController {
         if (image.bytes > SCREENSHOT_MAX_BYTES) continue;
         this.#url = geometry.url;
         this.#title = geometry.title;
+        const view: ShotView = { documentId: geometry.documentId, scrollX: geometry.viewport.x, scrollY: geometry.viewport.y, width: geometry.viewport.width, height: geometry.viewport.height };
         return { ok: true, value: {
           ...image, width: Math.max(1, Math.round(rect.width * scale)), height: Math.max(1, Math.round(rect.height * scale)),
-          url: geometry.url, documentId: geometry.documentId, cut,
+          url: geometry.url, documentId: geometry.documentId, cut, area: { rect, scale, view },
         } };
       }
       return { ok: false, error: { code: "LIMIT_EXCEEDED", message: `The screenshot stayed over ${SCREENSHOT_MAX_BYTES.toLocaleString("en-US")} bytes at reduced size; capture the viewport or one element instead.`, retryable: false, phase: "page" } };
@@ -991,6 +1014,11 @@ export class TabController {
    */
   async #presentation(tabId: number, action: DomAction, frame: number): Promise<PageExecuteRequest["present"]> {
     if (!action.target) return null;
+    return this.#paceIfVisible(tabId, frame === 0);
+  }
+
+  /** The cursor's pace for the next action in a tab its window shows (when the top frame `draws` it); a tab out of sight restarts its pace. */
+  async #paceIfVisible(tabId: number, draws: boolean): Promise<PageExecuteRequest["present"]> {
     let visible = false;
     try {
       visible = (await this.#browserApi.tabs.query({ active: true })).some((tab) => tab.id === tabId && tab.active === true && tab.hidden !== true);
@@ -1001,7 +1029,89 @@ export class TabController {
       this.#cursor.forget(tabId);
       return null;
     }
-    return frame === 0 ? this.#cursor.next(tabId) : null;
+    return draws ? this.#cursor.next(tabId) : null;
+  }
+
+  /**
+   * Sends a pointer request at a point in the top frame's viewport, read off
+   * a screenshot whose top frame showed `view`. The top frame checks it still
+   * does and hit-tests the point; when the point is in a cross-origin frame,
+   * the request goes on to that frame (named like an outline names it, so
+   * its refs carry the name), with the point moved into its viewport, at
+   * most `FRAME_LIMITS.depth` frames deep.
+   *
+   * In a tab its window shows, an effect first shows bside's cursor at the
+   * points (drawn by the top frame, so only for points in the top document
+   * and its same-origin frames). If `signal` aborts during a glide, the page
+   * is told to stop, and events not yet dispatched are not (`SKIPPED`).
+   */
+  async pointer(view: ShotView, action: PointerAction, signal?: AbortSignal): Promise<PageOutcome<PointerReport>> {
+    const tabId = this.#tabId;
+    if (tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
+    if (await this.#isFile())
+      return pageError("UNSUPPORTED_PAGE", FILE_READ_ONLY);
+    const present = action.kind === "locate" ? null : await this.#paceIfVisible(tabId, true);
+    if (present && signal?.aborted) return { ok: true, value: { kind: "acted", frame: 0, documentId: null, result: STOPPED_BEFORE_ACTION } };
+    let frameId = TOP_FRAME;
+    let frame = 0;
+    let offset = { x: 0, y: 0 };
+    for (let hops = 0; hops <= FRAME_LIMITS.depth; hops++) {
+      const request: PagePointerRequest = {
+        v: 1, id: crypto.randomUUID(), type: "page.pointer", frameId, tabId, refPrefix: frame === 0 ? "" : `f${frame}:`,
+        view: frameId === TOP_FRAME ? view : null, action: withPointerPoints(action, pointerPoints(action).map((point) => ({ x: point.x - offset.x, y: point.y - offset.y }))),
+        present: frameId === TOP_FRAME ? present : null,
+      };
+      const stop = () => {
+        const cancel: PageExecuteCancelRequest = { v: 1, id: crypto.randomUUID(), type: "page.execute-cancel", frameId: TOP_FRAME, tabId, executeId: request.id };
+        this.#browserApi.tabs.sendMessage(tabId, cancel, { frameId: TOP_FRAME }).catch(() => {});
+      };
+      if (request.present) signal?.addEventListener("abort", stop, { once: true });
+      let response: PageResponse | undefined;
+      try {
+        response = (await this.#browserApi.tabs.sendMessage(tabId, request, { frameId })) as PageResponse | undefined;
+      } catch {
+        if (action.kind !== "locate") return this.#lostDuringPointer(tabId, frame, action.kind);
+        return pageError("TAB_CHANGED", frame === 0 ? "The page is not available." : `Frame f${frame} did not answer; it may still be loading, or it is not a web page.`);
+      } finally {
+        signal?.removeEventListener("abort", stop);
+      }
+      if (request.present && response?.ok && response.type === "page.pointer") this.#cursor.landed(tabId, isCursorPoint(response.cursor) ? response.cursor : null);
+      if (!response) return pageError("TAB_CHANGED", "The page did not respond.");
+      if (!response.ok) return { ok: false, error: response.error };
+      if (response.type !== "page.pointer") return pageError("TAB_CHANGED", "Unexpected response from the page.");
+      const { outcome } = response;
+      if (outcome.kind === "hit") {
+        const box = { ...outcome.hit.box, x: outcome.hit.box.x + offset.x, y: outcome.hit.box.y + offset.y };
+        return { ok: true, value: { kind: "hit", frame, documentId: outcome.documentId, hit: { ...outcome.hit, box } } };
+      }
+      if (outcome.kind === "acted") {
+        // A frame's diff covers only that frame; what its click did to the page around it needs a fresh read.
+        const outside = frame !== 0 ? `\nThe diff covers frame f${frame} only; take a screenshot or read a snapshot to see changes elsewhere on the page.` : "";
+        return { ok: true, value: { kind: "acted", frame, documentId: outcome.documentId, result: { ...outcome.result, summary: `${outcome.result.summary}${outside}` } } };
+      }
+      const alias = this.#frames.name(tabId, outcome.frameId, frameId);
+      if (alias === null) return pageError("TARGET_MISSING", "This page has more frames than bside can name.");
+      frameId = outcome.frameId;
+      frame = alias;
+      offset = { x: offset.x + outcome.box.x, y: offset.y + outcome.box.y };
+    }
+    return pageError("TARGET_MISSING", `The point is in a frame nested more than ${FRAME_LIMITS.depth} deep, which bside does not reach.`);
+  }
+
+  /**
+   * A frame stopped answering during a pointer effect. A click in the top
+   * frame that tore down the document settles like a navigation; anything
+   * else is reported as possibly taken effect, never as done.
+   */
+  async #lostDuringPointer(tabId: number, frame: number, kind: PointerAction["kind"]): Promise<PageOutcome<PointerReport>> {
+    if (frame === 0 && kind === "click") {
+      const settled = await this.#settleNavigation(tabId);
+      if (settled.ok) {
+        await this.#refreshMetadata(settled.value.url);
+        return { ok: true, value: { kind: "acted", frame, documentId: null, result: { ok: true, summary: `Clicked; the page navigated to ${this.#url} (${JSON.stringify(this.#title ?? "")}). Earlier refs and screenshots are invalid; take a new screenshot or read a snapshot.` } } };
+      }
+    }
+    return pageError("TAB_CHANGED", `Lost contact with ${frame === 0 ? "the page" : `frame f${frame}`} during the action: it navigated, reloaded, or was removed, and the action may have taken effect. Take a new screenshot.`);
   }
 
   /** Firefox's id and the ref prefix for a named frame (0 is the top document); null for a name no outline of this tab gave out. */

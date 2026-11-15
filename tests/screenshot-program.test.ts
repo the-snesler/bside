@@ -84,7 +84,7 @@ describe("page.screenshot()", () => {
     const { run, program, captures } = setupProgram();
     const result = await run('const page = browser.tab("/tabs/1/page.md"); await page.screenshot();');
     expect(result.ok, result.summary).toBe(true);
-    expect(result.summary).toBe("[screenshot 1280x800 of https://example.com/] (image 1 of this result)");
+    expect(result.summary).toBe("[screenshot 1280x800 of https://example.com/] (image 1 of this result) [shot s1]");
     expect(captures).toEqual([{ tabId: 1, options: { format: "jpeg", quality: 70, rect: { x: 0, y: 0, width: 1280, height: 800 }, scale: 1 } }]);
     expect(JSON.stringify(result)).not.toContain(IMAGE_BASE64);
     expect(program.takeImages()).toEqual([{ mimeType: "image/jpeg", data: IMAGE_BASE64, placeholder: "[screenshot 1280x800 of https://example.com/]" }]);

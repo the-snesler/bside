@@ -35,14 +35,19 @@ export interface CursorPresented {
 
 export interface PageCursor {
   /**
-   * Glides to the gesture's element (scrolled into view if it is not) and
-   * plays it, taking about `ms` (scaled by distance) plus a short dwell.
+   * Glides to the gesture's element (scrolled into view if it is not), or
+   * exactly to its point for an action at screenshot coordinates (never
+   * scrolling), and plays it, taking about `ms`
+   * (scaled by distance) plus a short dwell. A stroke ends pressed, for
+   * `follow` to carry along the drag.
    * `from` is where the cursor was in the tab's previous document, used when
    * this document has not shown it yet. Resolves with where it ended (null
    * if the element has no box to point at), and `stopped` if `signal` aborted
    * first, in which case the action must not run.
    */
   present(gesture: CursorGesture, ms: number, from: CursorPoint | null, signal?: AbortSignal): Promise<CursorPresented>;
+  /** Puts the cursor at a drag's point as the drag reaches it, pressed; null releases it. */
+  follow(at: CursorPoint | null): void;
   /** Hides the cursor from view while bside takes a screenshot. */
   hideForCapture(hidden: boolean): void;
 }
@@ -243,7 +248,8 @@ export function createPageCursor(document: Document): PageCursor {
     const stopped = { stopped: true, at: null };
     if (signal?.aborted) return stopped;
     clearTimeout(fadeTimer);
-    const target = reveal(gesture.element);
+    // A point read off a screenshot is shown where it is: scrolling would move what it points at.
+    const target = "at" in gesture && gesture.at ? gesture.at : reveal(gesture.element);
     if (!target) return { stopped: false, at: null };
     attach();
     css(ring, { opacity: "0" });
@@ -257,6 +263,8 @@ export function createPageCursor(document: Document): PageCursor {
       if (!await moveTo(target, ms, signal)) return stopped;
       if (gesture.kind === "click") ripple(target);
       if (gesture.kind === "type") surround(gesture.element);
+      // The drag itself moves it from here (`follow`), as its events go out.
+      if (gesture.kind === "stroke") arrow.style.setProperty("transform", "scale(0.85)");
       if (gesture.kind === "drag") {
         arrow.style.setProperty("transform", "scale(0.85)");
         const end = viewportCenter(gesture.to, view);
@@ -277,5 +285,19 @@ export function createPageCursor(document: Document): PageCursor {
     if (hidden) view?.getComputedStyle(host).visibility;
   }
 
-  return { present, hideForCapture };
+  function follow(at: CursorPoint | null): void {
+    clearTimeout(fadeTimer);
+    if (!at) {
+      arrow.style.removeProperty("transform");
+      fadeLater();
+      return;
+    }
+    glide?.cancel();
+    glide = null;
+    point = at;
+    arrow.style.setProperty("transform", "scale(0.85)");
+    place(at);
+  }
+
+  return { present, follow, hideForCapture };
 }

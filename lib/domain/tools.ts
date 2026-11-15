@@ -248,6 +248,89 @@ export interface CaptureGeometry {
   element: PageRect | null;
 }
 
+/** A point in one frame's viewport, in CSS pixels (`clientX`/`clientY`). */
+export interface ViewportPoint {
+  x: number;
+  y: number;
+}
+
+/**
+ * What the top frame showed when a screenshot was taken: its document, scroll
+ * position, and viewport size. Coordinates read off that screenshot are valid
+ * only while the top frame still shows exactly this.
+ */
+export interface ShotView {
+  documentId: string;
+  scrollX: number;
+  scrollY: number;
+  width: number;
+  height: number;
+}
+
+export type PointerButton = "left" | "middle" | "right";
+
+/** Points one `click` pointer action may click, one after another. */
+export const MAX_CLICK_POINTS = 100;
+/** Points one `drag` path may have, start included; the pointer moves in small steps between them. */
+export const MAX_DRAG_POINTS = 500;
+
+/**
+ * The closed set of things done at viewport coordinates, all in the frame of
+ * the first point: `locate` reports the element under a point (a read);
+ * `click` clicks each point in turn (double-clicks with `double`); `hover`
+ * moves the pointer onto a point; `drag` presses the primary button at the
+ * first point, moves through the rest in small steps, and releases it at the
+ * last.
+ */
+export type PointerAction =
+  | { kind: "locate"; at: ViewportPoint }
+  | { kind: "click"; points: ViewportPoint[]; button: PointerButton; double: boolean }
+  | { kind: "hover"; at: ViewportPoint }
+  | { kind: "drag"; path: ViewportPoint[] };
+
+/** The element a point landed on: a label (`[e12 button "Save"]`, or `canvas 400×300`) and its border box in the answering frame's viewport. */
+export interface PointHit {
+  label: string;
+  box: PageRect;
+}
+
+/** A pointer action's points, the first deciding which frame answers. */
+export function pointerPoints(action: PointerAction): ViewportPoint[] {
+  switch (action.kind) {
+    case "locate":
+    case "hover":
+      return [action.at];
+    case "click":
+      return action.points;
+    case "drag":
+      return action.path;
+  }
+}
+
+/** The same pointer action with its points replaced (moved into a child frame's viewport), in order. */
+export function withPointerPoints(action: PointerAction, points: ViewportPoint[]): PointerAction {
+  switch (action.kind) {
+    case "locate":
+    case "hover":
+      return { ...action, at: points[0]! };
+    case "click":
+      return { ...action, points };
+    case "drag":
+      return { ...action, path: points };
+  }
+}
+
+/**
+ * A frame's answer to a pointer request: the point is in a cross-origin child
+ * frame (its Firefox id and content box in this frame's viewport), for the
+ * background to ask that frame; or what this frame's document has there.
+ */
+export type PointerOutcome =
+  | { kind: "frame"; frameId: number; box: PageRect }
+  | { kind: "hit"; documentId: string; hit: PointHit }
+  /** An effect's result: what it did, and the change to this frame's outline. */
+  | { kind: "acted"; documentId: string; result: ToolResult };
+
 /** Summary of a captured page, safe to persist alongside a conversation turn. */
 export interface PageArtifactSummary {
   artifactId: string;

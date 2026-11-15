@@ -81,6 +81,11 @@ describe("trace read labels", () => {
   it("labels drags", () => {
     expect(describeActivity(activity('await page.ref("e4").dragTo(page.ref("e9"));'), false).title).toBe("Dragging a page item");
     expect(describeActivity(activity('await page.ref("e4").dragTo("e9");', false), false)).toMatchObject({ title: "Couldn't drag a page item", status: "error" });
+    // Coordinate actions read as what they did, not as the screenshot they started from.
+    expect(describeActivity(activity('await page.screenshot(); await page.clickAt("s1", 10, 20);'), false).title).toBe("Clicking on the page");
+    expect(describeActivity(activity('await page.dragAlong("s1", [[1, 1], [9, 9]]);', false), false)).toMatchObject({ title: "Couldn't drag on the page", status: "error" });
+    expect(describeActivity(activity('await page.hoverAt("s1", 4, 4);'), false).title).toBe("Hovering on the page");
+    expect(describeActivity(activity('return await page.elementAt("s1", 4, 4);'), false).title).toBe("Checking a point on the page");
   });
 
   it("labels combobox choices like option selection", () => {

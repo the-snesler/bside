@@ -13,8 +13,9 @@ import {
   isPageSnapshotRequest,
   isPageTableRequest,
   isPageMenuTargetRequest,
+  isPagePointerRequest,
 } from "@/lib/protocol";
-import type { ContentMessage, PageExecuteRequest, PageResponse } from "@/lib/protocol";
+import type { ContentMessage, PageExecuteRequest, PagePointerRequest, PageResponse } from "@/lib/protocol";
 import type { CursorPoint } from "@/lib/domain/cursor";
 import {
   buildOutline,
@@ -27,6 +28,7 @@ import {
   measureForCapture,
   measureFrameForCapture,
   describeMenuTarget,
+  pointerAt,
   settleDom,
 } from "@/lib/tools/page-executor";
 import { createPageCursor } from "@/lib/tools/page-cursor";
@@ -37,6 +39,9 @@ import { isPageContentType } from "@/lib/domain/files";
 
 /** What a content script answers in a document that is a file, not a web page: the background reads the file itself. */
 const FILE_DOCUMENT = "This tab shows a file, not a web page: bside reads the file itself, and it has no refs or actions.";
+
+/** The glide to each click after the first in a batch at screenshot coordinates, so a long batch stays quick to watch. */
+const REPEAT_GLIDE_MS = 60;
 
 /** The shield shows again on its own if the background never ends a capture. */
 const CAPTURE_SHIELD_TIMEOUT_MS = 5_000;
@@ -124,6 +129,44 @@ export default defineContentScript({
       }
     };
 
+    /**
+     * Acts at screenshot coordinates. In a tab the user can see, the cursor
+     * glides to each point before its effect (the later clicks of a batch
+     * quickly) and moves with a drag as it happens, and the glide stays
+     * cancellable until the request ends, so a cancelled run stops a batch
+     * between clicks.
+     */
+    const pointer = async (message: PagePointerRequest): Promise<PageResponse> => {
+      let landed: CursorPoint | null = null;
+      let shown = 0;
+      const stop = new AbortController();
+      const present = cursor && message.present && document.visibilityState === "visible" ? message.present : null;
+      if (present) glides.set(message.id, stop);
+      try {
+        const answered = await pointerAt(document, registry, message.view, message.action, settleDom, {
+          refPrefix: message.refPrefix,
+          frameIdOf,
+          ...(present ? {
+            present: async (gesture) => {
+              const ms = shown++ ? Math.min(present.ms, REPEAT_GLIDE_MS) : present.ms;
+              const glide = await cursor!.present(gesture, ms, landed ?? present.from, stop.signal);
+              landed = glide.at ?? landed;
+              return !glide.stopped;
+            },
+            follow: (at) => {
+              cursor!.follow(at);
+              landed = at ?? landed;
+            },
+          } : {}),
+        });
+        if (answered.ok) return { v: 1, id: message.id, ok: true, type: "page.pointer", outcome: answered.outcome, cursor: landed };
+        const { code, summary } = answered.result;
+        return { v: 1, id: message.id, ok: false, error: { code: code === "STALE_SNAPSHOT" || code === "TARGET_MISSING" ? code : "NOT_INTERACTABLE", message: summary, retryable: false, phase: "page" } };
+      } finally {
+        glides.delete(message.id);
+      }
+    };
+
     let captureTimer: ReturnType<typeof setTimeout> | undefined;
     const endCapture = () => {
       clearTimeout(captureTimer);
@@ -194,6 +237,7 @@ export default defineContentScript({
         captureTimer = setTimeout(endCapture, CAPTURE_SHIELD_TIMEOUT_MS);
         return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.capture-prepare", geometry: measured.geometry });
       }
+      if (isPagePointerRequest(message)) return pointer(message);
       if (isPageCaptureDoneRequest(message)) {
         endCapture();
         return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.capture-done" });
