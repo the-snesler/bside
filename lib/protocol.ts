@@ -22,7 +22,10 @@ import type {
   PageFindResult,
   PageSnapshot,
   PageTable,
+  PointerAction,
+  PointerOutcome,
   SearchPage,
+  ShotView,
   ToolCall,
   ToolResult,
 } from "@/lib/domain/tools";
@@ -39,7 +42,7 @@ import { isCustomInstructionsText, isSiteNote, isSiteOrigin, type SiteNote } fro
 import { isMemoryDraft, isMemoryName, MEMORY_WRITE_POLICIES, type MemoryApproval, type MemoryChange, type MemoryDraft, type MemoryEntry, type MemorySettingsV1 } from "@/lib/domain/memory";
 import { isMcpToolName, MCP_TRUST_LEVELS, type McpApproval, type McpServerStatus, type McpTrust } from "@/lib/domain/mcp";
 import { isMcpServerId } from "@/lib/mcp/servers";
-import { isSessionId, isViewableImagePath, isWorkspacePath, MAX_SESSION_TITLE_LEN, validateDomAction, validateElementTarget, validateHttpUrl } from "@/lib/validation";
+import { isSessionId, isViewableImagePath, isWorkspacePath, MAX_SESSION_TITLE_LEN, validateDomAction, validateElementTarget, validateHttpUrl, validatePointerAction, validateShotView } from "@/lib/validation";
 import type { AskContextV1 } from "@/lib/domain/ask";
 import { isTaskDraft, isTaskId, type TaskDraft, type ScheduledTask, type ScheduledSource, type NotificationSettingsV1 } from "@/lib/domain/automation";
 
@@ -51,7 +54,7 @@ import { isTaskDraft, isTaskId, type TaskDraft, type ScheduledTask, type Schedul
 // `tabs.sendMessage(tabId, request, { frameId })`; a content script answers
 // only requests naming its own frame. Snapshot, find, search results, the
 // shield, capture-done, execute-cancel, and fetch-file are top-frame requests (`frameId` 0); health,
-// outline, execute, table, capture-prepare, and menu-target may go to any frame. A frame other
+// outline, execute, table, capture-prepare, pointer, and menu-target may go to any frame. A frame other
 // than the top renders its refs with the prefix the background names it by
 // (`refPrefix`, e.g. `f3:`); the top frame's prefix is empty.
 // ---------------------------------------------------------------------------
@@ -186,6 +189,27 @@ export interface PageCapturePrepareRequest {
   childFrameId: number | null;
 }
 
+/**
+ * Acts at viewport coordinates read off a screenshot. The top frame gets the
+ * screenshot's `view` and refuses (`STALE_SNAPSHOT`) unless it still shows
+ * that document at that scroll position and viewport size; it then hit-tests
+ * the point (skipping bside's own page shield, descending into shadow roots
+ * and same-origin frames) and answers what is there, or, when the point is in
+ * a cross-origin child frame, that frame's id and content box, for the
+ * background to send the request on to it (`view` null, points in that
+ * frame's viewport).
+ */
+export interface PagePointerRequest {
+  v: 1;
+  id: string;
+  type: "page.pointer";
+  frameId: number;
+  tabId: number;
+  refPrefix: string;
+  view: ShotView | null;
+  action: PointerAction;
+}
+
 /** Ends a capture: the page shield shows again if it was hidden for it. */
 export interface PageCaptureDoneRequest {
   v: 1;
@@ -228,7 +252,7 @@ export interface PageMenuTargetRequest {
 }
 
 export type PageRequest = PageHealthRequest | PageSnapshotRequest | PageFindRequest | PageOutlineRequest | PageSearchResultsRequest | PageExecuteRequest |
-  PageExecuteCancelRequest | PageTableRequest | PageShieldRequest | PageCapturePrepareRequest | PageCaptureDoneRequest | PageFetchFileRequest | PageMenuTargetRequest;
+  PageExecuteCancelRequest | PageTableRequest | PageShieldRequest | PageCapturePrepareRequest | PageCaptureDoneRequest | PageFetchFileRequest | PageMenuTargetRequest | PagePointerRequest;
 
 export interface PageHealthResponse {
   v: 1;
@@ -321,6 +345,14 @@ export interface PageCapturePrepareResponse {
   geometry: CaptureGeometry;
 }
 
+export interface PagePointerResponse {
+  v: 1;
+  id: string;
+  ok: true;
+  type: "page.pointer";
+  outcome: PointerOutcome;
+}
+
 export interface PageCaptureDoneResponse {
   v: 1;
   id: string;
@@ -366,6 +398,7 @@ export type PageResponse =
   | PageCaptureDoneResponse
   | PageFetchFileResponse
   | PageMenuTargetResponse
+  | PagePointerResponse
   | PageErrorResponse;
 
 export function isPageHealthRequest(value: unknown): value is PageHealthRequest {
@@ -439,6 +472,15 @@ export function isPageCapturePrepareRequest(value: unknown): value is PageCaptur
   if (measuresChild && (!isFrameId(candidate.childFrameId) || candidate.childFrameId === 0 || candidate.target !== null)) return false;
   return isFrameId(candidate.frameId) && isRefPrefix(candidate.frameId, candidate.refPrefix) && isTabId(candidate.tabId) &&
     (candidate.target === null || validateElementTarget(candidate.target) !== null);
+}
+
+export function isPagePointerRequest(value: unknown): value is PagePointerRequest {
+  if (!isEnvelope(value) || value.type !== "page.pointer") return false;
+  const candidate = value as Record<string, unknown>;
+  // Only the top frame checks the screenshot's view; a child frame is reached through it.
+  const view = candidate.frameId === 0 ? validateShotView(candidate.view) !== null : candidate.view === null;
+  return isFrameId(candidate.frameId) && isRefPrefix(candidate.frameId, candidate.refPrefix) && isTabId(candidate.tabId) && view &&
+    validatePointerAction(candidate.action) !== null;
 }
 
 export function isPageCaptureDoneRequest(value: unknown): value is PageCaptureDoneRequest {

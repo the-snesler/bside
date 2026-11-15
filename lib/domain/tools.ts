@@ -248,6 +248,43 @@ export interface CaptureGeometry {
   element: PageRect | null;
 }
 
+/** A point in one frame's viewport, in CSS pixels (`clientX`/`clientY`). */
+export interface ViewportPoint {
+  x: number;
+  y: number;
+}
+
+/**
+ * What the top frame showed when a screenshot was taken: its document, scroll
+ * position, and viewport size. Coordinates read off that screenshot are valid
+ * only while the top frame still shows exactly this.
+ */
+export interface ShotView {
+  documentId: string;
+  scrollX: number;
+  scrollY: number;
+  width: number;
+  height: number;
+}
+
+/** The closed set of things done at viewport coordinates: `locate` reports the element under one point. */
+export type PointerAction = { kind: "locate"; at: ViewportPoint };
+
+/** The element a point landed on: a label (`[e12 button "Save"]`, or `canvas 400×300`) and its border box in the answering frame's viewport. */
+export interface PointHit {
+  label: string;
+  box: PageRect;
+}
+
+/**
+ * A frame's answer to a pointer request: the point is in a cross-origin child
+ * frame (its Firefox id and content box in this frame's viewport), for the
+ * background to ask that frame; or what this frame's document has there.
+ */
+export type PointerOutcome =
+  | { kind: "frame"; frameId: number; box: PageRect }
+  | { kind: "hit"; documentId: string; hit: PointHit };
+
 /** Summary of a captured page, safe to persist alongside a conversation turn. */
 export interface PageArtifactSummary {
   artifactId: string;

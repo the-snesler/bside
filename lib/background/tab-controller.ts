@@ -36,6 +36,7 @@ import type {
   PageFindRequest,
   PageHealthRequest,
   PageOutlineRequest,
+  PagePointerRequest,
   PageResponse,
   PageSearchResultsRequest,
   PageShieldRequest,
@@ -44,7 +45,10 @@ import type {
   PageTableRequest,
 } from "@/lib/protocol";
 import { MAX_FRAME_OUTLINE_CHARS } from "@/lib/protocol";
-import type { CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, PageArtifactSummary, PageErrorCode, PageFindResult, PageRect, PageSnapshot, PageTable, SearchPage, ToolResult } from "@/lib/domain/tools";
+import type {
+  CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, PageArtifactSummary, PageErrorCode, PageFindResult, PageRect, PageSnapshot, PageTable, PointerAction,
+  PointHit, SearchPage, ShotView, ToolResult,
+} from "@/lib/domain/tools";
 import { findInOutline, lineOffsets, sliceOutline } from "@/lib/domain/outline";
 import { base64ToBytes, PdfError, renderPdfText, type PdfText } from "@/lib/domain/pdf";
 import { FILE_LIMITS, FileError, isPageContentType, looksLikeFileUrl, readableText, type FileFetchResult } from "@/lib/domain/files";
@@ -239,6 +243,20 @@ export interface Screenshot {
   documentId: string;
   /** Whether a full-page or element capture was cut at `FULL_PAGE_MAX_CSS`. */
   cut: boolean;
+  /**
+   * How the image maps onto the page: the document rectangle it shows (CSS
+   * pixels), the image pixels per CSS pixel, and what the top frame showed
+   * (document, scroll position, viewport size), so a point in the image is a
+   * point in the viewport while the top frame still shows that.
+   */
+  area: { rect: PageRect; scale: number; view: ShotView };
+}
+
+/** What a pointer request found: the frame it landed in (0 for the top document, else its name number), that frame's document, and the element there with its box in the top frame's viewport. */
+export interface PointerReport {
+  frame: number;
+  documentId: string;
+  hit: PointHit;
 }
 
 export interface TabControllerBrowserApi {
@@ -836,9 +854,10 @@ export class TabController {
         if (image.bytes > SCREENSHOT_MAX_BYTES) continue;
         this.#url = geometry.url;
         this.#title = geometry.title;
+        const view: ShotView = { documentId: geometry.documentId, scrollX: geometry.viewport.x, scrollY: geometry.viewport.y, width: geometry.viewport.width, height: geometry.viewport.height };
         return { ok: true, value: {
           ...image, width: Math.max(1, Math.round(rect.width * scale)), height: Math.max(1, Math.round(rect.height * scale)),
-          url: geometry.url, documentId: geometry.documentId, cut,
+          url: geometry.url, documentId: geometry.documentId, cut, area: { rect, scale, view },
         } };
       }
       return { ok: false, error: { code: "LIMIT_EXCEEDED", message: `The screenshot stayed over ${SCREENSHOT_MAX_BYTES.toLocaleString("en-US")} bytes at reduced size; capture the viewport or one element instead.`, retryable: false, phase: "page" } };
@@ -1002,6 +1021,49 @@ export class TabController {
       return null;
     }
     return frame === 0 ? this.#cursor.next(tabId) : null;
+  }
+
+  /**
+   * Sends a pointer request at a point in the top frame's viewport, read off
+   * a screenshot whose top frame showed `view`. The top frame checks it still
+   * does and hit-tests the point; when the point is in a cross-origin frame,
+   * the request goes on to that frame (named like an outline names it, so
+   * its refs carry the name), with the point moved into its viewport, at
+   * most `FRAME_LIMITS.depth` frames deep.
+   */
+  async pointer(view: ShotView, action: PointerAction): Promise<PageOutcome<PointerReport>> {
+    const tabId = this.#tabId;
+    if (tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
+    if (await this.#isPdf()) return pageError("UNSUPPORTED_PAGE", PDF_READ_ONLY);
+    let frameId = TOP_FRAME;
+    let frame = 0;
+    let offset = { x: 0, y: 0 };
+    for (let hops = 0; hops <= FRAME_LIMITS.depth; hops++) {
+      const request: PagePointerRequest = {
+        v: 1, id: crypto.randomUUID(), type: "page.pointer", frameId, tabId, refPrefix: frame === 0 ? "" : `f${frame}:`,
+        view: frameId === TOP_FRAME ? view : null, action: shiftPointerAction(action, -offset.x, -offset.y),
+      };
+      let response: PageResponse | undefined;
+      try {
+        response = (await this.#browserApi.tabs.sendMessage(tabId, request, { frameId })) as PageResponse | undefined;
+      } catch {
+        return pageError("TAB_CHANGED", frame === 0 ? "The page is not available." : `Frame f${frame} did not answer; it may still be loading, or it is not a web page.`);
+      }
+      if (!response) return pageError("TAB_CHANGED", "The page did not respond.");
+      if (!response.ok) return { ok: false, error: response.error };
+      if (response.type !== "page.pointer") return pageError("TAB_CHANGED", "Unexpected response from the page.");
+      const { outcome } = response;
+      if (outcome.kind === "hit") {
+        const box = { ...outcome.hit.box, x: outcome.hit.box.x + offset.x, y: outcome.hit.box.y + offset.y };
+        return { ok: true, value: { frame, documentId: outcome.documentId, hit: { ...outcome.hit, box } } };
+      }
+      const alias = this.#frames.name(tabId, outcome.frameId, frameId);
+      if (alias === null) return pageError("TARGET_MISSING", "This page has more frames than bside can name.");
+      frameId = outcome.frameId;
+      frame = alias;
+      offset = { x: offset.x + outcome.box.x, y: offset.y + outcome.box.y };
+    }
+    return pageError("TARGET_MISSING", `The point is in a frame nested more than ${FRAME_LIMITS.depth} deep, which bside does not reach.`);
   }
 
   /** Firefox's id and the ref prefix for a named frame (0 is the top document); null for a name no outline of this tab gave out. */
@@ -1173,6 +1235,11 @@ function captureRect(geometry: CaptureGeometry, request: ScreenshotRequest): { r
   const cut = (request.area === "full" && !geometry.element && (geometry.page.width > page.width || geometry.page.height > page.height)) ||
     (geometry.element !== null && (right < area.x + area.width || bottom < area.y + area.height));
   return { rect: { x, y, width: Math.max(0, right - x), height: Math.max(0, bottom - y) }, cut };
+}
+
+/** A pointer action with its points moved by (dx, dy): into a child frame's viewport. */
+function shiftPointerAction(action: PointerAction, dx: number, dy: number): PointerAction {
+  return { ...action, at: { x: action.at.x + dx, y: action.at.y + dy } };
 }
 
 function shiftRect(rect: PageRect, dx: number, dy: number): PageRect {

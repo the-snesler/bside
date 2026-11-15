@@ -13,6 +13,7 @@ import {
   isPageOutlineRequest,
   isPageCaptureDoneRequest,
   isPageCapturePrepareRequest,
+  isPagePointerRequest,
   isPageTableRequest,
   isPageSearchResultsRequest,
   isPageShieldRequest,
@@ -486,6 +487,29 @@ describe("isPageExecuteRequest: accepts the closed action union only", () => {
     expect(isPageExecuteCancelRequest({ ...cancel, executeId: "" })).toBe(false);
     expect(isPageExecuteCancelRequest({ ...cancel, executeId: "x".repeat(101) })).toBe(false);
     expect(isPageExecuteCancelRequest({ ...cancel, tabId: undefined })).toBe(false);
+  });
+});
+
+describe("isPagePointerRequest", () => {
+  const view = { documentId: "doc", scrollX: 0, scrollY: 500, width: 1280, height: 800 };
+  const locate = { kind: "locate", at: { x: 10.5, y: 20 } };
+  const top = { v: 1, id: "1", type: "page.pointer", frameId: 0, tabId: 3, refPrefix: "", view, action: locate };
+
+  it("needs the screenshot's view in the top frame only, where it is checked", () => {
+    expect(isPagePointerRequest(top)).toBe(true);
+    expect(isPagePointerRequest({ ...top, view: null })).toBe(false);
+    expect(isPagePointerRequest({ ...top, frameId: 7, refPrefix: "f2:", view: null })).toBe(true);
+    expect(isPagePointerRequest({ ...top, frameId: 7, refPrefix: "f2:" })).toBe(false);
+    expect(isPagePointerRequest({ ...top, view: { ...view, extra: 1 } })).toBe(false);
+    expect(isPagePointerRequest({ ...top, view: { ...view, width: -1 } })).toBe(false);
+  });
+
+  it("accepts only the closed pointer actions with finite points in range", () => {
+    expect(isPagePointerRequest({ ...top, action: { kind: "click", at: { x: 1, y: 1 } } })).toBe(false);
+    expect(isPagePointerRequest({ ...top, action: { ...locate, selector: "#x" } })).toBe(false);
+    expect(isPagePointerRequest({ ...top, action: { kind: "locate", at: { x: Number.NaN, y: 1 } } })).toBe(false);
+    expect(isPagePointerRequest({ ...top, action: { kind: "locate", at: { x: 1e9, y: 1 } } })).toBe(false);
+    expect(isPagePointerRequest({ ...top, action: { kind: "locate", at: { x: "1", y: 1 } } })).toBe(false);
   });
 });
 

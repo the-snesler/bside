@@ -13,6 +13,7 @@ import {
   isPageSnapshotRequest,
   isPageTableRequest,
   isPageMenuTargetRequest,
+  isPagePointerRequest,
 } from "@/lib/protocol";
 import type { ContentMessage, PageExecuteRequest, PageResponse } from "@/lib/protocol";
 import type { CursorPoint } from "@/lib/domain/cursor";
@@ -27,6 +28,7 @@ import {
   measureForCapture,
   measureFrameForCapture,
   describeMenuTarget,
+  pointerAt,
   settleDom,
 } from "@/lib/tools/page-executor";
 import { createPageCursor } from "@/lib/tools/page-cursor";
@@ -193,6 +195,14 @@ export default defineContentScript({
         cursor?.hideForCapture(true);
         captureTimer = setTimeout(endCapture, CAPTURE_SHIELD_TIMEOUT_MS);
         return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.capture-prepare", geometry: measured.geometry });
+      }
+      if (isPagePointerRequest(message)) {
+        const answered = pointerAt(document, registry, message.view, message.action, { refPrefix: message.refPrefix, frameIdOf });
+        if (!answered.ok) {
+          const { code, summary } = answered.result;
+          return Promise.resolve({ v: 1, id: message.id, ok: false, error: { code: code === "STALE_SNAPSHOT" || code === "TARGET_MISSING" ? code : "NOT_INTERACTABLE", message: summary, retryable: false, phase: "page" } });
+        }
+        return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.pointer", outcome: answered.outcome });
       }
       if (isPageCaptureDoneRequest(message)) {
         endCapture();

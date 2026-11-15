@@ -15,9 +15,10 @@
  * label; other hidden elements are never targetable.
  *
  * Elements registered with `excludeFromOutline` (bside's own page shield and cursor) are
- * skipped entirely. Effects are dispatched straight to the resolved element;
- * nothing here hit-tests by coordinates (no `elementFromPoint`), so an overlay
- * never redirects or blocks an agent action.
+ * skipped entirely. Effects are dispatched straight to the resolved element,
+ * so an overlay never redirects or blocks an agent action. Only pointer
+ * requests (`pointerAt`, coordinates read off a screenshot) hit-test by
+ * coordinates, and they skip excluded elements too.
  *
  * This file never touches `browser.*` APIs and never receives credentials or
  * generated JavaScript — it only ever sees a `Document`, opaque refs, and
@@ -28,8 +29,8 @@
 import { TABLE_LIMITS } from "@/lib/domain/tools";
 import { STOPPED_BEFORE_ACTION } from "@/lib/domain/cursor";
 import type {
-  CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, KeyModifier, PageFindResult, PageRect, PageSnapshot, PageTable, PressKey,
-  TableRole, ToolResult, UploadFile,
+  CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, KeyModifier, PageFindResult, PageRect, PageSnapshot, PageTable, PointerAction,
+  PointerOutcome, PressKey, ShotView, TableRole, ToolResult, UploadFile, ViewportPoint,
 } from "@/lib/domain/tools";
 import { formatKeyChord } from "@/lib/validation";
 import { boundOutline, findInOutline, sliceOutline } from "@/lib/domain/outline";
@@ -1947,12 +1948,7 @@ export function measureForCapture(document: Document, registry: ElementRefRegist
   { ok: true; geometry: CaptureGeometry } | { ok: false; result: ToolResult } {
   const view = document.defaultView;
   const root = document.documentElement;
-  const viewport: PageRect = {
-    x: view?.scrollX ?? 0,
-    y: view?.scrollY ?? 0,
-    width: root?.clientWidth || view?.innerWidth || 0,
-    height: root?.clientHeight || view?.innerHeight || 0,
-  };
+  const viewport = viewportRect(document);
   const page = {
     width: Math.max(viewport.width, root?.scrollWidth ?? 0, document.body?.scrollWidth ?? 0),
     height: Math.max(viewport.height, root?.scrollHeight ?? 0, document.body?.scrollHeight ?? 0),
@@ -1986,13 +1982,31 @@ export function measureFrameForCapture(document: Document, registry: ElementRefR
   if (!measured.ok) return measured;
   const frame = frameElements(document).find((candidate) => frameIdOf(candidate) === frameId);
   if (!frame) return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: "The frame is no longer on the page. Read a fresh snapshot." } };
-  const border = documentRect(frame, document.defaultView);
+  return { ok: true, geometry: { ...measured.geometry, element: frameContentBox(frame, documentRect(frame, document.defaultView)) } };
+}
+
+/** The scrolled viewport in document coordinates: the scroll position and the visible size (without scrollbars). */
+function viewportRect(document: Document): PageRect {
+  const view = document.defaultView;
+  const root = document.documentElement;
+  return {
+    x: view?.scrollX ?? 0,
+    y: view?.scrollY ?? 0,
+    width: root?.clientWidth || view?.innerWidth || 0,
+    height: root?.clientHeight || view?.innerHeight || 0,
+  };
+}
+
+/** Where a frame element draws its document (its content box), given its border box in some coordinate space. */
+function frameContentBox(frame: Element, border: PageRect): PageRect {
   const style = styleOf(frame);
-  const x = border.x + frame.clientLeft + (parseFloat(style?.paddingLeft ?? "") || 0);
-  const y = border.y + frame.clientTop + (parseFloat(style?.paddingTop ?? "") || 0);
-  const width = frame.clientWidth - (parseFloat(style?.paddingLeft ?? "") || 0) - (parseFloat(style?.paddingRight ?? "") || 0);
-  const height = frame.clientHeight - (parseFloat(style?.paddingTop ?? "") || 0) - (parseFloat(style?.paddingBottom ?? "") || 0);
-  return { ok: true, geometry: { ...measured.geometry, element: { x, y, width: Math.max(0, width), height: Math.max(0, height) } } };
+  const padding = (side: string) => parseFloat(style?.getPropertyValue(`padding-${side}`) ?? "") || 0;
+  return {
+    x: border.x + frame.clientLeft + padding("left"),
+    y: border.y + frame.clientTop + padding("top"),
+    width: Math.max(0, frame.clientWidth - padding("left") - padding("right")),
+    height: Math.max(0, frame.clientHeight - padding("top") - padding("bottom")),
+  };
 }
 
 /** Every iframe/frame element in a document, its shadow roots, and its same-origin frames. */
@@ -2031,4 +2045,143 @@ function documentRect(element: Element, top: Window | null): PageRect {
 export function describeMenuTarget(element: Element | undefined): string | null {
   if (!element || element.localName !== "img") return null;
   return (element.getAttribute("alt") || element.getAttribute("aria-label") || "").slice(0, 300) || null;
+}
+
+// ---------------------------------------------------------------------------
+// Pointer requests: coordinates read off a screenshot
+// ---------------------------------------------------------------------------
+
+/** Same-origin frames a hit test descends into, like the outline's frame depth. */
+const MAX_HIT_FRAME_DEPTH = 3;
+/** Shadow roots a hit test descends through. */
+const MAX_HIT_SHADOW_DEPTH = 32;
+/** How far the scroll position or viewport size may drift (fractional scrolling, rounding) and still match a screenshot. */
+const VIEW_TOLERANCE_PX = 1;
+const MEDIA_TAGS = new Set(["canvas", "img", "svg", "video", "picture", "iframe", "frame", "embed", "object"]);
+
+/**
+ * What is at a point: an element (and where its document's viewport sits in
+ * the answering frame's viewport), or a cross-origin child frame for the
+ * background to ask (its content box in the answering frame's viewport).
+ */
+type PointTarget =
+  | { kind: "element"; element: Element; offset: ViewportPoint }
+  | { kind: "frame"; frameId: number; box: PageRect };
+
+/** The topmost element at a point in a document or shadow root, skipping bside's own page shield. */
+function topmostAt(root: Document | ShadowRoot, point: ViewportPoint): Element | null {
+  let stack: Element[];
+  try {
+    stack = Array.from((root as DocumentOrShadowRoot).elementsFromPoint?.(point.x, point.y) ?? []);
+  } catch {
+    return null;
+  }
+  return stack.find((element) => !OUTLINE_EXCLUDED.has(element)) ?? null;
+}
+
+function inside(point: ViewportPoint, box: PageRect): boolean {
+  return point.x >= box.x && point.y >= box.y && point.x < box.x + box.width && point.y < box.y + box.height;
+}
+
+/**
+ * Hit-tests a point in a document's viewport the way a real pointer would
+ * land: the topmost element (not bside's shield), then down through open and
+ * closed shadow roots and same-origin frames. A cross-origin frame is
+ * answered by its own content script, so it is returned for the background
+ * to address.
+ */
+function hitTest(document: Document, point: ViewportPoint, frameIdOf: ((frame: Element) => number) | undefined, depth = 0): PointTarget | null {
+  let element = topmostAt(document, point);
+  for (let level = 0; element && level < MAX_HIT_SHADOW_DEPTH; level++) {
+    const shadow = shadowRootOf(element);
+    if (!shadow) break;
+    const inner = topmostAt(shadow, point);
+    // A shadow root's hit list also has the host and its ancestors; only nodes in the shadow tree go deeper.
+    if (!inner || inner === element || inner.getRootNode() !== shadow) break;
+    element = inner;
+  }
+  if (!element) return null;
+  const tag = tagOf(element);
+  if (tag === "iframe" || tag === "frame") {
+    const border = element.getBoundingClientRect();
+    const box = frameContentBox(element, { x: border.left, y: border.top, width: border.width, height: border.height });
+    if (inside(point, box)) {
+      let inner: Document | null = null;
+      try { inner = (element as HTMLIFrameElement).contentDocument; } catch { inner = null; }
+      if (inner) {
+        const nested = depth < MAX_HIT_FRAME_DEPTH ? hitTest(inner, { x: point.x - box.x, y: point.y - box.y }, frameIdOf, depth + 1) : null;
+        if (nested?.kind === "element") return { ...nested, offset: { x: nested.offset.x + box.x, y: nested.offset.y + box.y } };
+        if (nested?.kind === "frame") return { ...nested, box: { ...nested.box, x: nested.box.x + box.x, y: nested.box.y + box.y } };
+      } else {
+        const frameId = frameIdOf?.(element) ?? -1;
+        if (frameId > 0) return { kind: "frame", frameId, box };
+      }
+    }
+  }
+  return { kind: "element", element, offset: { x: 0, y: 0 } };
+}
+
+/** An element the outline has no ref for: its tag, a media element's size, and a little of its text or alt. */
+function plainLabel(element: Element): string {
+  const tag = tagOf(element);
+  if (MEDIA_TAGS.has(tag)) {
+    const box = element.getBoundingClientRect();
+    const alt = element.getAttribute("alt") || element.getAttribute("aria-label") || element.getAttribute("title") || "";
+    return `${tag} ${Math.round(box.width)}×${Math.round(box.height)}${alt ? ` ${JSON.stringify(clip(trimText(alt), 80))}` : ""}`;
+  }
+  const text = clip(trimText(composedText(element, 120)), 80);
+  return text ? `${tag} ${JSON.stringify(text)}` : tag;
+}
+
+/**
+ * How the model should know the element at a point: its control's ref when it
+ * is (or is inside) one in the outline, a media element inside a control as
+ * both, and anything else by tag and text.
+ */
+function describeHit(element: Element, outline: Outline): string {
+  const proxies = new Map<Element, OutlineControl>();
+  for (const control of outline.controls) if (control.proxy) proxies.set(control.proxy, control);
+  let node: Element | null = element;
+  for (let level = 0; node && level < 64; level++, node = composedParent(node)) {
+    const control = outline.byElement.get(node) ?? proxies.get(node);
+    if (!control) continue;
+    return node !== element && MEDIA_TAGS.has(tagOf(element)) ? `${plainLabel(element)} in ${describe(control)}` : describe(control);
+  }
+  return plainLabel(element);
+}
+
+/** Why the top frame no longer shows what a screenshot showed, or null when it still does. */
+function viewChange(document: Document, registry: ElementRefRegistry, view: ShotView): string | null {
+  if (view.documentId !== registry.documentId) return "The page loaded a new document since that screenshot.";
+  const live = viewportRect(document);
+  if (Math.abs(live.x - view.scrollX) > VIEW_TOLERANCE_PX || Math.abs(live.y - view.scrollY) > VIEW_TOLERANCE_PX) return "The page scrolled since that screenshot.";
+  if (Math.abs(live.width - view.width) > VIEW_TOLERANCE_PX || Math.abs(live.height - view.height) > VIEW_TOLERANCE_PX) return "The window was resized since that screenshot.";
+  return null;
+}
+
+/**
+ * Answers a pointer request in this frame. The top frame first checks it
+ * still shows what the screenshot showed (`view`); a child frame gets no
+ * view, since the top frame checked it. The point must be inside this
+ * frame's viewport. A point in a cross-origin child frame is answered with
+ * that frame for the background to ask; otherwise with the element there.
+ */
+export function pointerAt(document: Document, registry: ElementRefRegistry, view: ShotView | null, action: PointerAction, options: OutlineOptions = {}):
+  { ok: true; outcome: PointerOutcome } | { ok: false; result: ToolResult } {
+  if (view) {
+    const changed = viewChange(document, registry, view);
+    if (changed) return { ok: false, result: { ok: false, code: "STALE_SNAPSHOT", summary: `${changed} Take a new screenshot and read the coordinates from it.` } };
+  }
+  const point = action.at;
+  const viewport = viewportRect(document);
+  if (point.x < 0 || point.y < 0 || point.x >= viewport.width || point.y >= viewport.height) {
+    return { ok: false, result: { ok: false, code: "NOT_INTERACTABLE", summary: `The point is outside the visible part of the ${view ? "page" : "frame"}.` } };
+  }
+  const target = hitTest(document, point, options.frameIdOf);
+  if (!target) return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: "Nothing on the page is at that point." } };
+  if (target.kind === "frame") return { ok: true, outcome: target };
+  const border = target.element.getBoundingClientRect();
+  const box = { x: border.left + target.offset.x, y: border.top + target.offset.y, width: border.width, height: border.height };
+  const label = describeHit(target.element, buildOutline(document, registry, options));
+  return { ok: true, outcome: { kind: "hit", documentId: registry.documentId, hit: { label, box } } };
 }

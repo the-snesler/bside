@@ -5,7 +5,7 @@
  * on, by the agent loop after the provider returns complete arguments.
  */
 
-import type { CharacterKey, DomAction, ElementTarget, JsonValue, KeyModifier, NamedKey, PressKey, UploadFile } from "@/lib/domain/tools";
+import type { CharacterKey, DomAction, ElementTarget, JsonValue, KeyModifier, NamedKey, PointerAction, PressKey, ShotView, UploadFile, ViewportPoint } from "@/lib/domain/tools";
 
 const MAX_REF_LEN = 32;
 const MAX_DOCUMENT_ID_LEN = 64;
@@ -113,6 +113,38 @@ export function validateElementTarget(raw: unknown): ElementTarget | null {
     return { kind: "role", role: raw.role, name: raw.name, exact: raw.exact };
   }
   return null;
+}
+
+/** How far from a viewport's origin a coordinate may be, in CSS pixels (pages are cut at 12,000; frames can sit further in). */
+export const MAX_VIEWPORT_COORDINATE = 100_000;
+
+/** A finite point within `MAX_VIEWPORT_COORDINATE` of the viewport's origin. */
+export function validateViewportPoint(raw: unknown): ViewportPoint | null {
+  if (!isObject(raw) || !hasExactKeys(raw, ["x", "y"])) return null;
+  const inRange = (value: unknown) => typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= MAX_VIEWPORT_COORDINATE;
+  return inRange(raw.x) && inRange(raw.y) ? { x: raw.x as number, y: raw.y as number } : null;
+}
+
+/** What the top frame showed when a screenshot was taken: a document id, a scroll position, and a viewport size. */
+export function validateShotView(raw: unknown): ShotView | null {
+  if (!isObject(raw) || !hasExactKeys(raw, ["documentId", "scrollX", "scrollY", "width", "height"])) return null;
+  if (!isBoundedString(raw.documentId, MAX_DOCUMENT_ID_LEN)) return null;
+  const finite = (value: unknown, min: number) => typeof value === "number" && Number.isFinite(value) && value >= min && value <= MAX_VIEWPORT_COORDINATE;
+  if (!finite(raw.scrollX, -MAX_VIEWPORT_COORDINATE) || !finite(raw.scrollY, -MAX_VIEWPORT_COORDINATE) || !finite(raw.width, 0) || !finite(raw.height, 0)) return null;
+  return { documentId: raw.documentId, scrollX: raw.scrollX as number, scrollY: raw.scrollY as number, width: raw.width as number, height: raw.height as number };
+}
+
+/** One member of the closed `PointerAction` union, with its points in range. */
+export function validatePointerAction(raw: unknown): PointerAction | null {
+  if (!isObject(raw)) return null;
+  switch (raw.kind) {
+    case "locate": {
+      const at = validateViewportPoint(raw.at);
+      return at && hasExactKeys(raw, ["kind", "at"]) ? { kind: "locate", at } : null;
+    }
+    default:
+      return null;
+  }
 }
 
 /**
