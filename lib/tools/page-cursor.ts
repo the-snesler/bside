@@ -20,10 +20,11 @@ const PERIWINKLE = "107 130 219";
 /** The arrow's fill. */
 const BLUE = "#2f6bf3";
 const SVG = "http://www.w3.org/2000/svg";
-/** The arrow's outline (Tabler's "pointer" icon), in a 24 × 24 box drawn at 24 px. */
+/** The arrow's outline (Tabler's "pointer" icon), in a 24 × 24 box drawn at `ARROW_PX`. */
 const ARROW_PATH = "M11 21L4 4l17 7l-6.265 2.685a2 2 0 0 0-1.05 1.05z";
-/** The arrow's tip, from the cursor element's top-left corner. */
-const TIP = { x: 4, y: 4 };
+const ARROW_PX = 20;
+/** The arrow's tip, from the cursor element's top-left corner (the path's 4, 4, scaled). */
+const TIP = { x: (4 * ARROW_PX) / 24, y: (4 * ARROW_PX) / 24 };
 /** The cursor fades out this long after its last gesture. */
 const IDLE_FADE_MS = 2_500;
 
@@ -126,8 +127,8 @@ export function createPageCursor(document: Document): PageCursor {
   const cursor = document.createElement("div");
   css(cursor, { position: "fixed", left: "0", top: "0", display: "flex", "align-items": "flex-start", opacity: "0", transition: "opacity 180ms ease-out", "will-change": "transform" });
   const arrow = document.createElementNS(SVG, "svg");
-  arrow.setAttribute("width", "24");
-  arrow.setAttribute("height", "24");
+  arrow.setAttribute("width", String(ARROW_PX));
+  arrow.setAttribute("height", String(ARROW_PX));
   arrow.setAttribute("viewBox", "0 0 24 24");
   css(arrow, {
     display: "block", overflow: "visible", "transform-origin": `${TIP.x}px ${TIP.y}px`, transition: "transform 90ms ease-out",
@@ -148,7 +149,7 @@ export function createPageCursor(document: Document): PageCursor {
   const tag = document.createElement("span");
   tag.textContent = "bside";
   css(tag, {
-    margin: "18px 0 0 -4px", padding: "1px 7px", "border-radius": "999px", background: `rgb(${PERIWINKLE})`, color: CREAM,
+    margin: "15px 0 0 -3px", padding: "1px 7px", "border-radius": "999px", background: `rgb(${PERIWINKLE})`, color: CREAM,
     font: "600 11px/1.4 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif", "letter-spacing": "normal", "white-space": "nowrap",
     "box-shadow": "0 1px 3px rgb(0 0 0 / 0.3)",
   });
