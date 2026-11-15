@@ -27,7 +27,7 @@
  */
 
 import { TABLE_LIMITS } from "@/lib/domain/tools";
-import { STOPPED_BEFORE_ACTION } from "@/lib/domain/cursor";
+import { STOPPED_BEFORE_ACTION, type CursorPoint } from "@/lib/domain/cursor";
 import type {
   CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, KeyModifier, PageFindResult, PageRect, PageSnapshot, PageTable, PointerAction,
   PointerButton, PointerOutcome, PressKey, ShotView, TableRole, ToolResult, UploadFile, ViewportPoint,
@@ -1849,12 +1849,20 @@ function describeReorder(before: readonly string[], after: readonly string[]): s
   return lines;
 }
 
-/** What the agent's visible cursor does on arrival (`lib/tools/page-cursor.ts`): a click ripple, a ring around a field being typed in, nothing (hover), or a press-and-carry to `to`. */
+/**
+ * What the agent's visible cursor does on arrival (`lib/tools/page-cursor.ts`):
+ * a click ripple, a ring around a field being typed in, nothing (hover), a
+ * press-and-carry to `to`, or a press-and-carry along a path. A click or
+ * hover at screenshot coordinates names its point (`at`, in the top
+ * viewport), and a stroke its path: the cursor goes exactly there and never
+ * scrolls the page, which would move what the coordinates point at.
+ */
 export type CursorGesture =
-  | { kind: "click"; element: Element }
+  | { kind: "click"; element: Element; at?: CursorPoint }
   | { kind: "type"; element: Element }
-  | { kind: "hover"; element: Element }
-  | { kind: "drag"; element: Element; to: Element };
+  | { kind: "hover"; element: Element; at?: CursorPoint }
+  | { kind: "drag"; element: Element; to: Element }
+  | { kind: "stroke"; element: Element; path: CursorPoint[] };
 
 export interface ExecuteOptions extends OutlineOptions {
   /**
@@ -2308,7 +2316,7 @@ export async function pointerAt(
   view: ShotView | null,
   action: PointerAction,
   settle: Settle = settleDom,
-  options: OutlineOptions = {},
+  options: ExecuteOptions = {},
 ): Promise<{ ok: true; outcome: PointerOutcome } | { ok: false; result: ToolResult }> {
   if (view) {
     const changed = viewChange(document, registry, view);
@@ -2336,11 +2344,16 @@ export async function pointerAt(
   // Points move into the document the first one landed in (a same-origin frame's viewport).
   const local = points.map((point) => ({ x: point.x - target.offset.x, y: point.y - target.offset.y }));
   const urlBefore = document.location?.href;
+  // The cursor is drawn by the top frame over the whole tab, at the request's own points (the top viewport's).
+  const show = async (gesture: CursorGesture) => !options.present || await options.present(gesture);
+  const stopped = (result: ToolResult): { ok: true; outcome: PointerOutcome } => ({ ok: true, outcome: { kind: "acted", documentId: registry.documentId, result } });
   let message: string;
   if (action.kind === "hover") {
+    if (!await show({ kind: "hover", element: target.element, at: first })) return stopped(STOPPED_BEFORE_ACTION);
     movePointerTo(target.element, 0, { clientX: local[0]!.x, clientY: local[0]!.y }, at(local[0]!, 0));
     message = `Moved the pointer onto ${label}.`;
   } else if (action.kind === "drag") {
+    if (!await show({ kind: "stroke", element: target.element, path: points })) return stopped(STOPPED_BEFORE_ACTION);
     const end = dragAlong(target.element, local);
     const endLabel = end === target.element ? "the same element" : describeHit(end, before);
     message = `Dragged from ${label} through ${points.length} points to ${endLabel}.`;
@@ -2350,6 +2363,9 @@ export async function pointerAt(
       // Each click lands on what is there now: an earlier click may have changed the page.
       const element = index === 0 ? target.element : deepestAt(home, point);
       if (!element) return { ok: false, result: { ok: false, code: "TARGET_MISSING", summary: `${verb} ${index} point${index === 1 ? "" : "s"}; nothing is at point ${index + 1} any more, so the rest were not clicked.` } };
+      if (!await show({ kind: "click", element, at: points[index]! })) {
+        return stopped(index ? { ok: false, code: "SKIPPED", summary: `Stopped after clicking ${index} of ${local.length} points; the rest were not clicked.` } : STOPPED_BEFORE_ACTION);
+      }
       clickAt(element, point, action.button, action.double);
     }
     message = local.length === 1 ? `${verb} ${label}.` : `${verb} ${local.length} points, the first on ${label}.`;

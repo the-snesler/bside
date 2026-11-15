@@ -1768,7 +1768,7 @@ export class BrowserProgram {
     if (action.kind === "click" || action.kind === "drag") this.#refuseIfReadOnly(`${method}()`);
     // A lost response can follow a committed effect; disable automatic retry before dispatch.
     if (action.kind !== "locate") this.onEffect();
-    const outcome = await controller.pointer(record.view, action);
+    const outcome = await controller.pointer(record.view, action, signal);
     if (action.kind !== "locate") this.#usedPage(controller);
     if (!outcome.ok) throw this.#pageError(outcome.error, tabId);
     const url = controller.currentAttachment()?.url;

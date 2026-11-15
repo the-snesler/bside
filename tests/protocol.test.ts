@@ -493,7 +493,7 @@ describe("isPageExecuteRequest: accepts the closed action union only", () => {
 describe("isPagePointerRequest", () => {
   const view = { documentId: "doc", scrollX: 0, scrollY: 500, width: 1280, height: 800 };
   const locate = { kind: "locate", at: { x: 10.5, y: 20 } };
-  const top = { v: 1, id: "1", type: "page.pointer", frameId: 0, tabId: 3, refPrefix: "", view, action: locate };
+  const top = { v: 1, id: "1", type: "page.pointer", frameId: 0, tabId: 3, refPrefix: "", view, action: locate, present: null };
 
   it("needs the screenshot's view in the top frame only, where it is checked", () => {
     expect(isPagePointerRequest(top)).toBe(true);
@@ -517,6 +517,16 @@ describe("isPagePointerRequest", () => {
     expect(isPagePointerRequest({ ...top, action: { kind: "drag", path: [point] } })).toBe(false);
     expect(isPagePointerRequest({ ...top, action: { kind: "drag", path: Array(501).fill(point) } })).toBe(false);
     expect(isPagePointerRequest({ ...top, action: { kind: "drag", path: [point, { x: 1 }] } })).toBe(false);
+  });
+
+  it("lets only the top frame show the cursor, and never for a hit test", () => {
+    const click = { kind: "click", points: [{ x: 1, y: 2 }], button: "left", double: false };
+    expect(isPagePointerRequest({ ...top, action: click, present: { ms: 300, from: null } })).toBe(true);
+    expect(isPagePointerRequest({ ...top, present: { ms: 300, from: null } })).toBe(false);
+    expect(isPagePointerRequest({ ...top, frameId: 7, refPrefix: "f2:", view: null, action: click, present: { ms: 300, from: null } })).toBe(false);
+    expect(isPagePointerRequest({ ...top, action: click, present: { ms: 5000, from: null } })).toBe(false);
+    const { present: _present, ...missing } = top;
+    expect(isPagePointerRequest(missing)).toBe(false);
   });
 
   it("accepts only the closed pointer actions with finite points in range", () => {

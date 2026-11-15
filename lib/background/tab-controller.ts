@@ -1014,6 +1014,11 @@ export class TabController {
    */
   async #presentation(tabId: number, action: DomAction, frame: number): Promise<PageExecuteRequest["present"]> {
     if (!action.target) return null;
+    return this.#paceIfVisible(tabId, frame === 0);
+  }
+
+  /** The cursor's pace for the next action in a tab its window shows (when the top frame `draws` it); a tab out of sight restarts its pace. */
+  async #paceIfVisible(tabId: number, draws: boolean): Promise<PageExecuteRequest["present"]> {
     let visible = false;
     try {
       visible = (await this.#browserApi.tabs.query({ active: true })).some((tab) => tab.id === tabId && tab.active === true && tab.hidden !== true);
@@ -1024,7 +1029,7 @@ export class TabController {
       this.#cursor.forget(tabId);
       return null;
     }
-    return frame === 0 ? this.#cursor.next(tabId) : null;
+    return draws ? this.#cursor.next(tabId) : null;
   }
 
   /**
@@ -1034,11 +1039,18 @@ export class TabController {
    * the request goes on to that frame (named like an outline names it, so
    * its refs carry the name), with the point moved into its viewport, at
    * most `FRAME_LIMITS.depth` frames deep.
+   *
+   * In a tab its window shows, an effect first shows bside's cursor at the
+   * points (drawn by the top frame, so only for points in the top document
+   * and its same-origin frames). If `signal` aborts during a glide, the page
+   * is told to stop, and events not yet dispatched are not (`SKIPPED`).
    */
-  async pointer(view: ShotView, action: PointerAction): Promise<PageOutcome<PointerReport>> {
+  async pointer(view: ShotView, action: PointerAction, signal?: AbortSignal): Promise<PageOutcome<PointerReport>> {
     const tabId = this.#tabId;
     if (tabId === null) return pageError("UNSUPPORTED_PAGE", "No page is attached.");
     if (await this.#isPdf()) return pageError("UNSUPPORTED_PAGE", PDF_READ_ONLY);
+    const present = action.kind === "locate" ? null : await this.#paceIfVisible(tabId, true);
+    if (present && signal?.aborted) return { ok: true, value: { kind: "acted", frame: 0, documentId: null, result: STOPPED_BEFORE_ACTION } };
     let frameId = TOP_FRAME;
     let frame = 0;
     let offset = { x: 0, y: 0 };
@@ -1046,14 +1058,23 @@ export class TabController {
       const request: PagePointerRequest = {
         v: 1, id: crypto.randomUUID(), type: "page.pointer", frameId, tabId, refPrefix: frame === 0 ? "" : `f${frame}:`,
         view: frameId === TOP_FRAME ? view : null, action: withPointerPoints(action, pointerPoints(action).map((point) => ({ x: point.x - offset.x, y: point.y - offset.y }))),
+        present: frameId === TOP_FRAME ? present : null,
       };
+      const stop = () => {
+        const cancel: PageExecuteCancelRequest = { v: 1, id: crypto.randomUUID(), type: "page.execute-cancel", frameId: TOP_FRAME, tabId, executeId: request.id };
+        this.#browserApi.tabs.sendMessage(tabId, cancel, { frameId: TOP_FRAME }).catch(() => {});
+      };
+      if (request.present) signal?.addEventListener("abort", stop, { once: true });
       let response: PageResponse | undefined;
       try {
         response = (await this.#browserApi.tabs.sendMessage(tabId, request, { frameId })) as PageResponse | undefined;
       } catch {
         if (action.kind !== "locate") return this.#lostDuringPointer(tabId, frame, action.kind);
         return pageError("TAB_CHANGED", frame === 0 ? "The page is not available." : `Frame f${frame} did not answer; it may still be loading, or it is not a web page.`);
+      } finally {
+        signal?.removeEventListener("abort", stop);
       }
+      if (request.present && response?.ok && response.type === "page.pointer") this.#cursor.landed(tabId, isCursorPoint(response.cursor) ? response.cursor : null);
       if (!response) return pageError("TAB_CHANGED", "The page did not respond.");
       if (!response.ok) return { ok: false, error: response.error };
       if (response.type !== "page.pointer") return pageError("TAB_CHANGED", "Unexpected response from the page.");

@@ -126,9 +126,10 @@ export interface PageExecuteRequest {
 }
 
 /**
- * Stops the cursor glide of a `page.execute` still in flight (`executeId`, its
- * request id) when the run is cancelled; an action whose events have not been
- * dispatched yet then does nothing. Top frame only, like the cursor.
+ * Stops the cursor glide of a `page.execute` or `page.pointer` still in flight
+ * (`executeId`, its request id) when the run is cancelled; an action whose
+ * events have not been dispatched yet then does nothing. Top frame only,
+ * like the cursor.
  */
 export interface PageExecuteCancelRequest {
   v: 1;
@@ -208,6 +209,8 @@ export interface PagePointerRequest {
   refPrefix: string;
   view: ShotView | null;
   action: PointerAction;
+  /** Shows the agent's cursor at the points before an effect, as for `page.execute`: top frame only, never for `locate`; null acts at once. */
+  present: CursorPresentation | null;
 }
 
 /** Ends a capture: the page shield shows again if it was hidden for it. */
@@ -351,6 +354,8 @@ export interface PagePointerResponse {
   ok: true;
   type: "page.pointer";
   outcome: PointerOutcome;
+  /** Where the cursor ended, in the top viewport; null when none was shown. */
+  cursor: CursorPoint | null;
 }
 
 export interface PageCaptureDoneResponse {
@@ -479,8 +484,9 @@ export function isPagePointerRequest(value: unknown): value is PagePointerReques
   const candidate = value as Record<string, unknown>;
   // Only the top frame checks the screenshot's view; a child frame is reached through it.
   const view = candidate.frameId === 0 ? validateShotView(candidate.view) !== null : candidate.view === null;
-  return isFrameId(candidate.frameId) && isRefPrefix(candidate.frameId, candidate.refPrefix) && isTabId(candidate.tabId) && view &&
-    validatePointerAction(candidate.action) !== null;
+  const action = validatePointerAction(candidate.action);
+  const present = candidate.present === null || (candidate.frameId === 0 && action?.kind !== "locate" && isCursorPresentation(candidate.present));
+  return isFrameId(candidate.frameId) && isRefPrefix(candidate.frameId, candidate.refPrefix) && isTabId(candidate.tabId) && view && action !== null && present;
 }
 
 export function isPageCaptureDoneRequest(value: unknown): value is PageCaptureDoneRequest {

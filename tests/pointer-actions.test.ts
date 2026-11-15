@@ -1,10 +1,12 @@
 // @vitest-environment happy-dom
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BrowserProgram, ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
 import { FrameAliases, TabController, type CaptureOptions, type TabControllerBrowserApi } from "@/lib/background/tab-controller";
 import type { CaptureGeometry, PointerAction, PointerOutcome, ShotView, ViewportPoint } from "@/lib/domain/tools";
 import type { PagePointerRequest, PageRequest } from "@/lib/protocol";
-import { createElementRefRegistry, pointerAt, type ElementRefRegistry } from "@/lib/tools/page-executor";
+import { createElementRefRegistry, pointerAt, type CursorGesture, type ElementRefRegistry } from "@/lib/tools/page-executor";
+import { createPageCursor, strokeRoute } from "@/lib/tools/page-cursor";
+import { cursorMs } from "@/lib/domain/cursor";
 
 const instant = async () => {};
 
@@ -256,5 +258,138 @@ describe("page.clickAt(), hoverAt(), dragAlong() in programs", () => {
     expect(result.summary).toContain(message);
     expect(pointers).toEqual([]);
     expect(onEffect).not.toHaveBeenCalled();
+  });
+});
+
+describe("the agent cursor at screenshot coordinates", () => {
+  let registry: ElementRefRegistry;
+  let view: ShotView;
+  let board: HTMLElement;
+  let clicks: { x: number; y: number }[];
+
+  beforeEach(() => {
+    document.body.innerHTML = '<canvas id="board" width="400" height="400"></canvas>';
+    window.scrollTo(0, 0);
+    registry = createElementRefRegistry("doc-top");
+    const root = document.documentElement;
+    view = { documentId: "doc-top", scrollX: window.scrollX, scrollY: window.scrollY, width: root.clientWidth || window.innerWidth, height: root.clientHeight || window.innerHeight };
+    board = document.getElementById("board")!;
+    Object.defineProperty(document, "elementsFromPoint", { configurable: true, value: () => [board, document.body] });
+    clicks = [];
+    board.addEventListener("click", (event) => clicks.push({ x: event.clientX, y: event.clientY }));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    document.documentElement.querySelectorAll("bside-cursor").forEach((host) => host.remove());
+  });
+
+  it("shows each click's exact point before that click, a hover's point, and a drag's whole path", async () => {
+    const order: string[] = [];
+    board.addEventListener("pointerdown", (event) => order.push(`down ${event.clientX},${event.clientY}`));
+    const present = vi.fn(async (gesture: CursorGesture) => {
+      order.push(`${gesture.kind} ${"at" in gesture ? `${gesture.at!.x},${gesture.at!.y}` : ""}`);
+      return true;
+    });
+    const points = [{ x: 10, y: 20 }, { x: 30, y: 40 }];
+    await pointerAt(document, registry, view, { kind: "click", points, button: "left", double: false }, instant, { present });
+    expect(order).toEqual(["click 10,20", "down 10,20", "click 30,40", "down 30,40"]);
+    expect(present.mock.calls.map(([gesture]) => gesture.element)).toEqual([board, board]);
+
+    present.mockClear();
+    await pointerAt(document, registry, view, { kind: "hover", at: { x: 5, y: 6 } }, instant, { present });
+    expect(present.mock.calls[0]![0]).toEqual({ kind: "hover", element: board, at: { x: 5, y: 6 } });
+    present.mockClear();
+    const path = [{ x: 1, y: 1 }, { x: 50, y: 1 }, { x: 50, y: 50 }];
+    await pointerAt(document, registry, view, { kind: "drag", path }, instant, { present });
+    expect(present.mock.calls).toEqual([[{ kind: "stroke", element: board, path }]]);
+  });
+
+  it("stops a batch between clicks when the glide is stopped, and before anything when the first one is", async () => {
+    let allowed = 1;
+    const present = async () => allowed-- > 0;
+    const batch = await pointerAt(document, registry, view, { kind: "click", points: [{ x: 1, y: 1 }, { x: 2, y: 2 }, { x: 3, y: 3 }], button: "left", double: false }, instant, { present });
+    expect(batch).toMatchObject({ ok: true, outcome: { kind: "acted", result: { ok: false, code: "SKIPPED", summary: "Stopped after clicking 1 of 3 points; the rest were not clicked." } } });
+    expect(clicks).toEqual([{ x: 1, y: 1 }]);
+    const none = await pointerAt(document, registry, view, { kind: "drag", path: [{ x: 1, y: 1 }, { x: 9, y: 9 }] }, instant, { present: async () => false });
+    expect(none).toMatchObject({ ok: true, outcome: { result: { code: "SKIPPED", summary: "Stopped before acting; nothing was done on the page." } } });
+    expect(clicks).toHaveLength(1);
+  });
+
+  it("goes exactly to a point without scrolling the page, even when the element's center is off-screen", async () => {
+    vi.spyOn(board, "getBoundingClientRect").mockReturnValue({ left: 0, top: -3000, width: 400, height: 8000, right: 400, bottom: 5000, x: 0, y: -3000, toJSON: () => ({}) });
+    const scroll = vi.fn();
+    board.scrollIntoView = scroll;
+    const cursor = createPageCursor(document);
+    expect(await cursor.present({ kind: "click", element: board, at: { x: 120, y: 80 } }, 10, null)).toEqual({ stopped: false, at: { x: 120, y: 80 } });
+    expect(await cursor.present({ kind: "stroke", element: board, path: [{ x: 10, y: 10 }, { x: 60, y: 10 }, { x: 60, y: 90 }] }, 10, null)).toEqual({ stopped: false, at: { x: 60, y: 90 } });
+    expect(scroll).not.toHaveBeenCalled();
+  });
+
+  it("samples a long stroke's route down, keeping its end", () => {
+    const path = Array.from({ length: 200 }, (_, i) => ({ x: i, y: 0 }));
+    const route = strokeRoute(path);
+    expect(route).toHaveLength(24);
+    expect(route.at(-1)).toEqual({ x: 199, y: 0 });
+    expect(strokeRoute(path.slice(0, 5))).toEqual(path.slice(1, 5));
+  });
+});
+
+describe("TabController.pointer: the cursor in a tab the user can see", () => {
+  function setup(active: boolean, hold = false) {
+    const requests: PagePointerRequest[] = [];
+    const cancels: { executeId: string }[] = [];
+    let release: (() => void) | null = null;
+    const api: TabControllerBrowserApi = { tabs: {
+      query: vi.fn(async (query: { active?: boolean }) => {
+        const all = [{ id: 1, url: "https://guestbook.example/", title: "Guestbook", active }];
+        return query.active ? all.filter((tab) => tab.active) : all;
+      }),
+      update: vi.fn(async () => {}), goBack: vi.fn(async () => {}),
+      sendMessage: vi.fn(async (_tabId: number, message: unknown) => {
+        const request = message as PageRequest;
+        if (request.type === "page.execute-cancel") {
+          cancels.push(request);
+          release?.();
+          return { v: 1, id: request.id, ok: true, type: "page.execute-cancel", cancelled: true };
+        }
+        if (request.type !== "page.pointer") throw new Error(`unexpected ${request.type}`);
+        requests.push(request);
+        if (hold) await new Promise<void>((resolve) => { release = resolve; });
+        const result = cancels.length ? { ok: false, code: "SKIPPED" as const, summary: "Stopped before acting; nothing was done on the page." } : { ok: true, summary: "Clicked." };
+        if (request.action.kind === "locate") return { v: 1, id: request.id, ok: true, type: "page.pointer", outcome: { kind: "hit", documentId: "doc", hit: { label: "canvas", box: { x: 0, y: 0, width: 1, height: 1 } } }, cursor: null };
+        return { v: 1, id: request.id, ok: true, type: "page.pointer", outcome: { kind: "acted", documentId: "doc", result }, cursor: request.present ? { x: 70 + requests.length, y: 80 } : null };
+      }),
+      onUpdated: { addListener: vi.fn(), removeListener: vi.fn() },
+    } };
+    return { api, requests, cancels };
+  }
+  const view: ShotView = { documentId: "doc", scrollX: 0, scrollY: 0, width: 1280, height: 800 };
+  const click: PointerAction = { kind: "click", points: [{ x: 10, y: 10 }], button: "left", double: false };
+
+  it("asks the top frame to show the cursor for effects, starting where the last one landed, never for a hit test", async () => {
+    const { api, requests } = setup(true);
+    const controller = await new TabController(api).forTab(1);
+    await controller.pointer(view, click);
+    await controller.pointer(view, { kind: "locate", at: { x: 1, y: 1 } });
+    await controller.pointer(view, { kind: "hover", at: { x: 1, y: 1 } });
+    expect(requests.map((request) => request.present)).toEqual([{ ms: cursorMs(0), from: null }, null, { ms: cursorMs(1), from: { x: 71, y: 80 } }]);
+  });
+
+  it("acts at once in a tab the user cannot see", async () => {
+    const { api, requests } = setup(false);
+    await (await new TabController(api).forTab(1)).pointer(view, click);
+    expect(requests[0]!.present).toBeNull();
+  });
+
+  it("tells the page to stop when the run is cancelled during the glide", async () => {
+    const { api, requests, cancels } = setup(true, true);
+    const controller = await new TabController(api).forTab(1);
+    const stop = new AbortController();
+    const outcome = controller.pointer(view, click, stop.signal);
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    stop.abort();
+    expect(await outcome).toMatchObject({ ok: true, value: { kind: "acted", result: { code: "SKIPPED" } } });
+    expect(cancels).toEqual([expect.objectContaining({ frameId: 0, tabId: 1, executeId: requests[0]!.id })]);
   });
 });
