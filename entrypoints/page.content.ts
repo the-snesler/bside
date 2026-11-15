@@ -197,12 +197,11 @@ export default defineContentScript({
         return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.capture-prepare", geometry: measured.geometry });
       }
       if (isPagePointerRequest(message)) {
-        const answered = pointerAt(document, registry, message.view, message.action, { refPrefix: message.refPrefix, frameIdOf });
-        if (!answered.ok) {
+        return pointerAt(document, registry, message.view, message.action, settleDom, { refPrefix: message.refPrefix, frameIdOf }).then((answered): PageResponse => {
+          if (answered.ok) return { v: 1, id: message.id, ok: true, type: "page.pointer", outcome: answered.outcome };
           const { code, summary } = answered.result;
-          return Promise.resolve({ v: 1, id: message.id, ok: false, error: { code: code === "STALE_SNAPSHOT" || code === "TARGET_MISSING" ? code : "NOT_INTERACTABLE", message: summary, retryable: false, phase: "page" } });
-        }
-        return Promise.resolve({ v: 1, id: message.id, ok: true, type: "page.pointer", outcome: answered.outcome });
+          return { v: 1, id: message.id, ok: false, error: { code: code === "STALE_SNAPSHOT" || code === "TARGET_MISSING" ? code : "NOT_INTERACTABLE", message: summary, retryable: false, phase: "page" } };
+        });
       }
       if (isPageCaptureDoneRequest(message)) {
         endCapture();

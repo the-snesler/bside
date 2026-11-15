@@ -2,9 +2,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { BrowserProgram, ScratchFiles, WorkspaceState } from "@/lib/background/browser-program";
 import { FrameAliases, TabController, type CaptureOptions, type TabControllerBrowserApi } from "@/lib/background/tab-controller";
-import type { CaptureGeometry, PageRect, PointerOutcome, ShotView } from "@/lib/domain/tools";
+import { pointerPoints, type CaptureGeometry, type PageRect, type PointerOutcome, type ShotView } from "@/lib/domain/tools";
 import type { PagePointerRequest, PageRequest } from "@/lib/protocol";
 import { createElementRefRegistry, excludeFromOutline, pointerAt, type ElementRefRegistry } from "@/lib/tools/page-executor";
+
+const instant = async () => {};
+const frameIdOf = (frame: Element) => Number(frame.getAttribute("data-frame-id") ?? -1);
 
 /** Gives an element a layout box, which happy-dom does not compute. */
 function place(element: Element, box: PageRect): void {
@@ -29,51 +32,51 @@ describe("pointerAt: what is at a point of the top frame", () => {
     view = { documentId: "doc-top", scrollX: window.scrollX, scrollY: window.scrollY, width: root.clientWidth || window.innerWidth, height: root.clientHeight || window.innerHeight };
   });
 
-  const at = (x: number, y: number, shot: ShotView | null = view) => pointerAt(document, registry, shot, { kind: "locate", at: { x, y } }, { frameIdOf: (frame) => Number(frame.getAttribute("data-frame-id") ?? -1) });
-  const hit = (outcome: ReturnType<typeof at>): Extract<PointerOutcome, { kind: "hit" }> => {
+  const at = (x: number, y: number, shot: ShotView | null = view) => pointerAt(document, registry, shot, { kind: "locate", at: { x, y } }, instant, { frameIdOf });
+  const hit = (outcome: Awaited<ReturnType<typeof at>>): Extract<PointerOutcome, { kind: "hit" }> => {
     expect(outcome.ok, JSON.stringify(outcome)).toBe(true);
     if (!outcome.ok || outcome.outcome.kind !== "hit") throw new Error("expected a hit");
     return outcome.outcome;
   };
 
-  it("names the control an element is inside by its ref, with the element's box", () => {
+  it("names the control an element is inside by its ref, with the element's box", async () => {
     const label = document.getElementById("label")!;
     place(label, { x: 12, y: 8, width: 40, height: 16 });
     stackAt(document, { "20,10": [label, document.getElementById("save")!, document.body, document.documentElement] });
-    const found = hit(at(20, 10));
+    const found = hit(await at(20, 10));
     expect(found.hit).toEqual({ label: '[e1 button "Save"]', box: { x: 12, y: 8, width: 40, height: 16 } });
     expect(found.documentId).toBe("doc-top");
   });
 
-  it("describes an element without a ref by its tag, a media element's size, and a little text", () => {
+  it("describes an element without a ref by its tag, a media element's size, and a little text", async () => {
     const board = document.getElementById("board")!;
     place(board, { x: 100, y: 200, width: 400, height: 300 });
     const text = document.getElementById("text")!;
     stackAt(document, { "150,250": [board, document.body], "5,600": [text, document.body] });
-    expect(hit(at(150, 250)).hit.label).toBe("canvas 400×300");
-    expect(hit(at(5, 600)).hit.label).toBe('p "Leave a drawing"');
+    expect(hit(await at(150, 250)).hit.label).toBe("canvas 400×300");
+    expect(hit(await at(5, 600)).hit.label).toBe('p "Leave a drawing"');
   });
 
-  it("looks through bside's own page shield to the page under it", () => {
+  it("looks through bside's own page shield to the page under it", async () => {
     const shield = document.createElement("div");
     document.documentElement.append(shield);
     excludeFromOutline(shield);
     const board = document.getElementById("board")!;
     stackAt(document, { "150,250": [shield, board, document.body] });
-    expect(hit(at(150, 250)).hit.label).toMatch(/^canvas /);
+    expect(hit(await at(150, 250)).hit.label).toMatch(/^canvas /);
   });
 
-  it("descends into shadow roots", () => {
+  it("descends into shadow roots", async () => {
     const host = document.getElementById("host")!;
     const shadow = host.attachShadow({ mode: "open" });
     shadow.innerHTML = "<button>Inner</button>";
     const inner = shadow.querySelector("button")!;
     stackAt(document, { "30,700": [host, document.body] });
     stackAt(shadow, { "30,700": [inner, host, document.body] });
-    expect(hit(at(30, 700)).hit.label).toMatch(/button "Inner"\]$/);
+    expect(hit(await at(30, 700)).hit.label).toMatch(/button "Inner"\]$/);
   });
 
-  it("hands a point in a cross-origin frame back with the frame's id and content box", () => {
+  it("hands a point in a cross-origin frame back with the frame's id and content box", async () => {
     const frame = document.getElementById("pay")!;
     place(frame, { x: 100, y: 400, width: 304, height: 204 });
     Object.defineProperties(frame, {
@@ -81,23 +84,23 @@ describe("pointerAt: what is at a point of the top frame", () => {
       clientLeft: { get: () => 2 }, clientTop: { get: () => 2 }, clientWidth: { get: () => 300 }, clientHeight: { get: () => 200 },
     });
     stackAt(document, { "150,450": [frame, document.body] });
-    expect(at(150, 450)).toEqual({ ok: true, outcome: { kind: "frame", frameId: 5, box: { x: 102, y: 402, width: 300, height: 200 } } });
+    expect(await at(150, 450)).toEqual({ ok: true, outcome: { kind: "frame", frameId: 5, box: { x: 102, y: 402, width: 300, height: 200 } } });
   });
 
-  it("refuses once the page is not what the screenshot showed: another document, another scroll position, another window size", () => {
-    expect(at(10, 10, { ...view, documentId: "doc-old" })).toMatchObject({ ok: false, result: { code: "STALE_SNAPSHOT", summary: expect.stringContaining("loaded a new document") } });
-    expect(at(10, 10, { ...view, scrollY: view.scrollY + 300 })).toMatchObject({ ok: false, result: { code: "STALE_SNAPSHOT", summary: expect.stringContaining("scrolled") } });
-    expect(at(10, 10, { ...view, width: view.width + 200 })).toMatchObject({ ok: false, result: { code: "STALE_SNAPSHOT", summary: expect.stringContaining("resized") } });
+  it("refuses once the page is not what the screenshot showed: another document, another scroll position, another window size", async () => {
+    expect(await at(10, 10, { ...view, documentId: "doc-old" })).toMatchObject({ ok: false, result: { code: "STALE_SNAPSHOT", summary: expect.stringContaining("loaded a new document") } });
+    expect(await at(10, 10, { ...view, scrollY: view.scrollY + 300 })).toMatchObject({ ok: false, result: { code: "STALE_SNAPSHOT", summary: expect.stringContaining("scrolled") } });
+    expect(await at(10, 10, { ...view, width: view.width + 200 })).toMatchObject({ ok: false, result: { code: "STALE_SNAPSHOT", summary: expect.stringContaining("resized") } });
     // Sub-pixel drift (fractional scrolling) still matches.
     stackAt(document, { "10,10": [document.body] });
-    expect(at(10, 10, { ...view, scrollY: view.scrollY + 0.5 }).ok).toBe(true);
+    expect((await at(10, 10, { ...view, scrollY: view.scrollY + 0.5 })).ok).toBe(true);
   });
 
-  it("refuses a point outside the viewport, and says when nothing is there", () => {
-    expect(at(-1, 10)).toMatchObject({ ok: false, result: { code: "NOT_INTERACTABLE" } });
-    expect(at(10, view.height)).toMatchObject({ ok: false, result: { code: "NOT_INTERACTABLE" } });
+  it("refuses a point outside the viewport, and says when nothing is there", async () => {
+    expect(await at(-1, 10)).toMatchObject({ ok: false, result: { code: "NOT_INTERACTABLE" } });
+    expect(await at(10, view.height)).toMatchObject({ ok: false, result: { code: "NOT_INTERACTABLE" } });
     stackAt(document, {});
-    expect(at(10, 10)).toMatchObject({ ok: false, result: { code: "TARGET_MISSING" } });
+    expect(await at(10, 10)).toMatchObject({ ok: false, result: { code: "TARGET_MISSING" } });
   });
 });
 
@@ -145,7 +148,10 @@ describe("page.elementAt(): coordinates read off a screenshot", () => {
     return { run, pointers, captures, state, program, onEffect };
   }
 
-  const button = (request: PagePointerRequest): PointerOutcome => ({ kind: "hit", documentId: "doc-top", hit: { label: '[e3 button "Submit"]', box: { x: request.action.at.x - 60, y: request.action.at.y - 30, width: 120, height: 60 } } });
+  const button = (request: PagePointerRequest): PointerOutcome => {
+    const [point] = pointerPoints(request.action);
+    return { kind: "hit", documentId: "doc-top", hit: { label: '[e3 button "Submit"]', box: { x: point!.x - 60, y: point!.y - 30, width: 120, height: 60 } } };
+  };
 
   it("gives viewport and element screenshots ids, and none to a full page", async () => {
     const { run } = setup({});
@@ -210,7 +216,7 @@ describe("page.elementAt(): coordinates read off a screenshot", () => {
     ['page.screenshot(); await page.elementAt("s1", -1, 10)', "x 0–1600"],
     ['page.screenshot(); await page.elementAt("s1", "10", 10)', "x 0–1600"],
     ['page.screenshot(); await page.elementAt("shot1", 10, 10)', 'screenshot id like "s1"'],
-    ['page.screenshot(); await page.elementAt("s1", 10)', "takes 3 argument"],
+    ['page.screenshot(); await page.elementAt("s1", 10)', 'Use elementAt("s1", x, y)'],
     ['page.screenshot(); await browser.tab("/tabs/2/page.md").elementAt("s1", 10, 10)', "Screenshot s1 is of /tabs/1/page.md, not /tabs/2/page.md"],
   ])("refuses bad arguments before reaching the page: %s", async (call, message) => {
     const { run, pointers } = setup({});

@@ -5,6 +5,7 @@ import youtubeBody from "@/lib/skills/youtube.md?raw";
 import summarizeBody from "@/lib/skills/summarize-page.md?raw";
 import tableBody from "@/lib/skills/extract-table.md?raw";
 import formBody from "@/lib/skills/fill-form.md?raw";
+import pointerBody from "@/lib/skills/pointer.md?raw";
 
 /** Packaged procedures, listed before saved ones; reserved names and read-only bodies. */
 export const BUILTIN_SKILLS: readonly Skill[] = [
@@ -12,6 +13,7 @@ export const BUILTIN_SKILLS: readonly Skill[] = [
   { name: "summarize-page", description: "Summarize the attached page's main point and useful details.", body: summarizeBody },
   { name: "extract-table", description: "Extract a page's structured table with headers, rows, and paging.", body: tableBody },
   { name: "fill-form", description: "Fill a form from information the user supplies, asking about missing or ambiguous values.", body: formBody },
+  { name: "pointer", description: "Click, drag, and hover at pixel coordinates read off a screenshot: canvases, drawings, maps, games, and widgets with no ref.", body: pointerBody },
 ];
 
 export const sidebarSkillCatalog = (skills: readonly Skill[]) => skills.map(({ name, description }) => ({

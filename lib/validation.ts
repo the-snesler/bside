@@ -5,6 +5,7 @@
  * on, by the agent loop after the provider returns complete arguments.
  */
 
+import { MAX_CLICK_POINTS, MAX_DRAG_POINTS } from "@/lib/domain/tools";
 import type { CharacterKey, DomAction, ElementTarget, JsonValue, KeyModifier, NamedKey, PointerAction, PressKey, ShotView, UploadFile, ViewportPoint } from "@/lib/domain/tools";
 
 const MAX_REF_LEN = 32;
@@ -134,6 +135,12 @@ export function validateShotView(raw: unknown): ShotView | null {
   return { documentId: raw.documentId, scrollX: raw.scrollX as number, scrollY: raw.scrollY as number, width: raw.width as number, height: raw.height as number };
 }
 
+function validatePoints(raw: unknown, min: number, max: number): ViewportPoint[] | null {
+  if (!Array.isArray(raw) || raw.length < min || raw.length > max) return null;
+  const points = raw.map(validateViewportPoint);
+  return points.every((point) => point !== null) ? points as ViewportPoint[] : null;
+}
+
 /** One member of the closed `PointerAction` union, with its points in range. */
 export function validatePointerAction(raw: unknown): PointerAction | null {
   if (!isObject(raw)) return null;
@@ -141,6 +148,21 @@ export function validatePointerAction(raw: unknown): PointerAction | null {
     case "locate": {
       const at = validateViewportPoint(raw.at);
       return at && hasExactKeys(raw, ["kind", "at"]) ? { kind: "locate", at } : null;
+    }
+    case "hover": {
+      const at = validateViewportPoint(raw.at);
+      return at && hasExactKeys(raw, ["kind", "at"]) ? { kind: "hover", at } : null;
+    }
+    case "click": {
+      if (!hasExactKeys(raw, ["kind", "points", "button", "double"]) || typeof raw.double !== "boolean") return null;
+      if (raw.button !== "left" && raw.button !== "middle" && raw.button !== "right") return null;
+      const points = validatePoints(raw.points, 1, MAX_CLICK_POINTS);
+      return points ? { kind: "click", points, button: raw.button, double: raw.double } : null;
+    }
+    case "drag": {
+      if (!hasExactKeys(raw, ["kind", "path"])) return null;
+      const path = validatePoints(raw.path, 2, MAX_DRAG_POINTS);
+      return path ? { kind: "drag", path } : null;
     }
     default:
       return null;

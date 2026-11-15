@@ -504,8 +504,24 @@ describe("isPagePointerRequest", () => {
     expect(isPagePointerRequest({ ...top, view: { ...view, width: -1 } })).toBe(false);
   });
 
+  it("accepts clicks, hovers, and drags with bounded point lists", () => {
+    const point = { x: 1, y: 2 };
+    expect(isPagePointerRequest({ ...top, action: { kind: "click", points: [point], button: "left", double: false } })).toBe(true);
+    expect(isPagePointerRequest({ ...top, action: { kind: "click", points: Array(100).fill(point), button: "right", double: false } })).toBe(true);
+    expect(isPagePointerRequest({ ...top, action: { kind: "click", points: Array(101).fill(point), button: "left", double: false } })).toBe(false);
+    expect(isPagePointerRequest({ ...top, action: { kind: "click", points: [], button: "left", double: false } })).toBe(false);
+    expect(isPagePointerRequest({ ...top, action: { kind: "click", points: [point], button: "back", double: false } })).toBe(false);
+    expect(isPagePointerRequest({ ...top, action: { kind: "click", points: [point], button: "left" } })).toBe(false);
+    expect(isPagePointerRequest({ ...top, action: { kind: "hover", at: point } })).toBe(true);
+    expect(isPagePointerRequest({ ...top, action: { kind: "drag", path: [point, point] } })).toBe(true);
+    expect(isPagePointerRequest({ ...top, action: { kind: "drag", path: [point] } })).toBe(false);
+    expect(isPagePointerRequest({ ...top, action: { kind: "drag", path: Array(501).fill(point) } })).toBe(false);
+    expect(isPagePointerRequest({ ...top, action: { kind: "drag", path: [point, { x: 1 }] } })).toBe(false);
+  });
+
   it("accepts only the closed pointer actions with finite points in range", () => {
     expect(isPagePointerRequest({ ...top, action: { kind: "click", at: { x: 1, y: 1 } } })).toBe(false);
+    expect(isPagePointerRequest({ ...top, action: { kind: "type", at: { x: 1, y: 1 } } })).toBe(false);
     expect(isPagePointerRequest({ ...top, action: { ...locate, selector: "#x" } })).toBe(false);
     expect(isPagePointerRequest({ ...top, action: { kind: "locate", at: { x: Number.NaN, y: 1 } } })).toBe(false);
     expect(isPagePointerRequest({ ...top, action: { kind: "locate", at: { x: 1e9, y: 1 } } })).toBe(false);

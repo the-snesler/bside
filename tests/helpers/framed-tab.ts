@@ -88,7 +88,7 @@ export function createFramedTab(specs: FakeFrameSpec[], tabUrl = specs[0]!.url) 
       case "page.capture-done":
         return { ...base, type: "page.capture-done" };
       case "page.pointer": {
-        const answered = pointerAt(document, registry, request.view, request.action, { refPrefix: request.refPrefix, frameIdOf });
+        const answered = await pointerAt(document, registry, request.view, request.action, instant, { refPrefix: request.refPrefix, frameIdOf });
         if (!answered.ok) return { v: 1, id: request.id, ok: false, error: { code: answered.result.code === "STALE_SNAPSHOT" ? "STALE_SNAPSHOT" : "NOT_INTERACTABLE", message: answered.result.summary, retryable: false, phase: "page" } };
         return { ...base, type: "page.pointer", outcome: answered.outcome };
       }

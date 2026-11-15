@@ -49,6 +49,7 @@ import type {
   CaptureGeometry, ChildFrame, DomAction, ElementTarget, FrameOutline, PageArtifactSummary, PageErrorCode, PageFindResult, PageRect, PageSnapshot, PageTable, PointerAction,
   PointHit, SearchPage, ShotView, ToolResult,
 } from "@/lib/domain/tools";
+import { pointerPoints, withPointerPoints } from "@/lib/domain/tools";
 import { findInOutline, lineOffsets, sliceOutline } from "@/lib/domain/outline";
 import { base64ToBytes, PdfError, renderPdfText, type PdfText } from "@/lib/domain/pdf";
 import { FILE_LIMITS, FileError, isPageContentType, looksLikeFileUrl, readableText, type FileFetchResult } from "@/lib/domain/files";
@@ -252,12 +253,15 @@ export interface Screenshot {
   area: { rect: PageRect; scale: number; view: ShotView };
 }
 
-/** What a pointer request found: the frame it landed in (0 for the top document, else its name number), that frame's document, and the element there with its box in the top frame's viewport. */
-export interface PointerReport {
-  frame: number;
-  documentId: string;
-  hit: PointHit;
-}
+/**
+ * What a pointer request found or did, in the frame it landed in (0 for the
+ * top document, else its name number): the element at a `locate` point with
+ * its box in the top frame's viewport, or an effect's result and the document
+ * it ran in (null when the page navigated away).
+ */
+export type PointerReport =
+  | { kind: "hit"; frame: number; documentId: string; hit: PointHit }
+  | { kind: "acted"; frame: number; documentId: string | null; result: ToolResult };
 
 export interface TabControllerBrowserApi {
   tabs: {
@@ -1041,12 +1045,13 @@ export class TabController {
     for (let hops = 0; hops <= FRAME_LIMITS.depth; hops++) {
       const request: PagePointerRequest = {
         v: 1, id: crypto.randomUUID(), type: "page.pointer", frameId, tabId, refPrefix: frame === 0 ? "" : `f${frame}:`,
-        view: frameId === TOP_FRAME ? view : null, action: shiftPointerAction(action, -offset.x, -offset.y),
+        view: frameId === TOP_FRAME ? view : null, action: withPointerPoints(action, pointerPoints(action).map((point) => ({ x: point.x - offset.x, y: point.y - offset.y }))),
       };
       let response: PageResponse | undefined;
       try {
         response = (await this.#browserApi.tabs.sendMessage(tabId, request, { frameId })) as PageResponse | undefined;
       } catch {
+        if (action.kind !== "locate") return this.#lostDuringPointer(tabId, frame, action.kind);
         return pageError("TAB_CHANGED", frame === 0 ? "The page is not available." : `Frame f${frame} did not answer; it may still be loading, or it is not a web page.`);
       }
       if (!response) return pageError("TAB_CHANGED", "The page did not respond.");
@@ -1055,7 +1060,12 @@ export class TabController {
       const { outcome } = response;
       if (outcome.kind === "hit") {
         const box = { ...outcome.hit.box, x: outcome.hit.box.x + offset.x, y: outcome.hit.box.y + offset.y };
-        return { ok: true, value: { frame, documentId: outcome.documentId, hit: { ...outcome.hit, box } } };
+        return { ok: true, value: { kind: "hit", frame, documentId: outcome.documentId, hit: { ...outcome.hit, box } } };
+      }
+      if (outcome.kind === "acted") {
+        // A frame's diff covers only that frame; what its click did to the page around it needs a fresh read.
+        const outside = frame !== 0 ? `\nThe diff covers frame f${frame} only; take a screenshot or read a snapshot to see changes elsewhere on the page.` : "";
+        return { ok: true, value: { kind: "acted", frame, documentId: outcome.documentId, result: { ...outcome.result, summary: `${outcome.result.summary}${outside}` } } };
       }
       const alias = this.#frames.name(tabId, outcome.frameId, frameId);
       if (alias === null) return pageError("TARGET_MISSING", "This page has more frames than bside can name.");
@@ -1064,6 +1074,22 @@ export class TabController {
       offset = { x: offset.x + outcome.box.x, y: offset.y + outcome.box.y };
     }
     return pageError("TARGET_MISSING", `The point is in a frame nested more than ${FRAME_LIMITS.depth} deep, which bside does not reach.`);
+  }
+
+  /**
+   * A frame stopped answering during a pointer effect. A click in the top
+   * frame that tore down the document settles like a navigation; anything
+   * else is reported as possibly taken effect, never as done.
+   */
+  async #lostDuringPointer(tabId: number, frame: number, kind: PointerAction["kind"]): Promise<PageOutcome<PointerReport>> {
+    if (frame === 0 && kind === "click") {
+      const settled = await this.#settleNavigation(tabId);
+      if (settled.ok) {
+        await this.#refreshMetadata(settled.value.url);
+        return { ok: true, value: { kind: "acted", frame, documentId: null, result: { ok: true, summary: `Clicked; the page navigated to ${this.#url} (${JSON.stringify(this.#title ?? "")}). Earlier refs and screenshots are invalid; take a new screenshot or read a snapshot.` } } };
+      }
+    }
+    return pageError("TAB_CHANGED", `Lost contact with ${frame === 0 ? "the page" : `frame f${frame}`} during the action: it navigated, reloaded, or was removed, and the action may have taken effect. Take a new screenshot.`);
   }
 
   /** Firefox's id and the ref prefix for a named frame (0 is the top document); null for a name no outline of this tab gave out. */
@@ -1235,11 +1261,6 @@ function captureRect(geometry: CaptureGeometry, request: ScreenshotRequest): { r
   const cut = (request.area === "full" && !geometry.element && (geometry.page.width > page.width || geometry.page.height > page.height)) ||
     (geometry.element !== null && (right < area.x + area.width || bottom < area.y + area.height));
   return { rect: { x, y, width: Math.max(0, right - x), height: Math.max(0, bottom - y) }, cut };
-}
-
-/** A pointer action with its points moved by (dx, dy): into a child frame's viewport. */
-function shiftPointerAction(action: PointerAction, dx: number, dy: number): PointerAction {
-  return { ...action, at: { x: action.at.x + dx, y: action.at.y + dy } };
 }
 
 function shiftRect(rect: PageRect, dx: number, dy: number): PageRect {
