@@ -132,8 +132,9 @@ export default defineContentScript({
     /**
      * Acts at screenshot coordinates. In a tab the user can see, the cursor
      * glides to each point before its effect (the later clicks of a batch
-     * quickly), and the glide stays cancellable until the request ends, so a
-     * cancelled run stops a batch between clicks.
+     * quickly) and moves with a drag as it happens, and the glide stays
+     * cancellable until the request ends, so a cancelled run stops a batch
+     * between clicks.
      */
     const pointer = async (message: PagePointerRequest): Promise<PageResponse> => {
       let landed: CursorPoint | null = null;
@@ -151,6 +152,10 @@ export default defineContentScript({
               const glide = await cursor!.present(gesture, ms, landed ?? present.from, stop.signal);
               landed = glide.at ?? landed;
               return !glide.stopped;
+            },
+            follow: (at) => {
+              cursor!.follow(at);
+              landed = at ?? landed;
             },
           } : {}),
         });

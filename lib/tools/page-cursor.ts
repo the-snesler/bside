@@ -36,14 +36,18 @@ export interface CursorPresented {
 export interface PageCursor {
   /**
    * Glides to the gesture's element (scrolled into view if it is not), or
-   * exactly to its point or along its path for an action at screenshot
-   * coordinates (never scrolling), and plays it, taking about `ms` (scaled by distance) plus a short dwell.
+   * exactly to its point for an action at screenshot coordinates (never
+   * scrolling), and plays it, taking about `ms`
+   * (scaled by distance) plus a short dwell. A stroke ends pressed, for
+   * `follow` to carry along the drag.
    * `from` is where the cursor was in the tab's previous document, used when
    * this document has not shown it yet. Resolves with where it ended (null
    * if the element has no box to point at), and `stopped` if `signal` aborted
    * first, in which case the action must not run.
    */
   present(gesture: CursorGesture, ms: number, from: CursorPoint | null, signal?: AbortSignal): Promise<CursorPresented>;
+  /** Puts the cursor at a drag's point as the drag reaches it, pressed; null releases it. */
+  follow(at: CursorPoint | null): void;
   /** Hides the cursor from view while bside takes a screenshot. */
   hideForCapture(hidden: boolean): void;
 }
@@ -106,16 +110,6 @@ export function arcPoints(a: CursorPoint, b: CursorPoint, steps = 8): CursorPoin
       y: (1 - t) ** 2 * a.y + 2 * (1 - t) * t * control.y + t ** 2 * b.y,
     };
   });
-}
-
-/** Most points a stroke's glide passes through; a longer path is sampled evenly, keeping its last point. */
-const STROKE_ROUTE_POINTS = 24;
-
-/** A stroke's path after its first point (where the cursor already is), sampled down to `STROKE_ROUTE_POINTS`. */
-export function strokeRoute(path: CursorPoint[]): CursorPoint[] {
-  const rest = path.slice(1);
-  if (rest.length <= STROKE_ROUTE_POINTS) return rest;
-  return Array.from({ length: STROKE_ROUTE_POINTS }, (_, i) => rest[Math.round(((i + 1) * (rest.length - 1)) / STROKE_ROUTE_POINTS)]!);
 }
 
 export function createPageCursor(document: Document): PageCursor {
@@ -194,24 +188,17 @@ export function createPageCursor(document: Document): PageCursor {
     css(cursor, { transform: `translate(${at.x - TIP.x}px, ${at.y - TIP.y}px)` });
   };
 
-  /**
-   * Moves to `to`, gliding along an arc (or, with `through`, along those
-   * points to it) unless motion is reduced (then it jumps and waits the same
-   * time).
-   */
-  async function moveTo(to: CursorPoint, ms: number, signal?: AbortSignal, through?: CursorPoint[]): Promise<boolean> {
+  /** Moves to `to`, gliding along an arc unless motion is reduced (then it jumps and waits the same time). */
+  async function moveTo(to: CursorPoint, ms: number, signal?: AbortSignal): Promise<boolean> {
     const from = point ?? to;
-    const route = through ? [from, ...through, to] : null;
-    let distance = Math.hypot(to.x - from.x, to.y - from.y);
-    if (route) distance = route.slice(1).reduce((sum, at, i) => sum + Math.hypot(at.x - route[i]!.x, at.y - route[i]!.y), 0);
-    const duration = glideMs(ms, distance);
+    const duration = glideMs(ms, Math.hypot(to.x - from.x, to.y - from.y));
     glide?.cancel();
     point = to;
     if (reducedMotion() || typeof cursor.animate !== "function" || from === to) {
       place(to);
       return sleep(duration, signal);
     }
-    const frames = (route ?? arcPoints(from, to)).map((at) => ({ transform: `translate(${at.x - TIP.x}px, ${at.y - TIP.y}px)` }));
+    const frames = arcPoints(from, to).map((at) => ({ transform: `translate(${at.x - TIP.x}px, ${at.y - TIP.y}px)` }));
     place(to);
     const animation = cursor.animate(frames, { duration, easing: "cubic-bezier(0.3, 0, 0.2, 1)" });
     glide = animation;
@@ -262,7 +249,7 @@ export function createPageCursor(document: Document): PageCursor {
     if (signal?.aborted) return stopped;
     clearTimeout(fadeTimer);
     // A point read off a screenshot is shown where it is: scrolling would move what it points at.
-    const target = gesture.kind === "stroke" ? gesture.path[0]! : "at" in gesture && gesture.at ? gesture.at : reveal(gesture.element);
+    const target = "at" in gesture && gesture.at ? gesture.at : reveal(gesture.element);
     if (!target) return { stopped: false, at: null };
     attach();
     css(ring, { opacity: "0" });
@@ -276,12 +263,8 @@ export function createPageCursor(document: Document): PageCursor {
       if (!await moveTo(target, ms, signal)) return stopped;
       if (gesture.kind === "click") ripple(target);
       if (gesture.kind === "type") surround(gesture.element);
-      if (gesture.kind === "stroke" && gesture.path.length > 1) {
-        arrow.style.setProperty("transform", "scale(0.85)");
-        const path = strokeRoute(gesture.path);
-        if (!await moveTo(path.at(-1)!, ms, signal, path.slice(0, -1))) return stopped;
-        arrow.style.removeProperty("transform");
-      }
+      // The drag itself moves it from here (`follow`), as its events go out.
+      if (gesture.kind === "stroke") arrow.style.setProperty("transform", "scale(0.85)");
       if (gesture.kind === "drag") {
         arrow.style.setProperty("transform", "scale(0.85)");
         const end = viewportCenter(gesture.to, view);
@@ -302,5 +285,19 @@ export function createPageCursor(document: Document): PageCursor {
     if (hidden) view?.getComputedStyle(host).visibility;
   }
 
-  return { present, hideForCapture };
+  function follow(at: CursorPoint | null): void {
+    clearTimeout(fadeTimer);
+    if (!at) {
+      arrow.style.removeProperty("transform");
+      fadeLater();
+      return;
+    }
+    glide?.cancel();
+    glide = null;
+    point = at;
+    arrow.style.setProperty("transform", "scale(0.85)");
+    place(at);
+  }
+
+  return { present, follow, hideForCapture };
 }

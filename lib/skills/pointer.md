@@ -30,8 +30,8 @@ Every point must be inside the screenshot. A `clickAt` call's points must all be
 - Measure first: `elementAt` on the canvas or board gives its box. For a grid of N columns, the cell width is the box width / N, and the center of column c (from 0) is `left + (c + 0.5) × cell`; the same for rows.
 - Pick a color or tool first (click its swatch), then paint.
 - Paint cells with one `clickAt` call listing their centers, row by row.
-- Draw strokes with `dragAlong`: the pointer moves in small steps between the points you give, so a straight line needs only its two ends and a shape only its corners.
-- If a stroke draws only part of the line or nothing, the page may draw only once per animation frame or may ignore synthetic input: click the cells one by one instead.
+- Draw strokes with `dragAlong`: the pointer moves in small steps between the points you give, at about a quick hand's speed, so a straight line needs only its two ends and a shape only its corners. A long stroke takes up to about 2 seconds.
+- If a stroke draws nothing or only part of the line, the page may ignore synthetic input: say so, and click the cells one by one instead.
 - Do not press the page's submit, send, or save control without the user's go-ahead: call `request_action_confirmation` first, as for any externally visible action.
 
 ## Limits

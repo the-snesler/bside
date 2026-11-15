@@ -1251,9 +1251,12 @@ function centerOf(element: Element): { clientX: number; clientY: number } {
 function pointerEvent(element: Element, type: string, init: MouseEventInit): boolean {
   const bubbles = !type.endsWith("enter") && !type.endsWith("leave");
   const options = { bubbles, cancelable: bubbles, composed: true, view: element.ownerDocument.defaultView, ...init };
-  if (type.startsWith("pointer")) {
+  if (type.startsWith("pointer") || type.endsWith("pointercapture")) {
     if (typeof PointerEvent !== "function") return true;
-    return element.dispatchEvent(new PointerEvent(type, { pointerId: 1, pointerType: "mouse", isPrimary: true, ...options }));
+    const pointer: PointerEventInit = { pointerId: 1, pointerType: "mouse", isPrimary: true, ...options };
+    // A synthetic move has no coalesced events unless given some, and drawing apps often paint only `getCoalescedEvents()`.
+    if (type === "pointermove") pointer.coalescedEvents = [new PointerEvent(type, pointer)];
+    return element.dispatchEvent(new PointerEvent(type, pointer));
   }
   return element.dispatchEvent(new MouseEvent(type, options));
 }
@@ -1319,9 +1322,30 @@ function dragEvent(element: Element, type: string, transfer: DataTransfer, point
   return element.dispatchEvent(event);
 }
 
-/** Lets the page's handlers run (animation frames, debounced listeners) between the steps of a drag. */
-function nextFrame(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 16));
+/**
+ * Waits for the page's next animation frame while it is shown, so a page
+ * that commits state after the press, or draws once per frame, sees each
+ * stretch of a drag; a hidden document runs no frames and throttles timers,
+ * so there it waits for one task (time for a framework to commit).
+ */
+function nextFrame(document: Document): Promise<void> {
+  const view = document.defaultView;
+  return new Promise((resolve) => {
+    if (view && document.visibilityState === "visible" && typeof view.requestAnimationFrame === "function") {
+      const fallback = setTimeout(resolve, 100);
+      view.requestAnimationFrame(() => {
+        clearTimeout(fallback);
+        resolve();
+      });
+      return;
+    }
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => {
+      channel.port1.close();
+      resolve();
+    };
+    channel.port2.postMessage(null);
+  });
 }
 
 /** Steps a pointer move takes from the source to the target, so libraries that need a minimum distance or several moves start dragging. */
@@ -1354,13 +1378,13 @@ async function drag(control: OutlineControl, to: OutlineControl): Promise<Effect
       return { ok: false, code: "NOT_INTERACTABLE", message: `The page cancelled dragging ${describe(control)} (its dragstart handler refused it).` };
     }
     dragEvent(source, "drag", transfer, from);
-    await nextFrame();
+    await nextFrame(source.ownerDocument);
     dragEvent(target, "dragenter", transfer, end);
     if (!source.contains(target) && !target.contains(source)) dragEvent(source, "dragleave", transfer, end);
     // dragover repeats while the pointer rests on the target; the last one decides whether it accepts the drop.
     dragEvent(source, "drag", transfer, end);
     dragEvent(target, "dragover", transfer, end);
-    await nextFrame();
+    await nextFrame(source.ownerDocument);
     dragEvent(source, "drag", transfer, end);
     const accepted = !dragEvent(target, "dragover", transfer, end);
     if (!accepted) {
@@ -1381,10 +1405,10 @@ async function drag(control: OutlineControl, to: OutlineControl): Promise<Effect
     };
     pointerEvent(source, "pointermove", { ...point, buttons: 1 });
     pointerEvent(source, "mousemove", { ...point, buttons: 1 });
-    await nextFrame();
+    await nextFrame(source.ownerDocument);
   }
   movePointerTo(target, 1);
-  await nextFrame();
+  await nextFrame(source.ownerDocument);
   pointerEvent(target, "pointerup", { ...end, button: 0, buttons: 0 });
   pointerEvent(target, "mouseup", { ...end, button: 0, buttons: 0 });
   return { ok: true, message: `Dragged ${label} (pointer events).` };
@@ -1852,17 +1876,18 @@ function describeReorder(before: readonly string[], after: readonly string[]): s
 /**
  * What the agent's visible cursor does on arrival (`lib/tools/page-cursor.ts`):
  * a click ripple, a ring around a field being typed in, nothing (hover), a
- * press-and-carry to `to`, or a press-and-carry along a path. A click or
- * hover at screenshot coordinates names its point (`at`, in the top
- * viewport), and a stroke its path: the cursor goes exactly there and never
- * scrolls the page, which would move what the coordinates point at.
+ * press-and-carry to `to`, or a press at a drag's first point (a stroke,
+ * which then moves with the drag through `ExecuteOptions.follow`). Gestures
+ * at screenshot coordinates name their point (`at`, in the top viewport):
+ * the cursor goes exactly there and never scrolls the page, which would move
+ * what the coordinates point at.
  */
 export type CursorGesture =
   | { kind: "click"; element: Element; at?: CursorPoint }
   | { kind: "type"; element: Element }
   | { kind: "hover"; element: Element; at?: CursorPoint }
   | { kind: "drag"; element: Element; to: Element }
-  | { kind: "stroke"; element: Element; path: CursorPoint[] };
+  | { kind: "stroke"; element: Element; at: CursorPoint };
 
 export interface ExecuteOptions extends OutlineOptions {
   /**
@@ -1871,6 +1896,8 @@ export interface ExecuteOptions extends OutlineOptions {
    * does nothing.
    */
   present?: (gesture: CursorGesture) => Promise<boolean>;
+  /** Moves the cursor with a drag at screenshot coordinates as it happens (top-viewport points), and null once its button went up. */
+  follow?: (at: CursorPoint | null) => void;
 }
 
 /** The cursor gesture for an action on `control` (and `to`, for a drag); null for a page scroll, which has no element. */
@@ -2174,16 +2201,20 @@ function viewChange(document: Document, registry: ElementRefRegistry, view: Shot
 }
 
 /**
- * The pointer id coordinate actions use. Firefox gives the mouse pointer id
- * 0, so a page that captures the pointer by the event's id
- * (`setPointerCapture(event.pointerId)`) names a pointer Firefox knows rather
- * than failing on an unknown one.
+ * The pointer id coordinate actions use: Firefox's mouse pointer. A page that
+ * captures the pointer by the event's id (`setPointerCapture(event.pointerId)`)
+ * gets the emulated capture (`emulatePointerCapture`), since Firefox itself
+ * refuses or ignores capture of a pointer whose button is not really down.
  */
 const MOUSE_POINTER_ID = 0;
 /** CSS pixels between the moves a drag makes along its path, so pages that paint where each move lands miss nothing. */
 const DRAG_STEP_PX = 4;
 /** Most moves one drag dispatches; a longer path takes bigger steps. */
 const MAX_DRAG_MOVES = 2_000;
+/** Moves a drag dispatches per animation frame (24 px at 4 px steps, a quick hand's speed), more when it would take over `MAX_DRAG_FRAMES`. */
+const DRAG_FRAME_STEPS = 6;
+/** Most animation frames one drag spans (about 2 s at 60 Hz). */
+const MAX_DRAG_FRAMES = 120;
 const BUTTONS: Record<PointerButton, { button: number; buttons: number }> = { left: { button: 0, buttons: 1 }, middle: { button: 1, buttons: 4 }, right: { button: 2, buttons: 2 } };
 const FOCUSABLE_TAGS = new Set(["input", "select", "textarea", "button"]);
 
@@ -2206,26 +2237,118 @@ function focusFrom(element: Element): void {
   (element.ownerDocument.activeElement as HTMLElement | null)?.blur?.();
 }
 
+/** Firefox's `exportFunction`, which makes a content-script function callable by the page (absent outside Firefox content scripts). */
+declare const exportFunction: (<T extends (...args: never[]) => unknown>(fn: T, scope: object) => T) | undefined;
+
+type CaptureMethods = Pick<Element, "setPointerCapture" | "releasePointerCapture" | "hasPointerCapture">;
+
+interface PointerCapture {
+  /** The element holding the capture, if the page took it; the first time, it gets gotpointercapture at `point`. */
+  holder(point: ViewportPoint, buttons: number): Element | null;
+  /** Ends the capture after the button went up (lostpointercapture at `point`). */
+  release(point: ViewportPoint): void;
+  /** Gives the page back its own capture methods. */
+  restore(): void;
+}
+
+/**
+ * Pointer capture for the synthetic mouse pointer while a coordinate action
+ * runs. Firefox's `setPointerCapture` throws NotFoundError for a pointer its
+ * content process has not seen (a hidden tab the real mouse never entered),
+ * and captures nothing for a pointer with no button really down, so a
+ * drawing app that captures in its pointerdown handler would stop right
+ * there. Until `restore`, the page's `setPointerCapture`,
+ * `releasePointerCapture`, and `hasPointerCapture` answer for
+ * `MOUSE_POINTER_ID` from this record (any other id goes to Firefox), and
+ * the action sends its moves and release to the element holding it.
+ */
+function emulatePointerCapture(element: Element): PointerCapture {
+  const view = element.ownerDocument.defaultView as (Window & { wrappedJSObject?: Window & typeof globalThis }) | null;
+  const page = view?.wrappedJSObject ?? view;
+  const prototype = (page as (Window & typeof globalThis) | null)?.Element?.prototype as CaptureMethods | undefined;
+  // The element as the page called on it; this side's view of it is found among the pressed element's ancestors.
+  let held: unknown = null;
+  let announced: Element | null = null;
+  const chain = hoverChain(element);
+  const ours = (node: unknown): Element | null => chain.find((candidate) => candidate === node || (candidate as { wrappedJSObject?: unknown }).wrappedJSObject === node) ?? (node instanceof Element ? node : null);
+  if (!prototype) return { holder: () => null, release: () => {}, restore: () => {} };
+  const original: CaptureMethods = { setPointerCapture: prototype.setPointerCapture, releasePointerCapture: prototype.releasePointerCapture, hasPointerCapture: prototype.hasPointerCapture };
+  const exported = <T extends (...args: never[]) => unknown>(fn: T): T => (typeof exportFunction === "function" ? exportFunction(fn, page!) : fn);
+  const shims: CaptureMethods = {
+    setPointerCapture: exported(function (this: Element, id: number) {
+      if (Number(id) !== MOUSE_POINTER_ID) return original.setPointerCapture.call(this, id);
+      held = this;
+    }),
+    releasePointerCapture: exported(function (this: Element, id: number) {
+      if (Number(id) !== MOUSE_POINTER_ID) return original.releasePointerCapture.call(this, id);
+      if (held === this) held = null;
+    }),
+    hasPointerCapture: exported(function (this: Element, id: number) {
+      return Number(id) === MOUSE_POINTER_ID ? held !== null && held === this : original.hasPointerCapture.call(this, id);
+    }),
+  };
+  Object.assign(prototype, shims);
+  const lose = (point: ViewportPoint) => {
+    if (announced?.isConnected) pointerEvent(announced, "lostpointercapture", at(point, 0));
+    announced = null;
+  };
+  return {
+    holder(point, buttons) {
+      const holder = held === null ? null : ours(held);
+      if (holder !== announced) {
+        lose(point);
+        if (holder) pointerEvent(holder, "gotpointercapture", at(point, buttons));
+        announced = holder;
+      }
+      return holder;
+    },
+    release(point) {
+      held = null;
+      lose(point);
+    },
+    restore() {
+      // Unconditionally: read back across the compartment boundary, an exported function is not identical to the one assigned.
+      Object.assign(prototype, original);
+    },
+  };
+}
+
+/** Where a click follows the release: on the element released over when that is the pressed one or holds it (an ancestor that captured the pointer), else nowhere. */
+function clickTarget(pressed: Element, released: Element): Element | null {
+  return released === pressed || hoverChain(pressed).includes(released) ? released : null;
+}
+
 /**
  * Clicks an element at a point the way a mouse does: moves onto it, then
  * down, up, and click (auxclick for the middle button, contextmenu for the
  * right one), twice and then dblclick for a double click. A cancelled
  * pointerdown suppresses the mouse events that follow it, as in a browser;
- * an uncancelled primary mousedown focuses what the element is in.
+ * an uncancelled primary mousedown focuses what the element is in. When the
+ * page captures the pointer on pointerdown, the release goes to the element
+ * holding it.
  */
 function clickAt(element: Element, point: ViewportPoint, button: PointerButton, double: boolean): void {
   const code = BUTTONS[button];
-  movePointerTo(element, 0, { clientX: point.x, clientY: point.y }, at(point, 0));
-  for (let detail = 1; detail <= (double ? 2 : 1); detail++) {
-    const down = { ...at(point, code.buttons), button: code.button, detail };
-    const up = { ...at(point, 0), button: code.button, detail };
-    const mouse = pointerEvent(element, "pointerdown", down);
-    if (mouse && pointerEvent(element, "mousedown", down) && button === "left") focusFrom(element);
-    pointerEvent(element, "pointerup", up);
-    if (mouse) pointerEvent(element, "mouseup", up);
-    pointerEvent(element, button === "left" ? "click" : button === "middle" ? "auxclick" : "contextmenu", up);
+  const capture = emulatePointerCapture(element);
+  try {
+    movePointerTo(element, 0, { clientX: point.x, clientY: point.y }, at(point, 0));
+    let target = element;
+    for (let detail = 1; detail <= (double ? 2 : 1); detail++) {
+      const down = { ...at(point, code.buttons), button: code.button, detail };
+      const up = { ...at(point, 0), button: code.button, detail };
+      const mouse = pointerEvent(element, "pointerdown", down);
+      if (mouse && pointerEvent(element, "mousedown", down) && button === "left") focusFrom(element);
+      const released = capture.holder(point, code.buttons) ?? element;
+      pointerEvent(released, "pointerup", up);
+      if (mouse) pointerEvent(released, "mouseup", up);
+      capture.release(point);
+      target = clickTarget(element, released) ?? element;
+      pointerEvent(target, button === "left" ? "click" : button === "middle" ? "auxclick" : "contextmenu", up);
+    }
+    if (double && button === "left") pointerEvent(target, "dblclick", { ...at(point, 0), button: 0, detail: 2 });
+  } finally {
+    capture.restore();
   }
-  if (double && button === "left") pointerEvent(element, "dblclick", { ...at(point, 0), button: 0, detail: 2 });
 }
 
 /** The path's points with steps of at most `DRAG_STEP_PX` between them (bigger past `MAX_DRAG_MOVES`), its first point left out. */
@@ -2245,39 +2368,57 @@ function dragSteps(path: ViewportPoint[]): ViewportPoint[] {
 
 /**
  * Presses the primary button on an element at the path's first point, moves
- * through the path in small steps, and releases at its last point. Moves go
- * to the element under each step, crossing over/out like a real pointer, or
- * all to the pressed element when the page captured the pointer on it
- * (`setPointerCapture` in its pointerdown handler) or when the step is
+ * through the path in small steps, and releases at its last point, like a
+ * quick hand: it waits a frame after the press (so a page can commit its
+ * "drawing" state and add its move listeners), then sends
+ * `DRAG_FRAME_STEPS` moves per animation frame, and waits a frame before the
+ * release. Moves go to the element under each step, crossing over/out like a
+ * real pointer, or to the element holding the pointer once the page captured
+ * it (`setPointerCapture`, emulated), or to the last element when a step is
  * outside the document. A click follows only when the button went up on the
- * element it went down on. Returns the element the drag ended on.
+ * element it went down on (or one holding it). `follow` gets the last point
+ * of each frame's moves. Returns the element the button went up on.
  */
-function dragAlong(element: Element, path: ViewportPoint[]): Element {
+async function dragAlong(element: Element, path: ViewportPoint[], follow?: (point: ViewportPoint) => void): Promise<Element> {
   const document = element.ownerDocument;
   const [start] = path;
-  movePointerTo(element, 0, { clientX: start!.x, clientY: start!.y }, at(start!, 0));
-  const down = { ...at(start!, 1), button: 0, detail: 1 };
-  const mouse = pointerEvent(element, "pointerdown", down);
-  if (mouse && pointerEvent(element, "mousedown", down)) focusFrom(element);
-  let captured = false;
-  try { captured = element.hasPointerCapture?.(MOUSE_POINTER_ID) ?? false; } catch { captured = false; }
-  let current = element;
-  let last = start!;
-  for (const step of dragSteps(path)) {
-    const under = captured ? element : deepestAt(document, step) ?? current;
-    if (under !== current) movePointerTo(under, 1, { clientX: step.x, clientY: step.y }, at(step, 1));
-    else {
-      pointerEvent(under, "pointermove", { ...at(step, 1), button: -1 });
-      if (mouse) pointerEvent(under, "mousemove", { ...at(step, 1), button: 0 });
+  const capture = emulatePointerCapture(element);
+  try {
+    movePointerTo(element, 0, { clientX: start!.x, clientY: start!.y }, at(start!, 0));
+    const down = { ...at(start!, 1), button: 0, detail: 1 };
+    const mouse = pointerEvent(element, "pointerdown", down);
+    if (mouse && pointerEvent(element, "mousedown", down)) focusFrom(element);
+    const steps = dragSteps(path);
+    const perFrame = Math.max(DRAG_FRAME_STEPS, Math.ceil(steps.length / MAX_DRAG_FRAMES));
+    let current = element;
+    let last = start!;
+    for (let index = 0; index < steps.length; index += perFrame) {
+      await nextFrame(document);
+      for (const step of steps.slice(index, index + perFrame)) {
+        const holder = capture.holder(step, 1);
+        const under = holder ?? deepestAt(document, step) ?? current;
+        if (!holder && under !== current) movePointerTo(under, 1, { clientX: step.x, clientY: step.y }, at(step, 1));
+        else {
+          pointerEvent(under, "pointermove", { ...at(step, 1), button: -1 });
+          if (mouse) pointerEvent(under, "mousemove", { ...at(step, 1), button: 0 });
+        }
+        current = under;
+        last = step;
+      }
+      follow?.(last);
     }
-    current = under;
-    last = step;
+    await nextFrame(document);
+    const released = capture.holder(last, 1) ?? current;
+    const up = { ...at(last, 0), button: 0, detail: 1 };
+    pointerEvent(released, "pointerup", up);
+    if (mouse) pointerEvent(released, "mouseup", up);
+    capture.release(last);
+    const clicked = clickTarget(element, released);
+    if (clicked) pointerEvent(clicked, "click", up);
+    return released;
+  } finally {
+    capture.restore();
   }
-  const up = { ...at(last, 0), button: 0, detail: 1 };
-  pointerEvent(current, "pointerup", up);
-  if (mouse) pointerEvent(current, "mouseup", up);
-  if (current === element) pointerEvent(element, "click", up);
-  return current;
 }
 
 /** Why a pointer action's points cannot all be used in this frame's document, or null: inside the viewport, and for clicks, all in one document. */
@@ -2353,8 +2494,14 @@ export async function pointerAt(
     movePointerTo(target.element, 0, { clientX: local[0]!.x, clientY: local[0]!.y }, at(local[0]!, 0));
     message = `Moved the pointer onto ${label}.`;
   } else if (action.kind === "drag") {
-    if (!await show({ kind: "stroke", element: target.element, path: points })) return stopped(STOPPED_BEFORE_ACTION);
-    const end = dragAlong(target.element, local);
+    if (!await show({ kind: "stroke", element: target.element, at: first })) return stopped(STOPPED_BEFORE_ACTION);
+    const follow = options.follow;
+    let end: Element;
+    try {
+      end = await dragAlong(target.element, local, follow && ((point) => follow({ x: point.x + target.offset.x, y: point.y + target.offset.y })));
+    } finally {
+      follow?.(null);
+    }
     const endLabel = end === target.element ? "the same element" : describeHit(end, before);
     message = `Dragged from ${label} through ${points.length} points to ${endLabel}.`;
   } else {

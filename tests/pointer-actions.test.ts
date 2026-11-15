@@ -5,7 +5,7 @@ import { FrameAliases, TabController, type CaptureOptions, type TabControllerBro
 import type { CaptureGeometry, PointerAction, PointerOutcome, ShotView, ViewportPoint } from "@/lib/domain/tools";
 import type { PagePointerRequest, PageRequest } from "@/lib/protocol";
 import { createElementRefRegistry, pointerAt, type CursorGesture, type ElementRefRegistry } from "@/lib/tools/page-executor";
-import { createPageCursor, strokeRoute } from "@/lib/tools/page-cursor";
+import { createPageCursor } from "@/lib/tools/page-cursor";
 import { cursorMs } from "@/lib/domain/cursor";
 
 const instant = async () => {};
@@ -14,7 +14,7 @@ const instant = async () => {};
 interface Seen { type: string; on: string; x: number; y: number; buttons: number; button: number; pointerId?: number; pressure?: number; detail: number }
 
 const TYPES = ["pointerover", "pointerenter", "pointermove", "pointerdown", "pointerup", "pointerout", "pointerleave", "mouseover", "mouseenter", "mousemove",
-  "mousedown", "mouseup", "mouseout", "mouseleave", "click", "auxclick", "contextmenu", "dblclick"];
+  "mousedown", "mouseup", "mouseout", "mouseleave", "click", "auxclick", "contextmenu", "dblclick", "gotpointercapture", "lostpointercapture"];
 
 describe("pointerAt: effects at a point", () => {
   let registry: ElementRefRegistry;
@@ -127,13 +127,100 @@ describe("pointerAt: effects at a point", () => {
     expect(result.ok && result.outcome.kind === "acted" && result.outcome.result.summary).toMatch(/^Dragged from canvas 0×0 through 3 points to div\./);
   });
 
-  it("sends every move and the release to the element that captured the pointer, then clicks it", async () => {
-    board.hasPointerCapture = (id: number) => id === 0;
-    await act({ kind: "drag", path: [{ x: 10, y: 10 }, { x: 430, y: 10 }, { x: 900, y: 900 }] });
-    expect(seen.filter((event) => event.type === "pointermove" && event.buttons === 1).every((event) => event.on === "board")).toBe(true);
-    expect(types("palette")).toEqual([]);
-    expect(seen.find((event) => event.type === "pointerup")).toMatchObject({ on: "board", x: 900, y: 900 });
-    expect(types("board").at(-1)).toBe("click");
+  describe("pointer capture, which Firefox refuses for a synthetic pointer", () => {
+    const native = Element.prototype.setPointerCapture;
+    const nativeRelease = Element.prototype.releasePointerCapture;
+    const nativeHas = Element.prototype.hasPointerCapture;
+    beforeEach(() => {
+      // As in a Firefox content process the real mouse never entered: the id is unknown.
+      Element.prototype.setPointerCapture = () => { throw new DOMException("Element.setPointerCapture: Invalid pointer id", "NotFoundError"); };
+      Element.prototype.releasePointerCapture = () => { throw new DOMException("Element.releasePointerCapture: Invalid pointer id", "NotFoundError"); };
+      Element.prototype.hasPointerCapture = () => false;
+    });
+    afterEach(() => {
+      Element.prototype.setPointerCapture = native;
+      Element.prototype.releasePointerCapture = nativeRelease;
+      Element.prototype.hasPointerCapture = nativeHas;
+    });
+
+    it("emulates it during a drag: every move and the release go to the element holding it, which then gets a click", async () => {
+      const replaced = Element.prototype.setPointerCapture;
+      const held: boolean[] = [];
+      board.addEventListener("pointerdown", (event) => board.setPointerCapture(event.pointerId));
+      board.addEventListener("pointermove", (event) => held.push(board.hasPointerCapture(event.pointerId)));
+      await act({ kind: "drag", path: [{ x: 10, y: 10 }, { x: 430, y: 10 }, { x: 900, y: 900 }] });
+      expect(seen.filter((event) => event.type === "pointermove" && event.buttons === 1).every((event) => event.on === "board")).toBe(true);
+      expect(held.slice(1).every(Boolean)).toBe(true);
+      expect(types("palette")).toEqual([]);
+      const capture = types("board").filter((type) => type.endsWith("capture") || type === "pointerdown" || type === "pointerup" || type === "click");
+      expect(capture).toEqual(["pointerdown", "gotpointercapture", "pointerup", "lostpointercapture", "click"]);
+      expect(seen.find((event) => event.type === "pointerup")).toMatchObject({ on: "board", x: 900, y: 900 });
+      // The page's own methods come back afterwards, and ids other than the mouse's still go to them.
+      expect(Element.prototype.setPointerCapture).toBe(replaced);
+      expect(() => board.setPointerCapture(0)).toThrow("Invalid pointer id");
+    });
+
+    it("lets the page release it during the drag, and then moves go to the element under each step again", async () => {
+      board.addEventListener("pointerdown", (event) => board.setPointerCapture(event.pointerId));
+      let moves = 0;
+      board.addEventListener("pointermove", (event) => { if (++moves === 3) board.releasePointerCapture(event.pointerId); });
+      await act({ kind: "drag", path: [{ x: 10, y: 10 }, { x: 430, y: 10 }] });
+      expect(types("board")).toContain("lostpointercapture");
+      expect(seen.find((event) => event.type === "pointerup")).toMatchObject({ on: "palette" });
+    });
+
+    it("emulates it for a click too, without the page's handler throwing", async () => {
+      const errors: unknown[] = [];
+      board.addEventListener("pointerdown", (event) => {
+        try { board.setPointerCapture(event.pointerId); } catch (error) { errors.push(error); }
+      });
+      await act(click([{ x: 10, y: 10 }]));
+      expect(errors).toEqual([]);
+      expect(types("board").slice(-6)).toEqual(["mousedown", "gotpointercapture", "pointerup", "mouseup", "lostpointercapture", "click"]);
+    });
+  });
+
+  it("gives the page time after the press, so state its pointerdown handler sets asynchronously is there for the moves", async () => {
+    let drawing = false;
+    const drawn: number[] = [];
+    // As a framework does: the handler schedules the state change; it lands after the event.
+    board.addEventListener("pointerdown", () => { void Promise.resolve().then(() => { drawing = true; }); });
+    board.addEventListener("pointermove", (event) => { if (drawing) drawn.push(event.clientX); });
+    board.addEventListener("pointerup", () => { drawing = false; });
+    await act({ kind: "drag", path: [{ x: 10, y: 10 }, { x: 102, y: 10 }] });
+    expect(drawn[0]).toBe(14);
+    expect(drawn.at(-1)).toBe(102);
+  });
+
+  it("spreads a drag's moves over animation frames, a few steps in each, and gives each move its coalesced events", async () => {
+    const frames: number[] = [];
+    let moves = 0;
+    let coalesced = true;
+    board.addEventListener("pointermove", (event) => {
+      moves++;
+      coalesced &&= event.getCoalescedEvents().length === 1 && event.getCoalescedEvents()[0]!.clientX === event.clientX;
+    });
+    const raf = window.requestAnimationFrame.bind(window);
+    const spy = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => raf((time) => { frames.push(moves); callback(time); }));
+    await act({ kind: "drag", path: [{ x: 10, y: 10 }, { x: 110, y: 10 }] });
+    spy.mockRestore();
+    // One hover move, then 25 steps of 4 px, six per frame, and a frame before the release.
+    expect(frames).toEqual([1, 7, 13, 19, 25, 26]);
+    expect(coalesced).toBe(true);
+  });
+
+  it("waits a task instead of a frame in a hidden tab, which runs no animation frames", async () => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" });
+    const raf = vi.spyOn(window, "requestAnimationFrame");
+    try {
+      const result = await act({ kind: "drag", path: [{ x: 10, y: 10 }, { x: 110, y: 10 }] });
+      expect(result.ok).toBe(true);
+      expect(raf).not.toHaveBeenCalled();
+      expect(seen.filter((event) => event.type === "pointermove" && event.buttons === 1)).toHaveLength(25);
+    } finally {
+      delete (document as { visibilityState?: unknown }).visibilityState;
+      raf.mockRestore();
+    }
   });
 
   it("moves the pointer onto a point without pressing anything", async () => {
@@ -301,8 +388,13 @@ describe("the agent cursor at screenshot coordinates", () => {
     expect(present.mock.calls[0]![0]).toEqual({ kind: "hover", element: board, at: { x: 5, y: 6 } });
     present.mockClear();
     const path = [{ x: 1, y: 1 }, { x: 50, y: 1 }, { x: 50, y: 50 }];
-    await pointerAt(document, registry, view, { kind: "drag", path }, instant, { present });
-    expect(present.mock.calls).toEqual([[{ kind: "stroke", element: board, path }]]);
+    const follow = vi.fn();
+    await pointerAt(document, registry, view, { kind: "drag", path }, instant, { present, follow });
+    expect(present.mock.calls).toEqual([[{ kind: "stroke", element: board, at: { x: 1, y: 1 } }]]);
+    // The cursor then moves with the drag, frame by frame, and is released at the end.
+    expect(follow.mock.calls.length).toBeGreaterThan(2);
+    expect(follow.mock.calls.at(-2)).toEqual([{ x: 50, y: 50 }]);
+    expect(follow.mock.calls.at(-1)).toEqual([null]);
   });
 
   it("stops a batch between clicks when the glide is stopped, and before anything when the first one is", async () => {
@@ -322,16 +414,8 @@ describe("the agent cursor at screenshot coordinates", () => {
     board.scrollIntoView = scroll;
     const cursor = createPageCursor(document);
     expect(await cursor.present({ kind: "click", element: board, at: { x: 120, y: 80 } }, 10, null)).toEqual({ stopped: false, at: { x: 120, y: 80 } });
-    expect(await cursor.present({ kind: "stroke", element: board, path: [{ x: 10, y: 10 }, { x: 60, y: 10 }, { x: 60, y: 90 }] }, 10, null)).toEqual({ stopped: false, at: { x: 60, y: 90 } });
+    expect(await cursor.present({ kind: "stroke", element: board, at: { x: 10, y: 10 } }, 10, null)).toEqual({ stopped: false, at: { x: 10, y: 10 } });
     expect(scroll).not.toHaveBeenCalled();
-  });
-
-  it("samples a long stroke's route down, keeping its end", () => {
-    const path = Array.from({ length: 200 }, (_, i) => ({ x: i, y: 0 }));
-    const route = strokeRoute(path);
-    expect(route).toHaveLength(24);
-    expect(route.at(-1)).toEqual({ x: 199, y: 0 });
-    expect(strokeRoute(path.slice(0, 5))).toEqual(path.slice(1, 5));
   });
 });
 
